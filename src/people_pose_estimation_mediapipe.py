@@ -45,6 +45,8 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
         self.min_detection_confidence = rospy.get_param('~min_detection_confidence', 0.5)
         self.min_tracking_confidence = rospy.get_param('~min_tracking_confidence', 0.5)
         self.min_visibility = rospy.get_param('~min_visibility', 0.5)
+        self.min_joints = rospy.get_param('~min_joints', 6)
+        self.max_z_diff = rospy.get_param('~max_z_diff', 1.0)
 
         # Initialize MediaPipe Solutions
         if self.use_hand:
@@ -177,6 +179,15 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 pose_msg.scores.append(joint_pos['score'])
                 pose_msg.poses.append(Pose(position=Point(x=x, y=y, z=z),
                                            orientation=Quaternion(w=1)))
+            # Filter out non-human detections (Method 2 & Method 3)
+            z_values = [p.position.z for p in pose_msg.poses]
+            if len(pose_msg.poses) < self.min_joints:
+                continue
+            if len(z_values) > 0:
+                z_diff = max(z_values) - min(z_values)
+                if z_diff > self.max_z_diff:
+                    continue
+
             people_pose_msg.poses.append(pose_msg)
 
             for i, conn in enumerate(self.limb_sequence):
