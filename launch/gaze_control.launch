@@ -1,0 +1,58 @@
+<launch>
+
+  <!-- Camera and MediaPipe options -->
+  <arg name="hand_enable" default="false" />
+  <arg name="INPUT_IMAGE" default="/openni_camera/rgb/image_rect_color" />
+  <arg name="INPUT_DEPTH_IMAGE" default="/openni_camera/depth_registered/hw_registered/image_rect" />
+  <arg name="INPUT_CAMERA_INFO" default="/openni_camera/rgb/camera_info" />
+
+  <!-- Gaze Control Options -->
+  <arg name="gaze_interval" default="5.0" />
+  <arg name="max_angular_velocity" default="0.5" />
+  <arg name="min_confidence" default="0.3" />
+
+  <!-- Initial Gaze & Deep Look Parameters -->
+  <!-- initial_gaze_yaw: Negative is right, positive is left. Default -0.5 is right side (approx -30 deg) -->
+  <arg name="initial_gaze_yaw" default="-0.5" />
+  <arg name="initial_gaze_pitch" default="0.3" />
+  <arg name="deep_look_angle" default="1.0" />
+  <arg name="deep_speed_scale" default="0.5" />
+  <arg name="nod_amplitude" default="0.15" />
+  <arg name="nod_duration" default="0.25" />
+
+  <!-- Start MediaPipe Pose Estimation Node -->
+  <node name="people_pose_estimation_mediapipe"
+        pkg="aero_demo" type="people_pose_estimation_mediapipe.py"
+        output="screen">
+    <remap from="~input" to="$(arg INPUT_IMAGE)" />
+    <remap from="~input/info" to="$(arg INPUT_CAMERA_INFO)" />
+    <remap from="~input/depth" to="$(arg INPUT_DEPTH_IMAGE)" />
+    <rosparam subst_value="true">
+      with_depth: true
+      hand:
+        enable: $(arg hand_enable)
+      min_detection_confidence: 0.5
+      min_tracking_confidence: 0.5
+      min_visibility: 0.5
+    </rosparam>
+  </node>
+
+  <!-- Start Human Gaze Checking Control Node -->
+  <node name="human_gaze_control"
+        pkg="aero_demo" type="human_gaze_control.py"
+        output="screen">
+    <remap from="~pose" to="/people_pose_estimation_mediapipe/pose" />
+    <rosparam subst_value="true">
+      gaze_interval: $(arg gaze_interval)
+      max_angular_velocity: $(arg max_angular_velocity)
+      min_confidence: $(arg min_confidence)
+      initial_gaze_yaw: $(arg initial_gaze_yaw)
+      initial_gaze_pitch: $(arg initial_gaze_pitch)
+      deep_look_angle: $(arg deep_look_angle)
+      deep_speed_scale: $(arg deep_speed_scale)
+      nod_amplitude: $(arg nod_amplitude)
+      nod_duration: $(arg nod_duration)
+    </rosparam>
+  </node>
+
+</launch>
