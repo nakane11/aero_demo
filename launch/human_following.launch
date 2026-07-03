@@ -6,20 +6,24 @@
   <arg name="INPUT_DEPTH_IMAGE" default="/openni_camera/depth_registered/hw_registered/image_rect" />
   <arg name="INPUT_CAMERA_INFO" default="/openni_camera/rgb/camera_info" />
 
+  <!-- Following Control Options -->
+  <arg name="v_max" default="0.25" />
+  <arg name="max_acceleration" default="0.2" />
+  <arg name="timeout_duration" default="10.0" />
+  <arg name="base_frame" default="base_link" />
+
   <!-- Gaze Control Options -->
-  <arg name="gaze_interval" default="5.0" />
+  <arg name="enable_gaze" default="true" />
+  <arg name="gaze_interval" default="3.0" />
   <arg name="max_angular_velocity" default="0.5" />
   <arg name="min_confidence" default="0.3" />
-
-  <!-- Initial Gaze & Deep Look Parameters -->
-  <!-- initial_gaze_yaw: Negative is right, positive is left. Default -0.5 is right side (approx -30 deg) -->
   <arg name="initial_gaze_yaw" default="-0.5" />
   <arg name="initial_gaze_pitch" default="0.3" />
   <arg name="deep_look_angle" default="1.0" />
   <arg name="deep_speed_scale" default="0.5" />
   <arg name="nod_amplitude" default="0.15" />
   <arg name="nod_duration" default="0.25" />
-  <arg name="gaze_hold_duration" default="0.5" />
+  <arg name="gaze_hold_duration" default="1.5" />
 
   <!-- Start MediaPipe Pose Estimation Node -->
   <node name="people_pose_estimation_mediapipe"
@@ -40,10 +44,25 @@
     </rosparam>
   </node>
 
-  <!-- Start Human Gaze Checking Control Node -->
+  <!-- Start Human Following Control Node -->
+  <node name="human_following_control"
+        pkg="aero_demo" type="human_following_control.py"
+        output="screen">
+    <remap from="~pose" to="/people_pose_estimation_mediapipe/pose" />
+    <rosparam subst_value="true">
+      base_frame: $(arg base_frame)
+      v_max: $(arg v_max)
+      max_acceleration: $(arg max_acceleration)
+      timeout_duration: $(arg timeout_duration)
+      min_confidence: $(arg min_confidence)
+    </rosparam>
+  </node>
+
+  <!-- Start Human Gaze Checking Control Node (Optional) -->
   <node name="human_gaze_control"
         pkg="aero_demo" type="human_gaze_control.py"
-        output="screen">
+        output="screen"
+        if="$(arg enable_gaze)">
     <remap from="~pose" to="/people_pose_estimation_mediapipe/pose" />
     <rosparam subst_value="true">
       gaze_interval: $(arg gaze_interval)
