@@ -1,0 +1,26 @@
+<launch>
+
+  <arg name="gui" default="true" />
+  <arg name="with_depth" default="true" />
+  <arg name="hand_enable" default="false" />
+  <arg name="INPUT_IMAGE" default="/openni_camera/rgb/image_rect_color" />
+  <arg name="INPUT_DEPTH_IMAGE" default="/openni_camera/depth_registered/hw_registered/image_rect" />
+  <arg name="INPUT_CAMERA_INFO" default="/openni_camera/rgb/camera_info" />
+  
+  <node name="people_pose_estimation_mediapipe"
+        pkg="aero_demo" type="people_pose_estimation_mediapipe.py"
+        output="screen">
+    <remap from="~input" to="$(arg INPUT_IMAGE)" />
+    <remap from="~input/info" to="$(arg INPUT_CAMERA_INFO)" />
+    <remap from="~input/depth" to="$(arg INPUT_DEPTH_IMAGE)" />
+    <rosparam subst_value="true">
+      with_depth: $(arg with_depth)
+      hand:
+        enable: $(arg hand_enable)
+      min_detection_confidence: 0.5
+      min_tracking_confidence: 0.5
+      min_visibility: 0.5
+    </rosparam>
+  </node>
+
+</launch>
