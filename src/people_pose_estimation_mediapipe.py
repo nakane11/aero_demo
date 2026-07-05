@@ -11,9 +11,10 @@ import matplotlib
 matplotlib.use('Agg') # Prevent GUI issues
 import matplotlib.cm
 
+import tf
 from jsk_topic_tools import ConnectionBasedTransport
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import Pose, Point, Quaternion, Vector3
+from geometry_msgs.msg import Pose, Point, Quaternion, Vector3, PointStamped
 from jsk_recognition_msgs.msg import PeoplePoseArray, PeoplePose, HumanSkeletonArray, HumanSkeleton, Segment
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
@@ -47,6 +48,10 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
         self.min_visibility = rospy.get_param('~min_visibility', 0.5)
         self.min_joints = rospy.get_param('~min_joints', 6)
         self.max_z_diff = rospy.get_param('~max_z_diff', 1.0)
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.min_neck_height = rospy.get_param('~min_neck_height', 0.8)
+        self.max_neck_height = rospy.get_param('~max_neck_height', 2.0)
+        self.tf_listener = tf.TransformListener()
 
         # Initialize MediaPipe Solutions
         if self.use_hand:
@@ -187,6 +192,36 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 z_diff = max(z_values) - min(z_values)
                 if z_diff > self.max_z_diff:
                     continue
+
+            # Filter by Neck/Nose height to avoid false positives (e.g., chairs)
+            neck_pos = None
+            if "Neck" in pose_msg.limb_names:
+                neck_idx = pose_msg.limb_names.index("Neck")
+                neck_pos = pose_msg.poses[neck_idx].position
+            elif "Nose" in pose_msg.limb_names:
+                nose_idx = pose_msg.limb_names.index("Nose")
+                neck_pos = pose_msg.poses[nose_idx].position
+
+            if neck_pos is None:
+                continue
+
+            camera_point = PointStamped()
+            camera_point.header = img_msg.header
+            camera_point.point = neck_pos
+            try:
+                self.tf_listener.waitForTransform(
+                    self.base_frame,
+                    camera_point.header.frame_id,
+                    rospy.Time(0),
+                    rospy.Duration(0.5)
+                )
+                base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
+                neck_height = base_point.point.z
+                if neck_height < self.min_neck_height or neck_height > self.max_neck_height:
+                    rospy.logwarn_throttle(2, f"Pose rejected by neck height filter: height={neck_height:.2f}m (limits: {self.min_neck_height}m - {self.max_neck_height}m)")
+                    continue
+            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+                rospy.logwarn_throttle(5, f"TF transform in neck height filter failed: {str(e)}")
 
             people_pose_msg.poses.append(pose_msg)
 
