@@ -23,10 +23,11 @@ class HumanFollowingControl(object):
         self.control_rate = rospy.get_param('~control_rate', 10.0)  # Hz
         self.timeout_duration = rospy.get_param('~timeout_duration', 20.0)  # Failsafe timeout (seconds)
         self.lost_topic = rospy.get_param('~lost_topic', '/human_gaze_control/lost')
+        self.kp = rospy.get_param('~kp', 0.5)  # Proportional gain for side-by-side following
+        self.v_bias = rospy.get_param('~v_bias', 0.15)  # Nominal walking speed (m/s)
 
         # Tracking state
         self.human_x = None
-        self.human_v_world = 0.0  # Estimated human speed in world frame
         self.last_pose_time = None
         self.human_lost = True
         self.current_vel_x = 0.0
@@ -79,22 +80,9 @@ class HumanFollowingControl(object):
             )
             base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
 
-            # Estimate human speed in world frame
-            now = rospy.Time.now()
-            if self.last_pose_time is not None:
-                dt = (now - self.last_pose_time).to_sec()
-                if 0.05 < dt < 5.0:
-                    v_rel = (base_point.point.x - self.human_x) / dt
-                    v_world = v_rel + self.current_vel_x
-                    # Low-pass filter to smooth speed estimation
-                    self.human_v_world = 0.7 * self.human_v_world + 0.3 * v_world
-                    self.human_v_world = np.clip(self.human_v_world, -1.5, 1.5)
-            else:
-                self.human_v_world = 0.0
-
             # Store the longitudinal position relative to the base_frame (positive = in front, negative = behind)
             self.human_x = base_point.point.x
-            self.last_pose_time = now
+            self.last_pose_time = rospy.Time.now()
 
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             rospy.logwarn_throttle(5, f"TF transformation failed: {str(e)}")
@@ -112,7 +100,7 @@ class HumanFollowingControl(object):
             time_since_pose = (now - self.last_pose_time).to_sec()
             if time_since_pose > dt:
                 # relative velocity = human absolute speed - robot speed
-                self.human_x += (self.human_v_world - self.current_vel_x) * dt
+                self.human_x += (self.v_bias - self.current_vel_x) * dt
 
         # 1. Safety Timeout & Lost Check
         if self.human_lost:
@@ -126,23 +114,9 @@ class HumanFollowingControl(object):
         else:
             x = self.human_x
 
-            # 2. Hybrid role velocity computation
-            if x < 0.0:  # Human is behind (Lead mode - robot leads)
-                d = abs(x)
-                if d <= 0.5:
-                    v_target = self.v_max
-                elif d < 1.0:
-                    v_target = self.v_max * (1.0 - (d - 0.5) / 0.5)
-                else:
-                    v_target = 0.0
-            else:  # Human is in front (Follow mode - robot follows)
-                d = x
-                if d <= 0.5:
-                    v_target = 0.0
-                elif d < 1.0:
-                    v_target = self.v_max * ((d - 0.5) / 0.5)
-                else:
-                    v_target = self.v_max
+            # 2. Proportional velocity control with feed-forward (target offset x = 0.0 for side-by-side)
+            v_target = self.v_bias + self.kp * x
+            v_target = np.clip(v_target, 0.0, self.v_max)
 
         # 3. Apply smooth acceleration/deceleration limits
         dt = 1.0 / self.control_rate
@@ -150,6 +124,12 @@ class HumanFollowingControl(object):
 
         diff = v_target - self.current_vel_x
         self.current_vel_x += np.clip(diff, -dv_limit, dv_limit)
+
+        # Log velocity details (throttled to 1.0s to avoid console flooding)
+        if self.human_lost or self.human_x is None:
+            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Human lost)")
+        else:
+            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s | target: {v_target:.3f} m/s | human_dist: {self.human_x:.2f} m")
 
         # 4. Publish velocity command (x-direction only)
         twist_msg = Twist()
