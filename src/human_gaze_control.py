@@ -36,10 +36,6 @@ class HumanGazeControl(object):
         self.initial_gaze_yaw = rospy.get_param('~initial_gaze_yaw', -0.5)  # Default: -0.5 rad (approx -30 deg, right side)
         self.initial_gaze_pitch = rospy.get_param('~initial_gaze_pitch', 0.3)  # Default: 0.3 rad (approx 17 deg, looking down)
         self.deep_look_angle = rospy.get_param('~deep_look_angle', 1.2)  # Additional angle for deep look (approx 69 deg)
-        self.deep_speed_scale = rospy.get_param('~deep_speed_scale', 0.5)  # Gaze speed multiplier for deep look (default 0.5 = half speed)
-        self.nod_amplitude = rospy.get_param('~nod_amplitude', 0.15)  # Pitch down angle for nod (default 0.15 rad, approx 8.5 deg)
-        self.nod_duration = rospy.get_param('~nod_duration', 0.25)  # Duration of nod down (default 0.25s)
-        self.gaze_hold_duration = rospy.get_param('~gaze_hold_duration', 0.5)  # Duration to hold gaze on human (default 0.5s)
         self.sweep_margin = rospy.get_param('~sweep_margin', 0.25)  # Margin to add to sweep angle (default 0.25 rad)
 
         # Tracking state
@@ -112,7 +108,7 @@ class HumanGazeControl(object):
             )
             base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
             base_z = base_point.point.z
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+        except Exception as e:
             rospy.logwarn_throttle(5, f"TF transform in gaze control failed: {str(e)}")
             return
 
@@ -227,8 +223,8 @@ class HumanGazeControl(object):
         target_neck_p = np.clip(target_neck_p, -0.349, 0.960)  # neck_p_joint: min=-0.349, max=0.960
 
         # Don't show log when returning to forward (all joints at 0)
-        if not (target_waist_y == 0.0 and target_neck_y == 0.0 and target_neck_p == 0.0):
-            rospy.loginfo(f"Commanding joint angles -> waist_y: {target_waist_y:.2f}, neck_y: {target_neck_y:.2f}, neck_p: {target_neck_p:.2f}")
+        """ if not (target_waist_y == 0.0 and target_neck_y == 0.0 and target_neck_p == 0.0):
+            rospy.loginfo(f"Commanding joint angles -> waist_y: {target_waist_y:.2f}, neck_y: {target_neck_y:.2f}, neck_p: {target_neck_p:.2f}") """
 
         # Update robot model
         self.robot.angle_vector(self.ri.angle_vector())
@@ -307,14 +303,7 @@ class HumanGazeControl(object):
 
 
                 elif self.state == "MOVING_TO_FORWARD":
-                    # Wait until the return motion to forward posture completes (1.0s), then hold
-                    if (now - self.state_start_time).to_sec() >= self.motion_duration:
-                        self.state = "FORWARD_HOLD"
-                        self.state_start_time = now
-                        self.motion_duration = 1.0
-
-                elif self.state == "FORWARD_HOLD":
-                    # Hold the forward posture for 1.0s, then resume normal forward tracking
+                    # Wait until the return motion to forward posture completes (1.0s), then start FORWARD tracking
                     if (now - self.state_start_time).to_sec() >= self.motion_duration:
                         self.state = "FORWARD"
                         self.state_start_time = now

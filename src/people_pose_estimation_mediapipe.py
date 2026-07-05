@@ -212,7 +212,7 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 self.tf_listener.waitForTransform(
                     self.base_frame,
                     camera_point.header.frame_id,
-                    rospy.Time(0),
+                    camera_point.header.stamp,
                     rospy.Duration(0.5)
                 )
                 base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
@@ -220,7 +220,7 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 if neck_height < self.min_neck_height or neck_height > self.max_neck_height:
                     rospy.logwarn_throttle(2, f"Pose rejected by neck height filter: height={neck_height:.2f}m (limits: {self.min_neck_height}m - {self.max_neck_height}m)")
                     continue
-            except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            except Exception as e:
                 rospy.logwarn_throttle(5, f"TF transform in neck height filter failed: {str(e)}")
 
             people_pose_msg.poses.append(pose_msg)
