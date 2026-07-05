@@ -7,10 +7,12 @@
   <arg name="INPUT_CAMERA_INFO" default="/openni_camera/rgb/camera_info" />
 
   <!-- Following Control Options -->
-  <arg name="v_max" default="0.25" />
+  <arg name="v_max" default="0.15" />
   <arg name="max_acceleration" default="0.2" />
   <arg name="timeout_duration" default="10.0" />
   <arg name="base_frame" default="base_link" />
+  <arg name="min_neck_height" default="0.8" />
+  <arg name="max_neck_height" default="2.0" />
 
   <!-- Gaze Control Options -->
   <arg name="enable_gaze" default="true" />
@@ -19,11 +21,12 @@
   <arg name="min_confidence" default="0.3" />
   <arg name="initial_gaze_yaw" default="-0.5" />
   <arg name="initial_gaze_pitch" default="0.3" />
-  <arg name="deep_look_angle" default="1.0" />
+  <arg name="deep_look_angle" default="1.2" />
   <arg name="deep_speed_scale" default="0.5" />
   <arg name="nod_amplitude" default="0.15" />
   <arg name="nod_duration" default="0.25" />
   <arg name="gaze_hold_duration" default="1.5" />
+  <arg name="sweep_margin" default="0.25" />
 
   <!-- Start MediaPipe Pose Estimation Node -->
   <node name="people_pose_estimation_mediapipe"
@@ -41,11 +44,14 @@
       min_visibility: 0.5
       min_joints: 6
       max_z_diff: 1.0
+      base_frame: $(arg base_frame)
+      min_neck_height: $(arg min_neck_height)
+      max_neck_height: $(arg max_neck_height)
     </rosparam>
   </node>
 
   <!-- Start Human Following Control Node -->
-  <node name="human_following_control"
+  <!-- <node name="human_following_control"
         pkg="aero_demo" type="human_following_control.py"
         output="screen">
     <remap from="~pose" to="/people_pose_estimation_mediapipe/pose" />
@@ -57,7 +63,7 @@
       min_confidence: $(arg min_confidence)
     </rosparam>
   </node>
-
+ -->
   <!-- Start Human Gaze Checking Control Node (Optional) -->
   <node name="human_gaze_control"
         pkg="aero_demo" type="human_gaze_control.py"
@@ -75,6 +81,7 @@
       nod_amplitude: $(arg nod_amplitude)
       nod_duration: $(arg nod_duration)
       gaze_hold_duration: $(arg gaze_hold_duration)
+      sweep_margin: $(arg sweep_margin)
     </rosparam>
   </node>
 
