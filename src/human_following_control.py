@@ -31,6 +31,8 @@ class HumanFollowingControl(object):
         self.last_pose_time = None
         self.human_lost = True
         self.current_vel_x = 0.0
+        self.is_grasped = False
+        self.movement_started = False
 
         # Setup TF listener
         self.tf_listener = tf.TransformListener()
@@ -39,6 +41,7 @@ class HumanFollowingControl(object):
         self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         self.pose_sub = rospy.Subscriber(self.pose_topic, PeoplePoseArray, self.pose_callback, queue_size=1)
         self.lost_sub = rospy.Subscriber(self.lost_topic, Bool, self.lost_callback, queue_size=1)
+        self.grasp_sub = rospy.Subscriber('/aero_hand/is_grasped', Bool, self.grasp_callback, queue_size=1)
 
         # Start control loop timer
         self.control_timer = rospy.Timer(rospy.Duration(1.0 / self.control_rate), self.control_loop)
@@ -90,6 +93,11 @@ class HumanFollowingControl(object):
     def lost_callback(self, msg):
         self.human_lost = msg.data
 
+    def grasp_callback(self, msg):
+        self.is_grasped = msg.data
+        if not self.is_grasped:
+            self.movement_started = False
+
     def control_loop(self, event):
         now = rospy.Time.now()
         dt = 1.0 / self.control_rate
@@ -102,21 +110,19 @@ class HumanFollowingControl(object):
                 # relative velocity = human absolute speed - robot speed
                 self.human_x += (self.v_bias - self.current_vel_x) * dt
 
-        # 1. Safety Timeout & Lost Check
-        if self.human_lost:
-            rospy.logwarn_throttle(10, "Gaze control reports human is lost. Stopping robot.")
+        # Check if movement should start (hand is grasped and human is first seen)
+        if self.is_grasped and not self.movement_started:
+            if not self.human_lost and self.human_x is not None:
+                self.movement_started = True
+                rospy.loginfo("Human detected while hand is grasped. Starting movement.")
+
+        # 1. Hand Grasp & Movement State Check
+        if not self.is_grasped:
             v_target = 0.0
-        elif self.last_pose_time is not None and (now - self.last_pose_time).to_sec() > self.timeout_duration:
-            rospy.logwarn_throttle(5, "Failsafe safety timeout triggered (no pose for 20s). Stopping robot.")
-            v_target = 0.0
-        elif self.human_x is None:
+        elif not self.movement_started:
             v_target = 0.0
         else:
-            x = self.human_x
-
-            # 2. Proportional velocity control with feed-forward (target offset x = 0.0 for side-by-side)
-            v_target = self.v_bias + self.kp * x
-            v_target = np.clip(v_target, 0.0, self.v_max)
+            v_target = 0.15
 
         # 3. Apply smooth acceleration/deceleration limits
         dt = 1.0 / self.control_rate
@@ -126,10 +132,12 @@ class HumanFollowingControl(object):
         self.current_vel_x += np.clip(diff, -dv_limit, dv_limit)
 
         # Log velocity details (throttled to 1.0s to avoid console flooding)
-        if self.human_lost or self.human_x is None:
-            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Human lost)")
+        if not self.is_grasped:
+            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Hand released)")
+        elif not self.movement_started:
+            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Waiting for human to be seen)")
         else:
-            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s | target: {v_target:.3f} m/s | human_dist: {self.human_x:.2f} m")
+            rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Moving at constant 0.15 m/s)")
 
         # 4. Publish velocity command (x-direction only)
         twist_msg = Twist()

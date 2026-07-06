@@ -20,7 +20,7 @@ class HumanGazeControl(object):
         # Load robot model and ROS interface
         self.robot = Aero()
         self.ri = AeroROSRobotInterface(self.robot)
-        
+
         # Sync robot model state with the physical/simulated robot
         self.robot.angle_vector(self.ri.angle_vector())
 
@@ -34,8 +34,12 @@ class HumanGazeControl(object):
         # Gaze targets parameters
         # Negative is right, positive is left for yaw joints
         self.initial_gaze_yaw = rospy.get_param('~initial_gaze_yaw', -0.5)  # Default: -0.5 rad (approx -30 deg, right side)
+        # Override initial gaze yaw to -1.2 rad (user request)
+        self.initial_gaze_yaw = -1.2
         self.initial_gaze_pitch = rospy.get_param('~initial_gaze_pitch', 0.3)  # Default: 0.3 rad (approx 17 deg, looking down)
         self.deep_look_angle = rospy.get_param('~deep_look_angle', 1.2)  # Additional angle for deep look (approx 69 deg)
+        # Override deep look angle to 0.8 so search goes to -2.0 rad (initial -1.2 - 0.8 = -2.0)
+        self.deep_look_angle = 0.8
         self.sweep_margin = rospy.get_param('~sweep_margin', 0.25)  # Margin to add to sweep angle (default 0.25 rad)
 
         # Tracking state
@@ -64,8 +68,12 @@ class HumanGazeControl(object):
         # Subscribe to people pose
         self.pose_sub = rospy.Subscriber('~pose', PeoplePoseArray, self.pose_callback, queue_size=1)
 
-        # Trigger initial look immediately
-        self.transition_to_initial_look()
+        # Subscribe to hand grasp state
+        self.is_grasped = False
+        self.grasp_sub = rospy.Subscriber('/aero_hand/is_grasped', Bool, self.grasp_callback, queue_size=1)
+
+        # Start in waiting posture (looking at initial gaze yaw/pitch)
+        self.transition_to_waiting_posture()
 
         rospy.loginfo("HumanGazeControl node initialized successfully.")
 
@@ -163,6 +171,29 @@ class HumanGazeControl(object):
                     self.lost_pub.publish(Bool(data=False))
                 self.transition_to_moving_to_forward()
 
+    def grasp_callback(self, msg):
+        with self.lock:
+            was_grasped = self.is_grasped
+            self.is_grasped = msg.data
+
+            if self.is_grasped and not was_grasped:
+                rospy.loginfo("Hand grasped! Starting gaze sweep.")
+                self.gaze_timer_start = rospy.Time.now()
+                self.transition_to_gaze_sweep()
+            elif not self.is_grasped and was_grasped:
+                rospy.loginfo("Hand released! Returning to initial waiting posture.")
+                if not self.is_lost:
+                    self.is_lost = True
+                    self.lost_pub.publish(Bool(data=True))
+                self.transition_to_waiting_posture()
+
+    def transition_to_waiting_posture(self):
+        self.state = "WAITING_FOR_GRASP"
+        self.state_start_time = rospy.Time.now()
+        self.motion_duration = 1.0
+        # Command back to the initial gaze posture (waist_y: 0.0, neck_y: initial_gaze_yaw, neck_p: initial_gaze_pitch)
+        self._send_gaze_command(self.initial_gaze_yaw, self.initial_gaze_pitch, duration=self.motion_duration)
+
     def transition_to_initial_look(self):
         self.state = "MOVING_TO_INITIAL"
         self.state_start_time = rospy.Time.now()
@@ -211,15 +242,14 @@ class HumanGazeControl(object):
         self._send_gaze_command(base_yaw, base_pitch, duration=1.5)
 
     def _send_gaze_command(self, target_yaw, target_pitch, duration=None, max_vel=None):
-        # Distribute yaw angle in a natural human-like balance (40% waist, 60% neck)
-        target_waist_y = 0.4 * target_yaw
-        target_neck_y = 0.6 * target_yaw
+        # Do not use waist yaw to avoid twisting the waist (makes it hard to hold hands)
+        target_waist_y = 0.0
+        target_neck_y = target_yaw
         target_neck_p = target_pitch
 
         # Enforce joint limits
         target_waist_y = np.clip(target_waist_y, -0.785, 0.785)  # waist_y_joint: min=-0.785, max=0.785
-        target_neck_y = target_yaw - target_waist_y
-        target_neck_y = np.clip(target_neck_y, -0.873, 0.873)  # neck_y_joint: min=-0.873, max=0.873
+        target_neck_y = np.clip(target_neck_y, -2.0, 2.0)  # neck_y_joint: min=-2.0, max=2.0
         target_neck_p = np.clip(target_neck_p, -0.349, 0.960)  # neck_p_joint: min=-0.349, max=0.960
 
         # Don't show log when returning to forward (all joints at 0)
@@ -250,8 +280,12 @@ class HumanGazeControl(object):
             with self.lock:
                 now = rospy.Time.now()
 
-                if self.state == "FORWARD":
-                    if (now - self.gaze_timer_start).to_sec() >= self.gaze_interval:
+                if self.state == "WAITING_FOR_GRASP":
+                    # Just stand still in the initial gaze posture, wait for grasp_callback to transition
+                    pass
+
+                elif self.state == "FORWARD":
+                    if self.is_grasped and (now - self.gaze_timer_start).to_sec() >= self.gaze_interval:
                         self.gaze_timer_start = now
                         self.transition_to_gaze_sweep()
 
