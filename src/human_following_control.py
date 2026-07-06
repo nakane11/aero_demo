@@ -33,6 +33,7 @@ class HumanFollowingControl(object):
         self.current_vel_x = 0.0
         self.is_grasped = False
         self.movement_started = False
+        self.zero_vel_publish_count = 0
 
         # Setup TF listener
         self.tf_listener = tf.TransformListener()
@@ -140,15 +141,27 @@ class HumanFollowingControl(object):
             rospy.loginfo_throttle(1.0, f"Robot velocity: {self.current_vel_x:.3f} m/s (Moving at constant 0.15 m/s)")
 
         # 4. Publish velocity command (x-direction only)
-        twist_msg = Twist()
-        twist_msg.linear.x = self.current_vel_x
-        twist_msg.linear.y = 0.0
-        twist_msg.linear.z = 0.0
-        twist_msg.angular.x = 0.0
-        twist_msg.angular.y = 0.0
-        twist_msg.angular.z = 0.0
-
-        self.cmd_vel_pub.publish(twist_msg)
+        if self.current_vel_x == 0.0:
+            if self.zero_vel_publish_count < 5:
+                twist_msg = Twist()
+                twist_msg.linear.x = 0.0
+                twist_msg.linear.y = 0.0
+                twist_msg.linear.z = 0.0
+                twist_msg.angular.x = 0.0
+                twist_msg.angular.y = 0.0
+                twist_msg.angular.z = 0.0
+                self.cmd_vel_pub.publish(twist_msg)
+                self.zero_vel_publish_count += 1
+        else:
+            self.zero_vel_publish_count = 0
+            twist_msg = Twist()
+            twist_msg.linear.x = self.current_vel_x
+            twist_msg.linear.y = 0.0
+            twist_msg.linear.z = 0.0
+            twist_msg.angular.x = 0.0
+            twist_msg.angular.y = 0.0
+            twist_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist_msg)
 
 if __name__ == '__main__':
     rospy.init_node('human_following_control')
