@@ -8,6 +8,7 @@ import cv_bridge
 import mediapipe as mp
 import tf
 
+from std_msgs.msg import Bool
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped, Vector3, Quaternion
 
@@ -40,10 +41,18 @@ class HeadPoseEstimation:
 
         # ROS publishers and subscribers
         self.bridge = cv_bridge.CvBridge()
+        self.tf_listener = tf.TransformListener()
+        
+        # Parameters for Attention
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.yaw_threshold = rospy.get_param('~yaw_threshold', 28.0)
+        self.pitch_min = rospy.get_param('~pitch_min', -15.0)
+        self.pitch_max = rospy.get_param('~pitch_max', 20.0)
         
         self.image_pub = rospy.Publisher('~output/image', Image, queue_size=1)
         self.pose_pub = rospy.Publisher('~output/head_pose', PoseStamped, queue_size=1)
         self.euler_pub = rospy.Publisher('~output/euler_angles', Vector3, queue_size=1)
+        self.attention_pub = rospy.Publisher('~output/attention', Bool, queue_size=1)
         
         # Subscribe to RGB image
         self.image_sub = rospy.Subscriber('~input/image_raw', Image, self.image_callback, queue_size=1, buff_size=2**24)
@@ -150,10 +159,62 @@ class HeadPoseEstimation:
                     euler_msg.z = roll
                     self.euler_pub.publish(euler_msg)
 
+                    # Transform to base_link and check Attention
+                    attention_flag = False
+                    try:
+                        # Ensure pose has the correct frame ID
+                        if pose_msg.header.frame_id == "":
+                            pose_msg.header.frame_id = "camera_link" # Fallback
+                            
+                        self.tf_listener.waitForTransform(
+                            self.base_frame,
+                            pose_msg.header.frame_id,
+                            pose_msg.header.stamp,
+                            rospy.Duration(0.1)
+                        )
+                        base_pose = self.tf_listener.transformPose(self.base_frame, pose_msg)
+                        
+                        # Extract euler from base_pose
+                        base_q = [base_pose.pose.orientation.x, base_pose.pose.orientation.y, base_pose.pose.orientation.z, base_pose.pose.orientation.w]
+                        base_roll, base_pitch, base_yaw = tf.transformations.euler_from_quaternion(base_q)
+                        base_pitch_deg = np.rad2deg(base_pitch)
+                        base_yaw_deg = np.rad2deg(base_yaw)
+                        
+                        # Note: Depending on TF tree setup, face orientation might point backwards relative to base_link X
+                        # if the person is facing the robot. Normalizing to [-180, 180] and checking proximity to 180 or 0.
+                        # For simplicity, we check if the transformed yaw/pitch fall within bounds. 
+                        # We'll use absolute threshold assuming robot looks at human.
+                        normalized_yaw = (base_yaw_deg + 180.0) % 360.0 - 180.0
+                        
+                        # Using heuristic for when facing the robot (Yaw is approx 180 deg offset from robot's forward)
+                        if abs(normalized_yaw) > (180.0 - self.yaw_threshold):
+                            # Looking at robot
+                            attention_flag = True
+                            
+                        # Overriding with camera frame heuristic for now to ensure it works even if TF is weird
+                        # but keeping the base_link logic ready
+                    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException, tf.Exception) as e:
+                        pass
+                        
+                    # Fallback/Primary logic using Camera Frame (since camera is in the head)
+                    # This ensures it works on your laptop webcam immediately
+                    if abs(yaw) < self.yaw_threshold and self.pitch_min < pitch < self.pitch_max:
+                        attention_flag = True
+                    else:
+                        attention_flag = False
+
+                    # Publish Attention
+                    self.attention_pub.publish(Bool(data=attention_flag))
+
                     # Draw text on image for visualization
                     cv2.putText(image, f"Pitch: {pitch:.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     cv2.putText(image, f"Yaw:   {yaw:.1f}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     cv2.putText(image, f"Roll:  {roll:.1f}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    
+                    if attention_flag:
+                        cv2.putText(image, "Attention: ON", (size[1] // 2 - 120, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                    else:
+                        cv2.putText(image, "Attention: OFF", (size[1] // 2 - 120, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
         # Publish the visualized image
         try:
