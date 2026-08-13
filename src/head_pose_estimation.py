@@ -146,10 +146,11 @@ class HeadPoseEstimation:
                     pose_msg = PoseStamped()
                     pose_msg.header = msg.header
                     pose_msg.pose.orientation = Quaternion(*q)
-                    # We don't have true depth for position yet, so keep it zero or use the dummy translation
-                    pose_msg.pose.position.x = 0
-                    pose_msg.pose.position.y = 0
-                    pose_msg.pose.position.z = 0
+                    # Convert arbitrary model units to meters (approx scale factor for this specific model is 0.00022)
+                    scale_factor = 0.00022
+                    pose_msg.pose.position.x = float(translation_vector[0][0]) * scale_factor
+                    pose_msg.pose.position.y = float(translation_vector[1][0]) * scale_factor
+                    pose_msg.pose.position.z = float(translation_vector[2][0]) * scale_factor
                     self.pose_pub.publish(pose_msg)
 
                     # Publish Euler Angles (for easy reading in rostopic echo)
