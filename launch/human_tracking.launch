@@ -1,0 +1,18 @@
+<launch>
+
+  <!-- 1. 全身骨格推定 (Body Pose Estimation) -->
+  <include file="$(find aero_demo)/launch/people_pose_mediapipe.launch" />
+
+  <!-- 2. 顔認識 (Face Pose Estimation) -->
+  <node name="head_pose_estimation" pkg="aero_demo" type="head_pose_estimation.py" output="screen">
+    <!-- people_pose_mediapipe.launch と同じカメラトピックを入力に指定 -->
+    <remap from="~input/image_raw" to="/openni_camera/rgb/image_rect_color" />
+  </node>
+
+  <!-- 3. カルマンフィルタ・トラッカー (Human Tracker) -->
+  <node name="human_tracker" pkg="aero_demo" type="human_tracker.py" output="screen">
+    <!-- 必要に応じて global_frame などのパラメータをここで上書き可能です -->
+    <!-- <param name="global_frame" value="map" /> -->
+  </node>
+
+</launch>
