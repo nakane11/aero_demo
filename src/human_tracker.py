@@ -32,6 +32,7 @@ class HumanTracker:
         self.Q = np.diag([0.1, 0.1, 1.0, 1.0])
         
         self.last_time = rospy.Time.now()
+        self.last_obs_time = rospy.Time.now()
         self.is_initialized = False
         
         self.pose_sub = rospy.Subscriber(
@@ -109,6 +110,7 @@ class HumanTracker:
                     self.predict(dt)
                     self.update(best_z)
                     self.last_time = current_time
+                    self.last_obs_time = current_time
                 else:
                     rospy.logwarn_throttle(1.0, "[human_tracker] Received message with dt <= 0 (%.4f). Is the camera frozen or time not updating?", dt)
         else:
@@ -121,14 +123,16 @@ class HumanTracker:
 
         current_time = rospy.Time.now()
         dt = (current_time - self.last_time).to_sec()
+        time_since_obs = (current_time - self.last_obs_time).to_sec()
         
-        if dt > 0.2 and dt < 2.0:
+        if dt > 0.05 and dt < 2.0:
             self.predict(dt)
             self.last_time = current_time
         
-        if dt > 3.0:
-            self.state[2] *= 0.9
-            self.state[3] *= 0.9
+        # If no real observation for more than 0.5 seconds, forcefully decay velocity to prevent fly-away
+        if time_since_obs > 0.5:
+            self.state[2] *= 0.5
+            self.state[3] *= 0.5
 
         self.publish_state()
 
