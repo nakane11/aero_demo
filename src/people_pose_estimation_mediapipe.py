@@ -61,6 +61,7 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
             )
         else:
             self.pose = mp.solutions.pose.Pose(
+                model_complexity=rospy.get_param('~model_complexity', 0), # 0 is faster, 1 is default, 2 is more accurate
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence
             )
