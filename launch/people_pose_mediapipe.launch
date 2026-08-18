@@ -3,9 +3,9 @@
   <arg name="gui" default="true" />
   <arg name="with_depth" default="true" />
   <arg name="hand_enable" default="false" />
-  <arg name="INPUT_IMAGE" default="/openni_camera/rgb/image_rect_color" />
-  <arg name="INPUT_DEPTH_IMAGE" default="/openni_camera/depth_registered/hw_registered/image_rect" />
-  <arg name="INPUT_CAMERA_INFO" default="/openni_camera/rgb/camera_info" />
+  <arg name="INPUT_IMAGE" default="/camera/color/image_raw/decompressed" />
+  <arg name="INPUT_DEPTH_IMAGE" default="/camera/depth/image_raw/decompressed" />
+  <arg name="INPUT_CAMERA_INFO" default="/camera/color/camera_info" />
   
   <node name="people_pose_estimation_mediapipe"
         pkg="aero_demo" type="people_pose_estimation_mediapipe.py"

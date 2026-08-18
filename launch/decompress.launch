@@ -1,0 +1,15 @@
+<launch>
+  <!-- 出力トピック名の引数（デフォルト値を設定していますが、必要に応じて変更可能です） -->
+  <arg name="color_out" default="/camera/color/image_raw/decompressed" />
+  <arg name="depth_out" default="/camera/depth/image_raw/decompressed" />
+
+  <!-- Color画像の解凍 (compressed -> raw) -->
+  <node pkg="image_transport" type="republish" name="decompress_color" output="screen"
+        args="compressed in:=/camera/color/image_raw raw out:=$(arg color_out)">
+  </node>
+
+  <!-- Depth画像の解凍 (compressedDepth -> raw) -->
+  <node pkg="image_transport" type="republish" name="decompress_depth" output="screen"
+        args="compressedDepth in:=/camera/depth/image_raw raw out:=$(arg depth_out)">
+  </node>
+</launch>

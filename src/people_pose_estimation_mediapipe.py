@@ -51,7 +51,9 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
         self.base_frame = rospy.get_param('~base_frame', 'base_link')
         self.min_neck_height = rospy.get_param('~min_neck_height', 0.8)
         self.max_neck_height = rospy.get_param('~max_neck_height', 2.0)
-        self.tf_listener = tf.TransformListener()
+        self.enable_neck_height_filter = rospy.get_param('~enable_neck_height_filter', False)
+        if self.enable_neck_height_filter:
+            self.tf_listener = tf.TransformListener()
 
         # Initialize MediaPipe Solutions
         if self.use_hand:
@@ -206,23 +208,26 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
             if neck_pos is None:
                 continue
 
-            camera_point = PointStamped()
-            camera_point.header = img_msg.header
-            camera_point.point = neck_pos
-            try:
-                self.tf_listener.waitForTransform(
-                    self.base_frame,
-                    camera_point.header.frame_id,
-                    camera_point.header.stamp,
-                    rospy.Duration(0.5)
-                )
-                base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
-                neck_height = base_point.point.z
-                if neck_height < self.min_neck_height or neck_height > self.max_neck_height:
-                    rospy.logwarn_throttle(2, f"Pose rejected by neck height filter: height={neck_height:.2f}m (limits: {self.min_neck_height}m - {self.max_neck_height}m)")
-                    continue
-            except Exception as e:
-                rospy.logwarn_throttle(5, f"TF transform in neck height filter failed: {str(e)}")
+            if self.enable_neck_height_filter:
+                camera_point = PointStamped()
+                camera_point.header = img_msg.header
+                camera_point.point = neck_pos
+                try:
+                    # Use latest available transform instead of exact stamp to avoid blocking
+                    camera_point.header.stamp = rospy.Time(0)
+                    self.tf_listener.waitForTransform(
+                        self.base_frame,
+                        camera_point.header.frame_id,
+                        rospy.Time(0),
+                        rospy.Duration(0.05)
+                    )
+                    base_point = self.tf_listener.transformPoint(self.base_frame, camera_point)
+                    neck_height = base_point.point.z
+                    if neck_height < self.min_neck_height or neck_height > self.max_neck_height:
+                        rospy.logwarn_throttle(2, f"Pose rejected by neck height filter: height={neck_height:.2f}m (limits: {self.min_neck_height}m - {self.max_neck_height}m)")
+                        continue
+                except Exception as e:
+                    rospy.logwarn_throttle(5, f"TF transform in neck height filter failed: {str(e)}")
 
             people_pose_msg.poses.append(pose_msg)
 
@@ -242,56 +247,58 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 skeleton_msg.bone_names.append(bone_name)
             skeleton_msgs.skeletons.append(skeleton_msg)
 
-        # calculate MarkerArray for RViz visualization
-        marker_array = MarkerArray()
-        try:
-            cmap = matplotlib.colormaps.get_cmap('hsv')
-        except AttributeError:
-            cmap = matplotlib.cm.get_cmap('hsv')
-
-        # Add joint spheres
-        marker_id = 0
-        for person_idx, pose_msg in enumerate(people_pose_msg.poses):
-            for joint_idx, (limb_name, score, pose) in enumerate(zip(pose_msg.limb_names, pose_msg.scores, pose_msg.poses)):
-                marker = Marker()
-                marker.header = img_msg.header
-                marker.ns = "joints"
-                marker.id = marker_id
-                marker_id += 1
-                marker.type = Marker.SPHERE
-                marker.action = Marker.ADD
-                marker.pose = pose
-                marker.scale = Vector3(x=0.06, y=0.06, z=0.06)
-                try:
-                    i = self.index2limbname.index(limb_name)
-                except ValueError:
-                    i = 0
-                rgba = cmap(1. * i / (len(self.index2limbname) - 1))
-                marker.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=1.0)
-                marker.lifetime = rospy.Duration(0.5)
-                marker_array.markers.append(marker)
-
-        # Add bone line list
-        for person_idx, skeleton_msg in enumerate(skeleton_msgs.skeletons):
-            marker = Marker()
-            marker.header = img_msg.header
-            marker.ns = "bones"
-            marker.id = person_idx
-            marker.type = Marker.LINE_LIST
-            marker.action = Marker.ADD
-            marker.scale = Vector3(x=0.02, y=0, z=0)
-            marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.8) # semi-transparent yellow
-            marker.lifetime = rospy.Duration(0.5)
-            for bone in skeleton_msg.bones:
-                marker.points.append(bone.start_point)
-                marker.points.append(bone.end_point)
-            if len(marker.points) > 0:
-                marker_array.markers.append(marker)
-
         self.pose_2d_pub.publish(people_pose_2d_msg)
         self.pose_pub.publish(people_pose_msg)
         self.skeleton_pub.publish(skeleton_msgs)
-        self.marker_pub.publish(marker_array)
+
+        # calculate MarkerArray for RViz visualization only if there are subscribers
+        if self.marker_pub.get_num_connections() > 0:
+            marker_array = MarkerArray()
+            try:
+                cmap = matplotlib.colormaps.get_cmap('hsv')
+            except AttributeError:
+                cmap = matplotlib.cm.get_cmap('hsv')
+
+            # Add joint spheres
+            marker_id = 0
+            for person_idx, pose_msg in enumerate(people_pose_msg.poses):
+                for joint_idx, (limb_name, score, pose) in enumerate(zip(pose_msg.limb_names, pose_msg.scores, pose_msg.poses)):
+                    marker = Marker()
+                    marker.header = img_msg.header
+                    marker.ns = "joints"
+                    marker.id = marker_id
+                    marker_id += 1
+                    marker.type = Marker.SPHERE
+                    marker.action = Marker.ADD
+                    marker.pose = pose
+                    marker.scale = Vector3(x=0.06, y=0.06, z=0.06)
+                    try:
+                        i = self.index2limbname.index(limb_name)
+                    except ValueError:
+                        i = 0
+                    rgba = cmap(1. * i / (len(self.index2limbname) - 1))
+                    marker.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=1.0)
+                    marker.lifetime = rospy.Duration(0.5)
+                    marker_array.markers.append(marker)
+
+            # Add bone line list
+            for person_idx, skeleton_msg in enumerate(skeleton_msgs.skeletons):
+                marker = Marker()
+                marker.header = img_msg.header
+                marker.ns = "bones"
+                marker.id = person_idx
+                marker.type = Marker.LINE_LIST
+                marker.action = Marker.ADD
+                marker.scale = Vector3(x=0.02, y=0, z=0)
+                marker.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.8) # semi-transparent yellow
+                marker.lifetime = rospy.Duration(0.5)
+                for bone in skeleton_msg.bones:
+                    marker.points.append(bone.start_point)
+                    marker.points.append(bone.end_point)
+                if len(marker.points) > 0:
+                    marker_array.markers.append(marker)
+
+            self.marker_pub.publish(marker_array)
 
         if self.visualize:
             vis_img = self._draw_joints(img, people_joint_positions)
