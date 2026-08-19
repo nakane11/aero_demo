@@ -5,8 +5,9 @@ import math
 import numpy as np
 from jsk_recognition_msgs.msg import PeoplePoseArray
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PointStamped, Quaternion, PoseStamped
+from geometry_msgs.msg import PointStamped, Quaternion, PoseStamped, Point
 from visualization_msgs.msg import Marker
+from sensor_msgs.msg import LaserScan
 
 class HumanTracker:
     def __init__(self):
@@ -14,28 +15,26 @@ class HumanTracker:
         self.target_joint = rospy.get_param('~target_joint', 'Neck')
         self.pose_topic = rospy.get_param('~pose_topic', '/people_pose_estimation_mediapipe/pose')
 
+        self.max_human_speed = rospy.get_param('~max_human_speed', 1.0)
+
         self.tf_listener = tf.TransformListener()
         self.tf_broadcaster = tf.TransformBroadcaster()
 
         self.odom_pub = rospy.Publisher('~human_state', Odometry, queue_size=1)
         self.marker_pub = rospy.Publisher('~marker', Marker, queue_size=1)
 
-        # Kalman filter initialization
-        # State: [x, y, vx, vy]
-        self.state = np.zeros(4)
-        self.P = np.eye(4) * 1.0 # Initial covariance
+        self.state = np.zeros(4) # [x, y, vx, vy]
+        self.P = np.eye(4)
+        self.q_scale = rospy.get_param('~kf_q_scale', 2.0)
+        self.r_scale = rospy.get_param('~kf_r_scale', 0.05)
+        self.is_initialized = False
+        self.last_yaw = 0.0
 
-        self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]])
-
-        # Decrease observation noise, increase process noise (especially for velocity) to make it very snappy
-        self.R = np.eye(2) * 0.05
-        self.Q = np.diag([0.1, 0.1, 1.0, 1.0])
-
-        self.last_time = rospy.Time.now()
         self.last_obs_time = rospy.Time.now()
         self.last_body_obs_time = rospy.Time.now()
-        self.is_initialized = False
+
+        self.last_scan = None
+        self.scan_sub = rospy.Subscriber('/scan', LaserScan, self.scan_cb, queue_size=1)
 
         self.pose_sub = rospy.Subscriber(
             self.pose_topic,
@@ -51,212 +50,336 @@ class HumanTracker:
             queue_size=1
         )
 
-        # Timer for prediction during occlusion and continuous publishing
         self.timer = rospy.Timer(rospy.Duration(0.1), self.timer_cb)
-        rospy.loginfo("Human Tracker initialized. Tracking joint: %s in frame: %s", self.target_joint, self.global_frame)
+        rospy.loginfo("Human Tracker initialized. Vision-primary tracking active.")
 
-    def predict(self, dt):
-        F = np.array([[1, 0, dt,  0],
-                      [0, 1,  0, dt],
-                      [0, 0,  1,  0],
-                      [0, 0,  0,  1]])
-        self.state = np.dot(F, self.state)
-        self.P = np.dot(F, np.dot(self.P, F.T)) + self.Q
+    def scan_cb(self, msg):
+        self.last_scan = msg
 
-    def update(self, z):
-        y = z - np.dot(self.H, self.state)
-        S = np.dot(self.H, np.dot(self.P, self.H.T)) + self.R
-        K = np.dot(self.P, np.dot(self.H.T, np.linalg.inv(S)))
-
-        self.state = self.state + np.dot(K, y)
-        self.P = self.P - np.dot(K, np.dot(self.H, self.P))
-        rospy.loginfo_throttle(1.0, "[human_tracker] Filter updated. New state: x=%.2f, y=%.2f, vx=%.2f, vy=%.2f",
-                               self.state[0], self.state[1], self.state[2], self.state[3])
+    def head_pose_cb(self, msg):
+        # Fallback to head if body hasn't been seen for 0.5s
+        if (rospy.Time.now() - self.last_body_obs_time).to_sec() > 0.5:
+            self.process_vision_pose(msg.header, msg.pose.position, is_body=False)
 
     def pose_cb(self, msg):
-        # Use system time consistently to avoid negative dt caused by camera/inference latency
-        current_time = rospy.Time.now()
-
-        best_z = None
         for person in msg.poses:
             target_idx = -1
             if "Neck" in person.limb_names:
                 idx = person.limb_names.index("Neck")
-                if person.scores[idx] > 0:
-                    target_idx = idx
+                if person.scores[idx] > 0.1: target_idx = idx
 
             if target_idx == -1 and "Nose" in person.limb_names:
                 idx = person.limb_names.index("Nose")
-                if person.scores[idx] > 0:
-                    target_idx = idx
+                if person.scores[idx] > 0.1: target_idx = idx
+
+            if target_idx == -1:
+                best_score = 0.1
+                for i, score in enumerate(person.scores):
+                    if score > best_score:
+                        best_score = score
+                        target_idx = i
 
             if target_idx != -1:
-                pose = person.poses[target_idx]
+                self.process_vision_pose(msg.header, person.poses[target_idx].position, is_body=True)
+                break
 
-                pt = PointStamped()
-                pt.header = msg.header
-                pt.point = pose.position
+    def process_vision_pose(self, header, position, is_body=True):
+        current_time = header.stamp
+        if current_time == rospy.Time(0):
+            current_time = rospy.Time.now()
 
-                try:
-                    self.tf_listener.waitForTransform(self.global_frame, pt.header.frame_id, rospy.Time(0), rospy.Duration(0.1))
-                    pt.header.stamp = rospy.Time(0)
-                    pt_global = self.tf_listener.transformPoint(self.global_frame, pt)
-                    best_z = np.array([pt_global.point.x, pt_global.point.y])
-                    break
-                except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-                    rospy.logwarn_throttle(2.0, "TF Error in human_tracker (check if '%s' exists): %s", self.global_frame, str(e))
-                    continue
-
-        if best_z is not None:
-            if not self.is_initialized:
-                rospy.loginfo("[human_tracker] Initializing tracker at x=%.2f, y=%.2f", best_z[0], best_z[1])
-                self.state = np.array([best_z[0], best_z[1], 0.0, 0.0])
-                self.last_time = current_time
-                self.is_initialized = True
-            else:
-                dt = (current_time - self.last_time).to_sec()
-                if dt > 0:
-                    self.predict(dt)
-                    self.update(best_z)
-                    self.last_time = current_time
-                    self.last_obs_time = current_time
-                    self.last_body_obs_time = current_time
-                else:
-                    rospy.logwarn_throttle(1.0, "[human_tracker] Received message with dt <= 0 (%.4f). Is the camera frozen or time not updating?", dt)
-        else:
-            rospy.loginfo_throttle(2.0, "[human_tracker] No valid target (Neck/Nose) found, or TF failed silently in this frame.")
-
-    def head_pose_cb(self, msg):
-        current_time = rospy.Time.now()
-
-        # Use face fallback immediately if the primary body tracker is lost (0.1s = approx 1 frame delay)
-        time_since_body = (current_time - self.last_body_obs_time).to_sec()
-        if time_since_body < 0.1:
-            return
+        pt = PointStamped()
+        pt.header = header
+        pt.point = position
 
         try:
-            # Transform face position to global_frame
-            self.tf_listener.waitForTransform(self.global_frame, msg.header.frame_id, rospy.Time(0), rospy.Duration(0.1))
+            try:
+                self.tf_listener.waitForTransform(self.global_frame, header.frame_id, current_time, rospy.Duration(0.05))
+                pt.header.stamp = current_time
+            except tf.Exception:
+                self.tf_listener.waitForTransform(self.global_frame, header.frame_id, rospy.Time(0), rospy.Duration(0.05))
+                pt.header.stamp = rospy.Time(0)
 
-            # Create a PointStamped for the face position
-            from geometry_msgs.msg import PointStamped
-            pt = PointStamped()
-            pt.header = msg.header
-            pt.header.stamp = rospy.Time(0) # Use latest TF
-            pt.point = msg.pose.position
+            pt_global = self.tf_listener.transformPoint(self.global_frame, pt)
+            target_global = np.array([pt_global.point.x, pt_global.point.y])
 
-            base_point = self.tf_listener.transformPoint(self.global_frame, pt)
+            best_z = target_global
 
-            # Extract 2D floor position
-            best_z = np.array([base_point.point.x, base_point.point.y])
+            # LiDAR Fusion
+            if self.last_scan is not None:
+                scan = self.last_scan
+                try:
+                    self.tf_listener.waitForTransform(scan.header.frame_id, self.global_frame, rospy.Time(0), rospy.Duration(0.05))
+                    tg_pt = PointStamped()
+                    tg_pt.header.frame_id = self.global_frame
+                    tg_pt.point.x = target_global[0]
+                    tg_pt.point.y = target_global[1]
+                    tg_laser = self.tf_listener.transformPoint(scan.header.frame_id, tg_pt)
+
+                    tx = tg_laser.point.x
+                    ty = tg_laser.point.y
+                    target_r = math.hypot(tx, ty)
+                    target_theta = math.atan2(ty, tx)
+
+                    valid_points = []
+                    angle = scan.angle_min
+                    for r in scan.ranges:
+                        if scan.range_min < r < scan.range_max:
+                            if abs(angle - target_theta) < math.radians(20) and abs(r - target_r) < 0.8:
+                                valid_points.append((r, angle))
+                        angle += scan.angle_increment
+
+                    if valid_points:
+                        best_r = min([p[0] for p in valid_points])
+                        points_near_min = [p for p in valid_points if abs(p[0] - best_r) < 0.15]
+                        avg_r = np.mean([p[0] for p in points_near_min])
+                        avg_angle = np.mean([p[1] for p in points_near_min])
+
+                        px = avg_r * math.cos(avg_angle)
+                        py = avg_r * math.sin(avg_angle)
+
+                        leg_pt = PointStamped()
+                        leg_pt.header.frame_id = scan.header.frame_id
+                        leg_pt.point.x = px
+                        leg_pt.point.y = py
+                        leg_global = self.tf_listener.transformPoint(self.global_frame, leg_pt)
+                        best_z = np.array([leg_global.point.x, leg_global.point.y])
+                except tf.Exception:
+                    pass
 
             if not self.is_initialized:
-                rospy.loginfo("[human_tracker] Initializing tracker from FACE at x=%.2f, y=%.2f", best_z[0], best_z[1])
+                rospy.loginfo("[human_tracker] Initialized tracker at x=%.2f, y=%.2f", best_z[0], best_z[1])
                 self.state = np.array([best_z[0], best_z[1], 0.0, 0.0])
-                self.last_time = current_time
+                self.P = np.eye(4)
                 self.is_initialized = True
+                self.last_obs_time = current_time
+                if is_body:
+                    self.last_body_obs_time = current_time
             else:
-                dt = (current_time - self.last_time).to_sec()
+                dt = (current_time - self.last_obs_time).to_sec()
                 if dt > 0:
-                    self.predict(dt)
-                    self.update(best_z)
-                    self.last_time = current_time
-                    self.last_obs_time = current_time
+                    time_since_last_valid = (rospy.Time.now() - self.last_obs_time).to_sec()
 
-            rospy.logdebug_throttle(1.0, "[human_tracker] Using FACE fallback for tracking.")
+                    F = np.array([
+                        [1.0, 0.0, dt, 0.0],
+                        [0.0, 1.0, 0.0, dt],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0]
+                    ])
+                    pred_state = F @ self.state
 
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            rospy.logwarn_throttle(2.0, "TF Error in face fallback: %s", str(e))
+                    jump_dist = np.hypot(best_z[0] - pred_state[0], best_z[1] - pred_state[1])
+                    max_allowed_jump = 2.0 * dt + 0.5
+
+                    if time_since_last_valid > 3.0:
+                        rospy.loginfo("[human_tracker] Re-acquiring target after %.2fs. Resetting state.", time_since_last_valid)
+                        self.state = np.array([best_z[0], best_z[1], 0.0, 0.0])
+                        self.P = np.eye(4)
+                        self.last_obs_time = current_time
+                        if is_body:
+                            self.last_body_obs_time = current_time
+                    elif jump_dist > max_allowed_jump:
+                        rospy.logwarn_throttle(1.0, "[human_tracker] Ignored outlier (jump: %.2fm)", jump_dist)
+                    else:
+                        Q = np.array([
+                            [dt**4/4, 0, dt**3/2, 0],
+                            [0, dt**4/4, 0, dt**3/2],
+                            [dt**3/2, 0, dt**2, 0],
+                            [0, dt**3/2, 0, dt**2]
+                        ]) * self.q_scale
+
+                        self.state = pred_state
+                        self.P = F @ self.P @ F.T + Q
+
+                        H = np.array([
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0]
+                        ])
+                        R = np.eye(2) * self.r_scale
+
+                        y = best_z - H @ self.state
+                        S = H @ self.P @ H.T + R
+                        K = self.P @ H.T @ np.linalg.inv(S)
+
+                        self.state = self.state + K @ y
+                        self.P = (np.eye(4) - K @ H) @ self.P
+
+                        self.last_obs_time = current_time
+                        if is_body:
+                            self.last_body_obs_time = current_time
+
+            self.publish_state()
+
+        except tf.Exception as e:
+            rospy.logwarn_throttle(2.0, "TF Error: %s", str(e))
 
     def timer_cb(self, event):
         if not self.is_initialized:
-            rospy.loginfo_throttle(2.0, "[human_tracker] Waiting for initialization...")
             return
 
-        current_time = rospy.Time.now()
-        dt = (current_time - self.last_time).to_sec()
-        time_since_obs = (current_time - self.last_obs_time).to_sec()
+        dt = (rospy.Time.now() - self.last_obs_time).to_sec()
 
-        if dt > 0.05 and dt < 2.0:
-            self.predict(dt)
-            self.last_time = current_time
+        # Try to use LiDAR tracking if vision is lost for a short while
+        if dt > 0.2 and self.last_scan is not None:
+            pred_x = self.state[0] + self.state[2] * dt
+            pred_y = self.state[1] + self.state[3] * dt
 
-        # If no real observation for more than 0.5 seconds, forcefully decay velocity to prevent fly-away
-        if time_since_obs > 0.5:
-            self.state[2] *= 0.5
-            self.state[3] *= 0.5
+            scan = self.last_scan
+            try:
+                self.tf_listener.waitForTransform(scan.header.frame_id, self.global_frame, rospy.Time(0), rospy.Duration(0.05))
+                tg_pt = PointStamped()
+                tg_pt.header.frame_id = self.global_frame
+                tg_pt.point.x = pred_x
+                tg_pt.point.y = pred_y
+                tg_laser = self.tf_listener.transformPoint(scan.header.frame_id, tg_pt)
 
-        self.publish_state()
+                tx = tg_laser.point.x
+                ty = tg_laser.point.y
+                target_r = math.hypot(tx, ty)
+                target_theta = math.atan2(ty, tx)
+
+                valid_points = []
+                angle = scan.angle_min
+                for r in scan.ranges:
+                    if scan.range_min < r < scan.range_max:
+                        if abs(angle - target_theta) < math.radians(20) and abs(r - target_r) < 0.8:
+                            valid_points.append((r, angle))
+                    angle += scan.angle_increment
+
+                if valid_points:
+                    best_r = min([p[0] for p in valid_points])
+                    points_near_min = [p for p in valid_points if abs(p[0] - best_r) < 0.15]
+                    avg_r = np.mean([p[0] for p in points_near_min])
+                    avg_angle = np.mean([p[1] for p in points_near_min])
+
+                    px = avg_r * math.cos(avg_angle)
+                    py = avg_r * math.sin(avg_angle)
+
+                    leg_pt = PointStamped()
+                    leg_pt.header.frame_id = scan.header.frame_id
+                    leg_pt.point.x = px
+                    leg_pt.point.y = py
+                    leg_global = self.tf_listener.transformPoint(self.global_frame, leg_pt)
+
+                    best_z = np.array([leg_global.point.x, leg_global.point.y])
+
+                    # Update KF with LiDAR measurement
+                    F = np.array([
+                        [1.0, 0.0, dt, 0.0],
+                        [0.0, 1.0, 0.0, dt],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0]
+                    ])
+                    pred_state = F @ self.state
+
+                    Q = np.array([
+                        [dt**4/4, 0, dt**3/2, 0],
+                        [0, dt**4/4, 0, dt**3/2],
+                        [dt**3/2, 0, dt**2, 0],
+                        [0, dt**3/2, 0, dt**2]
+                    ]) * self.q_scale
+
+                    self.P = F @ self.P @ F.T + Q
+                    self.state = pred_state
+
+                    H = np.array([
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0]
+                    ])
+                    R = np.eye(2) * self.r_scale
+
+                    y = best_z - H @ self.state
+                    S = H @ self.P @ H.T + R
+                    K = self.P @ H.T @ np.linalg.inv(S)
+
+                    self.state = self.state + K @ y
+                    self.P = (np.eye(4) - K @ H) @ self.P
+
+                    self.last_obs_time = rospy.Time.now()
+                    dt = 0.0 # reset dt since we just updated
+            except tf.Exception:
+                pass
+
+        if dt > 3.0:
+            rospy.logwarn_throttle(2.0, "[human_tracker] Target lost for >3.0s. Hiding.")
+            self.is_initialized = False
+            self.publish_state()
+        elif dt > 0.5:
+            self.state[2] *= 0.8
+            self.state[3] *= 0.8
+            self.publish_state()
 
     def publish_state(self):
+        if not self.is_initialized:
+            marker = Marker()
+            marker.header.frame_id = self.global_frame
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "human_velocity"
+            marker.id = 0
+            marker.action = Marker.DELETE
+            self.marker_pub.publish(marker)
+            return
+
         x, y, vx, vy = self.state
 
         speed = math.hypot(vx, vy)
-        yaw = 0.0
-        if speed > 0.01: # Lowered threshold to see minor movements
-            yaw = math.atan2(vy, vx)
+        if speed > self.max_human_speed:
+            scale = self.max_human_speed / speed
+            vx *= scale
+            vy *= scale
+            speed = self.max_human_speed
+            self.state[2] = vx
+            self.state[3] = vy
 
-        q = tf.transformations.quaternion_from_euler(0, 0, yaw)
+        # 速度が遅い（停止中）時は、前回向いていた方向をキープする
+        if speed > 0.15:
+            self.last_yaw = math.atan2(vy, vx)
 
-        self.tf_broadcaster.sendTransform(
-            (x, y, 0),
-            q,
-            rospy.Time.now(),
-            "human_link",
-            self.global_frame
-        )
+        q = tf.transformations.quaternion_from_euler(0, 0, self.last_yaw)
+
+        self.tf_broadcaster.sendTransform((x, y, 0), q, rospy.Time.now(), "human_link", self.global_frame)
 
         odom = Odometry()
         odom.header.stamp = rospy.Time.now()
         odom.header.frame_id = self.global_frame
         odom.child_frame_id = "human_link"
-
         odom.pose.pose.position.x = x
         odom.pose.pose.position.y = y
-        odom.pose.pose.position.z = 0.0
         odom.pose.pose.orientation = Quaternion(*q)
-
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
-
         self.odom_pub.publish(odom)
 
-        # Publish Marker for visualization (arrow pointing in velocity direction)
         marker = Marker()
         marker.header = odom.header
         marker.ns = "human_velocity"
         marker.id = 0
 
-        if speed > 0.05:
-            marker.type = Marker.ARROW
-            marker.action = Marker.ADD
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
 
-            # Reset pose to identity when using points
-            marker.pose.orientation.w = 1.0
+        display_vx = vx
+        display_vy = vy
+        if speed <= 0.05:
+            # Draw a very small arrow in the last known direction
+            display_vx = 0.05 * math.cos(self.last_yaw)
+            display_vy = 0.05 * math.sin(self.last_yaw)
 
-            # Start point (tail) is exactly the human's position, raised slightly (z=0.1)
-            from geometry_msgs.msg import Point
-            p_start = Point(x=x, y=y, z=0.1)
-            # End point (head) is scaled by velocity (1.0 means 1 m/s = 1 meter length), raised slightly
-            p_end = Point(x=x + vx * 1.0, y=y + vy * 1.0, z=0.1)
+        p_start = Point(x=x, y=y, z=0.1)
+        p_end = Point(x=x + display_vx * 1.0, y=y + display_vy * 1.0, z=0.1)
+        marker.points = [p_start, p_end]
 
-            marker.points = [p_start, p_end]
+        marker.scale.x = 0.025
+        marker.scale.y = 0.075
+        marker.scale.z = 0.075
 
-            # For points-based arrows: x=shaft diameter, y=head diameter, z=head length (halved size)
-            marker.scale.x = 0.025
-            marker.scale.y = 0.075
-            marker.scale.z = 0.075
+        marker.color.a = 1.0
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
 
-            marker.color.a = 1.0
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-
-            self.marker_pub.publish(marker)
-        else:
-            # If speed is too slow, hide the arrow to avoid drawing a 0-length arrow
-            marker.action = Marker.DELETE
-            self.marker_pub.publish(marker)
+        self.marker_pub.publish(marker)
 
 if __name__ == '__main__':
     rospy.init_node('human_tracker')

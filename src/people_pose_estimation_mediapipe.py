@@ -12,6 +12,7 @@ matplotlib.use('Agg') # Prevent GUI issues
 import matplotlib.cm
 
 import tf
+import math
 from jsk_topic_tools import ConnectionBasedTransport
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose, Point, Quaternion, Vector3, PointStamped
@@ -52,6 +53,7 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
         self.min_neck_height = rospy.get_param('~min_neck_height', 0.8)
         self.max_neck_height = rospy.get_param('~max_neck_height', 2.0)
         self.enable_neck_height_filter = rospy.get_param('~enable_neck_height_filter', False)
+        self.recent_human_positions = []
         if self.enable_neck_height_filter:
             self.tf_listener = tf.TransformListener()
 
@@ -187,15 +189,6 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 pose_msg.scores.append(joint_pos['score'])
                 pose_msg.poses.append(Pose(position=Point(x=x, y=y, z=z),
                                            orientation=Quaternion(w=1)))
-            # Filter out non-human detections (Method 2 & Method 3)
-            z_values = [p.position.z for p in pose_msg.poses]
-            if len(pose_msg.poses) < self.min_joints:
-                continue
-            if len(z_values) > 0:
-                z_diff = max(z_values) - min(z_values)
-                if z_diff > self.max_z_diff:
-                    continue
-
             # Filter by Neck/Nose height to avoid false positives (e.g., chairs)
             neck_pos = None
             if "Neck" in pose_msg.limb_names:
@@ -207,6 +200,26 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
 
             if neck_pos is None:
                 continue
+
+            current_time = rospy.Time.now()
+            self.recent_human_positions = [(t, p) for t, p in self.recent_human_positions if (current_time - t).to_sec() < 1.0]
+
+            is_valid_by_history = False
+            for t, p in self.recent_human_positions:
+                dist = math.sqrt((neck_pos.x - p.x)**2 + (neck_pos.y - p.y)**2 + (neck_pos.z - p.z)**2)
+                if dist < 1.0:
+                    is_valid_by_history = True
+                    break
+
+            # Filter out non-human detections (Method 2 & Method 3)
+            if not is_valid_by_history:
+                z_values = [p.position.z for p in pose_msg.poses]
+                if len(pose_msg.poses) < self.min_joints:
+                    continue
+                if len(z_values) > 0:
+                    z_diff = max(z_values) - min(z_values)
+                    if z_diff > self.max_z_diff:
+                        continue
 
             if self.enable_neck_height_filter:
                 camera_point = PointStamped()
@@ -229,6 +242,7 @@ class PeoplePoseEstimationMediaPipe(ConnectionBasedTransport):
                 except Exception as e:
                     rospy.logwarn_throttle(5, f"TF transform in neck height filter failed: {str(e)}")
 
+            self.recent_human_positions.append((current_time, neck_pos))
             people_pose_msg.poses.append(pose_msg)
 
             for i, conn in enumerate(self.limb_sequence):

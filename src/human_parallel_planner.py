@@ -19,18 +19,21 @@ class HumanParallelPlanner:
         self.base_frame = rospy.get_param('~base_frame', 'base_link')
 
         # Target relative position in human's coordinate frame (X: forward, Y: left)
-        # Default: 1.0m to the right (Y = -1.0)
+        # 0.6m to the left (Y = 0.6), since human is on the right of the robot.
         self.target_x = rospy.get_param('~target_x', 0.0)
-        self.target_y = rospy.get_param('~target_y', -1.0)
+        self.target_y = rospy.get_param('~target_y', 0.6)
+
+        # State Machine: WAITING (wait for human to come to right side) -> TRACKING (parallel walk)
+        self.state = "WAITING"
 
         # Control gains
-        self.kp_pos = rospy.get_param('~kp_pos', 0.4)  # Position feedback gain (lowered for safety)
+        self.kp_pos = rospy.get_param('~kp_pos', 0.8)  # Position feedback gain (lowered for safety)
         self.kp_yaw = rospy.get_param('~kp_yaw', 0.8)  # Yaw feedback gain (lowered for safety)
 
         # Velocity limits
-        self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.4)
+        self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.5)
         self.max_angular_vel = rospy.get_param('~max_angular_vel', 0.3)
-        self.max_accel = rospy.get_param('~max_accel', 0.2)
+        self.max_accel = rospy.get_param('~max_accel', 0.4)
 
         self.control_rate = rospy.get_param('~control_rate', 10.0) # Hz
 
@@ -41,6 +44,7 @@ class HumanParallelPlanner:
         self.human_vel_y = 0.0
         self.human_yaw = 0.0
         self.last_update_time = None
+        self.start_time = None
 
         self.current_cmd = Twist()
 
@@ -79,11 +83,20 @@ class HumanParallelPlanner:
         return angle
 
     def control_loop(self, event):
+        if self.start_time is None:
+            self.start_time = rospy.Time.now()
+
         if self.human_global_x is None:
             return
 
-        # Failsafe: if human is lost for too long (e.g. 2 seconds), stop moving
-        if (rospy.Time.now() - self.last_update_time).to_sec() > 2.0:
+        # 安全のため、起動後10秒間は制御を開始しない
+        if (rospy.Time.now() - self.start_time).to_sec() < 10.0:
+            self.stop_robot()
+            rospy.logwarn_throttle(2.0, "[ParallelPlanner] Waiting for 10 seconds safety delay...")
+            return
+
+        # Failsafe: if human is lost for too long (e.g. 0.5 seconds), stop moving immediately
+        if (rospy.Time.now() - self.last_update_time).to_sec() > 0.5:
             self.stop_robot()
             rospy.logwarn_throttle(2.0, "[ParallelPlanner] Human data timeout. Stopping robot.")
             return
@@ -100,10 +113,35 @@ class HumanParallelPlanner:
             self.stop_robot()
             return
 
+        # 1.5 State Machine Check
+        if self.state == "WAITING":
+            self.stop_robot()
+            hx_global = self.human_global_x - robot_x
+            hy_global = self.human_global_y - robot_y
+
+            # Transform human position to robot's local frame
+            hx_local = hx_global * math.cos(-robot_yaw) - hy_global * math.sin(-robot_yaw)
+            hy_local = hx_global * math.sin(-robot_yaw) + hy_global * math.cos(-robot_yaw)
+
+            # Check if human is to the right (hy_local < -0.3) and roughly alongside (-1.0 < hx_local < 1.0)
+            if hy_local < -0.3 and -1.0 < hx_local < 1.0:
+                rospy.loginfo("[ParallelPlanner] Human arrived on the right side! Switching to TRACKING state.")
+                self.state = "TRACKING"
+            else:
+                rospy.loginfo_throttle(2.0, "[ParallelPlanner] WAITING for human to come to the right side... (local pos: x=%.2f, y=%.2f)", hx_local, hy_local)
+                return
+
         # 2. Calculate the target position for the robot in the global frame
+        human_speed = math.hypot(self.human_vel_x, self.human_vel_y)
+
+        # 人間は前進のみで、ロボットの回転も無効化しているため、
+        # 人間が後ずさりした時に速度ベクトルから計算されるヨー角が180度反転して
+        # 目標位置が右側にフリップする（突っ込んでくる）のを完全に防ぎます。
+        current_human_yaw = robot_yaw
+
         # Rotate the relative target coordinates by the human's heading
-        target_global_x = self.human_global_x + self.target_x * math.cos(self.human_yaw) - self.target_y * math.sin(self.human_yaw)
-        target_global_y = self.human_global_y + self.target_x * math.sin(self.human_yaw) + self.target_y * math.cos(self.human_yaw)
+        target_global_x = self.human_global_x + self.target_x * math.cos(current_human_yaw) - self.target_y * math.sin(current_human_yaw)
+        target_global_y = self.human_global_y + self.target_x * math.sin(current_human_yaw) + self.target_y * math.cos(current_human_yaw)
 
         # 3. Position Error (Global)
         error_x_global = target_global_x - robot_x
@@ -112,29 +150,36 @@ class HumanParallelPlanner:
         # 4. Calculate desired robot velocity in GLOBAL frame (Feedforward + Feedback)
         human_speed = math.hypot(self.human_vel_x, self.human_vel_y)
 
-        # Deadband threshold: if human speed is very small (e.g. < 0.15 m/s), assume they are standing still
-        if human_speed < 0.15:
-            # If human stops, disable feedback and freeze
-            desired_vx_global = 0.0
-            desired_vy_global = 0.0
-        else:
-            # Feedforward: human's velocity + Feedback: Kp * Error
-            desired_vx_global = self.human_vel_x + self.kp_pos * error_x_global
-            desired_vy_global = self.human_vel_y + self.kp_pos * error_y_global
+        # Apply deadzone to position error to avoid micro-adjustments
+        deadzone_radius = 0.20 # 20cm
+        dist_error = math.hypot(error_x_global, error_y_global)
 
+        if dist_error < deadzone_radius:
+            # 目標位置から20cm以内なら、微調整をやめて人間の速度(フィードフォワード)のみで滑らかに走る
+            fb_x = 0.0
+            fb_y = 0.0
+        else:
+            # 20cm以上離れた場合は、その超過分に対してフィードバックをかける（急加速を防ぐため徐々に強くする）
+            scale = (dist_error - deadzone_radius) / dist_error
+            fb_x = self.kp_pos * error_x_global * scale
+            fb_y = self.kp_pos * error_y_global * scale
+
+        if human_speed < 0.15:
+            # 人間が止まった場合、目標位置に追いつくためのフィードバックのみを適用し、フィードフォワードは0にする
+            desired_vx_global = fb_x
+            desired_vy_global = fb_y
+        else:
+            # Feedforward: human's velocity + Feedback: Kp * Error (with deadzone)
+            desired_vx_global = self.human_vel_x + fb_x
+            desired_vy_global = self.human_vel_y + fb_y
         # 5. Transform desired global velocity into robot's LOCAL frame (base_link)
         # Since it's an omni-wheel robot, we can directly command vx and vy.
         cmd_vx = desired_vx_global * math.cos(-robot_yaw) - desired_vy_global * math.sin(-robot_yaw)
         cmd_vy = desired_vx_global * math.sin(-robot_yaw) + desired_vy_global * math.cos(-robot_yaw)
 
         # 6. Calculate desired angular velocity (Yaw control)
-        if human_speed < 0.15:
-            cmd_wz = 0.0
-        else:
-            # For side-by-side walking, face the same direction as the human
-            target_yaw = self.human_yaw
-            error_yaw = self.normalize_angle(target_yaw - robot_yaw)
-            cmd_wz = self.kp_yaw * error_yaw
+        # 安全のため、現在は回転を無効化（人間は前進のみを前提）
+        cmd_wz = 0.0
 
         # 7. Apply limits (Velocity and Acceleration constraints)
         dt = 1.0 / self.control_rate
@@ -151,7 +196,7 @@ class HumanParallelPlanner:
         # Apply acceleration limits smoothly
         self.current_cmd.linear.x += np.clip(cmd_vx - self.current_cmd.linear.x, -max_dv, max_dv)
         self.current_cmd.linear.y += np.clip(cmd_vy - self.current_cmd.linear.y, -max_dv, max_dv)
-        #self.current_cmd.angular.z += np.clip(cmd_wz - self.current_cmd.angular.z, -max_dv * 2.0, max_dv * 2.0) # Allow faster angular acceleration
+        self.current_cmd.angular.z += np.clip(cmd_wz - self.current_cmd.angular.z, -max_dv * 2.0, max_dv * 2.0)
 
         # Publish command
         self.cmd_vel_pub.publish(self.current_cmd)
