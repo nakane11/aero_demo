@@ -20,7 +20,8 @@ find_package(catkin REQUIRED COMPONENTS
 ## Uncomment this if the package has a setup.py. This macro ensures
 ## modules and global scripts declared therein get installed
 ## See http://ros.org/doc/api/catkin/html/user_guide/setup_dot_py.html
-# catkin_python_setup()
+## src/aero_demo/ の ROS 非依存ライブラリを import 可能にする
+catkin_python_setup()
 
 ################################################
 ## Declare ROS messages, services and actions ##
@@ -159,10 +160,21 @@ include_directories(
 
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
-# catkin_install_python(PROGRAMS
-#   scripts/my_python_script
-#   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-# )
+catkin_install_python(PROGRAMS
+  scripts/fake_people_pose_estimator_ros.py
+  scripts/head_pose_estimation.py
+  scripts/human_following_control.py
+  scripts/human_gaze_control.py
+  scripts/human_handover_behavior.py
+  scripts/human_palm_contact_behavior.py
+  scripts/human_parallel_planner.py
+  scripts/human_tracker.py
+  scripts/neck_tracker.py
+  scripts/palm_plane_visualizer.py
+  scripts/people_pose_estimation_mediapipe.py
+  scripts/people_pose_estimator_ros.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html

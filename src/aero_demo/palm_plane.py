@@ -2,8 +2,8 @@
 """Least-squares palm plane estimation from MediaPipe hand landmarks.
 
 Shared by ``human_palm_contact_behavior.py`` (which reaches for the palm)
-and ``palm_plane_visualizer.py`` (which only draws the result in RViz), so
-both agree on exactly what "the palm plane" means.
+and ``palm_plane_visualizer.py`` (which only draws the result in a
+scikit-robot viewer), so both agree on exactly what "the palm plane" means.
 
 Why a least-squares fit instead of one cross product
 ----------------------------------------------------
@@ -26,7 +26,10 @@ demanding a fixed quadruple, we fit a plane by SVD to whichever of
 averages out per-landmark jitter.
 
 The module deliberately depends only on numpy and ROS messages (no
-skrobot), so the visualiser can run on a machine without the robot model.
+skrobot), so the fitting itself runs on a machine without the robot model.
+The RViz marker helpers below are kept for ``human_palm_contact_behavior``
+and for anyone who still wants markers; the visualiser draws the same
+geometry with skrobot's viewer instead.
 """
 
 import math
@@ -95,22 +98,21 @@ def _unit(v):
     return np.asarray(v, dtype=np.float64) / n
 
 
-def collect_palm_points(person, hand='R', min_score=0.1, transform=None,
+def collect_palm_points(person, hand='R', min_score=0.1,
                         indices=PLANE_LANDMARKS):
-    """Pull the palm landmarks out of one ``PeoplePose`` message.
+    """Pull the palm landmarks out of one person's pose.
 
     Parameters
     ----------
-    person : jsk_recognition_msgs/PeoplePose
-        One entry of a ``PeoplePoseArray``.
+    person : people_pose_types.Person3D
+        推定クラス (people_pose_estimator_ros / fake_people_pose_estimator_ros)
+        が返す ``EstimationResult.people`` の 1 人分。点は既に
+        ``EstimationResult.frame_id`` (既定 base_link) 相対なので、ここでは
+        座標変換をしない。
     hand : str
         ``'R'`` or ``'L'`` -- which hand's landmarks to read.
     min_score : float
         Landmarks at or below this confidence are ignored.
-    transform : callable or None
-        ``f(geometry_msgs/Point) -> (3,) ndarray`` used to move each point
-        into the frame you want to work in (typically a TF lookup into
-        ``base_link``).  ``None`` keeps the raw message coordinates.
     indices : iterable of int
         Landmark indices to look for.
 
@@ -118,7 +120,7 @@ def collect_palm_points(person, hand='R', min_score=0.1, transform=None,
     -------
     dict
         ``{landmark_index: (3,) ndarray}`` for the landmarks that were
-        present, confident, and transformed without error.
+        present and confident.
     """
     names = list(person.limb_names)
     points = {}
@@ -129,13 +131,7 @@ def collect_palm_points(person, hand='R', min_score=0.1, transform=None,
         j = names.index(key)
         if person.scores[j] <= min_score:
             continue
-        p = person.poses[j].position
-        if transform is None:
-            points[i] = np.array([p.x, p.y, p.z], dtype=np.float64)
-        else:
-            xyz = transform(p)
-            if xyz is not None:
-                points[i] = np.asarray(xyz, dtype=np.float64)
+        points[i] = np.asarray(person.positions[j], dtype=np.float64)
     return points
 
 
