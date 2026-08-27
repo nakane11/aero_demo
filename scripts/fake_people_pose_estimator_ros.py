@@ -27,7 +27,8 @@ Assumptions
 * Exactly one person, standing in front of the robot, facing the camera,
   with both arms hanging down at the sides.  With ``~present_hand`` set to
   ``R`` or ``L`` that arm is instead held out towards the robot with the
-  palm facing the camera, which is the posture
+  fingertips pointing down and the index-finger side of the hand facing
+  the robot (like an offered handshake), which is the posture
   ``palm_plane_visualizer.py`` / ``human_palm_contact_behavior.py``
   are meant to be tested against.
 * The person stands within arm's reach (``~distance_range``, default
@@ -39,19 +40,27 @@ Assumptions
   ``palm_plane.py`` can fit a plane to the wrist + knuckle landmarks.
 * The person only moves slightly (postural sway, breathing, small yaw
   oscillation, micro arm swing).
-* Body proportions, standing position and motion parameters are randomized
-  once at start-up so that every run looks like a different person
-  (``~seed`` で固定できる)。
+* Body proportions, standing position, motion parameters and (when
+  ``~present_hand`` is set) the shoulder/elbow/wrist angles of the offered
+  arm are randomized once at start-up so that every run looks like a
+  different person offering their hand differently (``~seed`` で固定できる。
+  角度の範囲は ``~present_shoulder_elevation_deg_range`` などで調整できる)。
 * Not every keypoint is visible from a camera.  Two independent dropout
   layers reproduce this:
     1. MediaPipe visibility: a per-joint, slowly varying score.  Joints
-       below ``~min_visibility``, or projected outside the image, are
-       dropped from every result (as in the real estimator).
+       below ``~min_visibility`` are dropped from every result (as in the
+       real estimator).  Joints projected outside the image are *not*
+       dropped for this reason by default (``~filter_by_fov``, default
+       False) -- staying in frame isn't the thing under test right now;
+       set it True to also drop those, matching the real estimator.
     2. Depth holes: joints that have no valid depth are additionally
        dropped from ``EstimationResult.people`` only, exactly like the real
        estimator does when the depth image has no return for that pixel.
   On top of that, the whole detection (and each hand) is intermittently
   lost for a few frames, so consumers see results with no person in them.
+  Whatever gets dropped by any of the above still keeps its ground-truth
+  3D position in ``Person3D.hidden_positions`` / ``hidden_bones`` (see
+  ``aero_demo.palm_plane_view.PalmPlaneScene``, which draws it faintly).
 """
 
 import math
@@ -193,22 +202,58 @@ class FakeRosPeoplePoseEstimator(object):
 
         self.use_hand = rospy.get_param('~hand/enable', True)
         # '' : both arms hanging down, 'R'/'L' : that hand held out towards
-        # the robot (palm facing the camera), which is what
+        # the robot, fingertips down and the index-finger side facing the
+        # robot (handshake-like), which is what
         # palm_plane_visualizer.py / human_palm_contact_behavior.py expect.
         self.present_hand = str(
             rospy.get_param('~present_hand', '')).upper()[:1]
+        # ~present_hand の腕の構え方 (肩の挙上/開き、肘の曲げ、手首の曲げ/
+        # ひねり) を deg で一様分布から引く範囲。個体ごとに 1 回だけ
+        # _sample_person で引く。既定値は「肩を斜め前に上げ、肘を軽く
+        # 伸ばし、手首で微調整する」握手のような構えのまわりに収まる範囲。
+        # ~present_wrist_roll_deg_range は掌の法線 (どちらを向いて差し出す
+        # か) を大きく変える -- 掌を正面から横向きまで広く振って、フィット
+        # した法線に沿って近づく human_palm_contact_behavior 側が実際に
+        # どこまで追従できるかを確かめるためのもの。
+        self.present_shoulder_elevation_range = rospy.get_param(
+            '~present_shoulder_elevation_deg_range', [50.0, 85.0])
+        self.present_shoulder_azimuth_range = rospy.get_param(
+            '~present_shoulder_azimuth_deg_range', [-20.0, 20.0])
+        self.present_elbow_flex_range = rospy.get_param(
+            '~present_elbow_flex_deg_range', [-10.0, 30.0])
+        self.present_wrist_pitch_range = rospy.get_param(
+            '~present_wrist_pitch_deg_range', [-30.0, 10.0])
+        self.present_wrist_roll_range = rospy.get_param(
+            '~present_wrist_roll_deg_range', [-90.0, 90.0])
         # 手のランドマークを Person3D.bones にも繋ぐ ("RHand0->RHand1" など)。
         # 本物は体のボーンしか返さないので、可視化用の拡張。
         self.include_hand_bones = rospy.get_param('~include_hand_bones', True)
         self.min_visibility = rospy.get_param('~min_visibility', 0.5)
         self.min_joints = rospy.get_param('~min_joints', 6)
+        # 画角の外に出た関節を見えないものとして落とすか。今のところ画角に
+        # 収まるかどうかは検証したいポイントではないので既定 False (落とさ
+        # ない) -- 画角外でも ~min_visibility 相応の可視性さえあれば
+        # people に入る。True にすると本物同様、画角の外は無条件で見えない
+        # 扱いになる (viewer の四角すいと実際に落ちる関節を対応させたい
+        # ときなど)。
+        self.filter_by_fov = rospy.get_param('~filter_by_fov', False)
 
-        # virtual camera
-        self.width = int(rospy.get_param('~image_width', 640))
-        self.height = int(rospy.get_param('~image_height', 480))
+        # virtual camera.  Aero's camera is an Orbbec Femto Bolt (see
+        # https://github.com/nakane11/OrbbecSDK_ROS1/tree/aero,
+        # launch/femto_bolt.launch); its color sensor's FOV is
+        # H 80 deg x V 51 deg (Orbbec's published spec, e.g. 80x51 deg at
+        # its native 3840x2160) with square pixels, so fx == fy and the
+        # ratio fx/width (== fy/height, up to the H/V rounding) holds at
+        # any resolution.  Modelled here at 1280x720 (16:9, one of the
+        # sensor's supported color resolutions):
+        #   fx = fy = (1280/2) / tan(80 deg / 2) = 762.7
+        # (720x... 51 deg backs out to within ~1 deg of this, consistent
+        # with both being rounded from the same square-pixel fx).
+        self.width = int(rospy.get_param('~image_width', 1280))
+        self.height = int(rospy.get_param('~image_height', 720))
         self.intrinsics = CameraIntrinsics(
-            fx=rospy.get_param('~fx', 615.0),
-            fy=rospy.get_param('~fy', 615.0),
+            fx=rospy.get_param('~fx', 762.7),
+            fy=rospy.get_param('~fy', 762.7),
             cx=rospy.get_param('~cx', self.width / 2.0),
             cy=rospy.get_param('~cy', self.height / 2.0))
         # 仮想カメラの置き方。カメラは head_link に付いているので
@@ -234,6 +279,13 @@ class FakeRosPeoplePoseEstimator(object):
         # 全 seed で人物が見えるのは 28 / 31 deg で、骨格がより見えるのは 31。
         # 実機も neck_tracker が首を人に向けるので、人を見ている姿勢のほうが
         # 実態に近い。実推定はこの変換を TF から引くので、これらは fake 専用。
+        # 注意: 上の 300 フレーム x 5 seed の実測値は、旧デフォルトの仮想カメラ
+        # (640x480, fx=fy=615, 水平画角 55 deg 相当) かつ画角の外を無条件で
+        # 見えない扱いにしていた頃のもの。今は画角を Femto Bolt 実機に合わせて
+        # H 80 / V 51 deg に広げ、かつ ~filter_by_fov の既定を False にして
+        # 画角の外という理由だけでは関節を落とさなくした (上のコメント参照)
+        # ので、実際にはもっと視野に収まりやすくなっているはず -- 再計測
+        # するまでは目安として読むこと。
         self.camera_height = rospy.get_param('~camera_height', 1.618)
         self.camera_forward = rospy.get_param('~camera_forward', 0.174)
         self.camera_pitch = math.radians(
@@ -246,12 +298,11 @@ class FakeRosPeoplePoseEstimator(object):
         # Close enough that Aero can touch the offered palm without driving
         # the base: the arm reaches a palm at x = 0.30..0.60 m, and at these
         # distances the fitted palm centre lands at x ~ 0.44..0.60 m.  The
-        # lateral spread has to stay narrow too, otherwise the offered hand
-        # falls outside the virtual camera's 55 deg horizontal field of view
-        # and no hand landmarks are produced at all.  Standing this close is
-        # a tight fit for the camera: for roughly two in five random seeds
-        # the offered hand still lands outside the image and no palm plane
-        # can be fitted at all.  Fix ~seed when a repeatable pose is needed.
+        # lateral spread also used to matter for staying inside the virtual
+        # camera's 80 deg horizontal field of view (Femto Bolt spec, see
+        # ~fx above), but with ~filter_by_fov defaulting to False that no
+        # longer drops hand landmarks by itself.  Fix ~seed when a
+        # repeatable pose is needed.
         self.distance_range = rospy.get_param('~distance_range', [0.80, 1.00])
         self.lateral_range = rospy.get_param('~lateral_range', [-0.15, 0.15])
         self.height_range = rospy.get_param('~height_range', [1.55, 1.85])
@@ -342,11 +393,13 @@ class FakeRosPeoplePoseEstimator(object):
             for person in people:
                 self._apply_transform(person, self.base_from_camera)
             output_frame_id = self.output_frame
+            camera_pose = self.base_from_camera
         else:
             output_frame_id = self.camera_frame_id
+            camera_pose = np.eye(4)
         # 骨は変換後の点から作るので出力座標系になる
         for person in people:
-            person.bones = self._create_bones(person)
+            person.bones, person.hidden_bones = self._create_bones(person)
 
         image = None
         if self.draw_image:
@@ -359,7 +412,11 @@ class FakeRosPeoplePoseEstimator(object):
             camera_frame_id=self.camera_frame_id,
             image=image,
             joint_positions=people_joint_positions,
-            people=people))
+            people=people,
+            camera_intrinsics=self.intrinsics,
+            camera_width=self.width,
+            camera_height=self.height,
+            camera_pose=camera_pose))
 
     def _set_result(self, result):
         """結果を保持し、``wait_for_result`` の待ち手を起こす."""
@@ -420,6 +477,23 @@ class FakeRosPeoplePoseEstimator(object):
             head_yaw=_Osc(rng, math.radians(7.0)),
             head_pitch=_Osc(rng, 0.015),
         )
+
+        # ~present_hand の腕の構え (shoulder/elbow/wrist の角度, deg)。
+        # _body_positions がこれを使って毎フレームの姿勢を作る。人が変わる
+        # たびに 1 回だけ引き直すので、その人が差し出す構え自体は動作中
+        # 一定 (揺れ・呼吸などの微小な動きだけが乗る)。consumer 側
+        # (human_palm_contact_behavior_loop.py) がこの値を viewer に出す。
+        self.presented_arm_angles = None
+        if self.present_hand in ('R', 'L'):
+            self.presented_arm_angles = dict(
+                shoulder_elevation_deg=rng.uniform(
+                    *self.present_shoulder_elevation_range),
+                shoulder_azimuth_deg=rng.uniform(
+                    *self.present_shoulder_azimuth_range),
+                elbow_flex_deg=rng.uniform(*self.present_elbow_flex_range),
+                wrist_pitch_deg=rng.uniform(*self.present_wrist_pitch_range),
+                wrist_roll_deg=rng.uniform(*self.present_wrist_roll_range),
+            )
 
         # per-joint visibility bias (individual differences, camera setup,
         # clothing ...) and a slow flicker
@@ -511,16 +585,58 @@ class FakeRosPeoplePoseEstimator(object):
         hand_frames = {}
         for hand, sign, swing in (('R', -1.0, swing_r), ('L', 1.0, swing_l)):
             if hand == self.present_hand:
-                # hand held out towards the robot, as in a handover:
-                # elbow flexed, forearm pointing forward and slightly up,
-                # fingers up, palm facing the camera.
-                elbow = p(0.12 + 0.3 * swing, sign * sw * 0.95,
-                          h_sh - 0.9 * b['upper_arm'])
-                fdir = self._unit(xh * 0.90 - yh * sign * 0.15
-                                  + zh * (0.34 + 2.0 * swing))
+                # hand held out towards the robot, like an offered
+                # handshake, built from randomized shoulder/elbow/wrist
+                # angles (self.presented_arm_angles, see _sample_person) so
+                # different people offer the hand at different angles
+                # instead of always the same fixed template.
+                pa = self.presented_arm_angles
+                elev = math.radians(pa['shoulder_elevation_deg'])
+                azim = math.radians(pa['shoulder_azimuth_deg'])
+                flex = math.radians(pa['elbow_flex_deg'])
+                wpitch = math.radians(pa['wrist_pitch_deg'])
+                wroll = math.radians(pa['wrist_roll_deg'])
+
+                shoulder = pos['{}Shoulder'.format(hand)]
+                # hinge axis for the elbow/wrist bend -- roughly the body's
+                # left-right axis, so a positive elbow_flex/wrist_pitch
+                # bends the same perceived way (forearm/hand swinging up
+                # toward the shoulder) on both arms.
+                hinge = yh * sign
+
+                # shoulder_elevation: 0 deg = arm hanging straight down,
+                # 90 deg = raised to horizontal. shoulder_azimuth: 0 deg =
+                # raised straight toward the camera, +-90 deg = swung out
+                # to the side. Elevation is kept below horizontal by
+                # ~present_shoulder_elevation_deg_range's default so the
+                # wrist doesn't get pushed above the camera's vertical FOV
+                # at the close ~distance_range this person stands at.
+                raise_dir = self._unit(
+                    xh * math.cos(azim) + hinge * math.sin(azim))
+                upper_dir = self._unit(
+                    -zh * math.cos(elev) + raise_dir * math.sin(elev))
+                elbow = shoulder + b['upper_arm'] * upper_dir + xh * 0.3 * swing
+
+                # elbow_flex: 0 deg = forearm continues the upper arm;
+                # positive bends it back up toward the shoulder.
+                fdir = self._unit(self._rotate(upper_dir, hinge, flex))
                 wrist = elbow + b['forearm'] * fdir
-                u = self._unit(zh * 0.92 + xh * 0.30)     # fingers up/forward
-                n = self._unit(xh - u * float(xh.dot(u)))  # palm -> camera
+
+                # wrist_pitch: bend of the hand relative to the forearm
+                # (0 deg = fingers continue the forearm direction).
+                u = self._unit(self._rotate(fdir, hinge, wpitch))
+                # baseline palm normal (wrist_roll == 0 deg): perpendicular
+                # to both the hinge axis and the finger direction, so the
+                # index-finger edge of the hand faces the robot -- same
+                # convention as the relaxed hanging arm below (not the
+                # palm itself, which is what actually exercises whether a
+                # consumer approaches along the *fitted* palm normal
+                # instead of assuming the palm always faces the camera
+                # head-on).  wrist_roll then rolls the palm around the
+                # finger axis, so different people present the hand at
+                # different palm angles.
+                n0 = self._unit(np.cross(hinge, u))
+                n = self._unit(self._rotate(n0, u, wroll))
             else:
                 # relaxed hanging arm: fingers down, palm facing the thigh
                 elbow = p(b['elbow_fwd'] + swing,
@@ -542,6 +658,13 @@ class FakeRosPeoplePoseEstimator(object):
     @staticmethod
     def _unit(v):
         return v / np.linalg.norm(v)
+
+    @staticmethod
+    def _rotate(v, axis, angle):
+        """Rodrigues' rotation formula: rotate ``v`` by ``angle`` [rad]
+        around the unit vector ``axis``."""
+        c, s = math.cos(angle), math.sin(angle)
+        return v * c + np.cross(axis, v) * s + axis * axis.dot(v) * (1.0 - c)
 
     def _hand_bone_pairs(self, hand):
         """Bones of one hand, wrist -> Hand0 plus the 20 finger links."""
@@ -593,24 +716,36 @@ class FakeRosPeoplePoseEstimator(object):
         return np.array([q.dot(x_dir), q.dot(y_dir), q.dot(z_dir)])
 
     def _project(self, pc):
+        """Camera 座標系の点をピクセル座標へ投影する.
+
+        カメラの後ろ (``pc[2] <= 0.05``) は投影しようがないので None。
+        画角の外に出た場合はそれでも (u, v) を返す -- 画角内かどうかは
+        ``~filter_by_fov`` に従って ``_make_joint`` 側が判断する。
+        """
         if pc[2] <= 0.05:
             return None
         intr = self.intrinsics
         u = pc[0] * intr.fx / pc[2] + intr.cx
         v = pc[1] * intr.fy / pc[2] + intr.cy
-        if not (0.0 <= u < self.width and 0.0 <= v < self.height):
-            return None
         return u, v
+
+    def _in_frame(self, u, v):
+        return 0.0 <= u < self.width and 0.0 <= v < self.height
 
     @staticmethod
     def _apply_transform(person, transform):
-        """person の全関節点を transform の座標系へ移す (破壊的)."""
-        if not person.positions:
-            return
+        """person の全関節点 (可視 + 非可視) を transform の座標系へ移す (破壊的)."""
         matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-        points = np.asarray(person.positions, dtype=np.float64)   # (N, 3)
-        homogeneous = np.hstack([points, np.ones((len(points), 1))])
-        person.positions = list(homogeneous.dot(matrix.T)[:, :3])
+
+        def move(points):
+            if not points:
+                return points
+            pts = np.asarray(points, dtype=np.float64)   # (N, 3)
+            homogeneous = np.hstack([pts, np.ones((len(pts), 1))])
+            return list(homogeneous.dot(matrix.T)[:, :3])
+
+        person.positions = move(person.positions)
+        person.hidden_positions = move(person.hidden_positions)
 
     # ------------------------------------------------------------------
     # visibility / detection state
@@ -672,11 +807,15 @@ class FakeRosPeoplePoseEstimator(object):
         if self.use_hand:
             for hand in ('R', 'L'):
                 names = ['{}Hand{}'.format(hand, i) for i in range(21)]
-                if not self.hand_detected[hand]:
-                    joints += [dict(limb=n, x=0, y=0, score=-1)
-                               for n in names]
-                    continue
+                # computed unconditionally (even if the whole hand is
+                # lost this frame) so _make_joint can still attach the
+                # ground-truth ``cam`` position for the viewer's faint
+                # "not detected" drawing.
                 hpos = self._hand_positions(hand, hand_frames[hand])
+                if not self.hand_detected[hand]:
+                    joints += [self._make_joint(name, hpos[name], -1.0)
+                               for name in names]
+                    continue
                 for i, name in enumerate(names):
                     # MediaPipe hand landmarks carry no visibility, the
                     # real estimator reports score 1.0 for all of them
@@ -691,10 +830,17 @@ class FakeRosPeoplePoseEstimator(object):
         noisy = p_robot + self.nprng.normal(0.0, self.joint_noise, 3)
         pc = self._to_camera(noisy)
         uv = self._project(pc)
-        if uv is None or score < self.min_visibility:
-            # outside the image or below the visibility threshold ->
-            # dropped by the real estimator as well
-            return dict(limb=limb, x=0, y=0, score=-1)
+        out_of_frame = uv is not None and self.filter_by_fov \
+            and not self._in_frame(*uv)
+        if uv is None or out_of_frame or score < self.min_visibility:
+            # behind the camera, outside the image (only when
+            # ~filter_by_fov), or below the visibility threshold ->
+            # dropped by the real estimator as well.  ``cam`` is kept
+            # anyway (unlike the real estimator, this one has ground
+            # truth for joints it drops) purely so the viewer can draw
+            # them faintly; estimate_3d never looks at it when score < 0.
+            x, y = uv if uv is not None else (0, 0)
+            return dict(limb=limb, x=x, y=y, score=-1, cam=pc)
         if depth_hole is None:
             depth_hole = self.depth_hole_prob
         has_depth = self.rng.random() >= depth_hole
@@ -705,13 +851,24 @@ class FakeRosPeoplePoseEstimator(object):
     # 3D generation (本物の PeoplePoseEstimator.estimate_3d に相当)
     # ------------------------------------------------------------------
     def _to_people_3d(self, people_joint_positions):
-        """カメラ座標系の ``Person3D`` を作る (骨はまだ張らない)."""
+        """カメラ座標系の ``Person3D`` を作る (骨はまだ張らない).
+
+        本物の推定と同じ ``positions`` (可視 + 深度あり) に加えて、
+        ``hidden_positions`` に画角の外・可視性不足・深度欠測で落ちた
+        関節の真値を入れる (fake だけが知っている情報)。viewer で薄く
+        描くためだけのもので、``palm_plane`` などの実際の判断ロジックは
+        今まで通り ``positions`` / ``limb_names`` しか見ない。
+        """
         people = []
         for person_joint_positions in people_joint_positions:
             person = Person3D()
             for joint_pos in person_joint_positions:
                 # 深度画像が無いので、深度の欠測は has_depth で模擬する
                 if joint_pos['score'] < 0 or not joint_pos['has_depth']:
+                    if 'cam' in joint_pos:
+                        person.hidden_limb_names.append(joint_pos['limb'])
+                        person.hidden_positions.append(
+                            np.asarray(joint_pos['cam'], dtype=np.float64))
                     continue
                 person.limb_names.append(joint_pos['limb'])
                 person.scores.append(joint_pos['score'])
@@ -728,24 +885,31 @@ class FakeRosPeoplePoseEstimator(object):
         return people
 
     def _create_bones(self, person):
+        """可視の骨 (``bones``) と、片端以上が非可視の骨 (``hidden_bones``)."""
         pairs = [(self.index2limbname[c[0] - 1], self.index2limbname[c[1] - 1])
                  for c in self.limb_sequence]
         if self.use_hand and self.include_hand_bones:
             for hand in ('R', 'L'):
                 pairs += self._hand_bone_pairs(hand)
 
-        bones = []
+        def lookup(name):
+            if name in person.limb_names:
+                return person.positions[person.limb_names.index(name)], True
+            if name in person.hidden_limb_names:
+                idx = person.hidden_limb_names.index(name)
+                return person.hidden_positions[idx], False
+            return None, False
+
+        bones, hidden_bones = [], []
         for j1_name, j2_name in pairs:
-            if j1_name not in person.limb_names \
-                    or j2_name not in person.limb_names:
+            p1, visible1 = lookup(j1_name)
+            p2, visible2 = lookup(j2_name)
+            if p1 is None or p2 is None:
                 continue
-            j1_index = person.limb_names.index(j1_name)
-            j2_index = person.limb_names.index(j2_name)
-            bones.append(Bone(
-                name='{}->{}'.format(j1_name, j2_name),
-                start_point=person.positions[j1_index],
-                end_point=person.positions[j2_index]))
-        return bones
+            bone = Bone(name='{}->{}'.format(j1_name, j2_name),
+                       start_point=p1, end_point=p2)
+            (bones if (visible1 and visible2) else hidden_bones).append(bone)
+        return bones, hidden_bones
 
     # ------------------------------------------------------------------
     # visualization

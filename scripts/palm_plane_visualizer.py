@@ -10,7 +10,11 @@ Use it to check, before letting the robot reach, that
 
 * the plane sits flat on the human palm,
 * the green normal arrow points back at the robot (not into the person),
-* the blue/red approach and press targets land where you expect.
+* the blue/red approach and press targets land where you expect,
+* (``~source: fake`` only) the parts of the body the camera did *not*
+  capture -- drawn faintly, alongside a faint pyramid for the camera's
+  own field of view when ``~filter_by_fov`` is set true -- look like what
+  ``~present_hand`` / the standing position should actually produce.
 
 ``human_palm_contact_behavior.py`` draws the same scene (via
 ``aero_demo.palm_plane_view``) while actually reaching, so this node is only
@@ -48,7 +52,16 @@ Parameters
                                          ``~hand/enable`` と衝突するので使わない)
 ``~min_score`` (float, default 0.1)
 ``~rate_limit`` (float, default 0.0)     描画更新の最小間隔 [s] (0 = 毎フレーム)
-``~draw_skeleton`` (bool, default true)  骨格を線で描くか
+``~draw_skeleton`` (bool, default true)  骨格を線で描くか。検出できな
+                                         かった関節も (fake 推定のときだけ)
+                                         色を薄くして併せて描く
+``~draw_camera_frustum`` (bool, default true)  カメラの画角を表す薄い
+                                         四角すいを optical_frame から
+                                         伸ばして描くか。``~source: fake``
+                                         かつ ``~filter_by_fov`` が false
+                                         (既定) のときは、画角の外でも
+                                         関節が落ちず画角を考慮していない
+                                         ので、この設定によらず描かない
 ``~draw_robot`` (bool, default true)     Aero のモデルを base_link に置くか
 ``~use_hand`` (bool, default true)       手付きの URDF を読むか
 ``~viewer`` (str, default ``trimesh``)   ``trimesh`` (X のウィンドウ) か
@@ -143,11 +156,19 @@ class PalmPlaneVisualizer(object):
         self.stats = {'frames': 0, 'fitted': 0}
 
         self.viewer_name = str(rospy.get_param('~viewer', 'trimesh')).lower()
+        draw_camera = rospy.get_param('~draw_camera_frustum', True)
+        if self.source_name == 'fake' \
+                and not rospy.get_param('~filter_by_fov', False):
+            # fake の既定では画角の外でも関節を落とさない (~filter_by_fov
+            # 参照) = 画角を考慮していないので、四角すいを描いても意味が
+            # ない。
+            draw_camera = False
         self.scene = PalmPlaneScene(
             viewer=self.viewer_name,
             resolution=(rospy.get_param('~viewer_width', 960),
                         rospy.get_param('~viewer_height', 720)),
-            draw_skeleton=rospy.get_param('~draw_skeleton', True))
+            draw_skeleton=rospy.get_param('~draw_skeleton', True),
+            draw_camera=draw_camera)
         if rospy.get_param('~draw_robot', True):
             robot = load_aero(rospy.get_param('~use_hand', True))
             if robot is not None:
@@ -192,6 +213,9 @@ class PalmPlaneVisualizer(object):
     def _draw(self, result):
         if not self.scene.update_skeleton(result.people):
             rospy.logwarn('cannot draw the skeleton; disabling it')
+        self.scene.update_camera(
+            result.camera_intrinsics, result.camera_width,
+            result.camera_height, result.camera_pose)
 
         # 法線は観測者 (= result.frame_id の原点、既定では base_link の
         # ロボット自身) の方を向かせる。

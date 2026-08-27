@@ -82,7 +82,10 @@ EMBED_DEPTH = 0.01
 PalmPlane = namedtuple('PalmPlane', [
     'center',       # (3,) mid-palm point
     'normal',       # (3,) unit normal, pointing toward the viewpoint
-    'rot',          # (3,3) rotation matrix, local +Y = normal, +Z = fingers
+    'rot',          # (3,3) rotation matrix matching Aero's r/l_eef_grasp_link
+                    # axes: local +X = fingers (wrist->fingertip), +Y = the
+                    # dorsum->palm axis set to -normal (so the robot's palm
+                    # faces the human's), +Z = thumb<->pinky width
     'finger_dir',   # (3,) unit vector wrist -> knuckles, in the plane
     'used',         # sorted list of landmark indices used for the fit
     'rms',          # RMS distance of those points from the fitted plane [m]
@@ -201,11 +204,23 @@ def fit_palm_plane(points, viewpoint=None):
     if float(np.dot(normal, viewpoint - center)) < 0.0:
         normal = -normal
 
-    # --- build a full frame: +Y = normal, +Z = finger direction ----------
-    # The robot's hand approaches along its local -Y, so aligning +Y with
-    # the palm normal lands the hand flat against the palm; +Z along the
-    # fingers keeps the wrist roll anatomically sensible instead of
-    # depending on an arbitrary world axis.
+    # --- build a full frame: +X = fingers, +Y = palm normal --------------
+    # Checked directly against Aero's r/l_eef_grasp_link frame (built by
+    # loading the URDF in skrobot and probing it -- see the analysis in
+    # scripts/human_palm_contact_behavior.py's IK-target comment): local
+    # +X is the wrist -> fingertip direction (confirmed by how far along
+    # +X the fingertip links sit), and local +Y is the *dorsum -> palm*
+    # direction -- confirmed by driving the finger-curl joints and
+    # watching the fingertips move toward +Y as they close, which is
+    # exactly the side "the palm" is on.  +Z (thumb <-> pinky width)
+    # completes the right-handed frame.
+    #
+    # A robot palm pressed flat against the human's must face the human,
+    # i.e. point roughly opposite the human normal (which itself points
+    # from the human's palm toward the robot -- see below).  So the
+    # robot's local +Y (dorsum -> palm) must equal -normal, which is the
+    # same thing as saying local -Y (palm -> dorsum, "back of the hand")
+    # equals +normal.
     if finger_dir is None:
         # Fall back to any axis not parallel to the normal.
         ref = np.array([0.0, 0.0, 1.0])
@@ -215,14 +230,15 @@ def fit_palm_plane(points, viewpoint=None):
         if finger_dir is None:
             return None
 
-    z_axis = _unit(finger_dir - float(np.dot(finger_dir, normal)) * normal)
-    if z_axis is None:
+    x_axis = _unit(finger_dir - float(np.dot(finger_dir, normal)) * normal)
+    if x_axis is None:
         return None
-    x_axis = np.cross(normal, z_axis)
-    rot = np.column_stack([x_axis, normal, z_axis])
+    y_axis = -normal
+    z_axis = np.cross(x_axis, y_axis)
+    rot = np.column_stack([x_axis, y_axis, z_axis])
 
     return PalmPlane(center=center, normal=normal, rot=rot,
-                     finger_dir=z_axis, used=idxs, rms=rms,
+                     finger_dir=x_axis, used=idxs, rms=rms,
                      span=float(s[1]), span_ratio=span_ratio)
 
 
@@ -301,8 +317,8 @@ def palm_plane_markers(plane, frame_id, stamp=None, ns='palm_plane',
 
     quat = _matrix_to_quaternion_xyzw(plane.rot)
 
-    # 0: the fitted plane, drawn as a thin plate.  Local +Y is the normal,
-    # so the flat dimensions are x and z.
+    # 0: the fitted plane, drawn as a thin plate.  Local +Y is -normal
+    # (see palm_plane.fit_palm_plane), so the flat dimensions are x and z.
     plate = _base_marker(frame_id, stamp, ns, 0, Marker.CUBE, lifetime)
     plate.pose.position = Point(*plane.center)
     plate.pose.orientation.x = quat[0]

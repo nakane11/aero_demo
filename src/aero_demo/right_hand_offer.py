@@ -60,14 +60,24 @@ OFFER_DISTANCE = 0.15
 
 # IK is attempted with progressively fewer degrees of freedom / orientation
 # constraints, same fallback idea as human_palm_contact_behavior.py's
-# two-stage ``rotation_axis='yz'`` -> ``rotation_axis=False`` retry, extended
-# with an arm-only tier in case the lifter/waist of *_whole_body pull the
-# solver into a posture it cannot resolve for this particular target.
-# (limb_attr, rotation_axis) tried in order; first success wins.
+# ``rotation_mask='xz'`` -> ``rotation_mask=True`` -> ``rotation_mask=False``
+# retry, extended with an arm-only tier in case the lifter/waist of
+# *_whole_body pull the solver into a posture it cannot resolve for this
+# particular target.  ``rotation_mask`` (not the legacy ``rotation_axis``,
+# whose axis letters mean "ignore", inverted from what they look like --
+# see skrobot.coordinates.math) so 'xz' means "constrain X
+# (offer_target_coords.rot's finger axis) and Z (thumb<->pinky width),
+# leaving Y (the palm-normal axis the target is actually built around --
+# see palm_plane.fit_palm_plane) free for wrist roll".  That is the
+# physically meaningful constraint (align the palm, don't care about
+# roll about it), so it is tried before the fully-constrained ``True``.
+# (limb_attr, rotation_mask) tried in order; first success wins.
 IK_ATTEMPTS = (
-    ('rarm_whole_body', 'yz'),
+    ('rarm_whole_body', 'xz'),
+    ('rarm_whole_body', True),
     ('rarm_whole_body', False),
-    ('rarm', 'yz'),
+    ('rarm', 'xz'),
+    ('rarm', True),
     ('rarm', False),
 )
 
@@ -75,7 +85,7 @@ IK_ATTEMPTS = (
 OfferResult = namedtuple('OfferResult', [
     'success',        # bool
     'limb',           # str or None -- which IK_ATTEMPTS entry succeeded
-    'rotation_axis',  # the matching rotation_axis, or None
+    'rotation_mask',  # the matching rotation_mask, or None
     'target',         # skrobot.coordinates.Coordinates, the IK goal
     'reached',        # skrobot.coordinates.Coordinates, rarm_end_coords after solving
     'position_error', # float [m], |reached - target|
@@ -101,11 +111,12 @@ def offer_target_coords(plane, distance=OFFER_DISTANCE):
     Returns
     -------
     skrobot.coordinates.Coordinates
-        ``rot`` reuses ``plane.rot`` (local +Y = normal, +Z = fingers), the
-        same convention ``human_palm_contact_behavior.py`` feeds straight
-        into ``Coordinates(rot=...)`` -- the hand's local -Y is its
-        approach direction, so this orientation lands Aero's palm facing
-        the human's, without extra rotation bookkeeping here.
+        ``rot`` reuses ``plane.rot`` (local +X = fingers, +Y = -normal,
+        +Z = width -- see ``palm_plane.fit_palm_plane``), the same
+        convention ``human_palm_contact_behavior.py`` feeds straight into
+        ``Coordinates(rot=...)`` -- the hand's local +Y is its
+        dorsum->palm direction, so this orientation lands Aero's palm
+        facing the human's, without extra rotation bookkeeping here.
     """
     pos = np.asarray(plane.center, dtype=np.float64) \
         + np.asarray(plane.normal, dtype=np.float64) * distance
@@ -145,21 +156,32 @@ def solve_right_hand_offer(robot, plane, distance=OFFER_DISTANCE,
 
     target = offer_target_coords(plane, distance)
 
-    for limb_attr, rotation_axis in attempts:
+    for limb_attr, rotation_mask in attempts:
         limb = getattr(robot, limb_attr)
         try:
-            res = limb.inverse_kinematics(target, rotation_axis=rotation_axis)
+            # stop=200 (default 50) / revert_if_fail=False: a fully
+            # orientation-constrained target this far from reset_pose's
+            # seed needs more iterations than the default budget, and
+            # skrobot's default revert_if_fail=True snaps back to the
+            # seed on any non-improving iteration, which empirically
+            # gets the solver stuck at the seed instead of working
+            # through the reorientation (see
+            # human_palm_contact_behavior.py for the same fix, arrived
+            # at the same way).
+            res = limb.inverse_kinematics(
+                target, rotation_mask=rotation_mask,
+                stop=200, revert_if_fail=False)
         except Exception:
             res = False
         reached = robot.rarm_end_coords.copy_worldcoords()
         error = float(np.linalg.norm(reached.worldpos() - target.worldpos()))
         if res is not False:
             return OfferResult(
-                success=True, limb=limb_attr, rotation_axis=rotation_axis,
+                success=True, limb=limb_attr, rotation_mask=rotation_mask,
                 target=target, reached=reached, position_error=error,
                 angle_vector=robot.angle_vector())
 
     return OfferResult(
-        success=False, limb=None, rotation_axis=None,
+        success=False, limb=None, rotation_mask=None,
         target=target, reached=reached, position_error=error,
         angle_vector=robot.angle_vector())

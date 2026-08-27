@@ -47,14 +47,25 @@ Parameters
 ``~use_robot_interface`` (bool)          実機に指令を出すか。既定は
                                          ``~source: real`` のときだけ true
 ``~use_hand`` (bool, default true)       手付きの URDF を読むか
-``~hand_side`` (str, default ``R``)      触る手、``R`` か ``L``
+``~hand_side`` (str, default ``R``)      人間が差し出す手、``R`` か ``L``。
+                                         ロボットは同じ側の手で触れる (``R``
+                                         なら右手、``L`` なら左手)
                                          (``~hand`` は推定クラスの
                                          ``~hand/enable`` と衝突するので使わない)
 ``~min_score`` (float, default 0.1)
 ``~viewer`` (str, default ``trimesh``)   ``trimesh`` / ``viser`` / ``none``
 ``~open_browser`` (bool, default false)  ``~viewer: viser`` のときブラウザを
                                          自動で開くか
-``~draw_skeleton`` (bool, default true)  骨格を線で描くか
+``~draw_skeleton`` (bool, default true)  骨格を線で描くか。検出できな
+                                         かった関節も (``~source: fake``
+                                         のときだけ) 色を薄くして併せて描く
+``~draw_camera_frustum`` (bool, default true)  カメラの画角を表す薄い
+                                         四角すいを optical_frame から
+                                         伸ばして描くか。``~source: fake``
+                                         かつ ``~filter_by_fov`` が false
+                                         (既定) のときは、画角の外でも
+                                         関節が落ちず画角を考慮していない
+                                         ので、この設定によらず描かない
 ``~viewer_width`` / ``~viewer_height`` (int, default 960 / 720)
 ``~base_frame`` (str, default base_link)
 ``~output_frame`` (str, default ``~base_frame``)
@@ -91,6 +102,16 @@ HUMAN_REF_LIMBS = ('Nose', 'Neck')
 # 首を動かしてから次の判断までの待ち [s]。関節が動いている途中の角度で
 # 目標を決めないための間。
 NECK_SETTLE_TIME = 2.5
+
+# r/l_eef_grasp_link のローカル Y 軸が甲->掌方向 (dorsum -> palm) -- URDF
+# を skrobot で読み、指の曲げ関節を動かして先端がどちらへ寄るかを直接
+# 確かめて特定した (palm_plane.fit_palm_plane 参照)。人間の掌の法線を
+# 合わせたいのはこの軸で、軸まわりの回転 (手首ロール) までは合わせなくて
+# よい。``rotation_mask`` は「そろえる」側の軸を指定する (legacy の
+# ``rotation_axis`` とは逆の意味 -- skrobot.coordinates.math 参照) ので、
+# 自由にしたい Y を除いた 'xz' (指方向 + 親指-小指幅方向) を渡す。
+PALM_NORMAL_ROTATION_AXIS = 'y'
+PALM_ROTATION_MASK = 'xz'
 
 
 def create_pose_source(name):
@@ -194,7 +215,10 @@ class HumanPalmContactBehavior:
         # まま返ってきた場合など) の結果でロボットを動かすと危険なので使わない。
         self.pose_frame = rospy.get_param('~output_frame', self.base_frame)
         # 名前は ~hand ではなく ~hand_side (~hand/enable と衝突するため)。
+        # ここでいう「手」は差し出す人間側の手。ロボットは同じ側の手で触れる
+        # (人が右手を出したらロボットは右手で、左手を出したら左手で)。
         self.hand = str(rospy.get_param('~hand_side', 'R')).upper()[:1]
+        self.arm = 'r' if self.hand == 'R' else 'l'
         self.min_score = rospy.get_param('~min_score', 0.1)
 
         self.source_name = str(rospy.get_param('~source', 'real')).lower()
@@ -214,10 +238,22 @@ class HumanPalmContactBehavior:
             self.robot.angle_vector(ri.angle_vector())
         else:
             self.robot.reset_pose()
+            # reset_pose() defaults neck_p to 25deg (down). This behavior
+            # wants a slightly higher initial gaze (i.e. less downward
+            # pitch, 19deg) while no target is locked -- 25deg made the
+            # head start out lower than the NODDING sequence's "nod down"
+            # target (22.9deg, see control_loop), so the nod's first phase
+            # actually raised the head instead of lowering it.
+            self.robot.neck_p_joint.joint_angle(math.radians(19.0))
             rospy.logwarn('~use_robot_interface is false: only the model '
                           'moves, the real robot is never commanded')
 
         self.scene = self._init_scene()
+        if self.scene is not None:
+            # Draw the robot's actual hand frame every redraw, so a
+            # mismatch against the IK target frame (drawn in
+            # _solve_palm_ik) is visible at a glance.
+            self.scene.track_hand('{}arm_end_coords'.format(self.arm))
         self.ri = _DrawingRobotInterface(self.robot, self.scene, ri)
 
         self.last_neck_cmd_time = rospy.Time.now()
@@ -229,6 +265,10 @@ class HumanPalmContactBehavior:
         self.target_palm_center = None    # for gaze/lifter, base_link frame
         self.target_palm_normal = None    # unit vector, base_link frame
         self.state_start_time = rospy.Time.now()
+        # 直近の approach/press の結果 ("approach"/"press" -> (distance
+        # [m], reached))。human_palm_contact_behavior_loop.py が周回ごとの
+        # 成否をまとめるのに使う。
+        self._last_report = {}
 
         # 姿勢はトピックではなく推定クラスのインスタンスから受け取る。
         # 関節点は estimator 側で base_link 相対に変換済みなので、ここでは
@@ -242,9 +282,9 @@ class HumanPalmContactBehavior:
         self.timer = rospy.Timer(rospy.Duration(0.1), self.control_loop)
 
         rospy.loginfo("Human Palm Contact Behavior initialized "
-                      "(source=%s hand=%sHand robot_interface=%s). "
-                      "Waiting for human...",
-                      self.source_name, self.hand, self.use_ri)
+                      "(source=%s human_hand=%sHand robot_arm=%sarm "
+                      "robot_interface=%s). Waiting for human...",
+                      self.source_name, self.hand, self.arm, self.use_ri)
         if self.source_name == 'real':
             rospy.loginfo("Note: requires the pose estimator's hand tracking "
                           "(~hand/enable:=true) and the depth/color/info "
@@ -259,11 +299,19 @@ class HumanPalmContactBehavior:
         viewer_name = str(rospy.get_param('~viewer', 'trimesh')).lower()
         if viewer_name == 'none':
             return None
+        draw_camera = rospy.get_param('~draw_camera_frustum', True)
+        if self.source_name == 'fake' \
+                and not rospy.get_param('~filter_by_fov', False):
+            # fake の既定では画角の外でも関節を落とさない (~filter_by_fov
+            # 参照) = 画角を考慮していないので、四角すいを描いても意味が
+            # ない。
+            draw_camera = False
         scene = PalmPlaneScene(
             viewer=viewer_name,
             resolution=(rospy.get_param('~viewer_width', 960),
                         rospy.get_param('~viewer_height', 720)),
-            draw_skeleton=rospy.get_param('~draw_skeleton', True))
+            draw_skeleton=rospy.get_param('~draw_skeleton', True),
+            draw_camera=draw_camera)
         # base_link がモデルのルートなので、原点に置くだけで関節点の座標系と
         # 揃う。以降 IK で動かした姿勢がそのまま viewer に出る。
         scene.add_robot(self.robot)
@@ -339,6 +387,9 @@ class HumanPalmContactBehavior:
             return
         if not self.scene.update_skeleton(result.people):
             rospy.logwarn('cannot draw the skeleton; disabling it')
+        self.scene.update_camera(
+            result.camera_intrinsics, result.camera_width,
+            result.camera_height, result.camera_pose)
         if plane is None:
             self.scene.hide_plane()
         else:
@@ -428,21 +479,90 @@ class HumanPalmContactBehavior:
     # ------------------------------------------------------------------
     # motion
     # ------------------------------------------------------------------
+    def _look_at(self, target_pos):
+        """Point the neck at ``target_pos`` (base_link frame).
+
+        Solved in two stages, one per joint's own parent link, instead of
+        the old formula's single fixed "neck is at height 1.2" guess in
+        base_link: neck_y_joint's parent (body_link) and neck_p_joint's
+        parent (neck_link) sit at different heights, and whole-body IK is
+        free to turn the torso (waist_y/waist_p) while reaching, which
+        rotates both relative to base_link -- a gaze angle computed before
+        the arm IK runs no longer points at the target once the torso has
+        turned.  Yaw is solved first and applied immediately so the pitch
+        stage reads neck_link's post-yaw transform, matching how the two
+        joints actually compose.  Call this again after each whole-body IK
+        solve so the head keeps looking at the human's hand through the
+        actual approach/press motion, not just during the initial "look"
+        step.
+        """
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+
+        yaw_lx, yaw_ly, _ = self.robot.neck_y_joint.parent_link \
+            .inverse_transform_vector(target_pos)
+        self.robot.neck_y_joint.joint_angle(
+            np.clip(math.atan2(yaw_ly, yaw_lx), -1.5, 1.5))
+
+        pitch_lx, pitch_ly, pitch_lz = self.robot.neck_p_joint.parent_link \
+            .inverse_transform_vector(target_pos)
+        neck_pitch = math.atan2(pitch_lz, math.hypot(pitch_lx, pitch_ly))
+        self.robot.neck_p_joint.joint_angle(np.clip(-neck_pitch, -0.3, 0.5))
+
+
     def _report_reach(self, label, target):
         """IK が解けた姿勢で手先が目標からどれだけ離れているかを出す.
 
         IK が収束しなかったときは fallback 姿勢のまま指令が出るので、届いた
         つもりで空振りしていないかはここを見て判断する。
         """
+        end_coords = getattr(self.robot, '{}arm_end_coords'.format(self.arm))
         distance = float(np.linalg.norm(
-            self.robot.larm_end_coords.worldpos()
+            end_coords.worldpos()
             - np.asarray(target, dtype=np.float64)))
-        if distance <= 0.02:
+        reached = distance <= 0.02
+        self._last_report[label] = (distance, reached)
+        if reached:
             rospy.loginfo('%s pose: %.1f mm from the target',
                           label, distance * 1000.0)
         else:
             rospy.logwarn('%s pose: %.1f mm from the target -- IK did not '
                           'reach it', label, distance * 1000.0)
+
+    def _solve_palm_ik(self, whole_body, target_coords):
+        """Solve whole-body IK for ``target_coords``.
+
+        Aligns the palm-normal axis with ``target_coords`` while leaving
+        rotation about that axis (wrist roll) free (see
+        ``PALM_ROTATION_MASK``).  ``target_coords`` is drawn in the viewer
+        as the IK target frame regardless of whether the solve succeeds,
+        so a bad target is visible even when IK fails.  Falls back to a
+        fully constrained orientation and finally to position-only if the
+        preferred mask doesn't converge.
+
+        ``stop=200`` (default 50) and ``revert_if_fail=False``: this
+        reorientation can be large (the palm normal can point off to the
+        side, not just roughly at the camera -- see
+        fake_people_pose_estimator_ros.py's handshake-like
+        ``~present_hand`` pose) and needs more iterations than the default
+        budget; with ``revert_if_fail`` at its default of True the solver
+        snaps back to the seed on every non-improving iteration, which
+        empirically gets it stuck at the seed instead of working through
+        the reorientation at all.
+        """
+        if self.scene is not None:
+            self.scene.update_ik_target(target_coords)
+        for rotation_mask in (PALM_ROTATION_MASK, True, False):
+            try:
+                res = whole_body.inverse_kinematics(
+                    target_coords, rotation_mask=rotation_mask,
+                    stop=200, revert_if_fail=False)
+            except Exception as e:
+                rospy.logwarn("IK failed (rotation_mask=%r): %s",
+                              rotation_mask, e)
+                res = False
+            if res is not False:
+                return True
+        return False
 
     def control_loop(self, event):
         if self.state == "NODDING":
@@ -463,11 +583,12 @@ class HumanPalmContactBehavior:
         elif self.state == "REACHING":
             self.robot.angle_vector(self.ri.angle_vector())
 
-            cx, cy, cz = self.target_palm_center
+            cz = self.target_palm_center[2]
 
             # Torso up/down (lifter) to roughly match hand height. This is
-            # just a seed pose -- the whole-body IK below (larm_whole_body)
-            # is free to further adjust the lifter *and* the waist yaw/pitch
+            # just a seed pose -- the whole-body IK below (the arm matching
+            # ~hand_side, e.g. rarm_whole_body) is free to further adjust
+            # the lifter *and* the waist yaw/pitch
             # joints (waist_y_joint, waist_p_joint) to reach low targets,
             # e.g. a seated person's hand, without moving the base.
             lifter_amount = np.clip((1.0 - cz) * 1.5, 0.0, 1.0)
@@ -479,10 +600,7 @@ class HumanPalmContactBehavior:
                 pass
 
             # Look at the palm being touched.
-            neck_yaw = math.atan2(cy, cx)
-            neck_pitch = math.atan2(cz - 1.2, math.hypot(cx, cy))
-            self.robot.neck_y_joint.joint_angle(np.clip(neck_yaw, -1.5, 1.5))
-            self.robot.neck_p_joint.joint_angle(np.clip(-neck_pitch, -0.3, 0.5))
+            self._look_at(self.target_palm_center)
 
             rospy.loginfo("Adjusting posture and gaze first...")
             self.ri.angle_vector(self.robot.angle_vector(), 2.0)
@@ -495,22 +613,44 @@ class HumanPalmContactBehavior:
                 pos=self.target_palm_pos, rot=self.target_palm_rot)
 
             # Fallback posture (natural elbow position) used as the IK seed.
-            self.robot.l_shoulder_p_joint.joint_angle(-0.4)
-            self.robot.l_shoulder_r_joint.joint_angle(0.2)
-            self.robot.l_shoulder_y_joint.joint_angle(0.5)
-            self.robot.l_elbow_joint.joint_angle(-1.2)
-            self.robot.l_wrist_y_joint.joint_angle(0.0)
-            self.robot.l_wrist_p_joint.joint_angle(0.2)
-            self.robot.l_wrist_r_joint.joint_angle(1.5)
+            # (wrist_p/wrist_r are clamped to this arm's actual joint
+            # limits -- +-5deg / -85..+25deg for the left arm, +-5deg /
+            # -25..+85deg for the right -- the original +0.2/+1.5 were both
+            # out of range and silently clipped by skrobot.)
+            #
+            # shoulder_r/shoulder_y/wrist_r mirror in sign between the two
+            # arms (see aero_upper_typef.urdf.xacro's joint limits, which
+            # mirror the same way); shoulder_p/elbow/wrist_p/wrist_y don't.
+            mirror = 1.0 if self.arm == 'l' else -1.0
+            whole_body = getattr(self.robot, '{}arm_whole_body'.format(self.arm))
+            getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
+                .joint_angle(-0.4)
+            getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
+                .joint_angle(0.2 * mirror)
+            getattr(self.robot, '{}_shoulder_y_joint'.format(self.arm)) \
+                .joint_angle(0.5 * mirror)
+            getattr(self.robot, '{}_elbow_joint'.format(self.arm)) \
+                .joint_angle(-1.2)
+            getattr(self.robot, '{}_wrist_y_joint'.format(self.arm)) \
+                .joint_angle(0.0)
+            getattr(self.robot, '{}_wrist_p_joint'.format(self.arm)) \
+                .joint_angle(0.087)
+            getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
+                .joint_angle(0.436 * mirror)
 
-            try:
-                res = self.robot.larm_whole_body.inverse_kinematics(
-                    target_coords, rotation_axis='yz')
-                if res is False:
-                    res = self.robot.larm_whole_body.inverse_kinematics(
-                        target_coords, rotation_axis=False)
-            except Exception as e:
-                rospy.logwarn(f"IK failed: {e}. Using fallback posture.")
+            # Align the palm-normal axis (PALM_NORMAL_ROTATION_AXIS) with
+            # the human palm's normal and leave rotation about it free --
+            # see _solve_palm_ik and PALM_ROTATION_MASK above.
+            if not self._solve_palm_ik(whole_body, target_coords):
+                rospy.logwarn(
+                    "IK could not reach the approach pose; using fallback "
+                    "posture.")
+
+            # Whole-body IK may have turned the waist to reach the target,
+            # which rotates the neck with it -- re-aim after solving so
+            # the head is actually looking at the hand once the arm gets
+            # there, not just where it happened to be looking before.
+            self._look_at(self.target_palm_center)
 
             self._report_reach('approach', self.target_palm_pos)
             self.ri.angle_vector(self.robot.angle_vector(), 2.0)
@@ -528,14 +668,14 @@ class HumanPalmContactBehavior:
             embed_coords = Coordinates(
                 pos=embed_pos, rot=self.target_palm_rot)
 
-            try:
-                res = self.robot.larm_whole_body.inverse_kinematics(
-                    embed_coords, rotation_axis='yz')
-                if res is False:
-                    res = self.robot.larm_whole_body.inverse_kinematics(
-                        embed_coords, rotation_axis=False)
-            except Exception as e:
-                rospy.logwarn(f"IK failed: {e}. Staying at the approach pose.")
+            if not self._solve_palm_ik(whole_body, embed_coords):
+                rospy.logwarn(
+                    "IK could not reach the press pose; staying at the "
+                    "approach pose.")
+
+            # Same re-aim as after the approach solve -- keep looking at
+            # the hand (not the embed point under the skin) while pressing.
+            self._look_at(self.target_palm_center)
 
             self._report_reach('press', embed_pos)
             self.ri.angle_vector(self.robot.angle_vector(), 1.5)

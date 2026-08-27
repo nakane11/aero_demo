@@ -44,11 +44,22 @@ class Bone:
 
 @dataclass
 class Person3D:
-    """カメラ座標系での 1 人分の 3 次元姿勢."""
+    """カメラ座標系での 1 人分の 3 次元姿勢.
+
+    ``hidden_limb_names`` / ``hidden_positions`` は、可視性が足りない・
+    画角の外・深度が取れない等の理由で ``limb_names`` / ``positions`` から
+    除かれた関節を並行して保持する (最終的に人物とすら認識されない場合は
+    空)。fake_people_pose_estimator_ros.py だけが埋める -- 本物の推定は
+    見えていない関節の 3 次元位置を知りようがないので常に空のまま。
+    viewer (aero_demo.palm_plane_view) がこれを薄く描くのに使う。
+    """
     limb_names: list = field(default_factory=list)
     scores: list = field(default_factory=list)
     positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
     bones: list = field(default_factory=list)      # Bone
+    hidden_limb_names: list = field(default_factory=list)
+    hidden_positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
+    hidden_bones: list = field(default_factory=list)      # Bone, >=1 endpoint hidden
 
     def position_of(self, limb_name):
         if limb_name not in self.limb_names:
@@ -70,3 +81,13 @@ class EstimationResult:
     image: np.ndarray = None                    # BGR 画像
     joint_positions: list = field(default_factory=list)  # 2D 関節 (dict のリスト)
     people: list = field(default_factory=list)           # Person3D
+    # カメラの内部パラメータ・画像サイズ・frame_id 相対のカメラ姿勢。
+    # viewer (aero_demo.palm_plane_view) が画角の四角すいを描くのに使う。
+    # 本物は CameraInfo + TF から、偽推定は既知の仮想カメラ設定から埋める。
+    # TF が引けず people がカメラ座標系のまま返ってきた場合や、実推定で
+    # まだ CameraInfo を受け取っていない場合は camera_pose / camera_intrinsics
+    # が None のままのことがある。
+    camera_intrinsics: object = None             # CameraIntrinsics or None
+    camera_width: int = 0
+    camera_height: int = 0
+    camera_pose: np.ndarray = None               # camera_frame_id -> frame_id, 4x4 or None

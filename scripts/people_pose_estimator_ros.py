@@ -18,6 +18,7 @@ ROS 非依存クラスへ渡し、結果は
 
 import threading
 
+import numpy as np
 import rospy
 import cv_bridge
 import message_filters
@@ -208,9 +209,15 @@ class RosPeoplePoseEstimator(object):
         else:
             output_frame_id = self.output_frame
 
+        intrinsics = CameraIntrinsics.from_matrix(camera_info_msg.K)
         people, people_joint_positions = self.estimator.estimate_3d(
-            img, depth_img, CameraIntrinsics.from_matrix(camera_info_msg.K),
-            output_transform=output_transform)
+            img, depth_img, intrinsics, output_transform=output_transform)
+
+        # camera_frame_id -> output_frame_id の姿勢。viewer (palm_plane_view)
+        # が画角の四角すいを描くのに使う。TF が引けず output_transform が
+        # None のとき (people はカメラ座標系のまま) は単位行列でよい。
+        camera_pose = output_transform if output_transform is not None \
+            else np.eye(4)
 
         self._set_result(EstimationResult(
             stamp=img_msg.header.stamp,
@@ -218,7 +225,11 @@ class RosPeoplePoseEstimator(object):
             camera_frame_id=camera_frame_id,
             image=img,
             joint_positions=people_joint_positions,
-            people=people))
+            people=people,
+            camera_intrinsics=intrinsics,
+            camera_width=camera_info_msg.width,
+            camera_height=camera_info_msg.height,
+            camera_pose=camera_pose))
 
     def _set_result(self, result):
         """結果を保持し、``wait_for_result`` の待ち手を起こす."""

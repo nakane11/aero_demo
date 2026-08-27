@@ -29,6 +29,7 @@ COLOR_FINGER = [0, 200, 255, 255]
 COLOR_LANDMARK = [255, 255, 255, 255]
 COLOR_APPROACH = [50, 100, 255, 255]
 COLOR_PRESS = [255, 50, 50, 255]
+COLOR_FRUSTUM = [160, 180, 255, 90]
 
 # 骨格の線は部位ごとに色を変える。Person3D.bones の名前 ("Neck->RShoulder"
 # 形式) から下の bone_color で引く。
@@ -56,6 +57,22 @@ _BONE_GROUPS = (
 PLATE_SIZE = 0.12
 NORMAL_LENGTH = 0.15
 FINGER_LENGTH = 0.08
+IK_TARGET_AXIS_LENGTH = 0.08
+HAND_AXIS_LENGTH = 0.06
+# カメラの画角の四角すいをどこまで伸ばして描くか [m]。人が立つ距離
+# (fake_people_pose_estimator_ros.py の ~distance_range, 既定 0.8-1.0 m)
+# を包む程度の見た目にしてある -- 実際の可視距離とは無関係な表示用の値。
+FRUSTUM_DEPTH = 1.2
+
+
+def dim_color(rgba, alpha=70, gray=200, gray_mix=0.5):
+    """検出できなかった関節・骨用に、元の色を保ちつつ薄くする.
+
+    完全な灰色にはせず ``gray_mix`` だけ灰色に寄せるので、どの部位か
+    (例えば右腕は赤系、左腕は青系) は薄いなりに見分けがつく。
+    """
+    mixed = [int(c * (1.0 - gray_mix) + gray * gray_mix) for c in rgba[:3]]
+    return mixed + [alpha]
 
 
 def unit(v):
@@ -126,9 +143,17 @@ class PalmPlaneScene(object):
       * 白い球 … フィットに使ったランドマーク
       * 青い球 … 接近目標 (中心 + offset * 法線)
       * 赤い球 … 押し込み目標 (中心 - depth * 法線)
-      * 色分けした線 … 人物の骨格 (``Person3D.bones`` をそのまま繋ぐ)
+      * 色分けした線 … 人物の骨格 (``Person3D.bones`` をそのまま繋ぐ)。
+        検出できなかった関節 (``Person3D.hidden_bones``) も、色を薄くして
+        併せて描く -- fake_people_pose_estimator_ros.py だけが埋める
+        真値で、本物の推定では常に空 (何も薄く描かれない)。
+      * 薄い四角すい … カメラの画角 (``EstimationResult.camera_*``).
+        optical_frame から ``FRUSTUM_DEPTH`` だけ伸ばして描く。
       * ロボットモデル … ``add_robot`` を呼んだとき
       * 原点の座標軸 … 関節点の座標系 (``EstimationResult.frame_id``)
+      * 太めの座標軸 … IK を解くときの目標座標系 (``update_ik_target``)
+      * 細めの座標軸 … ロボットの手先 (eef_grasp_link 相当) の座標系。
+        ``track_hand`` で追わせた属性を毎 ``redraw`` ごとに読みに行く
 
     Parameters
     ----------
@@ -139,10 +164,12 @@ class PalmPlaneScene(object):
         ``trimesh`` のときのウィンドウの大きさ。
     draw_skeleton : bool
         骨格の線を描くか。
+    draw_camera : bool
+        カメラの画角の四角すいを描くか。
     """
 
     def __init__(self, viewer='trimesh', resolution=(960, 720),
-                 draw_skeleton=True):
+                 draw_skeleton=True, draw_camera=True):
         self.viewer_name = str(viewer).lower()
         if self.viewer_name == 'viser':
             # X のウィンドウを開かずブラウザに描くので、WSL や ssh 越しでも
@@ -158,12 +185,25 @@ class PalmPlaneScene(object):
                     self.viewer_name))
 
         self.draw_skeleton = draw_skeleton
+        self.draw_camera = draw_camera
         self.robot = None
+        self._hand_coords_attr = None
 
         # 関節点の座標系 (既定 base_link) の原点
         self.viewer.add(Axis(axis_radius=0.005, axis_length=0.2))
 
+        # IK の目標座標系と、ロボットの手先座標系。どちらもフィットした
+        # 手のひら平面 (self.plate 等) とは別に、実際に IK へ渡した/解けた
+        # 姿勢を見せるためのもの -- 平面の向きと手先の向きがずれていれば
+        # ここで気付ける。
+        self.ik_target_axis = Axis(
+            axis_radius=0.005, axis_length=IK_TARGET_AXIS_LENGTH)
+        self.hand_axis = Axis(
+            axis_radius=0.004, axis_length=HAND_AXIS_LENGTH)
+
         # 平面まわりの表示物。フィットできたフレームだけ viewer に入れる。
+        # plane.rot の局所 +Y が -normal (palm_plane.fit_palm_plane 参照)
+        # なので、薄くする軸は y。
         self.plate = set_color(
             Box(extents=[PLATE_SIZE, 0.002, PLATE_SIZE]), COLOR_PLATE)
         self.normal_arrow = set_color(
@@ -182,6 +222,8 @@ class PalmPlaneScene(object):
 
         self.shown = set()
         self.bone_links = []
+        self.camera_links = []
+        self._info_text = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -216,8 +258,49 @@ class PalmPlaneScene(object):
         self.robot = robot
         self.viewer.add(robot)
 
+    def track_hand(self, coords_attr):
+        """毎 ``redraw`` ごとに ``robot`` のこの属性から手先座標系を追う.
+
+        ``coords_attr`` は ``self.robot`` の属性名 (``'rarm_end_coords'``
+        など)。``None`` にすると手先の座標軸を隠す。
+        """
+        self._hand_coords_attr = coords_attr
+        self._show(self.hand_axis, coords_attr is not None)
+
+    def update_ik_target(self, coords):
+        """IK に渡した目標座標系を描き直す (``None`` なら隠す)."""
+        if coords is None:
+            self._show(self.ik_target_axis, False)
+            return
+        self.ik_target_axis.newcoords(coords.copy_worldcoords())
+        self._show(self.ik_target_axis, True)
+
     def redraw(self):
+        if self.robot is not None and self._hand_coords_attr is not None:
+            coords = getattr(self.robot, self._hand_coords_attr, None)
+            if coords is not None:
+                self.hand_axis.newcoords(coords.copy_worldcoords())
         self.viewer.redraw()
+
+    def show_info_text(self, lines):
+        """3D シーンの外側に、複数行のテキストパネルを出す/更新する.
+
+        ``viser`` のブラウザ UI にだけ GUI パネルがあるので、そこでのみ
+        表示する (``trimesh`` の pyglet ウィンドウには文字を描く手段が無い
+        ので、その場合は何もしない -- 呼び出し側で ``rospy.loginfo`` も
+        するとどちらの viewer でも確認できる)。
+
+        Parameters
+        ----------
+        lines : list of str
+        """
+        if self.viewer_name != 'viser':
+            return
+        text = '\n\n'.join(lines)
+        if self._info_text is None:
+            self._info_text = self.viewer._server.gui.add_markdown(text)
+        else:
+            self._info_text.content = text
 
     # ------------------------------------------------------------------
     # drawing
@@ -276,9 +359,12 @@ class PalmPlaneScene(object):
         ``Person3D.bones`` の本数は関節の欠落で毎フレーム変わるので、線は
         作り直す。どの関節同士を繋ぐかは推定側 (people_pose_estimator の
         ``limb_sequence`` / ``hand_sequence``) が決めた ``bones`` に従う。
+        ``Person3D.hidden_bones`` (fake 推定だけが埋める、検出できなかった
+        関節を含む骨) があれば色を薄くして併せて描く。
 
         線を作れなかったときは骨格の描画をあきらめて False を返す (以降の
-        呼び出しは何もしない)。
+        呼び出しは何もしない)。薄い骨のほうだけ描けなかった場合は、通常の
+        骨格自体は描けているので描画をあきらめない。
         """
         if not self.draw_skeleton:
             return True
@@ -297,4 +383,61 @@ class PalmPlaneScene(object):
                     return False
                 self.bone_links.append(link)
                 self._show(link, True)
+            for bone in getattr(person, 'hidden_bones', []):
+                try:
+                    link = LineString(
+                        np.asarray([bone.start_point, bone.end_point],
+                                   dtype=np.float64),
+                        color=dim_color(bone_color(bone.name)))
+                except Exception:
+                    continue
+                self.bone_links.append(link)
+                self._show(link, True)
         return True
+
+    def update_camera(self, intrinsics, width, height, pose):
+        """カメラの画角を表す四角すいを薄く描き直す (optical_frame から伸びる).
+
+        Parameters
+        ----------
+        intrinsics : aero_demo.people_pose_types.CameraIntrinsics or None
+        width, height : int
+            画像サイズ [px]。
+        pose : array_like or None
+            camera_frame_id -> 描画座標系 (``EstimationResult.frame_id``,
+            既定 base_link) の 4x4 同次変換行列
+            (``EstimationResult.camera_pose``)。どれか欠けていたら隠す。
+        """
+        for link in self.camera_links:
+            self._show(link, False)
+        self.camera_links = []
+
+        if not self.draw_camera or intrinsics is None or pose is None \
+                or width <= 0 or height <= 0:
+            return
+
+        matrix = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+        apex = matrix[:3, 3]
+        rot = matrix[:3, :3]
+
+        # 画像四隅の光線を、光学系フレーム (x=右, y=下, z=前) で作って
+        # world/base 姿勢へ回してから FRUSTUM_DEPTH だけ伸ばす。
+        corners = []
+        for u, v in ((0, 0), (width, 0), (width, height), (0, height)):
+            direction = np.array([(u - intrinsics.cx) / intrinsics.fx,
+                                  (v - intrinsics.cy) / intrinsics.fy,
+                                  1.0])
+            corners.append(apex + rot.dot(direction) * FRUSTUM_DEPTH)
+
+        # 頂点 -> 各隅 -> 頂点... と一筆書きにして 4 本の稜線を 1 本の
+        # LineString にまとめる (往復になるが見た目は変わらない)。
+        rays = LineString(np.asarray(
+            [apex, corners[0], apex, corners[1],
+             apex, corners[2], apex, corners[3], apex],
+            dtype=np.float64), color=COLOR_FRUSTUM)
+        far_rect = LineString(np.asarray(
+            corners + [corners[0]], dtype=np.float64), color=COLOR_FRUSTUM)
+
+        self.camera_links = [rays, far_rect]
+        for link in self.camera_links:
+            self._show(link, True)
