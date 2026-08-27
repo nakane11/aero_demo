@@ -30,6 +30,18 @@ which of two subdirectories the image goes to:
   ``<output_dir>/fail/``      IK missed either one (image still saved, at
                               whatever pose the fallback posture ended up in)
 
+Each image is named ``person_<round>_seed<seed>.png``, where ``<seed>`` is
+the ``~seed`` the round's ``FakeRosPeoplePoseEstimator`` auto-picked (see
+``fake_people_pose_estimator_ros.py``) -- passing that same value back as
+``~seed`` with ``~num_people:=1`` resamples the exact same person, so any
+round can be reproduced on its own.
+
+``<output_dir>/log.jsonl`` records one JSON line per round for offline
+analysis: the seed, the IK targets (approach/press position + orientation),
+how close IK actually got (``_report_reach``'s per-target distance and
+reached flag), and the robot's resulting hand pose and full joint-angle
+vector at the moment the snapshot was taken.
+
 Camera framing
 --------------
 The camera is a side elevation (looking along the base frame's Y axis, i.e.
@@ -37,14 +49,29 @@ perpendicular to the direction the robot reaches in), not the
 ``sample_render.py``-style three-quarter view, because the two framing
 constraints asked for are naturally each one image axis of a side view:
 
-* vertical: the robot's head (``head_end_coords``) down to its wheeled
-  lifter base (``base_link``) fills the frame top-to-bottom (a bit of
-  padding is added so the head/base aren't clipped at the very edge).
+* vertical: fills the frame top-to-bottom with the taller of the robot's
+  own extent (its head, ``head_end_coords``, down to its wheeled lifter
+  base, ``base_link``) and the tracked person's extent (every visible
+  landmark's Z range, i.e. roughly head-to-feet) -- so neither body gets
+  clipped at the top/bottom edge regardless of which one happens to be
+  taller or standing higher/lower (a bit of padding is added on top of
+  that).
 * horizontal: the frame is centered on the midpoint between the human (the
   last tracked person's Neck/Nose, i.e. where they stood) and the robot's
   reaching hand (``rarm_end_coords``/``larm_end_coords``, wherever IK left
   it, reached or not) -- but only *centered*, not fit; the horizontal span
   is whatever the vertical-fit distance happens to show.
+
+Palm-normal arrows
+-------------------
+Each snapshot also draws two arrows from the back of a hand toward its
+palm: one for the human's estimated palm (``target_palm_center`` /
+``target_palm_normal``, the plane fit from the tracked landmarks) and one
+for the robot's actual hand pose (``r/l_eef_grasp_link``'s local +Y axis,
+the same "dorsum -> palm" axis ``human_palm_contact_behavior.py`` aligns
+IK to -- see its ``PALM_NORMAL_ROTATION_AXIS``), so a mismatch between
+where the human's palm faced and where the robot ended up aiming is
+visible in the frame itself, not just in the numeric report.
 
 Required parameters
 --------------------
@@ -95,6 +122,7 @@ estimator's ``~distance_range`` / ``~present_*_deg_range`` / etc.), plus
                                           待つ理由が薄い。
 """
 
+import json
 import os
 import sys
 import threading
@@ -119,6 +147,54 @@ CAMERA_YFOV_DEG = 55.0
 VERTICAL_PAD = 0.15
 # Safety margin on top of the exact tan(fov/2) fit distance.
 DISTANCE_PAD = 1.08
+
+# Palm-normal arrows: length is the tail-to-tip span (tip lands on the
+# palm point), the rest are the shaft/head proportions of that span.
+ARROW_LENGTH = 0.15
+ARROW_SHAFT_RADIUS = 0.004
+ARROW_HEAD_RADIUS = 0.011
+ARROW_HEAD_LENGTH = 0.045
+COLOR_HUMAN_NORMAL = [0, 255, 0, 255]     # matches palm_plane_view.COLOR_NORMAL
+COLOR_ROBOT_NORMAL = [0, 160, 255, 255]   # distinct from the ok/fail sphere's
+                                           # green/red
+
+
+def _make_normal_arrow(tip, direction, color):
+    """A shaft+cone arrow of a fixed length, tail-to-tip along ``direction``.
+
+    ``tip`` is where the arrowhead ends up (the palm point); the tail
+    trails behind it by ``ARROW_LENGTH`` along ``-direction`` -- i.e. the
+    arrow points *into* ``tip`` from the back of the hand, matching "back
+    of hand -> palm" rather than starting at the palm and pointing away
+    from it.
+
+    skrobot has no ready-made directional-arrow primitive (only
+    ``Cylinder``/``Cone``, both authored pointing along +Z -- see
+    ``palm_plane_view.rotation_from_z``), so the shaft and head are built
+    as separate trimeshes, translated into place along +Z, and merged
+    into one ``Link`` the same way ``skrobot.model.primitives.Axis``
+    composites its three axis cylinders.
+    """
+    import trimesh
+    from skrobot.model import Link
+    from aero_demo.palm_plane_view import rotation_from_z, set_color, unit
+
+    d = unit(direction)
+    if d is None:
+        return None
+
+    shaft_length = ARROW_LENGTH - ARROW_HEAD_LENGTH
+    shaft = trimesh.creation.cylinder(
+        radius=ARROW_SHAFT_RADIUS, height=shaft_length, sections=12)
+    shaft.apply_translation([0.0, 0.0, shaft_length / 2.0])
+    head = trimesh.creation.cone(
+        radius=ARROW_HEAD_RADIUS, height=ARROW_HEAD_LENGTH, sections=12)
+    head.apply_translation([0.0, 0.0, shaft_length])
+    mesh = shaft + head
+
+    tail = np.asarray(tip, dtype=np.float64) - d * ARROW_LENGTH
+    link = Link(pos=tail, rot=rotation_from_z(d), visual_mesh=mesh)
+    return set_color(link, color)
 
 
 class _InstantRobotInterface(_hpcb._DrawingRobotInterface):
@@ -172,6 +248,12 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         self.round_count = 0
         self.results = []
         self._latest_person = None
+        # Set by _start_next_round from the fresh pose source's own
+        # ~seed=-1 auto-pick (FakeRosPeoplePoseEstimator.seed) -- carried
+        # into both the image filename and the log line so any single
+        # round can be reproduced later via ~seed:=<that value>
+        # ~num_people:=1.
+        self.current_seed = None
         # super().__init__() starts the 0.1s control_loop timer on its own
         # background thread before returning here -- with the instant robot
         # interface a whole round can finish fast enough to race the rest
@@ -190,6 +272,7 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
 
         for sub in ('success', 'fail'):
             os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
+        self.log_path = os.path.join(self.output_dir, 'log.jsonl')
 
         self._init_viser_renderer()
         rospy.on_shutdown(self._cleanup_renderer)
@@ -291,8 +374,15 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         """
         head_pos = self.robot.head_end_coords.worldpos()
         cart_pos = self.robot.base_link.worldpos()
-        z_lo = min(float(head_pos[2]), float(cart_pos[2])) - VERTICAL_PAD
-        z_hi = max(float(head_pos[2]), float(cart_pos[2])) + VERTICAL_PAD
+        # The vertical fit has to cover both bodies' top-to-bottom extent,
+        # not just the robot's -- a tracked person can stand taller than
+        # the robot's head or have their feet below the cart, and either
+        # would otherwise get clipped at the top/bottom edge.
+        human_z = np.atleast_2d(human_points)[:, 2]
+        z_lo = min(float(head_pos[2]), float(cart_pos[2]),
+                   float(human_z.min())) - VERTICAL_PAD
+        z_hi = max(float(head_pos[2]), float(cart_pos[2]),
+                   float(human_z.max())) + VERTICAL_PAD
 
         # cart_pos anchors how far back the robot's own body reaches (the
         # arm's shoulder sits close to it) -- without it the center would
@@ -318,8 +408,8 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         forward = np.array([0.0, -1.0, 0.0])
         up = np.array([0.0, 0.0, 1.0])
 
-        # Only the head/cart vertical extent drives the distance (a tight
-        # vertical fit); human_points/hand_pos only steer `center`
+        # z_lo/z_hi (both bodies' vertical extent, above) drive the
+        # distance; human_points/hand_pos otherwise only steer `center`
         # (horizontal centering, not framing) -- see module docstring.
         fov_v = np.deg2rad(CAMERA_YFOV_DEG)
         half_v = (z_hi - z_lo) / 2.0
@@ -348,6 +438,23 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         target_sphere = Sphere(radius=0.02, color=target_color)
         target_sphere.newcoords(Coordinates(pos=hand_pos))
         markers.append(target_sphere)
+
+        # Dorsum -> palm normal arrows -- see the module docstring's "Palm-
+        # normal arrows" section. Human: the plane fit from the tracked
+        # landmarks. Robot: r/l_eef_grasp_link's local +Y axis (the same
+        # axis human_palm_contact_behavior.py aligns IK to).
+        if self.target_palm_center is not None \
+                and self.target_palm_normal is not None:
+            human_arrow = _make_normal_arrow(
+                self.target_palm_center, self.target_palm_normal,
+                COLOR_HUMAN_NORMAL)
+            if human_arrow is not None:
+                markers.append(human_arrow)
+        robot_normal = hand_coords.worldrot().dot(np.array([0.0, 1.0, 0.0]))
+        robot_arrow = _make_normal_arrow(
+            hand_pos, robot_normal, COLOR_ROBOT_NORMAL)
+        if robot_arrow is not None:
+            markers.append(robot_arrow)
 
         # Same colored-per-body-part skeleton lines
         # human_palm_contact_behavior_loop.py's viewer draws (see
@@ -397,11 +504,75 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
                 self._viewer.delete(m)
 
         sub = 'success' if ok else 'fail'
+        seed_str = 'na' if self.current_seed is None else str(self.current_seed)
         path = os.path.join(
             self.output_dir, sub,
-            'person_{:04d}.png'.format(self.round_count))
+            'person_{:04d}_seed{}.png'.format(self.round_count, seed_str))
         iio.imwrite(path, image)
         return path
+
+    def _log_round(self, ok, image_path):
+        """Append one JSON line with everything needed to inspect/reproduce
+        this round after the fact: the sampled ``~seed``, the IK targets
+        (approach and press), how close IK actually got
+        (``_report_reach``'s per-label distance/reached), and the robot's
+        resulting hand pose and full joint-angle vector.
+
+        Written with a plain ``open(..., 'a')`` per round (no long-lived
+        file handle) so a crash partway through the batch still leaves
+        every already-finished round's line on disk, matching how images
+        are already written incrementally to ``success/``/``fail/``.
+        """
+        from skrobot.coordinates.math import matrix2quaternion
+
+        hand_coords = getattr(self.robot, '{}arm_end_coords'.format(self.arm))
+        hand_pos = hand_coords.worldpos()
+        hand_quat = matrix2quaternion(hand_coords.worldrot())
+
+        press_pos = None
+        if self.target_palm_center is not None \
+                and self.target_palm_normal is not None:
+            press_pos = (np.array(self.target_palm_center)
+                        - np.array(self.target_palm_normal) * _hpcb.EMBED_DEPTH
+                        ).tolist()
+
+        def _reach(label):
+            report = self._last_report.get(label)
+            if report is None:
+                return None
+            distance, reached = report
+            return {'distance_m': distance, 'reached': bool(reached)}
+
+        record = {
+            'round': self.round_count,
+            'seed': self.current_seed,
+            'ok': ok,
+            'hand_side': self.hand,
+            'arm': self.arm,
+            'image_path': image_path,
+            'target': {
+                'palm_center': self.target_palm_center,
+                'palm_normal': self.target_palm_normal,
+                'approach_pos': self.target_palm_pos,
+                'approach_quat': matrix2quaternion(
+                    self.target_palm_rot).tolist()
+                    if self.target_palm_rot is not None else None,
+                'press_pos': press_pos,
+            },
+            'ik_result': {
+                'approach': _reach('approach'),
+                'press': _reach('press'),
+            },
+            'robot': {
+                'hand_pos': hand_pos.tolist(),
+                'hand_quat': hand_quat.tolist(),
+                'joint_names': [j.name for j in self.robot.joint_list],
+                'joint_angle_vector':
+                    np.asarray(self.robot.angle_vector()).tolist(),
+            },
+        }
+        with open(self.log_path, 'a') as f:
+            f.write(json.dumps(record) + '\n')
 
     # ------------------------------------------------------------------
     # tracking the current person (for the horizontal framing center)
@@ -466,6 +637,7 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         ok = bool(approach and approach[1] and press and press[1])
 
         path = self._save_snapshot(ok)
+        self._log_round(ok, path)
         self.results.append(ok)
         n_ok = sum(1 for r in self.results if r)
         rospy.loginfo(
@@ -495,6 +667,10 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         self.state = "WAITING"
         self.state_start_time = rospy.Time.now()
         self.source = _hpcb.create_pose_source(self.source_name)
+        # FakeRosPeoplePoseEstimator picks (and logs) its own ~seed=-1
+        # random seed in __init__ -- grab it here so this round's image
+        # name / log line can point back to the exact person it sampled.
+        self.current_seed = getattr(self.source, 'seed', None)
         self._source_stopped = False
         self.pose_thread = threading.Thread(target=self.pose_loop)
         self.pose_thread.daemon = True
