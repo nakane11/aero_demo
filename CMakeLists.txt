@@ -168,6 +168,7 @@ catkin_install_python(PROGRAMS
   scripts/human_handover_behavior.py
   scripts/human_palm_contact_behavior.py
   scripts/human_palm_contact_behavior_loop.py
+  scripts/human_palm_contact_dataset_generator.py
   scripts/human_parallel_planner.py
   scripts/human_tracker.py
   scripts/neck_tracker.py
