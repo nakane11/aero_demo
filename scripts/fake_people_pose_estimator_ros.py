@@ -216,7 +216,7 @@ class FakeRosPeoplePoseEstimator(object):
         # した法線に沿って近づく human_palm_contact_behavior 側が実際に
         # どこまで追従できるかを確かめるためのもの。
         self.present_shoulder_elevation_range = rospy.get_param(
-            '~present_shoulder_elevation_deg_range', [50.0, 85.0])
+            '~present_shoulder_elevation_deg_range', [0.0, 85.0])
         self.present_shoulder_azimuth_range = rospy.get_param(
             '~present_shoulder_azimuth_deg_range', [-20.0, 20.0])
         self.present_elbow_flex_range = rospy.get_param(

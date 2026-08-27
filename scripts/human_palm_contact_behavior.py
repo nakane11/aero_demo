@@ -69,6 +69,11 @@ Parameters
 ``~viewer_width`` / ``~viewer_height`` (int, default 960 / 720)
 ``~base_frame`` (str, default base_link)
 ``~output_frame`` (str, default ``~base_frame``)
+``~plane_fit_timeout`` (float, default 4.0)  人物は検出できているのに手のひ
+                                         らの平面が何秒フィットできなければ
+                                         諦めて ``DONE`` に進む (ループ/デー
+                                         タセット生成側はこれを失敗ラウンド
+                                         として次へ進む) か。
 """
 
 import math
@@ -265,6 +270,10 @@ class HumanPalmContactBehavior:
         self.target_palm_center = None    # for gaze/lifter, base_link frame
         self.target_palm_normal = None    # unit vector, base_link frame
         self.state_start_time = rospy.Time.now()
+        # 平面フィットに失敗し続けている時間の計測用 (_track_with_neck 参照)。
+        # None なら「まだ失敗が始まっていない」。
+        self.plane_fit_timeout = rospy.get_param('~plane_fit_timeout', 4.0)
+        self._plane_fit_fail_since = None
         # 直近の approach/press の結果 ("approach"/"press" -> (distance
         # [m], reached))。human_palm_contact_behavior_loop.py が周回ごとの
         # 成否をまとめるのに使う。
@@ -434,6 +443,22 @@ class HumanPalmContactBehavior:
         current_y = self.robot.neck_y_joint.joint_angle()
 
         if plane is None:
+            # self.state_start_time より前のタイムスタンプは前のラウンド
+            # (あるいは前回別の理由で WAITING に入ったとき) の残骸なので、
+            # 今回の WAITING に入ってから初めて失敗したものとして計測し直す。
+            if self._plane_fit_fail_since is None \
+                    or self._plane_fit_fail_since < self.state_start_time:
+                self._plane_fit_fail_since = now
+            elapsed = (now - self._plane_fit_fail_since).to_sec()
+            if elapsed >= self.plane_fit_timeout:
+                rospy.logwarn(
+                    "Palm plane still not fittable after %.1fs (%d of %s "
+                    "landmarks); giving up on this person and moving on.",
+                    elapsed, len(palm_points),
+                    list(palm_plane.PLANE_LANDMARKS))
+                self._plane_fit_fail_since = None
+                self.state = "DONE"
+                return True
             rospy.loginfo_throttle(
                 2.0, "Human detected, but the palm plane could not be "
                 "fitted (%d of %s landmarks). Looking down...",
@@ -441,6 +466,7 @@ class HumanPalmContactBehavior:
             target_p = 0.3
         else:
             target_p = current_p
+            self._plane_fit_fail_since = None
         target_y = np.clip(neck_yaw, -1.5, 1.5)
 
         if abs(current_p - target_p) <= 0.1 \
@@ -528,7 +554,7 @@ class HumanPalmContactBehavior:
             rospy.logwarn('%s pose: %.1f mm from the target -- IK did not '
                           'reach it', label, distance * 1000.0)
 
-    def _solve_palm_ik(self, whole_body, target_coords):
+    def _solve_palm_ik(self, whole_body, target_coords, use_base=None):
         """Solve whole-body IK for ``target_coords``.
 
         Aligns the palm-normal axis with ``target_coords`` while leaving
@@ -548,6 +574,10 @@ class HumanPalmContactBehavior:
         snaps back to the seed on every non-improving iteration, which
         empirically gets it stuck at the seed instead of working through
         the reorientation at all.
+
+        ``use_base`` is passed through to ``inverse_kinematics`` as-is
+        (e.g. ``'planar'`` to let the cart move in the IK solve); left at
+        its default (``None``) the base is not included.
         """
         if self.scene is not None:
             self.scene.update_ik_target(target_coords)
@@ -555,7 +585,7 @@ class HumanPalmContactBehavior:
             try:
                 res = whole_body.inverse_kinematics(
                     target_coords, rotation_mask=rotation_mask,
-                    stop=200, revert_if_fail=False)
+                    stop=200, revert_if_fail=False, use_base=use_base)
             except Exception as e:
                 rospy.logwarn("IK failed (rotation_mask=%r): %s",
                               rotation_mask, e)
@@ -591,11 +621,39 @@ class HumanPalmContactBehavior:
             # the lifter *and* the waist yaw/pitch
             # joints (waist_y_joint, waist_p_joint) to reach low targets,
             # e.g. a seated person's hand, without moving the base.
-            lifter_amount = np.clip((1.0 - cz) * 1.5, 0.0, 1.0)
+            #
+            # knee_joint/ankle_joint form a parallelogram lifter (two 0.25m
+            # links, see lifter.urdf.xacro) driven by equal-and-opposite
+            # angles so the torso stays level while it crouches. Relative to
+            # its *current* angle, height given up is
+            # 0.5 * (cos(current_angle) - cos(angle)) [m] -- not linear in
+            # the angle (flat near angle=current_angle, steepening as it
+            # crouches further), so invert that relation for the angle
+            # instead of scaling the height gap directly. knee_joint's
+            # range is negative ([-1.5707, 0]) and ankle_joint's is
+            # positive ([0, 1.5707]) -- passing the same positive "amount"
+            # to both as this used to do got silently clamped to 0 on one
+            # of them every round, so the lifter never actually moved.
+            #
+            # Reference height is the current waist (body_link) height
+            # minus 0.1 m -- at reset_pose that's ~0.90m (body_link sits at
+            # ~1.00m), so a target at or above that height needs no crouch
+            # beyond whatever the lifter is already at (drop=0 below keeps
+            # the current angle exactly, rather than snapping to fully
+            # extended).
+            waist_z = self.robot.body_link.worldpos()[2]
+            current_lifter_angle = -self.robot.knee_joint.joint_angle()
+            drop = np.clip(waist_z - 0.1 - cz, 0.0, None)
+            # == -knee_joint.min_angle; the two ranges mirror each other.
+            max_lifter_angle = self.robot.ankle_joint.max_angle
+            cos_arg = np.clip(
+                math.cos(current_lifter_angle) - 2.0 * float(drop),
+                math.cos(max_lifter_angle), 1.0)
+            lifter_angle = math.acos(cos_arg)
             try:
-                self.robot.knee_joint.joint_angle(lifter_amount)
+                self.robot.knee_joint.joint_angle(-lifter_angle)
                 if hasattr(self.robot, 'ankle_joint'):
-                    self.robot.ankle_joint.joint_angle(-lifter_amount)
+                    self.robot.ankle_joint.joint_angle(lifter_angle)
             except AttributeError:
                 pass
 
@@ -623,6 +681,13 @@ class HumanPalmContactBehavior:
             # mirror the same way); shoulder_p/elbow/wrist_p/wrist_y don't.
             mirror = 1.0 if self.arm == 'l' else -1.0
             whole_body = getattr(self.robot, '{}arm_whole_body'.format(self.arm))
+            # whole_body is a sub-chain RobotModel (lifter + arm links only,
+            # see Aero._limb/_lifter_links) that doesn't include base_link,
+            # so none of its own links have parent_link=None and IK's
+            # automatic root-link scan (used by use_base='planar' below to
+            # decide where to attach the virtual cart joint) fails. Point
+            # it at the real root explicitly instead.
+            whole_body.root_link = self.robot.base_link
             getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
                 .joint_angle(-0.4)
             getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
@@ -641,7 +706,8 @@ class HumanPalmContactBehavior:
             # Align the palm-normal axis (PALM_NORMAL_ROTATION_AXIS) with
             # the human palm's normal and leave rotation about it free --
             # see _solve_palm_ik and PALM_ROTATION_MASK above.
-            if not self._solve_palm_ik(whole_body, target_coords):
+            if not self._solve_palm_ik(
+                    whole_body, target_coords, use_base='planar'):
                 rospy.logwarn(
                     "IK could not reach the approach pose; using fallback "
                     "posture.")

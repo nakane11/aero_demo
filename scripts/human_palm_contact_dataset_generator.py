@@ -420,9 +420,11 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
 
     def _save_snapshot(self, ok):
         import imageio.v3 as iio
-        from skrobot.model.primitives import LineString, Sphere
+        from skrobot.model.primitives import Axis, LineString, Sphere
         from skrobot.coordinates import Coordinates
-        from aero_demo.palm_plane_view import bone_color, dim_color
+        from aero_demo.palm_plane_view import (
+            BASE_ORIGIN_AXIS_LENGTH, BASE_ORIGIN_AXIS_RADIUS, bone_color,
+            dim_color)
 
         hand_coords = getattr(self.robot, '{}arm_end_coords'.format(self.arm))
         hand_pos = hand_coords.worldpos()
@@ -434,6 +436,14 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
             human_points = [ref]
 
         markers = []
+
+        # 台車 (base_link) の初期位置 = ワールド原点 (_start_next_round が
+        # 毎周回 reset_pose() で戻すので常にここ)。approach の IK は
+        # use_base='planar' で台車を動かせるので、動いたかどうかがこの
+        # 大きめの座標軸とロボット自身の台車の位置を見比べればわかる。
+        markers.append(Axis(axis_radius=BASE_ORIGIN_AXIS_RADIUS,
+                            axis_length=BASE_ORIGIN_AXIS_LENGTH))
+
         target_color = [50, 220, 50, 255] if ok else [220, 50, 50, 255]
         target_sphere = Sphere(radius=0.02, color=target_color)
         target_sphere.newcoords(Coordinates(pos=hand_pos))

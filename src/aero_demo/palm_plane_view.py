@@ -59,6 +59,11 @@ NORMAL_LENGTH = 0.15
 FINGER_LENGTH = 0.08
 IK_TARGET_AXIS_LENGTH = 0.08
 HAND_AXIS_LENGTH = 0.06
+# 台車 (base_link) の初期位置を示す原点座標軸。planar な IK で台車が動く
+# ことがあるので、動いたかどうか一目でわかるよう他の座標軸よりだいぶ
+# 大きくしてある。
+BASE_ORIGIN_AXIS_RADIUS = 0.015
+BASE_ORIGIN_AXIS_LENGTH = 0.4
 # カメラの画角の四角すいをどこまで伸ばして描くか [m]。人が立つ距離
 # (fake_people_pose_estimator_ros.py の ~distance_range, 既定 0.8-1.0 m)
 # を包む程度の見た目にしてある -- 実際の可視距離とは無関係な表示用の値。
@@ -189,8 +194,11 @@ class PalmPlaneScene(object):
         self.robot = None
         self._hand_coords_attr = None
 
-        # 関節点の座標系 (既定 base_link) の原点
-        self.viewer.add(Axis(axis_radius=0.005, axis_length=0.2))
+        # 関節点の座標系 (既定 base_link) の原点 = 台車の初期位置。planar な
+        # IK で台車が動いても原点は動かないので、他の座標軸よりだいぶ大きく
+        # 描いて、動いたかどうかここと見比べればわかるようにしてある。
+        self.viewer.add(Axis(axis_radius=BASE_ORIGIN_AXIS_RADIUS,
+                             axis_length=BASE_ORIGIN_AXIS_LENGTH))
 
         # IK の目標座標系と、ロボットの手先座標系。どちらもフィットした
         # 手のひら平面 (self.plate 等) とは別に、実際に IK へ渡した/解けた
