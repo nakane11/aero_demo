@@ -94,7 +94,16 @@ import rospy
 from visualization_msgs.msg import MarkerArray
 
 from skrobot.coordinates import Coordinates
+from skrobot.coordinates.math import matrix2ypr
 from skrobot.coordinates.math import rotate_vector
+from skrobot.coordinates.math import rotation_matrix_z_to_axis
+from skrobot.coordinates.math import rpy_matrix
+from skrobot.model.primitives import Cylinder
+from skrobot.planner import sqp_plan_trajectory
+from skrobot.planner import SweptSphereSdfCollisionChecker
+from skrobot.planner.utils import get_robot_config
+from skrobot.planner.utils import set_robot_config
+from skrobot.sdf import UnionSDF
 
 from aero_demo import palm_plane
 from aero_demo.palm_plane import EMBED_DEPTH
@@ -113,9 +122,77 @@ if _SCRIPT_DIR not in sys.path:
 # Neck reached 100%, so fall back to Neck rather than dropping the frame.
 HUMAN_REF_LIMBS = ('Nose', 'Neck')
 
+# 立ち位置 (足元) の基準にする limb の候補。Ankle -> Hip -> HUMAN_REF_LIMBS
+# の順に、見つかった最初のものを使う (_human_foot_xy 参照)。Ankle が一番
+# 立ち位置に近いが脚は隠れて見えないことが多いので、Hip、それも無ければ
+# 上半身の基準点 (Nose/Neck、実際の足元よりは体の中心寄りだが無いよりまし)
+# まで段階的にフォールバックする。
+HUMAN_FOOT_REF_LIMBS = (('RAnkle', 'LAnkle'), ('RHip', 'LHip'))
+
 # 首を動かしてから次の判断までの待ち [s]。関節が動いている途中の角度で
 # 目標を決めないための間。
 NECK_SETTLE_TIME = 2.5
+
+# 人体を障害物として近似するときの円柱半径 [m] (骨の名前に含まれるキーワード
+# でおおまかな太さを変える。マッチしなければ胴/脚として HUMAN_BONE_RADIUS_
+# DEFAULT を使う)。
+HUMAN_BONE_RADIUS = (
+    (('Shoulder', 'Elbow', 'Wrist'), 0.05),
+    (('Eye', 'Ear', 'Nose'), 0.10),
+)
+HUMAN_BONE_RADIUS_DEFAULT = 0.09
+
+# 人体回避の軌道最適化 (sqp_plan_trajectory) のウェイポイント数と安全マージン。
+HUMAN_AVOIDANCE_WAYPOINTS = 8
+HUMAN_AVOIDANCE_SAFETY_MARGIN = 0.03  # [m]
+
+# IK の use_base='planar' が台車 (wheel_base_link) を動かした結果、人間の
+# 足元 (_human_foot_sdf 参照) へ近づきすぎていないかの安全マージン。
+CART_AVOIDANCE_SAFETY_MARGIN = 0.05  # [m]
+
+# 人間の足元を近似する円柱の半径 [m]。person.bones の脚 (Hip->Knee->Ankle)
+# は検出できないことが多く (肩から先の腕・頭に比べてカメラに映りづらい/
+# 隠れやすい)、そこに頼らず立ち位置まわりに一律に置く。
+HUMAN_FOOT_RADIUS = 0.3
+
+
+def _bone_radius(bone_name):
+    for keywords, radius in HUMAN_BONE_RADIUS:
+        if any(k in bone_name for k in keywords):
+            return radius
+    return HUMAN_BONE_RADIUS_DEFAULT
+
+
+def _human_obstacle_sdf(person, touching_arm_prefix):
+    """``person.bones`` (骨格, base_link 座標系) から、ロボットが避けるべき
+    人体を近似した SDF (円柱の和) を作る。フレーム内に骨が見つからなければ
+    ``None``。
+
+    触れに行く側の前腕 (``"{R,L}Elbow->{R,L}Wrist"``) だけは除外する --
+    ロボットの手はまさにそこへ向かうので、障害物にすると届かなくなる。
+    掌自体 (``RHand*``/``LHand*``) はそもそも ``person.bones`` に含まれない
+    (people_pose_estimator.PeoplePoseEstimator._create_bones は
+    index2limbname の骨格だけを繋ぐ) ので、ここで別途除く必要はない。
+    """
+    exclude = '{0}Elbow->{0}Wrist'.format(touching_arm_prefix)
+    sdf_list = []
+    for bone in person.bones:
+        if bone.name == exclude:
+            continue
+        p0 = np.asarray(bone.start_point, dtype=np.float64)
+        p1 = np.asarray(bone.end_point, dtype=np.float64)
+        axis = p1 - p0
+        length = float(np.linalg.norm(axis))
+        if length < 1e-3:
+            continue
+        cyl = Cylinder(radius=_bone_radius(bone.name), height=length,
+                       with_sdf=True)
+        cyl.newcoords(Coordinates(
+            pos=(p0 + p1) / 2.0, rot=rotation_matrix_z_to_axis(axis)))
+        sdf_list.append(cyl.sdf)
+    if not sdf_list:
+        return None
+    return UnionSDF(sdf_list)
 
 # r/l_eef_grasp_link のローカル Y 軸が甲->掌方向 (dorsum -> palm) -- URDF
 # を skrobot で読み、指の曲げ関節を動かして先端がどちらへ寄るかを直接
@@ -138,7 +215,14 @@ def _unit(v):
     return np.asarray(v, dtype=np.float64) / n
 
 
-def _mirror_target_rotation(rot):
+# _mirror_target_rotation の握手向きは元々「指方向を 180 度反転」で一意に
+# 決めていたが、平面フィットの誤差次第では 180 度固定だと IK が解けないこと
+# があるので、代わりに ±90 度の 2 通りを試し、IK が解けた方を採用する
+# (control_loop 参照)。
+MIRROR_TURN_CANDIDATES_DEG = (90.0, -90.0)
+
+
+def _mirror_target_rotation(rot, turn_deg=180.0):
     """Handshake-mirror a palm-target rotation (e.g. ``PalmPlane.rot``).
 
     ``rot``'s +X is the finger direction and +Z is the thumb<->pinky width
@@ -161,9 +245,11 @@ def _mirror_target_rotation(rot):
       it as the robot's +X would point the robot's fingertips the same
       way -- past the human's hand, away from them -- whereas in an
       actual handshake each hand's fingers point back across the other's
-      palm toward *their* wrist.  So the robot's +X is the human's +X
-      negated (a 180 deg turn about the shared +Y, which leaves +Y --
-      "face the human" -- untouched).
+      palm toward *their* wrist.  So the robot's +X is turned ``turn_deg``
+      about the shared +Y (which leaves +Y -- "face the human" --
+      untouched); at the default 180 deg this is a plain negation, but
+      callers trying several candidate orientations (see
+      ``MIRROR_TURN_CANDIDATES_DEG``) pass other angles too.
     """
     x_axis = _unit(rot[:, 0])
     if x_axis is None:
@@ -189,41 +275,55 @@ def _mirror_target_rotation(rot):
     if z_axis is None:
         return rot
     y_axis = np.cross(z_axis, x_axis)
-    # 180 deg about +Y: fingers point back toward the human's wrist
-    # instead of past their hand, while +Y (facing the human) is
-    # untouched.
-    return np.column_stack([-x_axis, y_axis, -z_axis])
+    # Turn (x_axis, z_axis) by turn_deg about +Y; +Y itself is untouched.
+    phi = math.radians(turn_deg)
+    turned_x = math.cos(phi) * x_axis + math.sin(phi) * z_axis
+    turned_z = -math.sin(phi) * x_axis + math.cos(phi) * z_axis
+    return np.column_stack([turned_x, y_axis, turned_z])
 
 
 # 人間の掌平面 (palm_plane.fit_palm_plane の結果) を IK ターゲットへ変換した
 # もの。pos/rot は人間自身の掌の位置・姿勢 (contact_target/plane.rot その
 # まま、_lock_target が描画やデータセット生成のために残しておく分)、
-# hand_rot はロボットの手が向くべき向き (_mirror_target_rotation 参照)、
-# center/normal は gaze/lifter が使う掌中心とその法線。
+# center/normal は gaze/lifter が使う掌中心とその法線。candidates は
+# MIRROR_TURN_CANDIDATES_DEG のそれぞれについての PalmIkCandidate --
+# ロボットの手が向くべき向きが turn_deg ごとに変わるので、IK が解けた方を
+# control_loop が選ぶ。
 PalmIkTargets = namedtuple('PalmIkTargets', [
-    'pos', 'rot', 'hand_rot', 'center', 'normal',
-    'approach_coords', 'press_coords'])
+    'pos', 'rot', 'center', 'normal', 'candidates'])
+
+# turn_deg: _mirror_target_rotation に渡した角度 (どの向きの候補か)。
+# hand_rot: ロボットの手が向くべき向き (_mirror_target_rotation 参照)。
+# approach_coords/press_coords: hand_rot を向きに使う IK ターゲット。
+PalmIkCandidate = namedtuple('PalmIkCandidate', [
+    'turn_deg', 'hand_rot', 'approach_coords', 'press_coords'])
 
 
-def palm_plane_to_ik_targets(plane):
+def palm_plane_to_ik_targets(plane, turn_degs=MIRROR_TURN_CANDIDATES_DEG):
     """人間の掌平面から、ロボットが IK で解く approach/press ターゲット
-    (skrobot ``Coordinates``, base_link frame) を作る.
+    (skrobot ``Coordinates``, base_link frame) の候補群を作る.
 
+    ``turn_degs`` それぞれについて 1 つの ``PalmIkCandidate`` を作る --
     ``approach_coords`` はまず触れに行く位置、``press_coords`` はそこから
     ``EMBED_DEPTH`` だけ掌の中へ押し込んだ位置で、向きはどちらも
     ``hand_rot`` (人間の掌姿勢を握手のように鏡写しした向き) で揃える。
     """
     pos = palm_plane.contact_target(plane)
-    hand_rot = _mirror_target_rotation(plane.rot)
     embed_pos = plane.center - plane.normal * EMBED_DEPTH
+    candidates = []
+    for turn_deg in turn_degs:
+        hand_rot = _mirror_target_rotation(plane.rot, turn_deg=turn_deg)
+        candidates.append(PalmIkCandidate(
+            turn_deg=turn_deg,
+            hand_rot=hand_rot,
+            approach_coords=Coordinates(pos=pos.tolist(), rot=hand_rot),
+            press_coords=Coordinates(pos=embed_pos.tolist(), rot=hand_rot)))
     return PalmIkTargets(
         pos=pos.tolist(),
         rot=plane.rot,
-        hand_rot=hand_rot,
         center=plane.center.tolist(),
         normal=plane.normal.tolist(),
-        approach_coords=Coordinates(pos=pos.tolist(), rot=hand_rot),
-        press_coords=Coordinates(pos=embed_pos.tolist(), rot=hand_rot))
+        candidates=candidates)
 
 
 def create_pose_source(name):
@@ -378,6 +478,23 @@ class HumanPalmContactBehavior:
         self.target_palm_center = None    # for gaze/lifter, base_link frame
         self.target_palm_normal = None    # unit vector, base_link frame
         self._ik_targets = None           # PalmIkTargets, set by _lock_target
+        self._locked_person = None        # Person3D, set by _lock_target;
+                                           # used to build the human obstacle
+                                           # model for _move_avoiding_human
+        self._human_sdf = None            # UnionSDF (bone cylinders), built
+                                           # once by _lock_target from
+                                           # _locked_person; used by
+                                           # _move_avoiding_human for arm
+                                           # avoidance
+        self._human_foot_sdf = None        # CylinderSDF at the person's
+                                           # standing position, built once
+                                           # by _lock_target; used by
+                                           # _solve_palm_ik to keep the cart
+                                           # (wheel_base_link) away from the
+                                           # human's feet/legs, which the
+                                           # bone cylinders above usually
+                                           # don't cover (see
+                                           # HUMAN_FOOT_REF_LIMBS)
         self.state_start_time = rospy.Time.now()
         # 平面フィットに失敗し続けている時間の計測用 (_track_with_neck 参照)。
         # None なら「まだ失敗が始まっていない」。
@@ -496,6 +613,26 @@ class HumanPalmContactBehavior:
                     return person.positions[j]
         return None
 
+    def _human_foot_xy(self, person):
+        """立ち位置 (x, y) の推定 (台車の押し出し判定用, 無ければ None).
+
+        ``HUMAN_FOOT_REF_LIMBS`` の候補を順に試し、両側とも見えていれば
+        その中点を、片側だけなら見えている方を使う。
+        """
+        for left, right in HUMAN_FOOT_REF_LIMBS:
+            pts = []
+            for limb in (left, right):
+                if limb in person.limb_names:
+                    j = person.limb_names.index(limb)
+                    if person.scores[j] > 0.1:
+                        pts.append(person.positions[j])
+            if pts:
+                return np.mean(pts, axis=0)[:2]
+        ref = self._human_ref(person)
+        if ref is not None:
+            return np.asarray(ref, dtype=np.float64)[:2]
+        return None
+
     def _best_palm(self, result):
         """最初の有効な人物とその手のひら平面を返す.
 
@@ -553,7 +690,7 @@ class HumanPalmContactBehavior:
             return    # 首を動かしたのでこのフレームはここまで
         if plane is None:
             return
-        self._lock_target(plane, palm_points, now)
+        self._lock_target(plane, palm_points, person, now)
 
     def _track_with_neck(self, person, plane, palm_points, now):
         """人の方を向く。指令を出したら True を返す."""
@@ -601,17 +738,51 @@ class HumanPalmContactBehavior:
         self.last_neck_cmd_time = now
         return True
 
-    def _lock_target(self, plane, palm_points, now):
-        # target_palm_pos/target_hand_rot 等は palm_plane_to_ik_targets が
-        # 人間の掌平面から作った IK ターゲット。target_palm_rot だけは
-        # 人間自身の掌姿勢そのもの (ロボット側の向きではない) を残す --
-        # データセット生成側が人間の指方向の矢印を描くのに使う。
+    def _build_human_foot_sdf(self, person):
+        """立ち位置に台車の高さ分の衝突円柱を置く (無ければ None).
+
+        ``_human_sdf`` の骨格円柱は肩から先 (腕・頭) が中心で、脚
+        (Hip->Knee->Ankle) は隠れて見えないことが多く実質カバーされない。
+        台車 (``wheel_base_link``) はまさに床面のその高さを動くので、
+        脚の代わりに立ち位置まわりへ一律に置いた円柱で代用する
+        (``_solve_palm_ik`` の台車の押し出し判定に使う)。
+        """
+        foot_xy = self._human_foot_xy(person)
+        if foot_xy is None:
+            return None
+        cart_mesh = self.robot.wheel_base_link.collision_mesh
+        height = float(cart_mesh.extents[2]) if cart_mesh is not None \
+            else 0.15
+        cylinder = Cylinder(
+            radius=HUMAN_FOOT_RADIUS, height=height, with_sdf=True)
+        cylinder.newcoords(Coordinates(
+            pos=[float(foot_xy[0]), float(foot_xy[1]), height / 2.0]))
+        return cylinder.sdf
+
+    def _lock_target(self, plane, palm_points, person, now):
+        # target_palm_pos 等は palm_plane_to_ik_targets が人間の掌平面から
+        # 作った IK ターゲット。target_palm_rot だけは人間自身の掌姿勢その
+        # もの (ロボット側の向きではない) を残す -- データセット生成側が
+        # 人間の指方向の矢印を描くのに使う。target_hand_rot は候補
+        # (±90度) のうちどれが解けるか control_loop が試すまで決まらない
+        # ので、ここでは None のままにする。
         self._ik_targets = palm_plane_to_ik_targets(plane)
         self.target_palm_pos = self._ik_targets.pos
         self.target_palm_rot = self._ik_targets.rot
         self.target_palm_center = self._ik_targets.center
         self.target_palm_normal = self._ik_targets.normal
-        self.target_hand_rot = self._ik_targets.hand_rot
+        self.target_hand_rot = None
+        # 骨格 (person.bones) は _move_avoiding_human が人体を障害物として
+        # 近似するのに使う。推定は直後に止まるので、以降はこのフレームの
+        # 骨格が固定で残る。
+        self._locked_person = person
+        arm_prefix = 'R' if self.hand == 'R' else 'L'
+        try:
+            self._human_sdf = _human_obstacle_sdf(person, arm_prefix)
+        except Exception as e:
+            rospy.logwarn('could not build human obstacle model: %s', e)
+            self._human_sdf = None
+        self._human_foot_sdf = self._build_human_foot_sdf(person)
 
         # Same geometry the viewer draws, so what you see is what the robot
         # is about to reach for.
@@ -681,7 +852,40 @@ class HumanPalmContactBehavior:
             rospy.logwarn('%s pose: %.1f mm from the target -- IK did not '
                           'reach it', label, distance * 1000.0)
 
-    def _solve_palm_ik(self, whole_body, target_coords, use_base=None):
+    def _clear_cart_from_foot(self, foot_sdf,
+                              margin=CART_AVOIDANCE_SAFETY_MARGIN):
+        """台車 (``wheel_base_link``) の中心 (x, y) を ``foot_sdf``
+        (``_build_human_foot_sdf`` の結果, 立ち位置に置いた円柱) の半径
+        ``HUMAN_FOOT_RADIUS`` + ``margin`` の外側まで押し出した位置を返す。
+        台車の中心が既にその外側にあれば None。
+
+        台車の footprint 自体の大きさは見ず、中心点が円の中に入っていない
+        かだけを見る (台車の外接円まで足すと過剰にマージンを取ってしまう
+        ため、ここでは中心点のみのシンプルな判定にしている)。
+
+        台車自体は実機では動かない -- ``use_base='planar'`` はモデルの中だ
+        けの仮想関節で (module docstring および ``_move_avoiding_human`` 参
+        照)、実機へは ``angle_vector`` (関節角のみ) しか送らない。つまり
+        台車と人間の干渉は経路計画で「避ける」ものではなく、IK が仮想的に
+        選んだ台車位置が近すぎる場合にその場で押し出し、その位置に台車を
+        固定した上で腕だけを解き直す (呼び出し側の ``_solve_palm_ik`` 参
+        照) ためにここで押し出し先を計算する。
+        """
+        if foot_sdf is None:
+            return None
+        cart_xy = np.asarray(self.robot.translation[:2], dtype=np.float64)
+        foot_xy = np.asarray(foot_sdf.worldpos()[:2], dtype=np.float64)
+        needed_clear = HUMAN_FOOT_RADIUS + margin
+
+        offset = cart_xy - foot_xy
+        dist = float(np.linalg.norm(offset))
+        if dist >= needed_clear:
+            return None
+        direction = offset / dist if dist > 1e-6 else np.array([1.0, 0.0])
+        return foot_xy + direction * needed_clear
+
+    def _solve_palm_ik(self, whole_body, target_coords, use_base=None,
+                        foot_sdf=None):
         """Solve whole-body IK for ``target_coords``.
 
         ``target_coords`` carries a fully-determined orientation (see
@@ -704,22 +908,137 @@ class HumanPalmContactBehavior:
 
         ``use_base`` is passed through to ``inverse_kinematics`` as-is
         (e.g. ``'planar'`` to let the cart move in the IK solve); left at
-        its default (``None``) the base is not included.
+        its default (``None``) the base is not included. skrobot's
+        ``inverse_kinematics`` has no working collision-avoidance hook of
+        its own (its ``check_collision``/``obstacles`` kwargs are unused
+        dead code), so when ``use_base`` did let the base move and the
+        solved cart position ends up too close to ``foot_sdf`` (see
+        ``_clear_cart_from_foot``), the cart is pushed clear of it and the
+        arm is re-solved with the cart held fixed at that pushed-out
+        position (rather than snapping all the way back to no base motion
+        at all).
         """
         if self.scene is not None:
             self.scene.update_ik_target(target_coords)
-        for rotation_axis in (True, False):
+
+        def try_ik(base_choice):
+            for rotation_axis in (True, False):
+                try:
+                    res = whole_body.inverse_kinematics(
+                        target_coords, rotation_axis=rotation_axis,
+                        stop=200, revert_if_fail=False, use_base=base_choice)
+                except Exception as e:
+                    rospy.logwarn("IK failed (rotation_axis=%r): %s",
+                                  rotation_axis, e)
+                    res = False
+                if res is not False:
+                    return True
+            return False
+
+        if not try_ik(use_base):
+            return False
+        if use_base is None:
+            return True
+
+        pushed_xy = self._clear_cart_from_foot(foot_sdf)
+        if pushed_xy is None:
+            return True
+
+        rospy.logwarn(
+            "IK moved the cart to within %.0f mm of the human's feet; "
+            "pushing it clear and re-solving the arm with the cart fixed "
+            "there.", CART_AVOIDANCE_SAFETY_MARGIN * 1000.0)
+        theta, _, _ = matrix2ypr(self.robot.rotation)
+        self.robot.newcoords(Coordinates(
+            pos=[pushed_xy[0], pushed_xy[1], 0.0],
+            rot=rpy_matrix(theta, 0.0, 0.0)))
+        return try_ik(None)
+
+    def _solve_palm_ik_candidates(self, whole_body, candidates, coords_attr,
+                                   use_base=None, foot_sdf=None):
+        """``candidates`` (``PalmIkCandidate`` のリスト, 通常は ±90度の 2 つ)
+        を順に試し、IK が解けた最初の候補を返す.
+
+        ``coords_attr`` は各候補から取り出す座標の属性名 (``'approach_
+        coords'`` / ``'press_coords'``)。どちらも解けなければ最後に試した
+        候補のまま (フォールバック姿勢) を返す -- ``_solve_palm_ik`` の
+        「解けなくても描画・続行はする」という従来の挙動を踏襲する。
+
+        Returns
+        -------
+        (candidate, solved) : 使う候補と、それが実際に解けたかどうか。
+        """
+        for i, candidate in enumerate(candidates):
+            target_coords = getattr(candidate, coords_attr)
+            if self._solve_palm_ik(
+                    whole_body, target_coords, use_base=use_base,
+                    foot_sdf=foot_sdf):
+                rospy.loginfo(
+                    'IK solved with a %.0f deg mirrored turn.',
+                    candidate.turn_deg)
+                return candidate, True
+            rospy.logwarn(
+                'IK could not solve with a %.0f deg mirrored turn%s.',
+                candidate.turn_deg,
+                '; trying the next candidate' if i + 1 < len(candidates)
+                else '')
+        return candidates[-1], False
+
+    def _move_avoiding_human(self, whole_body, av_start, duration):
+        """``av_start`` から ``whole_body`` の現在の関節角 (直前に
+        ``_solve_palm_ik`` が解いた姿勢) まで、人体を避ける経路を通って
+        実際に動かす。
+
+        経路は ``sqp_plan_trajectory`` (SQP, see collision_free_trajectory.py
+        example) で ``self._locked_person`` の骨格を円柱近似した SDF
+        (``_human_obstacle_sdf``) を障害物として最適化する。骨格が無い
+        (fake 推定など) か最適化が失敗した場合は、これまで通り直接補間して
+        動かす。
+
+        ベース (waist/lifter 以外の台車) は対象にしない -- 実機への指令は
+        ``angle_vector`` (関節角のみ) で、台車を動かすものではないので、
+        経路計画も実際に送る関節だけを対象にすれば指令と一致する。
+        """
+        joint_list = list(whole_body.joint_list)
+        av_goal = get_robot_config(self.robot, joint_list, with_base=False)
+
+        human_sdf = self._human_sdf
+
+        def move_directly():
+            set_robot_config(self.robot, joint_list, av_goal)
+            self.ri.angle_vector(self.robot.angle_vector(), duration)
+            self.ri.wait_interpolation()
+
+        if human_sdf is None:
+            move_directly()
+            return
+
+        checker = SweptSphereSdfCollisionChecker(human_sdf, self.robot)
+        for link in whole_body.link_list:
+            if link.collision_mesh is None:
+                continue
             try:
-                res = whole_body.inverse_kinematics(
-                    target_coords, rotation_axis=rotation_axis,
-                    stop=200, revert_if_fail=False, use_base=use_base)
+                checker.add_collision_link(link)
             except Exception as e:
-                rospy.logwarn("IK failed (rotation_axis=%r): %s",
-                              rotation_axis, e)
-                res = False
-            if res is not False:
-                return True
-        return False
+                rospy.logwarn('skipping %s for human-collision checking: '
+                              '%s', link.name, e)
+
+        try:
+            av_seq = sqp_plan_trajectory(
+                checker, av_start, av_goal, joint_list,
+                HUMAN_AVOIDANCE_WAYPOINTS,
+                safety_margin=HUMAN_AVOIDANCE_SAFETY_MARGIN)
+        except Exception as e:
+            rospy.logwarn('human-avoiding trajectory planning failed (%s); '
+                          'moving directly instead', e)
+            move_directly()
+            return
+
+        step_duration = duration / len(av_seq)
+        for av in av_seq:
+            set_robot_config(self.robot, joint_list, av)
+            self.ri.angle_vector(self.robot.angle_vector(), step_duration)
+            self.ri.wait_interpolation()
 
     def control_loop(self, event):
         if self.state == "NODDING":
@@ -794,8 +1113,6 @@ class HumanPalmContactBehavior:
             rospy.loginfo("Extending arm toward the palm...")
             self.robot.angle_vector(self.ri.angle_vector())
 
-            target_coords = self._ik_targets.approach_coords
-
             # Fallback posture (natural elbow position) used as the IK seed.
             # (wrist_p/wrist_r are clamped to this arm's actual joint
             # limits -- +-5deg / -85..+25deg for the left arm, +-5deg /
@@ -814,6 +1131,15 @@ class HumanPalmContactBehavior:
             # decide where to attach the virtual cart joint) fails. Point
             # it at the real root explicitly instead.
             whole_body.root_link = self.robot.base_link
+
+            # Captured here (synced from the real/interpolated arm at line
+            # ~924, before the fallback seed posture below overwrites it in
+            # the model) so _move_avoiding_human can later plan a path from
+            # where the arm actually is, not from the IK seed.
+            joint_list = list(whole_body.joint_list)
+            av_start_approach = get_robot_config(
+                self.robot, joint_list, with_base=False)
+
             getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
                 .joint_angle(-0.4)
             getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
@@ -829,14 +1155,21 @@ class HumanPalmContactBehavior:
             getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
                 .joint_angle(0.436 * mirror)
 
-            # target_coords carries the mirrored handshake orientation
-            # (see _mirror_target_rotation) -- solved exactly on all 3
-            # axes, see _solve_palm_ik.
-            if not self._solve_palm_ik(
-                    whole_body, target_coords, use_base='planar'):
+            # Each candidate carries a differently-turned mirrored handshake
+            # orientation (see MIRROR_TURN_CANDIDATES_DEG /
+            # _mirror_target_rotation) -- solved exactly on all 3 axes, see
+            # _solve_palm_ik. Try them in order and keep whichever one IK
+            # actually reaches; the press pose below reuses that same
+            # candidate so the hand doesn't twist between approach and
+            # press.
+            approach_candidate, approach_ok = self._solve_palm_ik_candidates(
+                whole_body, self._ik_targets.candidates, 'approach_coords',
+                use_base='planar', foot_sdf=self._human_foot_sdf)
+            if not approach_ok:
                 rospy.logwarn(
-                    "IK could not reach the approach pose; using fallback "
-                    "posture.")
+                    "IK could not reach the approach pose with either "
+                    "mirrored turn; using fallback posture.")
+            self.target_hand_rot = approach_candidate.hand_rot
 
             # Whole-body IK may have turned the waist to reach the target,
             # which rotates the neck with it -- re-aim after solving so
@@ -845,8 +1178,7 @@ class HumanPalmContactBehavior:
             self._look_at(self.target_palm_center)
 
             self._report_reach('approach', self.target_palm_pos)
-            self.ri.angle_vector(self.robot.angle_vector(), 2.0)
-            self.ri.wait_interpolation()
+            self._move_avoiding_human(whole_body, av_start_approach, 2.0)
 
             # Second, slower motion: press past the approach pose so the
             # hand actually sinks into the palm rather than stopping just
@@ -854,7 +1186,10 @@ class HumanPalmContactBehavior:
             rospy.loginfo("Pressing into the palm...")
             self.robot.angle_vector(self.ri.angle_vector())
 
-            embed_coords = self._ik_targets.press_coords
+            embed_coords = approach_candidate.press_coords
+
+            av_start_press = get_robot_config(
+                self.robot, joint_list, with_base=False)
 
             if not self._solve_palm_ik(whole_body, embed_coords):
                 rospy.logwarn(
@@ -866,8 +1201,7 @@ class HumanPalmContactBehavior:
             self._look_at(self.target_palm_center)
 
             self._report_reach('press', embed_coords.worldpos())
-            self.ri.angle_vector(self.robot.angle_vector(), 1.5)
-            self.ri.wait_interpolation()
+            self._move_avoiding_human(whole_body, av_start_press, 1.5)
 
             rospy.loginfo("Finished palm contact behavior sequence.")
             # 接近と押し込みが終わったので描画の更新も止める。viewer は

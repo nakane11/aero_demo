@@ -220,8 +220,13 @@ class FakeRosPeoplePoseEstimator(object):
         # 人ごと・フレームごとに変わる)、ここで引く値はその基準からの
         # 傾きのオフセットとして乗る。既定値は握手の基準姿勢のまわりの
         # 小さな個人差の範囲。
+        # 85 deg 近くまで許すと肩/手首まわりが可動域限界に張り付いて IK が
+        # 届かないことが多い (human_palm_contact_behavior_loop.py のログを
+        # 集計すると shoulder_elevation が 50 deg を超えたあたりから成功率
+        # が急落し、70 deg 以上ではほぼ全滅していた)。ロボット腕が現実的に
+        # 追従できる範囲に絞る。
         self.present_shoulder_elevation_range = rospy.get_param(
-            '~present_shoulder_elevation_deg_range', [0.0, 85.0])
+            '~present_shoulder_elevation_deg_range', [0.0, 50.0])
         self.present_shoulder_azimuth_range = rospy.get_param(
             '~present_shoulder_azimuth_deg_range', [-20.0, 20.0])
         self.present_elbow_flex_range = rospy.get_param(

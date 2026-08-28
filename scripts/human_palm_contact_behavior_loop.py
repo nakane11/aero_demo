@@ -114,7 +114,7 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
                 approach[0] * 1000.0, '' if approach[1] else ' (missed)'))
         if press:
             lines.append('press: {:.1f} mm{}'.format(
-                press[0] * 1000.0, '' if press[1] else ' (missed)'))
+               press[0] * 1000.0, '' if press[1] else ' (missed)'))
         n_ok = sum(1 for r in self.contact_results if r['ok'])
         lines.append('{}/{} rounds reached the palm so far'.format(
             n_ok, self.round_count))
@@ -169,7 +169,7 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
         self.pose_thread.daemon = True
         self.pose_thread.start()
 
-        rospy.loginfo("Waiting for human (round %d)...", self.round_count + 1)
+        rospy.loginfo ("Waiting for human (round %d)...", self.round_count + 1)
 
 
 if __name__ == '__main__':
