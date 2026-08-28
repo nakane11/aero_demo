@@ -12,6 +12,7 @@ rospy は import しない。描けなかったことは例外ではなく戻り
 """
 
 import numpy as np
+import trimesh
 
 from skrobot.coordinates import Coordinates
 from skrobot.model.primitives import Axis
@@ -19,9 +20,11 @@ from skrobot.model.primitives import Box
 from skrobot.model.primitives import Capsule
 from skrobot.model.primitives import Cylinder
 from skrobot.model.primitives import LineString
+from skrobot.model.primitives import MeshLink
 from skrobot.model.primitives import Sphere
 
 from aero_demo import palm_plane
+from aero_demo import smpl_body
 
 # 色 (RViz のマーカーと合わせる), RGBA 0-255
 COLOR_PLATE = [255, 255, 0, 90]
@@ -31,6 +34,9 @@ COLOR_LANDMARK = [255, 255, 255, 255]
 COLOR_APPROACH = [50, 100, 255, 255]
 COLOR_PRESS = [255, 50, 50, 255]
 COLOR_FRUSTUM = [160, 180, 255, 90]
+# SMPL で胴体・頭を実体メッシュとして描くときの単色 (肌色寄り)。骨格を
+# 下から透けて見せたいので半透明にしてある。
+COLOR_BODY = [225, 190, 160, 110]
 
 # 骨格の線は部位ごとに色を変える。Person3D.bones の名前 ("Neck->RShoulder"
 # 形式) から下の bone_color で引く。
@@ -243,10 +249,18 @@ class PalmPlaneScene(object):
         骨格の線を描くか。
     draw_camera : bool
         カメラの画角の四角すいを描くか。
+    smpl_model_path : str or None
+        SMPL v1.0.0 の ``.pkl`` (例:
+        ``~/SMPL_python_v.1.0.0/smpl/models/basicmodel_m_lbs_10_207_0_v1.0.0.pkl``)。
+        ライセンス上リポジトリには同梱できないのでローカルパスで渡す。
+        ``None`` か、読み込みに失敗した場合 (ファイルが無い等) は
+        ``smpl_load_error`` にエラーメッセージを入れたうえで、胴体・頭を
+        従来通り Box/Sphere のプリミティブで描く (壊れない)。
     """
 
     def __init__(self, viewer='trimesh', resolution=(960, 720),
-                 draw_skeleton=True, draw_camera=True):
+                 draw_skeleton=True, draw_camera=True,
+                 smpl_model_path=None):
         self.viewer_name = str(viewer).lower()
         if self.viewer_name == 'viser':
             # X のウィンドウを開かずブラウザに描くので、WSL や ssh 越しでも
@@ -265,6 +279,19 @@ class PalmPlaneScene(object):
         self.draw_camera = draw_camera
         self.robot = None
         self._hand_coords_attr = None
+
+        # SMPL が使えれば胴体・頭を実体メッシュで描く。ファイルが無い/
+        # 読めない環境でも壊れないよう、失敗したら黙って従来の
+        # Box/Sphere 描画にフォールバックする (エラーメッセージだけ
+        # smpl_load_error に残し、呼び出し側が rospy.logwarn 等できる
+        # ようにする)。
+        self._smpl_model = None
+        self.smpl_load_error = None
+        if smpl_model_path:
+            try:
+                self._smpl_model = smpl_body.load_smpl_model(smpl_model_path)
+            except Exception as e:
+                self.smpl_load_error = str(e)
 
         # 関節点の座標系 (既定 base_link) の原点 = 台車の初期位置。planar な
         # IK で台車が動いても原点は動かないので、他の座標軸よりだいぶ大きく
@@ -449,6 +476,17 @@ class PalmPlaneScene(object):
             pos=(start + end) / 2.0, rot=rotation_from_z(end - start))
         return set_color(capsule, rgba)
 
+    def _bone_line(self, bone, rgba):
+        """1 本のボーンを (太さを持たない) 細い線にして返す.
+
+        SMPL メッシュが胴体の実体を描いてくれるので、その上に重ねる
+        骨格は太さの要らない細線で十分 -- ``_bone_capsule`` の体型
+        表現の代わりに使う (骨格を線で描いていた頃の見た目に戻す)。
+        """
+        start = np.asarray(bone.start_point, dtype=np.float64)
+        end = np.asarray(bone.end_point, dtype=np.float64)
+        return LineString(np.stack([start, end]), color=rgba)
+
     def _torso_box(self, joints, rgba):
         """肩・腰の 4 関節 (+ Neck) から胴体を 1 枚の板として作る.
 
@@ -531,50 +569,97 @@ class PalmPlaneScene(object):
         いずれも必要な関節が揃わなければ単に描かない (他の部位のように
         欠けた分だけ線を減らす、では絵にならない)。
 
-        カプセル/胴体の板/頭・鼻の球を作れなかったときは骨格の描画を
-        あきらめて False を返す (以降の呼び出しは何もしない)。薄い方だけ
-        描けなかった場合は、通常の骨格自体は描けているので描画を
-        あきらめない。
+        SMPL モデルが読み込めていれば (``__init__`` の
+        ``smpl_model_path``)、胴体・頭・四肢の実体として半透明の SMPL
+        メッシュ (``smpl_body.retarget_and_pose``, ``COLOR_BODY`` の
+        alpha を下げてある) を追加で描く。ただし部位ごとに色分けした
+        カプセル骨格 (``_bone_capsule``/``_torso_box``/``_head_sphere``)
+        は SMPL の有無にかかわらず常に描き、透けた SMPL メッシュ越しに
+        見えるようにする -- 鼻の目印 (``_nose_sphere``) だけは SMPL の
+        頭メッシュと二重に見えるため SMPL 描画時は省略する。必要な関節
+        (Neck + 両肩) が無い、またはリターゲットに失敗したフレーム/
+        人物は、その人物だけ SMPL メッシュを諦めてカプセル骨格のみに
+        なる (SMPL 未読み込みのときは常にこちら)。
+
+        カプセル/胴体の板/頭・鼻の球/SMPL メッシュを作れなかったときは
+        骨格の描画をあきらめて False を返す (以降の呼び出しは何もしない)。
+        薄い方だけ描けなかった場合は、通常の骨格自体は描けているので
+        描画をあきらめない。
         """
         if not self.draw_skeleton:
             return True
         for link in self.bone_links:
             self._show(link, False)
         self.bone_links = []
+        use_smpl = self._smpl_model is not None
+        # SMPL メッシュがあるときは、太いカプセル (簡易体型) は SMPL の
+        # 実体と喧嘩して見苦しいので、代わりに元の細い線 (_bone_line) で
+        # 骨格を描く -- 胴体・頭も (box/sphere の代役に頼らず) 他の部位
+        # と同じくボーンをそのまま線にする。
+        bone_shape = self._bone_line if use_smpl else self._bone_capsule
         for person in people:
             visible_joints = {}
             all_joints = {}
             for bone in person.bones:
-                if bone_group(bone.name) in ('torso', 'head'):
-                    collect_joints([bone], visible_joints)
-                    collect_joints([bone], all_joints)
+                collect_joints([bone], visible_joints)
+                collect_joints([bone], all_joints)
+                group = bone_group(bone.name)
+                if not use_smpl and group in ('torso', 'head'):
                     continue
                 try:
-                    link = self._bone_capsule(bone, bone_color(bone.name))
+                    link = bone_shape(bone, bone_color(bone.name))
                 except Exception:
                     self.draw_skeleton = False
                     return False
                 self.bone_links.append(link)
                 self._show(link, True)
             for bone in getattr(person, 'hidden_bones', []):
-                if bone_group(bone.name) in ('torso', 'head'):
-                    collect_joints([bone], all_joints)
+                collect_joints([bone], all_joints)
+                group = bone_group(bone.name)
+                if not use_smpl and group in ('torso', 'head'):
                     continue
                 try:
-                    link = self._bone_capsule(
+                    link = bone_shape(
                         bone, dim_color(bone_color(bone.name)))
                 except Exception:
                     continue
                 self.bone_links.append(link)
                 self._show(link, True)
 
-            for builder, ready, group in (
-                    (self._torso_box,
-                     lambda j: all(k in j for k in _TORSO_JOINTS), 'torso'),
-                    (self._head_sphere,
-                     lambda j: 'Neck' in j, 'head'),
-                    (self._nose_sphere,
-                     lambda j: 'Nose' in j, 'head')):
+            if use_smpl:
+                joints = dict(all_joints)
+                joints.update(visible_joints)
+                try:
+                    result = smpl_body.retarget_and_pose(
+                        self._smpl_model, joints)
+                except Exception:
+                    result = None
+                if result is not None:
+                    verts, faces = result
+                    try:
+                        mesh = trimesh.Trimesh(
+                            vertices=verts, faces=faces, process=False)
+                        link = set_color(MeshLink(visual_mesh=mesh),
+                                         COLOR_BODY)
+                    except Exception:
+                        link = None
+                    if link is not None:
+                        self.bone_links.append(link)
+                        self._show(link, True)
+
+            # use_smpl のときは torso/head も上の bone_shape ループで既に
+            # 線として描いてあるので、box/sphere の代役は不要 (SMPL の
+            # リターゲットに失敗した人物だけ、素の骨格線がフォール
+            # バックとして残る)。
+            builders = [] if use_smpl else [
+                (self._torso_box,
+                 lambda j: all(k in j for k in _TORSO_JOINTS), 'torso'),
+                (self._head_sphere,
+                 lambda j: 'Neck' in j, 'head'),
+                (self._nose_sphere,
+                 lambda j: 'Nose' in j, 'head'),
+            ]
+            for builder, ready, group in builders:
                 if ready(visible_joints):
                     joints, rgba = visible_joints, COLOR_BONES[group]
                 elif ready(all_joints):

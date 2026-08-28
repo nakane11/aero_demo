@@ -62,16 +62,17 @@ constraints asked for are naturally each one image axis of a side view:
   it, reached or not) -- but only *centered*, not fit; the horizontal span
   is whatever the vertical-fit distance happens to show.
 
-Palm-normal arrows
--------------------
-Each snapshot also draws two arrows from the back of a hand toward its
-palm: one for the human's estimated palm (``target_palm_center`` /
-``target_palm_normal``, the plane fit from the tracked landmarks) and one
-for the robot's actual hand pose (``r/l_eef_grasp_link``'s local +Y axis,
-the same "dorsum -> palm" axis ``human_palm_contact_behavior.py`` aligns
-IK to -- see its ``PALM_NORMAL_ROTATION_AXIS``), so a mismatch between
-where the human's palm faced and where the robot ended up aiming is
-visible in the frame itself, not just in the numeric report.
+Wrist -> fingertip arrows
+--------------------------
+Each snapshot also draws two arrows from the wrist toward the fingertips:
+one for the human's estimated hand (``target_palm_rot``'s local +X axis,
+i.e. ``palm_plane.fit_palm_plane``'s ``finger_dir``, the plane fit from the
+tracked landmarks) and one for the robot's actual hand pose
+(``r/l_eef_grasp_link``'s local +X axis, the same wrist -> fingertip axis --
+see the frame-orientation comment in ``aero_demo.palm_plane.fit_palm_plane``),
+so a mismatch between where the human's fingers pointed and where the
+robot's hand ended up aiming is visible in the frame itself, not just in
+the numeric report.
 
 Required parameters
 --------------------
@@ -131,6 +132,8 @@ import traceback
 import numpy as np
 import rospy
 
+from skrobot.coordinates import Coordinates
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -148,25 +151,26 @@ VERTICAL_PAD = 0.15
 # Safety margin on top of the exact tan(fov/2) fit distance.
 DISTANCE_PAD = 1.08
 
-# Palm-normal arrows: length is the tail-to-tip span (tip lands on the
-# palm point), the rest are the shaft/head proportions of that span.
+# Wrist -> fingertip arrows: length is the tail-to-tip span (tail sits at
+# the wrist/palm point), the rest are the shaft/head proportions of that
+# span.
 ARROW_LENGTH = 0.15
 ARROW_SHAFT_RADIUS = 0.004
 ARROW_HEAD_RADIUS = 0.011
 ARROW_HEAD_LENGTH = 0.045
-COLOR_HUMAN_NORMAL = [0, 255, 0, 255]     # matches palm_plane_view.COLOR_NORMAL
-COLOR_ROBOT_NORMAL = [0, 160, 255, 255]   # distinct from the ok/fail sphere's
-                                           # green/red
+COLOR_HUMAN_FINGER = [0, 200, 255, 255]   # matches palm_plane_view.COLOR_FINGER
+COLOR_ROBOT_FINGER = [255, 140, 0, 255]   # distinct from the ok/fail sphere's
+                                           # green/red and the human arrow's
+                                           # cyan
 
 
-def _make_normal_arrow(tip, direction, color):
+def _make_direction_arrow(base, direction, color):
     """A shaft+cone arrow of a fixed length, tail-to-tip along ``direction``.
 
-    ``tip`` is where the arrowhead ends up (the palm point); the tail
-    trails behind it by ``ARROW_LENGTH`` along ``-direction`` -- i.e. the
-    arrow points *into* ``tip`` from the back of the hand, matching "back
-    of hand -> palm" rather than starting at the palm and pointing away
-    from it.
+    ``base`` is where the tail starts (the wrist/palm point); the
+    arrowhead lands ``ARROW_LENGTH`` further along ``direction`` -- i.e.
+    the arrow points *out of* ``base`` toward the fingertips, matching
+    "wrist -> fingertip" rather than pointing into the palm from behind.
 
     skrobot has no ready-made directional-arrow primitive (only
     ``Cylinder``/``Cone``, both authored pointing along +Z -- see
@@ -192,7 +196,7 @@ def _make_normal_arrow(tip, direction, color):
     head.apply_translation([0.0, 0.0, shaft_length])
     mesh = shaft + head
 
-    tail = np.asarray(tip, dtype=np.float64) - d * ARROW_LENGTH
+    tail = np.asarray(base, dtype=np.float64)
     link = Link(pos=tail, rot=rotation_from_z(d), visual_mesh=mesh)
     return set_color(link, color)
 
@@ -421,7 +425,6 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
     def _save_snapshot(self, ok):
         import imageio.v3 as iio
         from skrobot.model.primitives import Axis, LineString, Sphere
-        from skrobot.coordinates import Coordinates
         from aero_demo.palm_plane_view import (
             BASE_ORIGIN_AXIS_LENGTH, BASE_ORIGIN_AXIS_RADIUS, bone_color,
             dim_color)
@@ -438,9 +441,9 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         markers = []
 
         # 台車 (base_link) の初期位置 = ワールド原点 (_start_next_round が
-        # 毎周回 reset_pose() で戻すので常にここ)。approach の IK は
-        # use_base='planar' で台車を動かせるので、動いたかどうかがこの
-        # 大きめの座標軸とロボット自身の台車の位置を見比べればわかる。
+        # 毎周回 reset_pose() の直後に明示的に戻すので常にここ)。approach
+        # の IK は use_base='planar' で台車を動かせるので、動いたかどうか
+        # がこの大きめの座標軸とロボット自身の台車の位置を見比べればわかる。
         markers.append(Axis(axis_radius=BASE_ORIGIN_AXIS_RADIUS,
                             axis_length=BASE_ORIGIN_AXIS_LENGTH))
 
@@ -449,20 +452,22 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         target_sphere.newcoords(Coordinates(pos=hand_pos))
         markers.append(target_sphere)
 
-        # Dorsum -> palm normal arrows -- see the module docstring's "Palm-
-        # normal arrows" section. Human: the plane fit from the tracked
-        # landmarks. Robot: r/l_eef_grasp_link's local +Y axis (the same
-        # axis human_palm_contact_behavior.py aligns IK to).
+        # Wrist -> fingertip arrows -- see the module docstring's "Wrist ->
+        # fingertip arrows" section. Human: local +X of the plane fit from
+        # the tracked landmarks. Robot: r/l_eef_grasp_link's local +X axis
+        # (the same wrist -> fingertip axis, see
+        # aero_demo.palm_plane.fit_palm_plane).
         if self.target_palm_center is not None \
-                and self.target_palm_normal is not None:
-            human_arrow = _make_normal_arrow(
-                self.target_palm_center, self.target_palm_normal,
-                COLOR_HUMAN_NORMAL)
+                and self.target_palm_rot is not None:
+            human_finger_dir = np.asarray(self.target_palm_rot)[:, 0]
+            human_arrow = _make_direction_arrow(
+                self.target_palm_center, human_finger_dir,
+                COLOR_HUMAN_FINGER)
             if human_arrow is not None:
                 markers.append(human_arrow)
-        robot_normal = hand_coords.worldrot().dot(np.array([0.0, 1.0, 0.0]))
-        robot_arrow = _make_normal_arrow(
-            hand_pos, robot_normal, COLOR_ROBOT_NORMAL)
+        robot_finger_dir = hand_coords.worldrot().dot(np.array([1.0, 0.0, 0.0]))
+        robot_arrow = _make_direction_arrow(
+            hand_pos, robot_finger_dir, COLOR_ROBOT_FINGER)
         if robot_arrow is not None:
             markers.append(robot_arrow)
 
@@ -663,12 +668,18 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         if rospy.is_shutdown():
             return
 
+        # reset_pose() only resets joint angles -- the previous round's
+        # approach IK (use_base='planar') can have translated/rotated
+        # base_link itself, which reset_pose() leaves untouched, so
+        # recenter it explicitly here too.
         self.robot.reset_pose()
+        self.robot.base_link.newcoords(Coordinates())
         self.ri.frozen = False
         self.ri.angle_vector(self.robot.angle_vector(), 0.0)
 
         self.target_palm_pos = None
         self.target_palm_rot = None
+        self.target_hand_rot = None
         self.target_palm_center = None
         self.target_palm_normal = None
         self.last_neck_cmd_time = rospy.Time.now()

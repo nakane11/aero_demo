@@ -36,6 +36,8 @@ import threading
 
 import rospy
 
+from skrobot.coordinates import Coordinates
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -132,14 +134,25 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
 
         # retract to a neutral pose before the next person is judged, so
         # the next round's IK doesn't start from wherever the last press
-        # left the arm.
+        # left the arm. reset_pose() only resets joint angles -- the
+        # previous round's approach IK (use_base='planar') can have
+        # translated/rotated base_link itself, which reset_pose() leaves
+        # untouched, so recenter it explicitly here too.
         self.robot.reset_pose()
+        self.robot.base_link.newcoords(Coordinates())
         self.ri.frozen = False
         self.ri.angle_vector(self.robot.angle_vector(), 2.0)
         self.ri.wait_interpolation()
 
+        # 前ラウンドの IK ターゲット座標系は _solve_palm_ik が描いたまま
+        # DONE でも消えずに残るので (redraw が止まるだけ)、次の人物を待つ
+        # 前に隠しておく。次にロックされたときまた update_ik_target が出す。
+        if self.scene is not None:
+            self.scene.update_ik_target(None)
+
         self.target_palm_pos = None
         self.target_palm_rot = None
+        self.target_hand_rot = None
         self.target_palm_center = None
         self.target_palm_normal = None
         self.last_neck_cmd_time = rospy.Time.now()

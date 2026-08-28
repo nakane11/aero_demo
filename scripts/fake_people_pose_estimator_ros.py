@@ -26,11 +26,12 @@ Assumptions
 -----------
 * Exactly one person, standing in front of the robot, facing the camera,
   with both arms hanging down at the sides.  With ``~present_hand`` set to
-  ``R`` or ``L`` that arm is instead held out towards the robot with the
-  fingertips pointing down and the index-finger side of the hand facing
-  the robot (like an offered handshake), which is the posture
-  ``palm_plane_visualizer.py`` / ``human_palm_contact_behavior.py``
-  are meant to be tested against.
+  ``R`` or ``L`` that arm is instead held out towards the robot in an
+  offered-handshake posture -- thumb up, little-finger side toward the
+  ground, palm facing sideways -- tilted by up to
+  ``~present_wrist_roll_deg_range`` (default +-30 deg) around the forearm
+  axis, which is the posture ``palm_plane_visualizer.py`` /
+  ``human_palm_contact_behavior.py`` are meant to be tested against.
 * The person stands within arm's reach (``~distance_range``, default
   0.75-0.95 m), so the offered palm can be touched without driving the
   base.  At that distance the camera only sees the upper body: the legs,
@@ -211,10 +212,14 @@ class FakeRosPeoplePoseEstimator(object):
         # ひねり) を deg で一様分布から引く範囲。個体ごとに 1 回だけ
         # _sample_person で引く。既定値は「肩を斜め前に上げ、肘を軽く
         # 伸ばし、手首で微調整する」握手のような構えのまわりに収まる範囲。
-        # ~present_wrist_roll_deg_range は掌の法線 (どちらを向いて差し出す
-        # か) を大きく変える -- 掌を正面から横向きまで広く振って、フィット
-        # した法線に沿って近づく human_palm_contact_behavior 側が実際に
-        # どこまで追従できるかを確かめるためのもの。
+        # ~present_wrist_roll_deg_range は掌の法線をどちらへ向けて差し出す
+        # かを決める、前腕軸 (指方向) まわりの回転。0 deg は「小指側が地面を
+        # 向く (掌が横を向く)」姿勢 -- 握手で差し出す掌の基準姿勢 -- になる
+        # ように _body_positions 側で毎フレーム基準を作り直しており (肩/肘/
+        # 手首の角度から決まる指方向は人によって違うので、基準そのものも
+        # 人ごと・フレームごとに変わる)、ここで引く値はその基準からの
+        # 傾きのオフセットとして乗る。既定値は握手の基準姿勢のまわりの
+        # 小さな個人差の範囲。
         self.present_shoulder_elevation_range = rospy.get_param(
             '~present_shoulder_elevation_deg_range', [0.0, 85.0])
         self.present_shoulder_azimuth_range = rospy.get_param(
@@ -224,7 +229,7 @@ class FakeRosPeoplePoseEstimator(object):
         self.present_wrist_pitch_range = rospy.get_param(
             '~present_wrist_pitch_deg_range', [-30.0, 10.0])
         self.present_wrist_roll_range = rospy.get_param(
-            '~present_wrist_roll_deg_range', [-90.0, 90.0])
+            '~present_wrist_roll_deg_range', [-30.0, 30.0])
         # 手のランドマークを Person3D.bones にも繋ぐ ("RHand0->RHand1" など)。
         # 本物は体のボーンしか返さないので、可視化用の拡張。
         self.include_hand_bones = rospy.get_param('~include_hand_bones', True)
@@ -625,17 +630,29 @@ class FakeRosPeoplePoseEstimator(object):
                 # wrist_pitch: bend of the hand relative to the forearm
                 # (0 deg = fingers continue the forearm direction).
                 u = self._unit(self._rotate(fdir, hinge, wpitch))
-                # baseline palm normal (wrist_roll == 0 deg): perpendicular
-                # to both the hinge axis and the finger direction, so the
-                # index-finger edge of the hand faces the robot -- same
-                # convention as the relaxed hanging arm below (not the
-                # palm itself, which is what actually exercises whether a
-                # consumer approaches along the *fitted* palm normal
-                # instead of assuming the palm always faces the camera
-                # head-on).  wrist_roll then rolls the palm around the
-                # finger axis, so different people present the hand at
-                # different palm angles.
-                n0 = self._unit(np.cross(hinge, u))
+                # baseline palm normal (wrist_roll == 0 deg): the "offered
+                # handshake" reference, thumb up / little-finger side down
+                # (palm facing sideways rather than up, down, or at the
+                # camera).  Built from the world-up direction projected
+                # perpendicular to the finger axis u (so it stays the
+                # correct reference regardless of which way this person's
+                # arm happens to reach): that projected-up direction is
+                # where the thumb (v) should point, and v = u x n (R hand)
+                # / n x u (L hand) -- see the v computed below -- inverts
+                # to the n that makes it so.  wrist_roll then tilts the
+                # palm away from that reference around the finger axis, so
+                # different people present the hand at slightly different
+                # angles instead of always the exact same handshake tilt.
+                up_perp = self._unit(zh - float(np.dot(zh, u)) * u)
+                if up_perp is None:
+                    # u happens to be (near-)vertical -- no well-defined
+                    # "sideways" reference here, fall back to the old
+                    # hinge/finger-axis baseline rather than dividing by
+                    # zero.
+                    n0 = self._unit(np.cross(hinge, u))
+                else:
+                    n0 = self._unit(np.cross(up_perp, u) if hand == 'R'
+                                    else np.cross(u, up_perp))
                 n = self._unit(self._rotate(n0, u, wroll))
             else:
                 # relaxed hanging arm: fingers down, palm facing the thigh

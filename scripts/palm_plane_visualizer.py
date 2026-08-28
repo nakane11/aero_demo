@@ -72,6 +72,13 @@ Parameters
                                          自動で開くか
 ``~viewer_width`` / ``~viewer_height`` (int, default 960 / 720)
                                          ``~viewer: trimesh`` のときだけ有効
+``~smpl_model_path`` (str, default ``~/SMPL_python_v.1.0.0/smpl/models/``
+                     ``basicmodel_m_lbs_10_207_0_v1.0.0.pkl``)
+                                         SMPL v1.0.0 の .pkl (ライセンス上
+                                         リポジトリには同梱しないので
+                                         ローカルパスで渡す)。読めなければ
+                                         警告を出して従来のカプセル/箱の
+                                         骨格描画にフォールバックする。
 """
 
 import os
@@ -168,7 +175,18 @@ class PalmPlaneVisualizer(object):
             resolution=(rospy.get_param('~viewer_width', 960),
                         rospy.get_param('~viewer_height', 720)),
             draw_skeleton=rospy.get_param('~draw_skeleton', True),
-            draw_camera=draw_camera)
+            draw_camera=draw_camera,
+            smpl_model_path=rospy.get_param(
+                '~smpl_model_path',
+                os.path.expanduser(
+                    '~/SMPL_python_v.1.0.0/smpl/models/'
+                    'basicmodel_m_lbs_10_207_0_v1.0.0.pkl')))
+        if self.scene.smpl_load_error is not None:
+            rospy.logwarn(
+                'could not load the SMPL model (%s), falling back to the '
+                'capsule/box skeleton drawing. Set ~smpl_model_path to a '
+                'valid basicmodel_*.pkl to draw an SMPL body mesh instead.',
+                self.scene.smpl_load_error)
         if rospy.get_param('~draw_robot', True):
             robot = load_aero(rospy.get_param('~use_hand', True))
             if robot is not None:
@@ -224,7 +242,8 @@ class PalmPlaneVisualizer(object):
             self.stats['frames'] += 1
             points = palm_plane.collect_palm_points(
                 person, hand=self.hand, min_score=self.min_score)
-            plane = palm_plane.fit_palm_plane(points, viewpoint=viewpoint)
+            plane = palm_plane.fit_palm_plane(
+                points, hand=self.hand, viewpoint=viewpoint)
             if plane is None:
                 rospy.loginfo_throttle(
                     2.0, 'palm plane not fitted: only %d of %s landmarks '

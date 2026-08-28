@@ -52,6 +52,15 @@ MCP_INDICES = (5, 9, 13, 17)          # index / middle / ring / pinky knuckles
 # thumb CMC (1) leaves the plane as the thumb opposes, so both are excluded.
 PLANE_LANDMARKS = (WRIST_INDEX,) + MCP_INDICES
 
+# Relative position of each knuckle across the palm, index (thumb) side to
+# pinky side -- MediaPipe's landmark layout is anatomically fixed (index
+# MCP is always on the thumb side, pinky MCP always on the little-finger
+# side) regardless of which way the hand happens to be turned, so this
+# ordering -- unlike "which side faces the robot" -- is a reliable way to
+# tell the palm side from the back of the hand.  Values only need the
+# right relative order/spacing, not any particular unit.
+MCP_LATERAL_RANK = {5: 1.5, 9: 0.5, 13: -0.5, 17: -1.5}
+
 LANDMARK_LABELS = {
     0: 'wrist', 1: 'thumb_cmc', 5: 'index_mcp', 9: 'middle_mcp',
     13: 'ring_mcp', 17: 'pinky_mcp',
@@ -81,7 +90,8 @@ EMBED_DEPTH = 0.01
 
 PalmPlane = namedtuple('PalmPlane', [
     'center',       # (3,) mid-palm point
-    'normal',       # (3,) unit normal, pointing toward the viewpoint
+    'normal',       # (3,) unit normal, pointing out of the palm (see
+                    # fit_palm_plane's anatomical sign resolution)
     'rot',          # (3,3) rotation matrix matching Aero's r/l_eef_grasp_link
                     # axes: local +X = fingers (wrist->fingertip), +Y = the
                     # dorsum->palm axis set to -normal (so the robot's palm
@@ -138,7 +148,7 @@ def collect_palm_points(person, hand='R', min_score=0.1,
     return points
 
 
-def fit_palm_plane(points, viewpoint=None):
+def fit_palm_plane(points, hand='R', viewpoint=None):
     """Fit a plane to the palm landmarks by SVD.
 
     Parameters
@@ -147,9 +157,14 @@ def fit_palm_plane(points, viewpoint=None):
         ``{landmark_index: (3,) ndarray}`` as returned by
         :func:`collect_palm_points`.  At least :data:`MIN_PALM_POINTS`
         entries are required.
+    hand : str
+        ``'R'`` or ``'L'`` -- which hand ``points`` came from.  Needed to
+        resolve the fitted normal's palm/back-of-hand sign from the
+        knuckles' own left-right layout (see below); get this wrong and
+        every plane from this call comes out back-to-front.
     viewpoint : (3,) array_like or None
-        The normal's sign is ambiguous, so it is flipped to point toward
-        this position -- the observer the human is presenting the palm to.
+        Fallback sign reference, used only when too few knuckles survived
+        tracking to tell the palm side from the layout itself (see below).
         Defaults to the frame origin (``base_link``, i.e. the robot).
 
     Returns
@@ -197,12 +212,68 @@ def fit_palm_plane(points, viewpoint=None):
         center = mcp_center
         finger_dir = None
 
-    # --- orient the normal toward the observer ---------------------------
-    if viewpoint is None:
-        viewpoint = np.zeros(3)
-    viewpoint = np.asarray(viewpoint, dtype=np.float64)
-    if float(np.dot(normal, viewpoint - center)) < 0.0:
-        normal = -normal
+    # +X = fingers (wrist -> knuckle row), in the plane.  Computed before
+    # resolving the normal's sign because this projection is sign-of-
+    # -normal-independent (dot(finger_dir, normal) * normal is the same
+    # for +-normal), and the anatomical sign check right below needs it.
+    if finger_dir is None:
+        # Fall back to any axis not parallel to the normal.
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(float(normal[2])) > 0.9:
+            ref = np.array([1.0, 0.0, 0.0])
+        finger_dir = _unit(ref - float(np.dot(ref, normal)) * normal)
+        if finger_dir is None:
+            return None
+
+    x_axis = _unit(finger_dir - float(np.dot(finger_dir, normal)) * normal)
+    if x_axis is None:
+        return None
+
+    # --- orient the normal using the hand's own anatomy -------------------
+    # The SVD normal's sign is ambiguous (palm or back of hand -- both
+    # surfaces are parallel to the same fitted plane), and it must not be
+    # resolved by guessing "whichever side faces the robot": that breaks
+    # down whenever the palm is presented edge-on / sideways to the robot
+    # rather than flat-on (exactly the case for a natural handshake
+    # posture, see fake_people_pose_estimator_ros.py's
+    # ~present_wrist_roll_deg_range), where a small pose change can flip
+    # which side that heuristic calls "facing the robot".
+    #
+    # What is anatomically fixed regardless of viewing angle is MediaPipe's
+    # knuckle layout: index MCP (5) is always on the thumb side and pinky
+    # MCP (17) always on the little-finger side (MCP_LATERAL_RANK).  A
+    # lateral axis built from that ordering, combined with the fixed
+    # left/right handedness of an R or L hand, pins down the normal's sign
+    # without needing to know where the robot is at all.
+    #
+    # This mirrors fake_people_pose_estimator_ros.py's own hand frame
+    # convention (u=finger_dir, v=thumb-side, n=palm normal), where the
+    # (u, v, n) triple is left-handed for the right hand and right-handed
+    # for the left one -- see that module's ``_body_positions`` -- i.e.
+    # v = u x n for R, v = n x u for L, which inverted for n gives the
+    # formulas below.
+    lateral = np.zeros(3)
+    n_ranked = 0
+    for i, rank in MCP_LATERAL_RANK.items():
+        if i in points:
+            lateral += rank * (points[i] - centroid)
+            n_ranked += 1
+    v_axis = _unit(lateral - float(np.dot(lateral, x_axis)) * x_axis) \
+        if n_ranked >= 2 else None
+    if v_axis is not None:
+        anatomical_normal = (np.cross(v_axis, x_axis) if hand == 'R'
+                             else np.cross(x_axis, v_axis))
+        if float(np.dot(normal, anatomical_normal)) < 0.0:
+            normal = -normal
+    else:
+        # Fewer than 2 knuckles with distinct thumb/pinky ranks survived
+        # tracking -- not enough to tell the palm side from the layout, so
+        # fall back to the old "faces the robot" guess.
+        if viewpoint is None:
+            viewpoint = np.zeros(3)
+        viewpoint = np.asarray(viewpoint, dtype=np.float64)
+        if float(np.dot(normal, viewpoint - center)) < 0.0:
+            normal = -normal
 
     # --- build a full frame: +X = fingers, +Y = palm normal --------------
     # Checked directly against Aero's r/l_eef_grasp_link frame (built by
@@ -217,22 +288,9 @@ def fit_palm_plane(points, viewpoint=None):
     #
     # A robot palm pressed flat against the human's must face the human,
     # i.e. point roughly opposite the human normal (which itself points
-    # from the human's palm toward the robot -- see below).  So the
-    # robot's local +Y (dorsum -> palm) must equal -normal, which is the
-    # same thing as saying local -Y (palm -> dorsum, "back of the hand")
-    # equals +normal.
-    if finger_dir is None:
-        # Fall back to any axis not parallel to the normal.
-        ref = np.array([0.0, 0.0, 1.0])
-        if abs(float(normal[2])) > 0.9:
-            ref = np.array([1.0, 0.0, 0.0])
-        finger_dir = _unit(ref - float(np.dot(ref, normal)) * normal)
-        if finger_dir is None:
-            return None
-
-    x_axis = _unit(finger_dir - float(np.dot(finger_dir, normal)) * normal)
-    if x_axis is None:
-        return None
+    # out of the human's palm -- see above).  So the robot's local +Y
+    # (dorsum -> palm) must equal -normal, which is the same thing as
+    # saying local -Y (palm -> dorsum, "back of the hand") equals +normal.
     y_axis = -normal
     z_axis = np.cross(x_axis, y_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])

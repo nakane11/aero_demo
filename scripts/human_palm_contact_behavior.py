@@ -67,6 +67,13 @@ Parameters
                                          関節が落ちず画角を考慮していない
                                          ので、この設定によらず描かない
 ``~viewer_width`` / ``~viewer_height`` (int, default 960 / 720)
+``~smpl_model_path`` (str, default ``~/SMPL_python_v.1.0.0/smpl/models/``
+                     ``basicmodel_m_lbs_10_207_0_v1.0.0.pkl``)
+                                         SMPL v1.0.0 の .pkl (ライセンス上
+                                         リポジトリには同梱しないので
+                                         ローカルパスで渡す)。読めなければ
+                                         警告を出して従来のカプセル/箱の
+                                         骨格描画にフォールバックする。
 ``~base_frame`` (str, default base_link)
 ``~output_frame`` (str, default ``~base_frame``)
 ``~plane_fit_timeout`` (float, default 4.0)  人物は検出できているのに手のひ
@@ -80,12 +87,14 @@ import math
 import os
 import sys
 import threading
+from collections import namedtuple
 
 import numpy as np
 import rospy
 from visualization_msgs.msg import MarkerArray
 
 from skrobot.coordinates import Coordinates
+from skrobot.coordinates.math import rotate_vector
 
 from aero_demo import palm_plane
 from aero_demo.palm_plane import EMBED_DEPTH
@@ -110,13 +119,111 @@ NECK_SETTLE_TIME = 2.5
 
 # r/l_eef_grasp_link のローカル Y 軸が甲->掌方向 (dorsum -> palm) -- URDF
 # を skrobot で読み、指の曲げ関節を動かして先端がどちらへ寄るかを直接
-# 確かめて特定した (palm_plane.fit_palm_plane 参照)。人間の掌の法線を
-# 合わせたいのはこの軸で、軸まわりの回転 (手首ロール) までは合わせなくて
-# よい。``rotation_mask`` は「そろえる」側の軸を指定する (legacy の
-# ``rotation_axis`` とは逆の意味 -- skrobot.coordinates.math 参照) ので、
-# 自由にしたい Y を除いた 'xz' (指方向 + 親指-小指幅方向) を渡す。
-PALM_NORMAL_ROTATION_AXIS = 'y'
-PALM_ROTATION_MASK = 'xz'
+# 確かめて特定した (palm_plane.fit_palm_plane 参照)。
+#
+# fit_palm_plane が作る plane.rot はそのままだと robot 側の +Y (甲->掌) が
+# 人間の掌の法線と正対する ("人間の掌に向き合う") 向きになっているが、
+# +X (指方向) と +Z (親指<->小指幅方向) は人間自身のものをそのまま流用
+# しているので、前腕軸まわりの傾き (fake_people_pose_estimator_ros.py の
+# ~present_wrist_roll_deg_range と同じ意味の量) はロボット側も人間と
+# "同じ" 向きになってしまう。握手はそこが逆で、向かい合う 2 人は鏡写しの
+# 関係にあるので、人間が鉛直の基準からある向きへ傾けたら、ロボットは同じ
+# 基準から逆向きに傾けるのが対称になる (_mirror_target_rotation 参照)。
+# その傾きさえ決めてしまえば向きは一意に決まるので、IK は
+# ``rotation_axis=True`` (3 軸とも厳密に合わせる) で解く。
+def _unit(v):
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return None
+    return np.asarray(v, dtype=np.float64) / n
+
+
+def _mirror_target_rotation(rot):
+    """Handshake-mirror a palm-target rotation (e.g. ``PalmPlane.rot``).
+
+    ``rot``'s +X is the finger direction and +Z is the thumb<->pinky width
+    axis, both copied straight from the human's fitted palm (see
+    ``palm_plane.fit_palm_plane``); +Y already faces the robot's palm
+    toward the human's.  Two things need fixing before this is a plausible
+    handshake instead of a plain copy of the human's own frame:
+
+    * Roll around the finger axis: copying +Z as-is would give the robot
+      the *same* roll as the human -- i.e. the same tilt away from a
+      plain vertical, thumb-up handshake -- instead of a mirrored one.
+      Two people shaking hands face each other as mirror images: if the
+      human tilts N degrees off vertical one way, the robot should tilt N
+      degrees off vertical the *other* way (both measured from the same
+      "vertical, thumb-up" reference for this approach direction), so
+      e.g. a human tilted 45 deg one way and a robot mirrored 45 deg the
+      other way end up 90 deg apart rather than lined up.
+    * Finger direction: the human's +X points from their wrist toward
+      their fingertips, i.e. roughly away from their own body.  Copying
+      it as the robot's +X would point the robot's fingertips the same
+      way -- past the human's hand, away from them -- whereas in an
+      actual handshake each hand's fingers point back across the other's
+      palm toward *their* wrist.  So the robot's +X is the human's +X
+      negated (a 180 deg turn about the shared +Y, which leaves +Y --
+      "face the human" -- untouched).
+    """
+    x_axis = _unit(rot[:, 0])
+    if x_axis is None:
+        return rot
+
+    up = np.array([0.0, 0.0, 1.0])
+    # Invariant under x_axis -> -x_axis (it only depends on x_axis via its
+    # projection matrix), so it doubles as the reference for the
+    # finger-reversed axis used below.
+    up_perp = _unit(up - float(np.dot(up, x_axis)) * x_axis)
+    if up_perp is None:
+        # Finger axis ~vertical: no well-defined "vertical, thumb-up"
+        # reference to mirror around, so keep the human's own orientation
+        # rather than doing something arbitrary.
+        return rot
+
+    z_axis_in = rot[:, 2]
+    theta = math.atan2(
+        float(np.dot(x_axis, np.cross(up_perp, z_axis_in))),
+        float(np.dot(up_perp, z_axis_in)))
+
+    z_axis = _unit(rotate_vector(up_perp, -theta, x_axis))
+    if z_axis is None:
+        return rot
+    y_axis = np.cross(z_axis, x_axis)
+    # 180 deg about +Y: fingers point back toward the human's wrist
+    # instead of past their hand, while +Y (facing the human) is
+    # untouched.
+    return np.column_stack([-x_axis, y_axis, -z_axis])
+
+
+# 人間の掌平面 (palm_plane.fit_palm_plane の結果) を IK ターゲットへ変換した
+# もの。pos/rot は人間自身の掌の位置・姿勢 (contact_target/plane.rot その
+# まま、_lock_target が描画やデータセット生成のために残しておく分)、
+# hand_rot はロボットの手が向くべき向き (_mirror_target_rotation 参照)、
+# center/normal は gaze/lifter が使う掌中心とその法線。
+PalmIkTargets = namedtuple('PalmIkTargets', [
+    'pos', 'rot', 'hand_rot', 'center', 'normal',
+    'approach_coords', 'press_coords'])
+
+
+def palm_plane_to_ik_targets(plane):
+    """人間の掌平面から、ロボットが IK で解く approach/press ターゲット
+    (skrobot ``Coordinates``, base_link frame) を作る.
+
+    ``approach_coords`` はまず触れに行く位置、``press_coords`` はそこから
+    ``EMBED_DEPTH`` だけ掌の中へ押し込んだ位置で、向きはどちらも
+    ``hand_rot`` (人間の掌姿勢を握手のように鏡写しした向き) で揃える。
+    """
+    pos = palm_plane.contact_target(plane)
+    hand_rot = _mirror_target_rotation(plane.rot)
+    embed_pos = plane.center - plane.normal * EMBED_DEPTH
+    return PalmIkTargets(
+        pos=pos.tolist(),
+        rot=plane.rot,
+        hand_rot=hand_rot,
+        center=plane.center.tolist(),
+        normal=plane.normal.tolist(),
+        approach_coords=Coordinates(pos=pos.tolist(), rot=hand_rot),
+        press_coords=Coordinates(pos=embed_pos.tolist(), rot=hand_rot))
 
 
 def create_pose_source(name):
@@ -266,9 +373,11 @@ class HumanPalmContactBehavior:
         # State machine variables
         self.state = "WAITING"
         self.target_palm_pos = None       # approach target, base_link frame
-        self.target_palm_rot = None       # 3x3 rotation matrix, base_link frame
+        self.target_palm_rot = None       # human's fitted orientation, 3x3
+        self.target_hand_rot = None       # robot's mirrored orientation, 3x3
         self.target_palm_center = None    # for gaze/lifter, base_link frame
         self.target_palm_normal = None    # unit vector, base_link frame
+        self._ik_targets = None           # PalmIkTargets, set by _lock_target
         self.state_start_time = rospy.Time.now()
         # 平面フィットに失敗し続けている時間の計測用 (_track_with_neck 参照)。
         # None なら「まだ失敗が始まっていない」。
@@ -320,7 +429,18 @@ class HumanPalmContactBehavior:
             resolution=(rospy.get_param('~viewer_width', 960),
                         rospy.get_param('~viewer_height', 720)),
             draw_skeleton=rospy.get_param('~draw_skeleton', True),
-            draw_camera=draw_camera)
+            draw_camera=draw_camera,
+            smpl_model_path=rospy.get_param(
+                '~smpl_model_path',
+                os.path.expanduser(
+                    '~/SMPL_python_v.1.0.0/smpl/models/'
+                    'basicmodel_m_lbs_10_207_0_v1.0.0.pkl')))
+        if scene.smpl_load_error is not None:
+            rospy.logwarn(
+                'could not load the SMPL model (%s), falling back to the '
+                'capsule/box skeleton drawing. Set ~smpl_model_path to a '
+                'valid basicmodel_*.pkl to draw an SMPL body mesh instead.',
+                scene.smpl_load_error)
         # base_link がモデルのルートなので、原点に置くだけで関節点の座標系と
         # 揃う。以降 IK で動かした姿勢がそのまま viewer に出る。
         scene.add_robot(self.robot)
@@ -388,7 +508,8 @@ class HumanPalmContactBehavior:
                 continue
             points = palm_plane.collect_palm_points(
                 person, hand=self.hand, min_score=self.min_score)
-            return palm_plane.fit_palm_plane(points), points, person
+            return palm_plane.fit_palm_plane(points, hand=self.hand), \
+                points, person
         return None, {}, None
 
     def _draw_pose(self, result, plane, palm_points):
@@ -481,10 +602,16 @@ class HumanPalmContactBehavior:
         return True
 
     def _lock_target(self, plane, palm_points, now):
-        self.target_palm_pos = palm_plane.contact_target(plane).tolist()
-        self.target_palm_rot = plane.rot
-        self.target_palm_center = plane.center.tolist()
-        self.target_palm_normal = plane.normal.tolist()
+        # target_palm_pos/target_hand_rot 等は palm_plane_to_ik_targets が
+        # 人間の掌平面から作った IK ターゲット。target_palm_rot だけは
+        # 人間自身の掌姿勢そのもの (ロボット側の向きではない) を残す --
+        # データセット生成側が人間の指方向の矢印を描くのに使う。
+        self._ik_targets = palm_plane_to_ik_targets(plane)
+        self.target_palm_pos = self._ik_targets.pos
+        self.target_palm_rot = self._ik_targets.rot
+        self.target_palm_center = self._ik_targets.center
+        self.target_palm_normal = self._ik_targets.normal
+        self.target_hand_rot = self._ik_targets.hand_rot
 
         # Same geometry the viewer draws, so what you see is what the robot
         # is about to reach for.
@@ -557,13 +684,13 @@ class HumanPalmContactBehavior:
     def _solve_palm_ik(self, whole_body, target_coords, use_base=None):
         """Solve whole-body IK for ``target_coords``.
 
-        Aligns the palm-normal axis with ``target_coords`` while leaving
-        rotation about that axis (wrist roll) free (see
-        ``PALM_ROTATION_MASK``).  ``target_coords`` is drawn in the viewer
-        as the IK target frame regardless of whether the solve succeeds,
-        so a bad target is visible even when IK fails.  Falls back to a
-        fully constrained orientation and finally to position-only if the
-        preferred mask doesn't converge.
+        ``target_coords`` carries a fully-determined orientation (see
+        ``_mirror_target_rotation``) rather than leaving any axis free, so
+        this asks for an exact match on all 3 axes (``rotation_axis=True``).
+        ``target_coords`` is drawn in the viewer as the IK target frame
+        regardless of whether the solve succeeds, so a bad target is
+        visible even when IK fails.  Falls back to position-only if the
+        full orientation doesn't converge.
 
         ``stop=200`` (default 50) and ``revert_if_fail=False``: this
         reorientation can be large (the palm normal can point off to the
@@ -581,14 +708,14 @@ class HumanPalmContactBehavior:
         """
         if self.scene is not None:
             self.scene.update_ik_target(target_coords)
-        for rotation_mask in (PALM_ROTATION_MASK, True, False):
+        for rotation_axis in (True, False):
             try:
                 res = whole_body.inverse_kinematics(
-                    target_coords, rotation_mask=rotation_mask,
+                    target_coords, rotation_axis=rotation_axis,
                     stop=200, revert_if_fail=False, use_base=use_base)
             except Exception as e:
-                rospy.logwarn("IK failed (rotation_mask=%r): %s",
-                              rotation_mask, e)
+                rospy.logwarn("IK failed (rotation_axis=%r): %s",
+                              rotation_axis, e)
                 res = False
             if res is not False:
                 return True
@@ -667,8 +794,7 @@ class HumanPalmContactBehavior:
             rospy.loginfo("Extending arm toward the palm...")
             self.robot.angle_vector(self.ri.angle_vector())
 
-            target_coords = Coordinates(
-                pos=self.target_palm_pos, rot=self.target_palm_rot)
+            target_coords = self._ik_targets.approach_coords
 
             # Fallback posture (natural elbow position) used as the IK seed.
             # (wrist_p/wrist_r are clamped to this arm's actual joint
@@ -703,9 +829,9 @@ class HumanPalmContactBehavior:
             getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
                 .joint_angle(0.436 * mirror)
 
-            # Align the palm-normal axis (PALM_NORMAL_ROTATION_AXIS) with
-            # the human palm's normal and leave rotation about it free --
-            # see _solve_palm_ik and PALM_ROTATION_MASK above.
+            # target_coords carries the mirrored handshake orientation
+            # (see _mirror_target_rotation) -- solved exactly on all 3
+            # axes, see _solve_palm_ik.
             if not self._solve_palm_ik(
                     whole_body, target_coords, use_base='planar'):
                 rospy.logwarn(
@@ -728,11 +854,7 @@ class HumanPalmContactBehavior:
             rospy.loginfo("Pressing into the palm...")
             self.robot.angle_vector(self.ri.angle_vector())
 
-            center = np.array(self.target_palm_center)
-            normal = np.array(self.target_palm_normal)
-            embed_pos = (center - normal * EMBED_DEPTH).tolist()
-            embed_coords = Coordinates(
-                pos=embed_pos, rot=self.target_palm_rot)
+            embed_coords = self._ik_targets.press_coords
 
             if not self._solve_palm_ik(whole_body, embed_coords):
                 rospy.logwarn(
@@ -743,7 +865,7 @@ class HumanPalmContactBehavior:
             # the hand (not the embed point under the skin) while pressing.
             self._look_at(self.target_palm_center)
 
-            self._report_reach('press', embed_pos)
+            self._report_reach('press', embed_coords.worldpos())
             self.ri.angle_vector(self.robot.angle_vector(), 1.5)
             self.ri.wait_interpolation()
 
