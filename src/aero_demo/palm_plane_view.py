@@ -16,6 +16,7 @@ import numpy as np
 from skrobot.coordinates import Coordinates
 from skrobot.model.primitives import Axis
 from skrobot.model.primitives import Box
+from skrobot.model.primitives import Capsule
 from skrobot.model.primitives import Cylinder
 from skrobot.model.primitives import LineString
 from skrobot.model.primitives import Sphere
@@ -53,6 +54,47 @@ _BONE_GROUPS = (
     ('rleg', ('RKnee', 'RAnkle')),
     ('lleg', ('LKnee', 'LAnkle')),
 )
+
+# 骨格を線ではなくカプセル (体幹) で描くときの太さ [m]。部位ごとの見た目の
+# 太さの目安で、実寸の体格を表すものではない。
+BONE_RADIUS = {
+    'torso': 0.05,
+    'rarm': 0.032,
+    'larm': 0.032,
+    'rleg': 0.045,
+    'lleg': 0.045,
+    'rhand': 0.008,
+    'lhand': 0.008,
+}
+# カプセル (円柱 + 半球キャップ) は高さがマイナスになると trimesh が例外を
+# 出すので、両端の関節がほぼ重なっている骨でもこれ以上には潰さない。
+MIN_BONE_HEIGHT = 0.005
+
+# 胴体 (Neck-RShoulder/LShoulder/RHip/LHip の 4 本) は細いカプセルを
+# Neck に集めて描くと扇のようになって不自然なので、1 枚の板 (Box) に
+# まとめて描く。TORSO_DEPTH はその前後方向の厚み、TORSO_MIN_WIDTH は
+# 肩・腰の関節がほぼ重なって見えるとき (真横向きなど) の下限の幅。
+TORSO_DEPTH = 0.12
+TORSO_MIN_WIDTH = 0.15
+# 胴体の板を組み立てるのに要る関節名 (すべて揃わなければ描かない)。
+_TORSO_JOINTS = ('Neck', 'RShoulder', 'LShoulder', 'RHip', 'LHip')
+
+# 頭も細いカプセルの束ではなく 1 個の球で描く。前後・左右は Neck の真上
+# (胴体の中心線上) に固定し、高さだけ Nose との Z 差 (Nose が隠れていれば
+# HEAD_OFFSET) で決める -- Neck->Nose には前後方向の成分も大きいが、それを
+# そのまま中心に使うと頭が前に出て胴体の中心からずれてしまうので使わない。
+HEAD_RADIUS = 0.11
+# Nose が隠れているときの保険の高さ (Neck から真上に何 m か)。
+# fake_people_pose_estimator_ros.py の身長比 (h_nose - h_shoulder ≒ 身長の
+# 12 %) から見積もった値。
+HEAD_OFFSET = 0.20
+# Nose が見えていても、しゃがむ・見上げるなどで Neck とほぼ同じ高さまで
+# 沈んでしまった場合に頭が胴体に埋まって見えないよう、これより低くはしない。
+HEAD_MIN_HEIGHT = 0.08
+# 鼻は頭の球の目印として、実際に推定された Nose の位置に小さい球を
+# 追加で描く (頭の球自体は前後方向を胴体中心に寄せた近似なので、鼻だけは
+# 推定値そのままの位置を見せる -- 頭の球の前面からはみ出て見えてよい)。
+NOSE_RADIUS = 0.028
 
 PLATE_SIZE = 0.12
 NORMAL_LENGTH = 0.15
@@ -122,20 +164,50 @@ def set_color(link, rgba):
     return link
 
 
-def bone_color(name):
-    """ボーン名 ("Neck->RShoulder" 形式) から部位の色を返す.
+def bone_group(name):
+    """ボーン名 ("Neck->RShoulder" 形式) から部位 (``COLOR_BONES`` のキー) を返す.
 
-    手のランドマークのボーン ("RHand0->RHand1" など) は手の色にまとめる。
+    手のランドマークのボーン ("RHand0->RHand1" など) は手の部位にまとめる。
     """
     if 'RHand' in name:
-        return COLOR_BONES['rhand']
+        return 'rhand'
     if 'LHand' in name:
-        return COLOR_BONES['lhand']
+        return 'lhand'
     joints = name.split('->')
     for group, members in _BONE_GROUPS:
         if any(joint in members for joint in joints):
-            return COLOR_BONES[group]
-    return COLOR_BONES['torso']
+            return group
+    return 'torso'
+
+
+def bone_color(name):
+    """ボーン名から部位の色を返す."""
+    return COLOR_BONES[bone_group(name)]
+
+
+def bone_radius(name):
+    """ボーン名から部位のカプセル半径を返す."""
+    return BONE_RADIUS[bone_group(name)]
+
+
+def collect_joints(bones, joints=None):
+    """``bone.name`` ("A->B" 形式) から端点の関節名と座標を拾い集める.
+
+    胴体を 1 枚の板にまとめるのに、Neck/RShoulder/LShoulder/RHip/LHip の
+    座標がどのボーンの端点として出てきたか知りたいだけなので、ボーンの
+    向き (start が A か B か) 自体は問わない。既に分かっている関節名は
+    上書きしない (``joints`` を渡せば複数回に分けて呼び出せる)。
+    """
+    if joints is None:
+        joints = {}
+    for bone in bones:
+        parts = bone.name.split('->')
+        if len(parts) != 2:
+            continue
+        a, b = parts
+        joints.setdefault(a, np.asarray(bone.start_point, dtype=np.float64))
+        joints.setdefault(b, np.asarray(bone.end_point, dtype=np.float64))
+    return joints
 
 
 class PalmPlaneScene(object):
@@ -361,18 +433,108 @@ class PalmPlaneScene(object):
         for sphere in self.landmarks.values():
             self._show(sphere, False)
 
+    def _bone_capsule(self, bone, rgba):
+        """1 本のボーンを部位の太さのカプセルにして返す (骨表現の体幹)."""
+        start = np.asarray(bone.start_point, dtype=np.float64)
+        end = np.asarray(bone.end_point, dtype=np.float64)
+        radius = bone_radius(bone.name)
+        length = float(np.linalg.norm(end - start))
+        # カプセルは円柱部分の高さ + 両端の半球なので、関節位置 (start/end)
+        # がちょうど半球の中心に来るよう円柱部分だけ短くする。骨が短すぎて
+        # マイナスになる場合は MIN_BONE_HEIGHT で下げ止まる (見た目上は
+        # 半球同士が重なるだけで、エラーにはならない)。
+        height = max(length - 2.0 * radius, MIN_BONE_HEIGHT)
+        capsule = Capsule(
+            radius=radius, height=height,
+            pos=(start + end) / 2.0, rot=rotation_from_z(end - start))
+        return set_color(capsule, rgba)
+
+    def _torso_box(self, joints, rgba):
+        """肩・腰の 4 関節 (+ Neck) から胴体を 1 枚の板として作る.
+
+        Neck-肩中点-腰中点を通る軸を長さ方向 (Z) に、肩と腰の関節を結ぶ
+        向きを幅方向 (X) にした直方体。奥行き (Y) は関節位置からは分から
+        ないので ``TORSO_DEPTH`` で固定値にしてある。
+        """
+        neck = joints['Neck']
+        hip_center = (joints['RHip'] + joints['LHip']) / 2.0
+
+        z = unit(hip_center - neck)
+        if z is None:
+            raise ValueError('neck and hip center coincide')
+        x = unit(joints['LShoulder'] - joints['RShoulder'])
+        if x is None:
+            x = unit(joints['LHip'] - joints['RHip'])
+        if x is None:
+            raise ValueError('shoulder and hip joints coincide')
+        y = unit(np.cross(z, x))
+        if y is None:
+            raise ValueError('shoulder/hip line is parallel to the spine')
+        # x を z, y に直交させ直す (肩の向きは脊柱と厳密には直交しない)。
+        x = np.cross(y, z)
+
+        width = max((float(np.linalg.norm(
+            joints['LShoulder'] - joints['RShoulder']))
+            + float(np.linalg.norm(joints['LHip'] - joints['RHip']))) / 2.0,
+            TORSO_MIN_WIDTH)
+        height = max(float(np.linalg.norm(hip_center - neck)),
+                    MIN_BONE_HEIGHT)
+
+        box = Box(extents=[width, TORSO_DEPTH, height],
+                 pos=(neck + hip_center) / 2.0,
+                 rot=np.column_stack([x, y, z]))
+        return set_color(box, rgba)
+
+    def _head_sphere(self, joints, rgba):
+        """頭を Neck の真上 (胴体の中心線上) に 1 個の球として作る.
+
+        前後・左右は Neck と同じにする (Neck->Nose には前後方向の成分も
+        大きいので、そのまま使うと頭が前に出て胴体の中心からずれる)。
+        高さだけ Nose の Z 座標と Neck の Z 座標の差で決めるので、首を
+        縦に振れば (これは真上に固定した分は動かないが) その人の首・頭の
+        実際の高さにはちゃんと合う。Nose が見えないときは ``HEAD_OFFSET``
+        で妥協する。
+        """
+        neck = joints['Neck']
+        if 'Nose' in joints:
+            height = float(joints['Nose'][2] - neck[2])
+        else:
+            height = HEAD_OFFSET
+        height = max(height, HEAD_MIN_HEIGHT)
+        center = neck + np.array([0.0, 0.0, height])
+        sphere = Sphere(radius=HEAD_RADIUS, pos=center)
+        return set_color(sphere, rgba)
+
+    def _nose_sphere(self, joints, rgba):
+        """鼻先の目印を、推定された Nose の位置そのままに小さい球で描く."""
+        sphere = Sphere(radius=NOSE_RADIUS, pos=joints['Nose'])
+        return set_color(sphere, rgba)
+
     def update_skeleton(self, people):
-        """ボーンを部位ごとに色を変えた線で描き直す.
+        """ボーンを部位ごとに色を変えたカプセル (簡易体型メッシュ) で描き直す.
 
-        ``Person3D.bones`` の本数は関節の欠落で毎フレーム変わるので、線は
-        作り直す。どの関節同士を繋ぐかは推定側 (people_pose_estimator の
-        ``limb_sequence`` / ``hand_sequence``) が決めた ``bones`` に従う。
-        ``Person3D.hidden_bones`` (fake 推定だけが埋める、検出できなかった
-        関節を含む骨) があれば色を薄くして併せて描く。
+        ``Person3D.bones`` の本数は関節の欠落で毎フレーム変わるので、
+        カプセルは毎回作り直す。どの関節同士を繋ぐかは推定側
+        (people_pose_estimator の ``limb_sequence`` / ``hand_sequence``) が
+        決めた ``bones`` に従う。``Person3D.hidden_bones`` (fake 推定だけが
+        埋める、検出できなかった関節を含む骨) があれば色を薄くして併せて
+        描く。
 
-        線を作れなかったときは骨格の描画をあきらめて False を返す (以降の
-        呼び出しは何もしない)。薄い骨のほうだけ描けなかった場合は、通常の
-        骨格自体は描けているので描画をあきらめない。
+        胴体・頭・鼻だけは特別扱い。胴体は Neck-RShoulder/LShoulder/RHip/
+        LHip の 4 本を Neck に集めてカプセルで描くと扇状になって不自然
+        なので、5 関節が揃っていれば ``_torso_box`` で 1 枚の板として描く。
+        頭も Neck-Nose 等の細いカプセルの束ではなく ``_head_sphere`` で
+        1 個の球として描く -- 前後・左右は Neck の真上 (胴体の中心線上)
+        に固定し、高さだけ Nose との Z 座標の差で決める。鼻はその頭の
+        球の目印として、``_nose_sphere`` で推定された Nose の位置その
+        ままに小さい球を追加で描く (頭の球の前面からはみ出て見える)。
+        いずれも必要な関節が揃わなければ単に描かない (他の部位のように
+        欠けた分だけ線を減らす、では絵にならない)。
+
+        カプセル/胴体の板/頭・鼻の球を作れなかったときは骨格の描画を
+        あきらめて False を返す (以降の呼び出しは何もしない)。薄い方だけ
+        描けなかった場合は、通常の骨格自体は描けているので描画を
+        あきらめない。
         """
         if not self.draw_skeleton:
             return True
@@ -380,24 +542,51 @@ class PalmPlaneScene(object):
             self._show(link, False)
         self.bone_links = []
         for person in people:
+            visible_joints = {}
+            all_joints = {}
             for bone in person.bones:
+                if bone_group(bone.name) in ('torso', 'head'):
+                    collect_joints([bone], visible_joints)
+                    collect_joints([bone], all_joints)
+                    continue
                 try:
-                    link = LineString(
-                        np.asarray([bone.start_point, bone.end_point],
-                                   dtype=np.float64),
-                        color=bone_color(bone.name))
+                    link = self._bone_capsule(bone, bone_color(bone.name))
                 except Exception:
                     self.draw_skeleton = False
                     return False
                 self.bone_links.append(link)
                 self._show(link, True)
             for bone in getattr(person, 'hidden_bones', []):
+                if bone_group(bone.name) in ('torso', 'head'):
+                    collect_joints([bone], all_joints)
+                    continue
                 try:
-                    link = LineString(
-                        np.asarray([bone.start_point, bone.end_point],
-                                   dtype=np.float64),
-                        color=dim_color(bone_color(bone.name)))
+                    link = self._bone_capsule(
+                        bone, dim_color(bone_color(bone.name)))
                 except Exception:
+                    continue
+                self.bone_links.append(link)
+                self._show(link, True)
+
+            for builder, ready, group in (
+                    (self._torso_box,
+                     lambda j: all(k in j for k in _TORSO_JOINTS), 'torso'),
+                    (self._head_sphere,
+                     lambda j: 'Neck' in j, 'head'),
+                    (self._nose_sphere,
+                     lambda j: 'Nose' in j, 'head')):
+                if ready(visible_joints):
+                    joints, rgba = visible_joints, COLOR_BONES[group]
+                elif ready(all_joints):
+                    joints, rgba = all_joints, dim_color(COLOR_BONES[group])
+                else:
+                    continue
+                try:
+                    link = builder(joints, rgba)
+                except Exception:
+                    if joints is visible_joints:
+                        self.draw_skeleton = False
+                        return False
                     continue
                 self.bone_links.append(link)
                 self._show(link, True)
