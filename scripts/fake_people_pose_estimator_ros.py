@@ -120,6 +120,20 @@ HAND_DEPTH_HOLE = {0: 0.00, 9: 0.00, 13: 0.00, 17: 0.03,
                    20: 0.18}
 HAND_DEPTH_HOLE_DEFAULT = 0.08
 
+# Below this norm, the world-up vector projected perpendicular to the
+# presented hand's finger direction (``up_perp`` in ``_body_positions``) is
+# too small to trust *as-is* for a "which way is sideways" reference -- its
+# direction would end up set by whatever residual horizontal component is
+# left in a near-vertical finger direction, which swings across the full
+# range of azimuths for barely-different joint angles. Empirically (random
+# sampling across the default ~present_*_deg_range values) the baseline
+# palm normal's world-x component snaps to the numerically unstable +-1.0
+# extremes once this norm drops much below ~0.2, well before it is
+# actually zero, so below this norm ``_body_positions`` blends toward a
+# stable fallback instead of trusting the noisy unit vector outright (see
+# the comment where it's used).
+UP_PERP_BLEND_NORM = 0.2
+
 # Nominal MediaPipe visibility of each body joint for a person standing
 # upright in front of the camera.  Legs are frequently out of the image or
 # occluded by furniture, wrists are noisy because they are thin and moving.
@@ -648,16 +662,35 @@ class FakeRosPeoplePoseEstimator(object):
                 # palm away from that reference around the finger axis, so
                 # different people present the hand at slightly different
                 # angles instead of always the exact same handshake tilt.
-                up_perp = self._unit(zh - float(np.dot(zh, u)) * u)
-                if up_perp is None:
-                    # u happens to be (near-)vertical -- no well-defined
-                    # "sideways" reference here, fall back to the old
-                    # hinge/finger-axis baseline rather than dividing by
-                    # zero.
-                    n0 = self._unit(np.cross(hinge, u))
+                up_perp_raw = zh - float(np.dot(zh, u)) * u
+                up_perp_norm = np.linalg.norm(up_perp_raw)
+                if up_perp_norm >= UP_PERP_BLEND_NORM:
+                    up_perp = up_perp_raw / up_perp_norm
                 else:
-                    n0 = self._unit(np.cross(up_perp, u) if hand == 'R'
-                                    else np.cross(u, up_perp))
+                    # u is (near-)vertical -- world "up" barely survives the
+                    # projection, so normalizing up_perp_raw as-is would
+                    # make its *direction* dominated by whatever sub-degree
+                    # numerical noise is left in u's tiny horizontal
+                    # component instead of by the actual pose, making n0
+                    # spin essentially at random for barely-different joint
+                    # angles (observed: exact +-1.0 swings in n0's world-x
+                    # component from run to run). Blend it toward the old
+                    # hinge/finger-axis baseline -- which stays well-defined
+                    # however vertical u gets -- weighted by how much of
+                    # up_perp_raw's own magnitude survived the projection,
+                    # so the reference direction turns smoothly through the
+                    # near-vertical region instead of snapping in and out
+                    # of trusting an unstable unit vector at a hard cutoff.
+                    hinge_perp = self._unit(hinge - float(np.dot(hinge, u)) * u)
+                    if hinge_perp is None:
+                        hinge_perp = np.zeros(3)
+                    weight = up_perp_norm / UP_PERP_BLEND_NORM
+                    up_perp = self._unit(
+                        weight * up_perp_raw + (1.0 - weight) * hinge_perp)
+                    if up_perp is None:
+                        up_perp = hinge_perp
+                n0 = self._unit(np.cross(up_perp, u) if hand == 'R'
+                                else np.cross(u, up_perp))
                 n = self._unit(self._rotate(n0, u, wroll))
             else:
                 # relaxed hanging arm: fingers down, palm facing the thigh

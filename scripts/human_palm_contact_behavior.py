@@ -231,15 +231,22 @@ def _mirror_target_rotation(rot, turn_deg=180.0):
     toward the human's.  Two things need fixing before this is a plausible
     handshake instead of a plain copy of the human's own frame:
 
-    * Roll around the finger axis: copying +Z as-is would give the robot
-      the *same* roll as the human -- i.e. the same tilt away from a
-      plain vertical, thumb-up handshake -- instead of a mirrored one.
-      Two people shaking hands face each other as mirror images: if the
-      human tilts N degrees off vertical one way, the robot should tilt N
-      degrees off vertical the *other* way (both measured from the same
-      "vertical, thumb-up" reference for this approach direction), so
-      e.g. a human tilted 45 deg one way and a robot mirrored 45 deg the
-      other way end up 90 deg apart rather than lined up.
+    * Roll around +Y (the approach direction): copying +Z as-is would give
+      the robot the *same* roll as the human -- i.e. the same tilt away
+      from a plain vertical, thumb-up handshake -- instead of a mirrored
+      one.  Two people shaking hands face each other as mirror images: if
+      the human tilts N degrees off vertical one way, the robot should
+      tilt N degrees off vertical the *other* way (both measured from the
+      same "vertical, thumb-up" reference *for the shared +Y*, i.e. a
+      reflection about the vertical plane containing +Y), so e.g. a human
+      tilted 45 deg one way and a robot mirrored 45 deg the other way end
+      up 90 deg apart rather than lined up.  +Y itself is left completely
+      untouched by this reflection (unlike mirroring around +X, which
+      would recompute +Y from the reflected +Z and let it drift away from
+      the human-derived direction that already correctly faces the robot
+      -- and degenerates whenever the *finger* direction is close to
+      vertical, e.g. a presented arm hanging low, even though +Y itself
+      is nowhere near vertical then).
     * Finger direction: the human's +X points from their wrist toward
       their fingertips, i.e. roughly away from their own body.  Copying
       it as the robot's +X would point the robot's fingertips the same
@@ -251,30 +258,30 @@ def _mirror_target_rotation(rot, turn_deg=180.0):
       callers trying several candidate orientations (see
       ``MIRROR_TURN_CANDIDATES_DEG``) pass other angles too.
     """
-    x_axis = _unit(rot[:, 0])
-    if x_axis is None:
+    y_axis = rot[:, 1]
+    x_axis_in = _unit(rot[:, 0])
+    if x_axis_in is None:
         return rot
 
     up = np.array([0.0, 0.0, 1.0])
-    # Invariant under x_axis -> -x_axis (it only depends on x_axis via its
+    # Invariant under y_axis -> -y_axis (it only depends on y_axis via its
     # projection matrix), so it doubles as the reference for the
     # finger-reversed axis used below.
-    up_perp = _unit(up - float(np.dot(up, x_axis)) * x_axis)
+    up_perp = _unit(up - float(np.dot(up, y_axis)) * y_axis)
     if up_perp is None:
-        # Finger axis ~vertical: no well-defined "vertical, thumb-up"
-        # reference to mirror around, so keep the human's own orientation
-        # rather than doing something arbitrary.
+        # +Y (the approach direction) ~vertical: no well-defined
+        # "vertical, thumb-up" reference to mirror around, so keep the
+        # human's own orientation rather than doing something arbitrary.
         return rot
 
-    z_axis_in = rot[:, 2]
     theta = math.atan2(
-        float(np.dot(x_axis, np.cross(up_perp, z_axis_in))),
-        float(np.dot(up_perp, z_axis_in)))
+        float(np.dot(y_axis, np.cross(up_perp, x_axis_in))),
+        float(np.dot(up_perp, x_axis_in)))
 
-    z_axis = _unit(rotate_vector(up_perp, -theta, x_axis))
-    if z_axis is None:
+    x_axis = _unit(rotate_vector(up_perp, -theta, y_axis))
+    if x_axis is None:
         return rot
-    y_axis = np.cross(z_axis, x_axis)
+    z_axis = np.cross(x_axis, y_axis)
     # Turn (x_axis, z_axis) by turn_deg about +Y; +Y itself is untouched.
     phi = math.radians(turn_deg)
     turned_x = math.cos(phi) * x_axis + math.sin(phi) * z_axis
@@ -890,11 +897,25 @@ class HumanPalmContactBehavior:
 
         ``target_coords`` carries a fully-determined orientation (see
         ``_mirror_target_rotation``) rather than leaving any axis free, so
-        this asks for an exact match on all 3 axes (``rotation_axis=True``).
-        ``target_coords`` is drawn in the viewer as the IK target frame
-        regardless of whether the solve succeeds, so a bad target is
-        visible even when IK fails.  Falls back to position-only if the
-        full orientation doesn't converge.
+        this first asks for an exact match on all 3 axes
+        (``rotation_axis=True``).  ``target_coords`` is drawn in the viewer
+        as the IK target frame regardless of whether the solve succeeds,
+        so a bad target is visible even when IK fails.
+
+        If the full 3-axis solve doesn't converge, this does *not* drop
+        straight to position-only: it first retries with
+        ``rotation_axis='y'``.  skrobot's legacy ``rotation_axis`` string
+        names the axis to leave *unconstrained*, so ``'y'`` frees the
+        local X/Z rotation-error components while still forcing the local
+        Y axis -- ``r/l_eef_grasp_link``'s dorsum->palm direction, i.e.
+        exactly the axis that has to match the human palm's normal for
+        the hand to press flush against it (see the module comment above
+        ``_mirror_target_rotation``) -- to converge exactly.  What's left
+        free is only the roll around that axis (finger direction / thumb
+        side), which matters far less for making contact than the palm
+        normal does.  Only if that also fails does it drop to
+        ``rotation_axis=False`` (position-only, no orientation control at
+        all) as the last resort.
 
         ``stop=200`` (default 50) and ``revert_if_fail=False``: this
         reorientation can be large (the palm normal can point off to the
@@ -922,7 +943,7 @@ class HumanPalmContactBehavior:
             self.scene.update_ik_target(target_coords)
 
         def try_ik(base_choice):
-            for rotation_axis in (True, False):
+            for rotation_axis in (True, 'y', False):
                 try:
                     res = whole_body.inverse_kinematics(
                         target_coords, rotation_axis=rotation_axis,

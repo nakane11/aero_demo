@@ -62,17 +62,16 @@ constraints asked for are naturally each one image axis of a side view:
   it, reached or not) -- but only *centered*, not fit; the horizontal span
   is whatever the vertical-fit distance happens to show.
 
-Wrist -> fingertip arrows
---------------------------
-Each snapshot also draws two arrows from the wrist toward the fingertips:
-one for the human's estimated hand (``target_palm_rot``'s local +X axis,
-i.e. ``palm_plane.fit_palm_plane``'s ``finger_dir``, the plane fit from the
-tracked landmarks) and one for the robot's actual hand pose
-(``r/l_eef_grasp_link``'s local +X axis, the same wrist -> fingertip axis --
-see the frame-orientation comment in ``aero_demo.palm_plane.fit_palm_plane``),
-so a mismatch between where the human's fingers pointed and where the
-robot's hand ended up aiming is visible in the frame itself, not just in
-the numeric report.
+IK target / hand coordinate frames
+-----------------------------------
+Same two coordinate-frame axes ``human_palm_contact_behavior_loop.py``'s
+scene draws (``PalmPlaneScene.ik_target_axis`` / ``.hand_axis``): the IK
+target frame most recently passed to ``_solve_palm_ik`` (the press target,
+since that is the last of the two solves before ``DONE`` -- see
+``_solve_palm_ik``'s override below) and the robot's actual hand frame
+(``r/l_eef_grasp_link``, wherever IK left it, reached or not), so a mismatch
+between where the robot was asked to go and where it actually ended up is
+visible in the frame itself, not just in the numeric report.
 
 Required parameters
 --------------------
@@ -113,6 +112,16 @@ estimator's ``~distance_range`` / ``~present_*_deg_range`` / etc.), plus
                                           待つ最大秒数 (繋がったままだが
                                           応答が返らないクライアントで
                                           無限に待たないため)。
+``~scene_settle_time`` (float, default 0.2)
+                                          描画物を viewer に追加してから
+                                          ``get_render()`` を呼ぶまでの
+                                          待ち時間 [s]。``add()`` は
+                                          websocket にメッセージを積むだけで、
+                                          ブラウザ側の反映 (特に SMPL の
+                                          メッシュのような大きなペイロード)
+                                          は非同期なので、無いと稀に人物の
+                                          メッシュが映る前のフレームを
+                                          撮ってしまう。
 ``~round_pause`` (float, default 0.2)    次の周回のサンプリングを始める前に
                                           置く待ち時間 [s]。
 ``~neck_settle_time`` (float, default 0.3)
@@ -121,6 +130,15 @@ estimator's ``~distance_range`` / ``~present_*_deg_range`` / etc.), plus
                                           この値に短縮する。実機に指令を出す
                                           わけではないので、100 人分回すのに
                                           待つ理由が薄い。
+``~smpl_model_path`` (str, default ``~/SMPL_python_v.1.0.0/smpl/models/``
+                     ``basicmodel_m_lbs_10_207_0_v1.0.0.pkl``)
+                                          人物の描画に使う SMPL v1.0.0 の
+                                          .pkl (``human_palm_contact_behavior.py``
+                                          と同じ既定パス/フォールバック。
+                                          ライセンス上リポジトリには同梱
+                                          しないのでローカルパスで渡す)。
+                                          読めなければ警告を出して従来の
+                                          骨格の線描画にフォールバックする。
 """
 
 import json
@@ -150,55 +168,6 @@ CAMERA_YFOV_DEG = 55.0
 VERTICAL_PAD = 0.15
 # Safety margin on top of the exact tan(fov/2) fit distance.
 DISTANCE_PAD = 1.08
-
-# Wrist -> fingertip arrows: length is the tail-to-tip span (tail sits at
-# the wrist/palm point), the rest are the shaft/head proportions of that
-# span.
-ARROW_LENGTH = 0.15
-ARROW_SHAFT_RADIUS = 0.004
-ARROW_HEAD_RADIUS = 0.011
-ARROW_HEAD_LENGTH = 0.045
-COLOR_HUMAN_FINGER = [0, 200, 255, 255]   # matches palm_plane_view.COLOR_FINGER
-COLOR_ROBOT_FINGER = [255, 140, 0, 255]   # distinct from the ok/fail sphere's
-                                           # green/red and the human arrow's
-                                           # cyan
-
-
-def _make_direction_arrow(base, direction, color):
-    """A shaft+cone arrow of a fixed length, tail-to-tip along ``direction``.
-
-    ``base`` is where the tail starts (the wrist/palm point); the
-    arrowhead lands ``ARROW_LENGTH`` further along ``direction`` -- i.e.
-    the arrow points *out of* ``base`` toward the fingertips, matching
-    "wrist -> fingertip" rather than pointing into the palm from behind.
-
-    skrobot has no ready-made directional-arrow primitive (only
-    ``Cylinder``/``Cone``, both authored pointing along +Z -- see
-    ``palm_plane_view.rotation_from_z``), so the shaft and head are built
-    as separate trimeshes, translated into place along +Z, and merged
-    into one ``Link`` the same way ``skrobot.model.primitives.Axis``
-    composites its three axis cylinders.
-    """
-    import trimesh
-    from skrobot.model import Link
-    from aero_demo.palm_plane_view import rotation_from_z, set_color, unit
-
-    d = unit(direction)
-    if d is None:
-        return None
-
-    shaft_length = ARROW_LENGTH - ARROW_HEAD_LENGTH
-    shaft = trimesh.creation.cylinder(
-        radius=ARROW_SHAFT_RADIUS, height=shaft_length, sections=12)
-    shaft.apply_translation([0.0, 0.0, shaft_length / 2.0])
-    head = trimesh.creation.cone(
-        radius=ARROW_HEAD_RADIUS, height=ARROW_HEAD_LENGTH, sections=12)
-    head.apply_translation([0.0, 0.0, shaft_length])
-    mesh = shaft + head
-
-    tail = np.asarray(base, dtype=np.float64)
-    link = Link(pos=tail, rot=rotation_from_z(d), visual_mesh=mesh)
-    return set_color(link, color)
 
 
 class _InstantRobotInterface(_hpcb._DrawingRobotInterface):
@@ -249,9 +218,38 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
 
         _hpcb.NECK_SETTLE_TIME = rospy.get_param('~neck_settle_time', 0.3)
 
+        # Same SMPL body mesh human_palm_contact_behavior_loop.py's scene
+        # draws (via PalmPlaneScene.update_skeleton) -- see
+        # _save_snapshot, which calls the same
+        # aero_demo.palm_plane_view.build_skeleton_links this repo's other
+        # viewers use, so a mismatch never has to be reasoned about frame
+        # by frame here. Missing/unreadable file falls back to the plain
+        # skeleton lines this script already drew (does not raise).
+        from aero_demo import smpl_body
+        self._smpl_model = None
+        smpl_model_path = rospy.get_param(
+            '~smpl_model_path',
+            os.path.expanduser(
+                '~/SMPL_python_v.1.0.0/smpl/models/'
+                'basicmodel_m_lbs_10_207_0_v1.0.0.pkl'))
+        try:
+            self._smpl_model = smpl_body.load_smpl_model(smpl_model_path)
+        except Exception as e:
+            rospy.logwarn(
+                'could not load the SMPL model (%s), falling back to the '
+                'plain skeleton line drawing. Set ~smpl_model_path to a '
+                'valid basicmodel_*.pkl to draw an SMPL body mesh '
+                'instead.', e)
+
         self.round_count = 0
         self.results = []
         self._latest_person = None
+        # Set by _solve_palm_ik (below) every time it's called -- the
+        # press target overwrites the approach one, so by DONE this is the
+        # last (press) IK target, same as what
+        # PalmPlaneScene.ik_target_axis would be showing at that point in
+        # human_palm_contact_behavior_loop.py's interactive viewer.
+        self._last_ik_target_coords = None
         # Set by _start_next_round from the fresh pose source's own
         # ~seed=-1 auto-pick (FakeRosPeoplePoseEstimator.seed) -- carried
         # into both the image filename and the log line so any single
@@ -381,11 +379,15 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         # The vertical fit has to cover both bodies' top-to-bottom extent,
         # not just the robot's -- a tracked person can stand taller than
         # the robot's head or have their feet below the cart, and either
-        # would otherwise get clipped at the top/bottom edge.
+        # would otherwise get clipped at the top/bottom edge. hand_pos is
+        # included too: a reaching arm can swing its elbow/hand above the
+        # head or below the cart (e.g. a low or overhead offered palm),
+        # and head/cart alone missed that -- this showed up as the robot's
+        # head and raised arm getting clipped at the top edge in practice.
         human_z = np.atleast_2d(human_points)[:, 2]
-        z_lo = min(float(head_pos[2]), float(cart_pos[2]),
+        z_lo = min(float(head_pos[2]), float(cart_pos[2]), float(hand_pos[2]),
                    float(human_z.min())) - VERTICAL_PAD
-        z_hi = max(float(head_pos[2]), float(cart_pos[2]),
+        z_hi = max(float(head_pos[2]), float(cart_pos[2]), float(hand_pos[2]),
                    float(human_z.max())) + VERTICAL_PAD
 
         # cart_pos anchors how far back the robot's own body reaches (the
@@ -417,23 +419,50 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         # (horizontal centering, not framing) -- see module docstring.
         fov_v = np.deg2rad(CAMERA_YFOV_DEG)
         half_v = (z_hi - z_lo) / 2.0
-        distance = (half_v / np.tan(fov_v / 2.0)) * DISTANCE_PAD
+        distance = half_v / np.tan(fov_v / 2.0)
+
+        # The distance above assumes every piece of content sits at the
+        # same depth (world Y) as `center` -- but the approach IK can
+        # translate the cart along Y (``use_base='planar'``), so the robot
+        # can end up noticeably closer to the camera than the human is.
+        # A point that much closer appears that much bigger than the flat
+        # assumption accounts for, and clips at the top/bottom edge even
+        # though its z was correctly folded into z_lo/z_hi above (seen in
+        # practice: the robot's head and raised arm cropped off while the
+        # human a couple meters further back stayed comfortably in frame).
+        # Pad the distance by the deepest content point's offset from
+        # `center` (content is already anchored on the human, hand and
+        # cart, i.e. exactly the points whose depth can diverge) so even
+        # the nearest point stays within the frustum.
+        depth_pad = float(content_hi[1]) - float(center[1])
+        distance = (distance + max(depth_pad, 0.0)) * DISTANCE_PAD
 
         position = center - forward * distance
         return position, center, up
 
     def _save_snapshot(self, ok):
         import imageio.v3 as iio
-        from skrobot.model.primitives import Axis, LineString, Sphere
+        from skrobot.model.primitives import Axis, Sphere
+        from aero_demo import palm_plane_view
         from aero_demo.palm_plane_view import (
-            BASE_ORIGIN_AXIS_LENGTH, BASE_ORIGIN_AXIS_RADIUS, bone_color,
-            dim_color)
+            BASE_ORIGIN_AXIS_LENGTH, BASE_ORIGIN_AXIS_RADIUS,
+            HAND_AXIS_LENGTH, IK_TARGET_AXIS_LENGTH)
 
         hand_coords = getattr(self.robot, '{}arm_end_coords'.format(self.arm))
         hand_pos = hand_coords.worldpos()
         human_points = None
-        if self._latest_person is not None and self._latest_person.positions:
-            human_points = self._latest_person.positions
+        if self._latest_person is not None:
+            # Include hidden_positions (the ~source:=fake ground truth for
+            # joints the fake camera wouldn't have seen), not just the
+            # visible ones -- build_skeleton_links below draws the SMPL
+            # mesh/capsules from the same visible+hidden union, so framing
+            # on visible-only points could center/zoom on a small fraction
+            # of a body whose actual (drawn) extent is much bigger,
+            # pushing the robot off-frame or filling the shot with a
+            # close-up of the person.
+            human_points = (
+                list(self._latest_person.positions)
+                + list(getattr(self._latest_person, 'hidden_positions', [])))
         if not human_points:
             ref = self.target_palm_center or hand_pos
             human_points = [ref]
@@ -452,48 +481,50 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         target_sphere.newcoords(Coordinates(pos=hand_pos))
         markers.append(target_sphere)
 
-        # Wrist -> fingertip arrows -- see the module docstring's "Wrist ->
-        # fingertip arrows" section. Human: local +X of the plane fit from
-        # the tracked landmarks. Robot: r/l_eef_grasp_link's local +X axis
-        # (the same wrist -> fingertip axis, see
-        # aero_demo.palm_plane.fit_palm_plane).
-        if self.target_palm_center is not None \
-                and self.target_palm_rot is not None:
-            human_finger_dir = np.asarray(self.target_palm_rot)[:, 0]
-            human_arrow = _make_direction_arrow(
-                self.target_palm_center, human_finger_dir,
-                COLOR_HUMAN_FINGER)
-            if human_arrow is not None:
-                markers.append(human_arrow)
-        robot_finger_dir = hand_coords.worldrot().dot(np.array([1.0, 0.0, 0.0]))
-        robot_arrow = _make_direction_arrow(
-            hand_pos, robot_finger_dir, COLOR_ROBOT_FINGER)
-        if robot_arrow is not None:
-            markers.append(robot_arrow)
+        # IK target / hand coordinate frames -- see the module docstring's
+        # "IK target / hand coordinate frames" section. Same two axes
+        # PalmPlaneScene.ik_target_axis/.hand_axis draw in
+        # human_palm_contact_behavior_loop.py's interactive viewer.
+        if self._last_ik_target_coords is not None:
+            ik_target_axis = Axis(
+                axis_radius=0.005, axis_length=IK_TARGET_AXIS_LENGTH)
+            ik_target_axis.newcoords(self._last_ik_target_coords)
+            markers.append(ik_target_axis)
+        hand_axis = Axis(axis_radius=0.004, axis_length=HAND_AXIS_LENGTH)
+        hand_axis.newcoords(hand_coords.copy_worldcoords())
+        markers.append(hand_axis)
 
-        # Same colored-per-body-part skeleton lines
-        # human_palm_contact_behavior_loop.py's viewer draws (see
-        # aero_demo.palm_plane_view.PalmPlaneScene.update_skeleton) --
+        # Same skeleton drawing human_palm_contact_behavior_loop.py's
+        # scene produces (aero_demo.palm_plane_view.PalmPlaneScene.
+        # update_skeleton) -- an SMPL body mesh (self._smpl_model, if it
+        # loaded) plus the colored-per-body-part bone lines/capsules,
         # bones dimmed the same way for landmarks that were tracked but
         # dropped (~source:=fake's ground truth for what the camera would
-        # not have seen), instead of this script's own plain gray dots.
+        # not have seen). Both call the same
+        # aero_demo.palm_plane_view.build_skeleton_links so the two
+        # scripts never draw two different pictures of the same person.
         if self._latest_person is not None:
-            for bone in getattr(self._latest_person, 'bones', []):
-                line = LineString(
-                    np.asarray([bone.start_point, bone.end_point],
-                              dtype=np.float64),
-                    color=bone_color(bone.name))
-                markers.append(line)
-            for bone in getattr(self._latest_person, 'hidden_bones', []):
-                line = LineString(
-                    np.asarray([bone.start_point, bone.end_point],
-                              dtype=np.float64),
-                    color=dim_color(bone_color(bone.name)))
-                markers.append(line)
+            skeleton_links, _ = palm_plane_view.build_skeleton_links(
+                [self._latest_person], self._smpl_model)
+            markers.extend(skeleton_links)
 
         for m in markers:
             self._viewer.add(m)
         self._viewer.redraw()
+
+        # self._viewer.add() only queues a scene-update message on the
+        # websocket; the browser applies it (parses the mesh buffers,
+        # uploads them to the GPU) asynchronously afterwards. Every other
+        # marker here is tiny (lines/spheres/axes) and was applied long
+        # before get_render() below ever reached the client in practice,
+        # but the SMPL body mesh (~6890 vertices/~13776 faces, easily the
+        # single biggest payload added all round) is not -- without
+        # waiting, get_render() can catch the client mid-upload and come
+        # back with everything else but a missing/half-drawn human mesh.
+        # ~scene_settle_time gives it time to land first.
+        settle_time = rospy.get_param('~scene_settle_time', 0.2)
+        if settle_time > 0.0:
+            rospy.sleep(settle_time)
 
         position, look_at, up = self._camera_view(human_points, hand_pos)
         client = self._get_client()
@@ -599,6 +630,21 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
             self._latest_person = person
         return plane, palm_points, person
 
+    def _solve_palm_ik(self, whole_body, target_coords, use_base=None,
+                        foot_sdf=None):
+        """Record ``target_coords`` -- see ``_last_ik_target_coords``.
+
+        Same coords ``PalmPlaneScene.update_ik_target`` would have been
+        given (``self.scene`` is always ``None`` here, ~viewer forced to
+        'none', so that call never happens on its own). Called once for
+        the approach target and again for the press target, so by DONE
+        this holds the press target -- the last one drawn in the
+        interactive viewer too.
+        """
+        self._last_ik_target_coords = target_coords.copy_worldcoords()
+        return super(HumanPalmContactDatasetGenerator, self)._solve_palm_ik(
+            whole_body, target_coords, use_base=use_base, foot_sdf=foot_sdf)
+
     # ------------------------------------------------------------------
     # state machine: intercept the DONE -> (restart) transition, same
     # trick human_palm_contact_behavior_loop.py uses.
@@ -684,6 +730,7 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
         self.target_palm_normal = None
         self.last_neck_cmd_time = rospy.Time.now()
         self._latest_person = None
+        self._last_ik_target_coords = None
 
         self.state = "WAITING"
         self.state_start_time = rospy.Time.now()

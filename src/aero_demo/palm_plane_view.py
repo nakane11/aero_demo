@@ -196,6 +196,207 @@ def bone_radius(name):
     return BONE_RADIUS[bone_group(name)]
 
 
+def bone_capsule(bone, rgba):
+    """1 本のボーンを部位の太さのカプセルにして返す (骨表現の体幹)."""
+    start = np.asarray(bone.start_point, dtype=np.float64)
+    end = np.asarray(bone.end_point, dtype=np.float64)
+    radius = bone_radius(bone.name)
+    length = float(np.linalg.norm(end - start))
+    # カプセルは円柱部分の高さ + 両端の半球なので、関節位置 (start/end)
+    # がちょうど半球の中心に来るよう円柱部分だけ短くする。骨が短すぎて
+    # マイナスになる場合は MIN_BONE_HEIGHT で下げ止まる (見た目上は
+    # 半球同士が重なるだけで、エラーにはならない)。
+    height = max(length - 2.0 * radius, MIN_BONE_HEIGHT)
+    capsule = Capsule(
+        radius=radius, height=height,
+        pos=(start + end) / 2.0, rot=rotation_from_z(end - start))
+    return set_color(capsule, rgba)
+
+
+def bone_line(bone, rgba):
+    """1 本のボーンを (太さを持たない) 細い線にして返す.
+
+    SMPL メッシュが胴体の実体を描いてくれるので、その上に重ねる
+    骨格は太さの要らない細線で十分 -- ``bone_capsule`` の体型
+    表現の代わりに使う (骨格を線で描いていた頃の見た目に戻す)。
+    """
+    start = np.asarray(bone.start_point, dtype=np.float64)
+    end = np.asarray(bone.end_point, dtype=np.float64)
+    return LineString(np.stack([start, end]), color=rgba)
+
+
+def torso_box(joints, rgba):
+    """肩・腰の 4 関節 (+ Neck) から胴体を 1 枚の板として作る.
+
+    Neck-肩中点-腰中点を通る軸を長さ方向 (Z) に、肩と腰の関節を結ぶ
+    向きを幅方向 (X) にした直方体。奥行き (Y) は関節位置からは分から
+    ないので ``TORSO_DEPTH`` で固定値にしてある。
+    """
+    neck = joints['Neck']
+    hip_center = (joints['RHip'] + joints['LHip']) / 2.0
+
+    z = unit(hip_center - neck)
+    if z is None:
+        raise ValueError('neck and hip center coincide')
+    x = unit(joints['LShoulder'] - joints['RShoulder'])
+    if x is None:
+        x = unit(joints['LHip'] - joints['RHip'])
+    if x is None:
+        raise ValueError('shoulder and hip joints coincide')
+    y = unit(np.cross(z, x))
+    if y is None:
+        raise ValueError('shoulder/hip line is parallel to the spine')
+    # x を z, y に直交させ直す (肩の向きは脊柱と厳密には直交しない)。
+    x = np.cross(y, z)
+
+    width = max((float(np.linalg.norm(
+        joints['LShoulder'] - joints['RShoulder']))
+        + float(np.linalg.norm(joints['LHip'] - joints['RHip']))) / 2.0,
+        TORSO_MIN_WIDTH)
+    height = max(float(np.linalg.norm(hip_center - neck)),
+                MIN_BONE_HEIGHT)
+
+    box = Box(extents=[width, TORSO_DEPTH, height],
+             pos=(neck + hip_center) / 2.0,
+             rot=np.column_stack([x, y, z]))
+    return set_color(box, rgba)
+
+
+def head_sphere(joints, rgba):
+    """頭を Neck の真上 (胴体の中心線上) に 1 個の球として作る.
+
+    前後・左右は Neck と同じにする (Neck->Nose には前後方向の成分も
+    大きいので、そのまま使うと頭が前に出て胴体の中心からずれる)。
+    高さだけ Nose の Z 座標と Neck の Z 座標の差で決めるので、首を
+    縦に振れば (これは真上に固定した分は動かないが) その人の首・頭の
+    実際の高さにはちゃんと合う。Nose が見えないときは ``HEAD_OFFSET``
+    で妥協する。
+    """
+    neck = joints['Neck']
+    if 'Nose' in joints:
+        height = float(joints['Nose'][2] - neck[2])
+    else:
+        height = HEAD_OFFSET
+    height = max(height, HEAD_MIN_HEIGHT)
+    center = neck + np.array([0.0, 0.0, height])
+    sphere = Sphere(radius=HEAD_RADIUS, pos=center)
+    return set_color(sphere, rgba)
+
+
+def nose_sphere(joints, rgba):
+    """鼻先の目印を、推定された Nose の位置そのままに小さい球で描く."""
+    sphere = Sphere(radius=NOSE_RADIUS, pos=joints['Nose'])
+    return set_color(sphere, rgba)
+
+
+def build_skeleton_links(people, smpl_model=None):
+    """1 フレーム分の骨格の描画物 (Link のリスト) を作る.
+
+    ``PalmPlaneScene.update_skeleton`` と、オフスクリーンで 1 枚だけ
+    撮る ``human_palm_contact_dataset_generator.py`` の両方が、同じ
+    絵 (SMPL が読み込めていれば実体メッシュ + 細線の骨格、無ければ
+    カプセル/胴体板/頭球の骨格) を描けるよう、その組み立てだけを
+    ``PalmPlaneScene`` の add/delete の状態管理から切り離してある
+    (呼び出し側が毎フレーム作り直して viewer に足す/消す)。
+
+    Parameters
+    ----------
+    people : list of Person3D-like
+        ``bones`` (検出できた骨) と ``hidden_bones`` (``~source: fake``
+        だけが埋める真値) を持つオブジェクトのリスト。
+    smpl_model : smpl_body.SmplModel or None
+        渡せば胴体・頭・四肢を SMPL の実体メッシュで追加描画する。
+
+    Returns
+    -------
+    (links, ok) : (list of Link, bool)
+        ``ok`` は、検出できた (薄くしていない) ボーン/胴体/頭が組み
+        立てられなかった (skrobot のバージョン差などで毎回起きる類の
+        失敗) ことを示す -- ``False`` なら呼び出し側はもう
+        ``build_skeleton_links`` を呼ばない方がよい。薄い方 (隠れた
+        骨) だけ組み立てられなかった場合はその 1 本を諦めるだけで
+        ``ok`` は ``True`` のまま。
+    """
+    links = []
+    use_smpl = smpl_model is not None
+    # SMPL メッシュがあるときは、太いカプセル (簡易体型) は SMPL の
+    # 実体と喧嘩して見苦しいので、代わりに元の細い線 (bone_line) で
+    # 骨格を描く -- 胴体・頭も (box/sphere の代役に頼らず) 他の部位
+    # と同じくボーンをそのまま線にする。
+    bone_shape = bone_line if use_smpl else bone_capsule
+    for person in people:
+        visible_joints = {}
+        all_joints = {}
+        for bone in getattr(person, 'bones', []):
+            collect_joints([bone], visible_joints)
+            collect_joints([bone], all_joints)
+            group = bone_group(bone.name)
+            if not use_smpl and group in ('torso', 'head'):
+                continue
+            try:
+                link = bone_shape(bone, bone_color(bone.name))
+            except Exception:
+                return links, False
+            links.append(link)
+        for bone in getattr(person, 'hidden_bones', []):
+            collect_joints([bone], all_joints)
+            group = bone_group(bone.name)
+            if not use_smpl and group in ('torso', 'head'):
+                continue
+            try:
+                link = bone_shape(bone, dim_color(bone_color(bone.name)))
+            except Exception:
+                continue
+            links.append(link)
+
+        if use_smpl:
+            joints = dict(all_joints)
+            joints.update(visible_joints)
+            try:
+                result = smpl_body.retarget_and_pose(smpl_model, joints)
+            except Exception:
+                result = None
+            if result is not None:
+                verts, faces = result
+                try:
+                    mesh = trimesh.Trimesh(
+                        vertices=verts, faces=faces, process=False)
+                    link = set_color(MeshLink(visual_mesh=mesh), COLOR_BODY)
+                except Exception:
+                    link = None
+                if link is not None:
+                    links.append(link)
+
+        # use_smpl のときは torso/head も上の bone_shape ループで既に
+        # 線として描いてあるので、box/sphere の代役は不要 (SMPL の
+        # リターゲットに失敗した人物だけ、素の骨格線がフォール
+        # バックとして残る)。鼻の目印は SMPL の頭メッシュと二重に
+        # 見えるため SMPL 描画時は省略する。
+        builders = [] if use_smpl else [
+            (torso_box,
+             lambda j: all(k in j for k in _TORSO_JOINTS), 'torso'),
+            (head_sphere,
+             lambda j: 'Neck' in j, 'head'),
+            (nose_sphere,
+             lambda j: 'Nose' in j, 'head'),
+        ]
+        for builder, ready, group in builders:
+            if ready(visible_joints):
+                joints, rgba = visible_joints, COLOR_BONES[group]
+            elif ready(all_joints):
+                joints, rgba = all_joints, dim_color(COLOR_BONES[group])
+            else:
+                continue
+            try:
+                link = builder(joints, rgba)
+            except Exception:
+                if joints is visible_joints:
+                    return links, False
+                continue
+            links.append(link)
+    return links, True
+
+
 def collect_joints(bones, joints=None):
     """``bone.name`` ("A->B" 形式) から端点の関節名と座標を拾い集める.
 
@@ -460,94 +661,6 @@ class PalmPlaneScene(object):
         for sphere in self.landmarks.values():
             self._show(sphere, False)
 
-    def _bone_capsule(self, bone, rgba):
-        """1 本のボーンを部位の太さのカプセルにして返す (骨表現の体幹)."""
-        start = np.asarray(bone.start_point, dtype=np.float64)
-        end = np.asarray(bone.end_point, dtype=np.float64)
-        radius = bone_radius(bone.name)
-        length = float(np.linalg.norm(end - start))
-        # カプセルは円柱部分の高さ + 両端の半球なので、関節位置 (start/end)
-        # がちょうど半球の中心に来るよう円柱部分だけ短くする。骨が短すぎて
-        # マイナスになる場合は MIN_BONE_HEIGHT で下げ止まる (見た目上は
-        # 半球同士が重なるだけで、エラーにはならない)。
-        height = max(length - 2.0 * radius, MIN_BONE_HEIGHT)
-        capsule = Capsule(
-            radius=radius, height=height,
-            pos=(start + end) / 2.0, rot=rotation_from_z(end - start))
-        return set_color(capsule, rgba)
-
-    def _bone_line(self, bone, rgba):
-        """1 本のボーンを (太さを持たない) 細い線にして返す.
-
-        SMPL メッシュが胴体の実体を描いてくれるので、その上に重ねる
-        骨格は太さの要らない細線で十分 -- ``_bone_capsule`` の体型
-        表現の代わりに使う (骨格を線で描いていた頃の見た目に戻す)。
-        """
-        start = np.asarray(bone.start_point, dtype=np.float64)
-        end = np.asarray(bone.end_point, dtype=np.float64)
-        return LineString(np.stack([start, end]), color=rgba)
-
-    def _torso_box(self, joints, rgba):
-        """肩・腰の 4 関節 (+ Neck) から胴体を 1 枚の板として作る.
-
-        Neck-肩中点-腰中点を通る軸を長さ方向 (Z) に、肩と腰の関節を結ぶ
-        向きを幅方向 (X) にした直方体。奥行き (Y) は関節位置からは分から
-        ないので ``TORSO_DEPTH`` で固定値にしてある。
-        """
-        neck = joints['Neck']
-        hip_center = (joints['RHip'] + joints['LHip']) / 2.0
-
-        z = unit(hip_center - neck)
-        if z is None:
-            raise ValueError('neck and hip center coincide')
-        x = unit(joints['LShoulder'] - joints['RShoulder'])
-        if x is None:
-            x = unit(joints['LHip'] - joints['RHip'])
-        if x is None:
-            raise ValueError('shoulder and hip joints coincide')
-        y = unit(np.cross(z, x))
-        if y is None:
-            raise ValueError('shoulder/hip line is parallel to the spine')
-        # x を z, y に直交させ直す (肩の向きは脊柱と厳密には直交しない)。
-        x = np.cross(y, z)
-
-        width = max((float(np.linalg.norm(
-            joints['LShoulder'] - joints['RShoulder']))
-            + float(np.linalg.norm(joints['LHip'] - joints['RHip']))) / 2.0,
-            TORSO_MIN_WIDTH)
-        height = max(float(np.linalg.norm(hip_center - neck)),
-                    MIN_BONE_HEIGHT)
-
-        box = Box(extents=[width, TORSO_DEPTH, height],
-                 pos=(neck + hip_center) / 2.0,
-                 rot=np.column_stack([x, y, z]))
-        return set_color(box, rgba)
-
-    def _head_sphere(self, joints, rgba):
-        """頭を Neck の真上 (胴体の中心線上) に 1 個の球として作る.
-
-        前後・左右は Neck と同じにする (Neck->Nose には前後方向の成分も
-        大きいので、そのまま使うと頭が前に出て胴体の中心からずれる)。
-        高さだけ Nose の Z 座標と Neck の Z 座標の差で決めるので、首を
-        縦に振れば (これは真上に固定した分は動かないが) その人の首・頭の
-        実際の高さにはちゃんと合う。Nose が見えないときは ``HEAD_OFFSET``
-        で妥協する。
-        """
-        neck = joints['Neck']
-        if 'Nose' in joints:
-            height = float(joints['Nose'][2] - neck[2])
-        else:
-            height = HEAD_OFFSET
-        height = max(height, HEAD_MIN_HEIGHT)
-        center = neck + np.array([0.0, 0.0, height])
-        sphere = Sphere(radius=HEAD_RADIUS, pos=center)
-        return set_color(sphere, rgba)
-
-    def _nose_sphere(self, joints, rgba):
-        """鼻先の目印を、推定された Nose の位置そのままに小さい球で描く."""
-        sphere = Sphere(radius=NOSE_RADIUS, pos=joints['Nose'])
-        return set_color(sphere, rgba)
-
     def update_skeleton(self, people):
         """ボーンを部位ごとに色を変えたカプセル (簡易体型メッシュ) で描き直す.
 
@@ -560,11 +673,11 @@ class PalmPlaneScene(object):
 
         胴体・頭・鼻だけは特別扱い。胴体は Neck-RShoulder/LShoulder/RHip/
         LHip の 4 本を Neck に集めてカプセルで描くと扇状になって不自然
-        なので、5 関節が揃っていれば ``_torso_box`` で 1 枚の板として描く。
-        頭も Neck-Nose 等の細いカプセルの束ではなく ``_head_sphere`` で
+        なので、5 関節が揃っていれば ``torso_box`` で 1 枚の板として描く。
+        頭も Neck-Nose 等の細いカプセルの束ではなく ``head_sphere`` で
         1 個の球として描く -- 前後・左右は Neck の真上 (胴体の中心線上)
         に固定し、高さだけ Nose との Z 座標の差で決める。鼻はその頭の
-        球の目印として、``_nose_sphere`` で推定された Nose の位置その
+        球の目印として、``nose_sphere`` で推定された Nose の位置その
         ままに小さい球を追加で描く (頭の球の前面からはみ出て見える)。
         いずれも必要な関節が揃わなければ単に描かない (他の部位のように
         欠けた分だけ線を減らす、では絵にならない)。
@@ -573,13 +686,19 @@ class PalmPlaneScene(object):
         ``smpl_model_path``)、胴体・頭・四肢の実体として半透明の SMPL
         メッシュ (``smpl_body.retarget_and_pose``, ``COLOR_BODY`` の
         alpha を下げてある) を追加で描く。ただし部位ごとに色分けした
-        カプセル骨格 (``_bone_capsule``/``_torso_box``/``_head_sphere``)
+        カプセル骨格 (``bone_capsule``/``torso_box``/``head_sphere``)
         は SMPL の有無にかかわらず常に描き、透けた SMPL メッシュ越しに
-        見えるようにする -- 鼻の目印 (``_nose_sphere``) だけは SMPL の
+        見えるようにする -- 鼻の目印 (``nose_sphere``) だけは SMPL の
         頭メッシュと二重に見えるため SMPL 描画時は省略する。必要な関節
         (Neck + 両肩) が無い、またはリターゲットに失敗したフレーム/
         人物は、その人物だけ SMPL メッシュを諦めてカプセル骨格のみに
         なる (SMPL 未読み込みのときは常にこちら)。
+
+        実際の組み立ては ``build_skeleton_links`` (このモジュールの自由
+        関数) に委ねてある -- オフスクリーンで 1 枚だけ撮る
+        ``human_palm_contact_dataset_generator.py`` も同じ関数を呼んで
+        まったく同じ絵を描くため。ここでは毎フレームの add/delete の
+        状態管理だけをする。
 
         カプセル/胴体の板/頭・鼻の球/SMPL メッシュを作れなかったときは
         骨格の描画をあきらめて False を返す (以降の呼び出しは何もしない)。
@@ -590,92 +709,12 @@ class PalmPlaneScene(object):
             return True
         for link in self.bone_links:
             self._show(link, False)
-        self.bone_links = []
-        use_smpl = self._smpl_model is not None
-        # SMPL メッシュがあるときは、太いカプセル (簡易体型) は SMPL の
-        # 実体と喧嘩して見苦しいので、代わりに元の細い線 (_bone_line) で
-        # 骨格を描く -- 胴体・頭も (box/sphere の代役に頼らず) 他の部位
-        # と同じくボーンをそのまま線にする。
-        bone_shape = self._bone_line if use_smpl else self._bone_capsule
-        for person in people:
-            visible_joints = {}
-            all_joints = {}
-            for bone in person.bones:
-                collect_joints([bone], visible_joints)
-                collect_joints([bone], all_joints)
-                group = bone_group(bone.name)
-                if not use_smpl and group in ('torso', 'head'):
-                    continue
-                try:
-                    link = bone_shape(bone, bone_color(bone.name))
-                except Exception:
-                    self.draw_skeleton = False
-                    return False
-                self.bone_links.append(link)
-                self._show(link, True)
-            for bone in getattr(person, 'hidden_bones', []):
-                collect_joints([bone], all_joints)
-                group = bone_group(bone.name)
-                if not use_smpl and group in ('torso', 'head'):
-                    continue
-                try:
-                    link = bone_shape(
-                        bone, dim_color(bone_color(bone.name)))
-                except Exception:
-                    continue
-                self.bone_links.append(link)
-                self._show(link, True)
-
-            if use_smpl:
-                joints = dict(all_joints)
-                joints.update(visible_joints)
-                try:
-                    result = smpl_body.retarget_and_pose(
-                        self._smpl_model, joints)
-                except Exception:
-                    result = None
-                if result is not None:
-                    verts, faces = result
-                    try:
-                        mesh = trimesh.Trimesh(
-                            vertices=verts, faces=faces, process=False)
-                        link = set_color(MeshLink(visual_mesh=mesh),
-                                         COLOR_BODY)
-                    except Exception:
-                        link = None
-                    if link is not None:
-                        self.bone_links.append(link)
-                        self._show(link, True)
-
-            # use_smpl のときは torso/head も上の bone_shape ループで既に
-            # 線として描いてあるので、box/sphere の代役は不要 (SMPL の
-            # リターゲットに失敗した人物だけ、素の骨格線がフォール
-            # バックとして残る)。
-            builders = [] if use_smpl else [
-                (self._torso_box,
-                 lambda j: all(k in j for k in _TORSO_JOINTS), 'torso'),
-                (self._head_sphere,
-                 lambda j: 'Neck' in j, 'head'),
-                (self._nose_sphere,
-                 lambda j: 'Nose' in j, 'head'),
-            ]
-            for builder, ready, group in builders:
-                if ready(visible_joints):
-                    joints, rgba = visible_joints, COLOR_BONES[group]
-                elif ready(all_joints):
-                    joints, rgba = all_joints, dim_color(COLOR_BONES[group])
-                else:
-                    continue
-                try:
-                    link = builder(joints, rgba)
-                except Exception:
-                    if joints is visible_joints:
-                        self.draw_skeleton = False
-                        return False
-                    continue
-                self.bone_links.append(link)
-                self._show(link, True)
-        return True
+        self.bone_links, ok = build_skeleton_links(people, self._smpl_model)
+        for link in self.bone_links:
+            self._show(link, True)
+        if not ok:
+            self.draw_skeleton = False
+        return ok
 
     def update_camera(self, intrinsics, width, height, pose):
         """カメラの画角を表す四角すいを薄く描き直す (optical_frame から伸びる).
