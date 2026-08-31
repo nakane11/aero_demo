@@ -382,7 +382,7 @@ def _to_smpl_rotation(R_robot):
     return _PERM.T.dot(R_robot).dot(_PERM)
 
 
-def retarget_and_pose(model, joints):
+def retarget_and_pose(model, joints, betas=None):
     """1 人分の関節位置 (ロボット座標系) から姿勢済みの SMPL 頂点を作る.
 
     Parameters
@@ -394,6 +394,11 @@ def retarget_and_pose(model, joints):
         ``palm_plane_view.update_skeleton`` が集める ``visible_joints``
         と (fake 推定だけが持つ) ``hidden_positions`` 由来の関節を
         まとめたもの (見えている値を優先) を渡す想定。
+    betas : (10,) array_like, optional
+        SMPL の体型パラメータ (痩型/肥満型などの体格差)。``None`` なら
+        平均体型 (全ゼロ) を使う。``Person3D.betas`` (fake 推定が人物
+        ごとに 1 回だけ引く, ``fake_people_pose_estimator_ros.py`` 参照)
+        をそのまま渡す想定 -- 実推定は体型を推定しないので常に ``None``。
 
     Returns
     -------
@@ -507,7 +512,8 @@ def retarget_and_pose(model, joints):
             pose[_NECK] = _mat_to_axis_angle(_to_smpl_rotation(R_local))
 
     # --- 頂点の生成・配置 ---
-    v_local, _ = smpl_forward(model, pose, np.zeros(10), np.zeros(3))
+    betas = np.zeros(10) if betas is None else np.asarray(betas, dtype=np.float64)
+    v_local, _ = smpl_forward(model, pose, betas, np.zeros(3))
     v_centered = v_local - model.J[_PELVIS]
     v_robot_local = v_centered.dot(_PERM.T)
     v_world = root_pos + scale * v_robot_local.dot(root_rot.T)

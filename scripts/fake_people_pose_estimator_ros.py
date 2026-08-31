@@ -330,6 +330,13 @@ class FakeRosPeoplePoseEstimator(object):
         self.distance_range = rospy.get_param('~distance_range', [0.80, 1.00])
         self.lateral_range = rospy.get_param('~lateral_range', [-0.15, 0.15])
         self.height_range = rospy.get_param('~height_range', [1.55, 1.85])
+        # SMPL の体型パラメータ (betas) のうち、体格差として見た目に
+        # 効きやすい先頭 2 次元 (だいたい身長寄り / だいたい肥満度寄り、と
+        # 言われる軸だが厳密な対応はモデルの学習データ依存) をこの範囲で
+        # 引き、痩型〜肥満型のバリエーションを出す。他の次元は 0 のまま
+        # (顔立ちなど細かい体型差までは作り込まない)。SMPL のモデルファイル
+        # が無ければ (palm_plane_view.py 側で) betas はそもそも参照されない。
+        self.betas_range = rospy.get_param('~betas_range', [-2.5, 2.5])
 
         # dropout / noise
         self.joint_noise = rospy.get_param('~joint_noise', 0.004)
@@ -483,6 +490,11 @@ class FakeRosPeoplePoseEstimator(object):
             elbow_fwd=rng.uniform(0.01, 0.05),
             wrist_fwd=rng.uniform(0.04, 0.11),
         )
+
+        betas = np.zeros(10)
+        betas[0] = rng.uniform(*self.betas_range)
+        betas[1] = rng.uniform(*self.betas_range)
+        self.body['betas'] = betas
 
         self.stand = dict(
             x=rng.uniform(*self.distance_range),
@@ -916,7 +928,7 @@ class FakeRosPeoplePoseEstimator(object):
         """
         people = []
         for person_joint_positions in people_joint_positions:
-            person = Person3D()
+            person = Person3D(betas=self.body['betas'])
             for joint_pos in person_joint_positions:
                 # 深度画像が無いので、深度の欠測は has_depth で模擬する
                 if joint_pos['score'] < 0 or not joint_pos['has_depth']:

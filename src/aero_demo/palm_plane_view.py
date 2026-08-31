@@ -27,8 +27,7 @@ from aero_demo import palm_plane
 from aero_demo import smpl_body
 
 # 色 (RViz のマーカーと合わせる), RGBA 0-255
-COLOR_PLATE = [255, 255, 0, 90]
-COLOR_NORMAL = [0, 255, 0, 255]
+COLOR_PLATE = [255, 140, 40, 140]
 COLOR_FINGER = [0, 200, 255, 255]
 COLOR_LANDMARK = [255, 255, 255, 255]
 COLOR_APPROACH = [50, 100, 255, 255]
@@ -36,7 +35,7 @@ COLOR_PRESS = [255, 50, 50, 255]
 COLOR_FRUSTUM = [160, 180, 255, 90]
 # SMPL で胴体・頭を実体メッシュとして描くときの単色 (肌色寄り)。骨格を
 # 下から透けて見せたいので半透明にしてある。
-COLOR_BODY = [225, 190, 160, 110]
+COLOR_BODY = [225, 190, 160, 60]
 
 # 骨格の線は部位ごとに色を変える。Person3D.bones の名前 ("Neck->RShoulder"
 # 形式) から下の bone_color で引く。
@@ -103,7 +102,6 @@ HEAD_MIN_HEIGHT = 0.08
 NOSE_RADIUS = 0.028
 
 PLATE_SIZE = 0.12
-NORMAL_LENGTH = 0.15
 FINGER_LENGTH = 0.08
 IK_TARGET_AXIS_LENGTH = 0.08
 HAND_AXIS_LENGTH = 0.06
@@ -151,22 +149,68 @@ def rotation_from_z(z_axis):
 
 
 def set_color(link, rgba):
-    """primitive の色を塗る (skrobot のバージョン差を吸収する)."""
-    meshes = getattr(link, 'visual_mesh', None)
-    if meshes is None:
+    """primitive の色を塗る (skrobot のバージョン差を吸収する).
+
+    ``Sphere`` 以外の面付き primitive (Box/Cylinder/Capsule/MeshLink) は
+    ``link.visual_mesh`` ではなく ``link.concatenated_visual_mesh`` を塗る。
+    ``skrobot.model.link.Link.__init__`` は ``visual_mesh`` を
+    ``trimesh.util.concatenate`` に通した*複製*を ``_concatenated_visual_
+    mesh`` としてキャッシュし、trimesh/viser/pyrender のどの viewer も
+    描画時にはそのキャッシュだけを読む (``concatenated_visual_mesh``
+    プロパティ経由)。元の ``visual_mesh`` は Link 構築後の複製の元に
+    なるだけで、以後は描画に使われない -- なので Link を作ってから (この
+    関数のように) 色を塗っても ``visual_mesh`` を塗るだけでは viewer に
+    反映されない。
+
+    半透明 (``rgba[3] < 255``) なときは ``face_colors`` に加えて
+    ``alphaMode='BLEND'`` の ``PBRMaterial`` も付ける。ViserViewer は
+    メッシュを glTF (.glb) に変換して送るが (``skrobot.viewers._viser
+    .ViserViewer._add_link`` の ``add_mesh_trimesh``)、trimesh の頂点色
+    エクスポートは既定で ``alphaMode: OPAQUE`` になりアルファ値を無視する
+    -- ``face_colors`` だけでは viser 側で不透明に見えてしまう。
+
+    ``Sphere`` だけは例外で、従来どおり ``link.visual_mesh`` を塗る。
+    ViserViewer は Sphere を icosphere として特別扱いする際、concatenated
+    ではなく ``link.visual_mesh.visual.face_colors`` を直接読むため
+    (``_add_link``) -- こちらは Link 構築後に塗っても効く。
+    """
+    if isinstance(link, Sphere):
+        meshes = getattr(link, 'visual_mesh', None)
+        if meshes is None:
+            return link
+        if not isinstance(meshes, (list, tuple)):
+            meshes = [meshes]
+        for mesh in meshes:
+            try:
+                mesh.visual.face_colors = rgba
+            except Exception:  # 描画できないほどのことではない
+                pass
         return link
-    if not isinstance(meshes, (list, tuple)):
-        meshes = [meshes]
-    for mesh in meshes:
+
+    mesh = getattr(link, 'concatenated_visual_mesh', None)
+    if mesh is None:
+        mesh = getattr(link, 'visual_mesh', None)
+    if mesh is None:
+        return link
+    meshes = mesh if isinstance(mesh, (list, tuple)) else [mesh]
+    for m in meshes:
         # 面を持つ primitive は face_colors、点群は vertex_colors。点群に
         # face_colors を入れても例外にはならず、色が付かないまま無視される
         # (trimesh.PointCloud.colors が空のままになる) ので型で振り分ける。
-        attr = 'face_colors' if getattr(mesh, 'faces', None) is not None \
-            else 'vertex_colors'
+        has_faces = getattr(m, 'faces', None) is not None
+        attr = 'face_colors' if has_faces else 'vertex_colors'
         try:
-            setattr(mesh.visual, attr, rgba)
+            setattr(m.visual, attr, rgba)
         except Exception:  # 描画できないほどのことではない
             pass
+        if has_faces and len(rgba) >= 4 and rgba[3] < 255:
+            try:
+                m.visual = trimesh.visual.TextureVisuals(
+                    material=trimesh.visual.material.PBRMaterial(
+                        baseColorFactor=[c / 255.0 for c in rgba],
+                        alphaMode='BLEND'))
+            except Exception:
+                pass
     return link
 
 
@@ -353,7 +397,8 @@ def build_skeleton_links(people, smpl_model=None):
             joints = dict(all_joints)
             joints.update(visible_joints)
             try:
-                result = smpl_body.retarget_and_pose(smpl_model, joints)
+                result = smpl_body.retarget_and_pose(
+                    smpl_model, joints, betas=getattr(person, 'betas', None))
             except Exception:
                 result = None
             if result is not None:
@@ -422,7 +467,6 @@ class PalmPlaneScene(object):
 
     描くもの
       * 半透明の黄色い板 … フィットした手のひら平面
-      * 緑の矢印 … 手のひら法線 (ロボット側を向くはず)
       * 水色の矢印 … 指方向 (手首 -> 指の付け根)
       * 白い球 … フィットに使ったランドマーク
       * 青い球 … 接近目標 (中心 + offset * 法線)
@@ -512,15 +556,17 @@ class PalmPlaneScene(object):
         # 平面まわりの表示物。フィットできたフレームだけ viewer に入れる。
         # plane.rot の局所 +Y が -normal (palm_plane.fit_palm_plane 参照)
         # なので、薄くする軸は y。
-        self.plate = set_color(
-            Box(extents=[PLATE_SIZE, 0.002, PLATE_SIZE]), COLOR_PLATE)
-        self.normal_arrow = set_color(
-            Cylinder(radius=0.004, height=NORMAL_LENGTH), COLOR_NORMAL)
-        self.finger_arrow = set_color(
-            Cylinder(radius=0.003, height=FINGER_LENGTH), COLOR_FINGER)
+        # Box/Cylinder は viser 側が link.concatenated_visual_mesh (構築時に
+        # 一度だけ複製されるキャッシュ) を見て描画するので、set_color() で
+        # 後から visual_mesh を塗っても viser には反映されない。色は
+        # コンストラクタの face_colors で最初から焼き込む。
+        self.plate = Box(extents=[PLATE_SIZE, 0.002, PLATE_SIZE],
+                         face_colors=COLOR_PLATE)
+        self.finger_arrow = Cylinder(radius=0.003, height=FINGER_LENGTH,
+                                     face_colors=COLOR_FINGER)
         self.approach = set_color(Sphere(radius=0.0125), COLOR_APPROACH)
         self.press = set_color(Sphere(radius=0.010), COLOR_PRESS)
-        self.plane_links = [self.plate, self.normal_arrow, self.finger_arrow,
+        self.plane_links = [self.plate, self.finger_arrow,
                             self.approach, self.press]
 
         # ランドマークは有無が毎フレーム変わるので 1 個ずつ出し入れする
@@ -636,9 +682,6 @@ class PalmPlaneScene(object):
 
         self.plate.newcoords(Coordinates(pos=center, rot=plane.rot))
         # 円柱は中心が原点で +Z 方向に伸びるので、始点から半分ずらす
-        self.normal_arrow.newcoords(Coordinates(
-            pos=center + plane.normal * (NORMAL_LENGTH / 2.0),
-            rot=rotation_from_z(plane.normal)))
         self.finger_arrow.newcoords(Coordinates(
             pos=center + plane.finger_dir * (FINGER_LENGTH / 2.0),
             rot=rotation_from_z(plane.finger_dir)))

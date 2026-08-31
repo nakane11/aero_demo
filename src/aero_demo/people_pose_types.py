@@ -60,6 +60,10 @@ class Person3D:
     hidden_limb_names: list = field(default_factory=list)
     hidden_positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
     hidden_bones: list = field(default_factory=list)      # Bone, >=1 endpoint hidden
+    # SMPL の体型パラメータ (10,), aero_demo.smpl_body.retarget_and_pose に
+    # そのまま渡す想定。fake_people_pose_estimator_ros.py だけが埋める --
+    # 本物の推定は体型を推定しないので常に None (平均体型として描かれる)。
+    betas: np.ndarray = None
 
     def position_of(self, limb_name):
         if limb_name not in self.limb_names:

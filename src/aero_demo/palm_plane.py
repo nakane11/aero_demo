@@ -386,7 +386,7 @@ def palm_plane_markers(plane, frame_id, stamp=None, ns='palm_plane',
     plate.scale.x = plate_size
     plate.scale.y = 0.002
     plate.scale.z = plate_size
-    plate.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=0.35)
+    plate.color = ColorRGBA(r=1.0, g=0.55, b=0.15, a=0.55)
     arr.markers.append(plate)
 
     # 1: palm normal.
