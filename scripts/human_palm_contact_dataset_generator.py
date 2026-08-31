@@ -586,8 +586,16 @@ class HumanPalmContactDatasetGenerator(HumanPalmContactBehavior):
             report = self._last_report.get(label)
             if report is None:
                 return None
-            distance, reached = report
-            return {'distance_m': distance, 'reached': bool(reached)}
+            distance, reached, rotation_axis, use_base = report
+            return {
+                'distance_m': distance,
+                'reached': bool(reached),
+                # IK がどの厳密さ (True=3軸厳密/'y'=法線のみ厳密/False=
+                # 位置のみ) と台車設定で収束したか。全滅していれば両方
+                # None (human_palm_contact_behavior.py's _solve_palm_ik 参照)。
+                'rotation_axis': rotation_axis,
+                'use_base': use_base,
+            }
 
         record = {
             'round': self.round_count,

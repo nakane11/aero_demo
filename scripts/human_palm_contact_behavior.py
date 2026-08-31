@@ -48,10 +48,19 @@ Parameters
                                          ``~source: real`` のときだけ true
 ``~use_hand`` (bool, default true)       手付きの URDF を読むか
 ``~hand_side`` (str, default ``R``)      人間が差し出す手、``R`` か ``L``。
-                                         ロボットは同じ側の手で触れる (``R``
-                                         なら右手、``L`` なら左手)
                                          (``~hand`` は推定クラスの
                                          ``~hand/enable`` と衝突するので使わない)
+``~same_hand`` (bool, default true)      ロボットが人間と同じ側の手で触れる
+                                         か。true (既定, これまでの挙動) は
+                                         同じ側の手で触れ、人間と向かい合っ
+                                         て握手のように鏡写しした向きで触れ
+                                         る。false は反対側の手で触れ、人間
+                                         と同じ方向を向いた状態で (鏡写しせ
+                                         ず) 掌平面をそのまま使う。次のラウ
+                                         ンドの ``WAITING`` に入る直前に読み
+                                         直すので、``human_palm_contact_
+                                         behavior_loop.py`` を使えばラウンド
+                                         の合間に rosparam で切り替えられる。
 ``~min_score`` (float, default 0.1)
 ``~viewer`` (str, default ``trimesh``)   ``trimesh`` / ``viser`` / ``none``
 ``~open_browser`` (bool, default false)  ``~viewer: viser`` のときブラウザを
@@ -154,6 +163,15 @@ CART_AVOIDANCE_SAFETY_MARGIN = 0.05  # [m]
 # は検出できないことが多く (肩から先の腕・頭に比べてカメラに映りづらい/
 # 隠れやすい)、そこに頼らず立ち位置まわりに一律に置く。
 HUMAN_FOOT_RADIUS = 0.3
+
+# ~same_hand=False (人間と反対の手で繋ぎ、同じ方向を向く) のとき、whole-
+# body IK (use_base='planar') の種として base_link をどれだけ人間の真横へ
+# ずらすか [m] (_human_facing_xy 参照)。0 のまま (人間の正面) だと、その
+# 場から見て目標がほぼ真後ろになり、IK が届く姿勢を見つけられず暴れる
+# (base_link が発散し、ロボットが視界の外へ消えたように見える) ので、少な
+# くとも掌までの奥行きに近い量はずらしておく必要がある -- 経験的な初期値
+# で、実測して外れているようなら調整すること。
+SAME_DIRECTION_STANDOFF = 0.45  # [m]
 
 
 def _bone_radius(bone_name):
@@ -306,20 +324,56 @@ PalmIkCandidate = namedtuple('PalmIkCandidate', [
     'turn_deg', 'hand_rot', 'approach_coords', 'press_coords'])
 
 
-def palm_plane_to_ik_targets(plane, turn_degs=MIRROR_TURN_CANDIDATES_DEG):
+def _correct_grasp_frame(hand_rot, arm):
+    """``l_eef_grasp_link`` は ``r_eef_grasp_link`` に対して +X (指方向)
+    まわりに 180 度ずれている (甲->掌方向 +Y / 親指<->小指幅 +Z がどちらも
+    反転している) -- 右手・右腕 (十分実績のある基準) のターゲットと左手・
+    左腕のターゲットが、体の左右対称性から数学的に一致するはずの関係に
+    なっているかを実際に計算して確認した。
+    ``shoulder_r``/``shoulder_y``/``wrist_r`` が左右の腕で符号反転するのと
+    同じ、URDF がミラーで作られていることに起因するずれ。
+
+    +X はそのまま、+Y と +Z だけを反転する。1 軸だけ反転すると回転行列で
+    なく鏡映行列 (行列式 -1) になり IK の回転目標として不正になるので、
+    必ず 2 軸同時に反転すること (行列式は +1 のまま保たれる)。
+    """
+    if arm != 'l':
+        return hand_rot
+    return np.column_stack(
+        [hand_rot[:, 0], -hand_rot[:, 1], -hand_rot[:, 2]])
+
+
+def palm_plane_to_ik_targets(plane, turn_degs=MIRROR_TURN_CANDIDATES_DEG,
+                              mirror=True, arm=None):
     """人間の掌平面から、ロボットが IK で解く approach/press ターゲット
     (skrobot ``Coordinates``, base_link frame) の候補群を作る.
 
-    ``turn_degs`` それぞれについて 1 つの ``PalmIkCandidate`` を作る --
+    ``arm`` (``'r'``/``'l'``, 実際に触れに行くロボットの腕) が ``'l'`` なら
+    ``_correct_grasp_frame`` で左腕の URDF のずれを補正する。``None`` のま
+    まなら (呼び出し側で腕がまだ決まっていない等) 補正しない。
+
+    ``mirror`` が True (既定, ``~same_hand`` が true のとき -- 人間と同じ
+    側の手で触れ、向かい合う) なら、``turn_degs`` それぞれについて 1 つの
+    ``PalmIkCandidate`` を作る -- 向きはどちらも ``hand_rot`` (人間の掌姿勢
+    を握手のように鏡写しした向き, ``_mirror_target_rotation``) で揃える。
+
+    ``mirror`` が False (``~same_hand`` が false のとき -- 人間と反対側の
+    手で触れ、人間と同じ方向を向く) なら鏡写しせず、``plane.rot`` をその
+    まま使った候補を 1 つだけ作る -- 向かい合わないぶん指方向を反転させる
+    理由が無く (+X/+Z とも人間自身のものをそのまま使ってよい)、左右の手が
+    互いに鏡像であること自体が握手の鏡写しの役目を果たすので、``turn_deg``
+    による調整は不要 (このとき ``turn_degs`` は無視される)。
+
     ``approach_coords`` はまず触れに行く位置、``press_coords`` はそこから
-    ``EMBED_DEPTH`` だけ掌の中へ押し込んだ位置で、向きはどちらも
-    ``hand_rot`` (人間の掌姿勢を握手のように鏡写しした向き) で揃える。
+    ``EMBED_DEPTH`` だけ掌の中へ押し込んだ位置。
     """
     pos = palm_plane.contact_target(plane)
     embed_pos = plane.center - plane.normal * EMBED_DEPTH
     candidates = []
-    for turn_deg in turn_degs:
-        hand_rot = _mirror_target_rotation(plane.rot, turn_deg=turn_deg)
+    for turn_deg in (turn_degs if mirror else (0.0,)):
+        hand_rot = _mirror_target_rotation(plane.rot, turn_deg=turn_deg) \
+            if mirror else plane.rot
+        hand_rot = _correct_grasp_frame(hand_rot, arm)
         candidates.append(PalmIkCandidate(
             turn_deg=turn_deg,
             hand_rot=hand_rot,
@@ -333,10 +387,19 @@ def palm_plane_to_ik_targets(plane, turn_degs=MIRROR_TURN_CANDIDATES_DEG):
         candidates=candidates)
 
 
-def create_pose_source(name):
-    """``~source`` で選んだ推定クラスのインスタンスを作る."""
+def create_pose_source(name, hand_side=None):
+    """``~source`` で選んだ推定クラスのインスタンスを作る.
+
+    ``~source:=fake`` かつ ``hand_side`` が指定されているときは、fake
+    推定器が差し出す手 (``~present_hand``) をそれに揃えてから作る --
+    揃っていないと、このノードが追跡する ``~hand_side`` と違う手が
+    差し出されてしまう (see human_palm_contact_dataset_generator.py の
+    同様の処理)。
+    """
     name = str(name).lower()
     if name == 'fake':
+        if hand_side:
+            rospy.set_param('~present_hand', hand_side)
         from fake_people_pose_estimator_ros import FakeRosPeoplePoseEstimator
         return FakeRosPeoplePoseEstimator()
     if name == 'real':
@@ -434,10 +497,12 @@ class HumanPalmContactBehavior:
         # まま返ってきた場合など) の結果でロボットを動かすと危険なので使わない。
         self.pose_frame = rospy.get_param('~output_frame', self.base_frame)
         # 名前は ~hand ではなく ~hand_side (~hand/enable と衝突するため)。
-        # ここでいう「手」は差し出す人間側の手。ロボットは同じ側の手で触れる
-        # (人が右手を出したらロボットは右手で、左手を出したら左手で)。
+        # ここでいう「手」は差し出す人間側の手。
         self.hand = str(rospy.get_param('~hand_side', 'R')).upper()[:1]
-        self.arm = 'r' if self.hand == 'R' else 'l'
+        # ロボット側の腕・向きの決め方 (~same_hand) を決める。次ラウンドの
+        # WAITING に入る直前にも呼び直すので、ラウンドの合間に rosparam で
+        # 切り替えられる (see _update_hand_side).
+        self._update_hand_side()
         self.min_score = rospy.get_param('~min_score', 0.1)
 
         self.source_name = str(rospy.get_param('~source', 'real')).lower()
@@ -508,14 +573,20 @@ class HumanPalmContactBehavior:
         self.plane_fit_timeout = rospy.get_param('~plane_fit_timeout', 4.0)
         self._plane_fit_fail_since = None
         # 直近の approach/press の結果 ("approach"/"press" -> (distance
-        # [m], reached))。human_palm_contact_behavior_loop.py が周回ごとの
-        # 成否をまとめるのに使う。
+        # [m], reached, rotation_axis, use_base))。rotation_axis/use_base は
+        # _solve_palm_ik が最後に試みた IK がどの厳密さ・台車設定で解けたか
+        # (解けていなければ None)。human_palm_contact_behavior_loop.py が
+        # 周回ごとの成否をまとめるのに使う。
         self._last_report = {}
+        # _solve_palm_ik が最後に解いた (または解けなかった) 結果
+        # ({'solved', 'rotation_axis', 'use_base'})。_report_reach が
+        # _last_report に転記するまでの橋渡し用。
+        self._last_ik_solve = None
 
         # 姿勢はトピックではなく推定クラスのインスタンスから受け取る。
         # 関節点は estimator 側で base_link 相対に変換済みなので、ここでは
         # TF を引かない。
-        self.source = create_pose_source(self.source_name)
+        self.source = create_pose_source(self.source_name, self.hand)
         self._source_stopped = False
         self.pose_thread = threading.Thread(target=self.pose_loop)
         self.pose_thread.daemon = True
@@ -525,13 +596,28 @@ class HumanPalmContactBehavior:
 
         rospy.loginfo("Human Palm Contact Behavior initialized "
                       "(source=%s human_hand=%sHand robot_arm=%sarm "
-                      "robot_interface=%s). Waiting for human...",
-                      self.source_name, self.hand, self.arm, self.use_ri)
+                      "same_hand=%s robot_interface=%s). Waiting for human...",
+                      self.source_name, self.hand, self.arm, self.same_hand,
+                      self.use_ri)
         if self.source_name == 'real':
             rospy.loginfo("Note: requires the pose estimator's hand tracking "
                           "(~hand/enable:=true) and the depth/color/info "
                           "topics remapped onto ~input, ~input/depth and "
                           "~input/info.")
+
+    def _update_hand_side(self):
+        """``~same_hand`` を読み直し、ロボットが使う腕を決める.
+
+        true (既定): 人間と同じ側の手で触れる (向かい合う, 従来の挙動)。
+        false: 人間と反対側の手で触れる (人間と同じ方向を向く) -- 使う腕を
+        入れ替えるだけで、鏡写しするかどうかの向きの計算は
+        ``palm_plane_to_ik_targets`` (``_lock_target`` が ``mirror=self.
+        same_hand`` で呼ぶ) 側の仕事。
+        """
+        self.same_hand = bool(rospy.get_param('~same_hand', True))
+        robot_hand = self.hand if self.same_hand \
+            else ('L' if self.hand == 'R' else 'R')
+        self.arm = 'r' if robot_hand == 'R' else 'l'
 
     # ------------------------------------------------------------------
     # viewer
@@ -639,6 +725,31 @@ class HumanPalmContactBehavior:
         if ref is not None:
             return np.asarray(ref, dtype=np.float64)[:2]
         return None
+
+    @staticmethod
+    def _human_facing_xy(person):
+        """人間の体が向いている水平方向 (x, y の単位ベクトル) を肩の並びか
+        ら推定する (両肩が見えていなければ None).
+
+        ``LShoulder - RShoulder`` が人間自身の「左」方向 (
+        ``fake_people_pose_estimator_ros.py`` の ``_body_positions`` と同じ
+        ``yh`` )。正面 (``xh``) はそれを鉛直軸まわりに -90 度回した向き
+        (``yh = R(90) xh`` の関係から ``xh = R(-90) yh``)。掌平面だけでは
+        「どちらを向いているか」までは分からない (``palm_plane.fit_palm_
+        plane`` の法線は手のひら自身の向きで、体の正面とは別) ので、
+        ``~same_hand=False`` (人間と同じ方向を向く) の IK 種を作るのに使う。
+        """
+        r = person.position_of('RShoulder')
+        l = person.position_of('LShoulder')
+        if r is None or l is None:
+            return None
+        lateral = (np.asarray(l, dtype=np.float64)[:2]
+                  - np.asarray(r, dtype=np.float64)[:2])
+        norm = float(np.linalg.norm(lateral))
+        if norm < 1e-6:
+            return None
+        lateral /= norm
+        return np.array([lateral[1], -lateral[0]])
 
     def _best_palm(self, result):
         """最初の有効な人物とその手のひら平面を返す.
@@ -773,7 +884,8 @@ class HumanPalmContactBehavior:
         # 人間の指方向の矢印を描くのに使う。target_hand_rot は候補
         # (±90度) のうちどれが解けるか control_loop が試すまで決まらない
         # ので、ここでは None のままにする。
-        self._ik_targets = palm_plane_to_ik_targets(plane)
+        self._ik_targets = palm_plane_to_ik_targets(
+            plane, mirror=self.same_hand, arm=self.arm)
         self.target_palm_pos = self._ik_targets.pos
         self.target_palm_rot = self._ik_targets.rot
         self.target_palm_center = self._ik_targets.center
@@ -851,7 +963,13 @@ class HumanPalmContactBehavior:
             end_coords.worldpos()
             - np.asarray(target, dtype=np.float64)))
         reached = distance <= 0.02
-        self._last_report[label] = (distance, reached)
+        # rotation_axis/use_base: 直前の _solve_palm_ik がどの厳密さ・台車
+        # 設定で解けたか (解けていなければ両方 None) -- _solve_palm_ik
+        # 参照。dataset generator の log.jsonl はこれをそのまま書き出す。
+        ik_solve = self._last_ik_solve or {}
+        self._last_report[label] = (
+            distance, reached,
+            ik_solve.get('rotation_axis'), ik_solve.get('use_base'))
         if reached:
             rospy.loginfo('%s pose: %.1f mm from the target',
                           label, distance * 1000.0)
@@ -943,6 +1061,8 @@ class HumanPalmContactBehavior:
             self.scene.update_ik_target(target_coords)
 
         def try_ik(base_choice):
+            """Returns (solved, rotation_axis) -- rotation_axis is whichever
+            of True/'y'/False converged, or None if all three failed."""
             for rotation_axis in (True, 'y', False):
                 try:
                     res = whole_body.inverse_kinematics(
@@ -953,27 +1073,43 @@ class HumanPalmContactBehavior:
                                   rotation_axis, e)
                     res = False
                 if res is not False:
-                    return True
-            return False
+                    rospy.loginfo("IK converged with rotation_axis=%r "
+                                  "(use_base=%r).", rotation_axis, base_choice)
+                    return True, rotation_axis
+                rospy.logwarn("IK did not converge with rotation_axis=%r "
+                              "(use_base=%r); %s.", rotation_axis, base_choice,
+                              "trying a looser rotation_axis"
+                              if rotation_axis is not False
+                              else "giving up on this target_coords")
+            return False, None
 
-        if not try_ik(use_base):
-            return False
-        if use_base is None:
-            return True
+        # 最終的にどの (rotation_axis, use_base) で解けた/解けなかったかを
+        # _report_reach 経由で _last_report に残す (dataset generator の
+        # log.jsonl 出力用)。
+        solved, rotation_axis = try_ik(use_base)
+        final_use_base = use_base
 
-        pushed_xy = self._clear_cart_from_foot(foot_sdf)
-        if pushed_xy is None:
-            return True
+        if solved and use_base is not None:
+            pushed_xy = self._clear_cart_from_foot(foot_sdf)
+            if pushed_xy is not None:
+                rospy.logwarn(
+                    "IK moved the cart to within %.0f mm of the human's "
+                    "feet; pushing it clear and re-solving the arm with "
+                    "the cart fixed there.",
+                    CART_AVOIDANCE_SAFETY_MARGIN * 1000.0)
+                theta, _, _ = matrix2ypr(self.robot.rotation)
+                self.robot.newcoords(Coordinates(
+                    pos=[pushed_xy[0], pushed_xy[1], 0.0],
+                    rot=rpy_matrix(theta, 0.0, 0.0)))
+                solved, rotation_axis = try_ik(None)
+                final_use_base = None
 
-        rospy.logwarn(
-            "IK moved the cart to within %.0f mm of the human's feet; "
-            "pushing it clear and re-solving the arm with the cart fixed "
-            "there.", CART_AVOIDANCE_SAFETY_MARGIN * 1000.0)
-        theta, _, _ = matrix2ypr(self.robot.rotation)
-        self.robot.newcoords(Coordinates(
-            pos=[pushed_xy[0], pushed_xy[1], 0.0],
-            rot=rpy_matrix(theta, 0.0, 0.0)))
-        return try_ik(None)
+        self._last_ik_solve = {
+            'solved': solved,
+            'rotation_axis': rotation_axis if solved else None,
+            'use_base': final_use_base if solved else None,
+        }
+        return solved
 
     def _solve_palm_ik_candidates(self, whole_body, candidates, coords_attr,
                                    use_base=None, foot_sdf=None):
@@ -1161,20 +1297,85 @@ class HumanPalmContactBehavior:
             av_start_approach = get_robot_config(
                 self.robot, joint_list, with_base=False)
 
-            getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
-                .joint_angle(-0.4)
-            getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
-                .joint_angle(0.2 * mirror)
-            getattr(self.robot, '{}_shoulder_y_joint'.format(self.arm)) \
-                .joint_angle(0.5 * mirror)
-            getattr(self.robot, '{}_elbow_joint'.format(self.arm)) \
-                .joint_angle(-1.2)
-            getattr(self.robot, '{}_wrist_y_joint'.format(self.arm)) \
-                .joint_angle(0.0)
-            getattr(self.robot, '{}_wrist_p_joint'.format(self.arm)) \
-                .joint_angle(0.087)
-            getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
-                .joint_angle(0.436 * mirror)
+            if self.same_hand:
+                # 向かい合って握手のように前へ伸ばす自然な肘の構え。
+                getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
+                    .joint_angle(-0.4)
+                getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
+                    .joint_angle(0.2 * mirror)
+                getattr(self.robot, '{}_shoulder_y_joint'.format(self.arm)) \
+                    .joint_angle(0.5 * mirror)
+                getattr(self.robot, '{}_elbow_joint'.format(self.arm)) \
+                    .joint_angle(-1.2)
+                getattr(self.robot, '{}_wrist_y_joint'.format(self.arm)) \
+                    .joint_angle(0.0)
+                getattr(self.robot, '{}_wrist_p_joint'.format(self.arm)) \
+                    .joint_angle(0.087)
+                getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
+                    .joint_angle(0.436 * mirror)
+            else:
+                # 同じ方向を向いて横に並び、手をつなぐ構え。目標は体の正面
+                # ではなく横 (人間の側) にあるので、上の「前へ伸ばす」種を
+                # そのまま使うと種と目標の姿勢差が大きすぎて IK が迷走しや
+                # すい (round_pause 前後で見えなくなる不具合の一因)。肩を
+                # 前へ挙げる (shoulder_p) 代わりに横へ開き (shoulder_r) 、
+                # 手首もひねらないニュートラルな構えにしておく。
+                # (経験的な初期値。実機/シミュレータでの収束率を見ながら
+                # 調整すること -- shoulder_r/y の可動域は shoulder_p/elbow/
+                # wrist_p/wrist_y ほど厳密に把握していない。)
+                getattr(self.robot, '{}_shoulder_p_joint'.format(self.arm)) \
+                    .joint_angle(0.0)
+                getattr(self.robot, '{}_shoulder_r_joint'.format(self.arm)) \
+                    .joint_angle(0.8 * mirror)
+                getattr(self.robot, '{}_shoulder_y_joint'.format(self.arm)) \
+                    .joint_angle(0.0)
+                getattr(self.robot, '{}_elbow_joint'.format(self.arm)) \
+                    .joint_angle(-1.0)
+                getattr(self.robot, '{}_wrist_y_joint'.format(self.arm)) \
+                    .joint_angle(0.0)
+                getattr(self.robot, '{}_wrist_p_joint'.format(self.arm)) \
+                    .joint_angle(0.087)
+                getattr(self.robot, '{}_wrist_r_joint'.format(self.arm)) \
+                    .joint_angle(0.0)
+
+            # ~same_hand が False (人間と反対の手で繋ぐ) のときは、ロボット
+            # は人間と向かい合うのではなく同じ方向を向く。回転だけを種にし
+            # て位置は変えないと、目標が体の正面ではなくほぼ真後ろになって
+            # しまい、whole-body IK (use_base='planar' で base_link 自体も
+            # 動かせる) の探索が不安定になりやすい (round_pause 前後でロボ
+            # ットが見えなくなる不具合の一因だった)。そこで向きだけでなく
+            # 立ち位置も、人間の正面方向 (肩のラインから推定,
+            # _human_facing_xy) の真横へずらした姿勢を種にする。人間の正面
+            # 方向が分からなければ (肩が見えていなければ) 何もせず、従来通
+            # り向かい合う想定の種のまま IK に任せる。
+            #
+            # base_link は 'planar' のときだけモデル内で動く仮想関節で、実
+            # 機へは角度指令 (angle_vector) しか送らない (_move_avoiding_
+            # human 冒頭のコメント参照) ので、ここでの移動・回転はあくまで
+            # IK の種であり、実機の台車を動かすものではない。
+            if not self.same_hand:
+                facing = self._human_facing_xy(self._locked_person) \
+                    if self._locked_person is not None else None
+                if facing is None:
+                    rospy.logwarn(
+                        "same_hand=False: could not tell which way the "
+                        "human is facing (shoulders not visible); using "
+                        "the default (face-to-face) IK seed instead.")
+                else:
+                    yaw = math.atan2(facing[1], facing[0])
+                    # 人間の「左」方向。ロボットが左腕で触れるなら人間の
+                    # 右側に、右腕で触れるなら人間の左側に立ちたいので、
+                    # 目標位置からこの方向へ立ち位置をずらす符号は腕の左右
+                    # で反転する。
+                    human_left = np.array([-facing[1], facing[0]])
+                    side = 1.0 if self.arm == 'r' else -1.0
+                    target_xy = np.asarray(
+                        self._ik_targets.pos[:2], dtype=np.float64)
+                    base_xy = target_xy \
+                        + side * SAME_DIRECTION_STANDOFF * human_left
+                    self.robot.base_link.newcoords(Coordinates(
+                        pos=[base_xy[0], base_xy[1], 0.0],
+                        rot=rpy_matrix(yaw, 0.0, 0.0)))
 
             # Each candidate carries a differently-turned mirrored handshake
             # orientation (see MIRROR_TURN_CANDIDATES_DEG /

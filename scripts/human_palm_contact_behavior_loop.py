@@ -28,6 +28,16 @@ All of ``human_palm_contact_behavior.py``'s parameters, plus
                                          を読む時間と、直前の押し込みの絵が
                                          一瞬で次の人に上書きされないための
                                          もの。
+
+``~same_hand`` / ``~hand_side`` (どちらも ``human_palm_contact_behavior.py``
+のパラメータだが、このノードは次のラウンドの ``WAITING`` に入る直前に毎回
+読み直す) ので、ラウンドの合間に ``rosparam set /<node>/same_hand <bool>``
+や ``rosparam set /<node>/hand_side <R|L>`` で切り替えられる。``~same_hand``
+は true (既定) が人間と同じ側の手で触れて向かい合い、false が反対側の手で
+触れて人間と同じ方向を向く。``~hand_side`` を切り替えると、次に生成する
+fake 推定器の ``~present_hand`` (差し出す手) も自動でそれに揃う
+(``create_pose_source`` 参照) ので、差し出される手と追跡する手がずれる
+ことはない。
 """
 
 import os
@@ -95,16 +105,26 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
         ok = bool(approach and approach[1] and press and press[1])
 
         angles = getattr(self.source, 'presented_arm_angles', None)
+        # fake_people_pose_estimator_ros.FakeRosPeoplePoseEstimator only
+        # (~source:=real has no ~seed); lets a round be reproduced later
+        # via ~seed:=<this value> without having to dig it out of the
+        # "fake_people_pose_estimator: seed=..." line logged separately
+        # when the source was created (see _start_next_round).
+        seed = getattr(self.source, 'seed', None)
         self.contact_results.append(dict(
             round=self.round_count,
             ok=ok,
             approach_mm=approach[0] * 1000.0 if approach else None,
             press_mm=press[0] * 1000.0 if press else None,
             angles=dict(angles) if angles else None,
+            seed=seed,
+            same_hand=self.same_hand,
         ))
 
-        lines = ['Round {}: {}'.format(
-            self.round_count, 'contact OK' if ok else 'FAILED')]
+        lines = ['Round {}: {}{} (same_hand={} robot_arm={}arm)'.format(
+            self.round_count, 'contact OK' if ok else 'FAILED',
+            ' (seed={})'.format(seed) if seed is not None else '',
+            self.same_hand, self.arm)]
         if angles:
             lines.append('offered-arm angles [deg]:')
             lines += ['  {} = {:.1f}'.format(k, v)
@@ -150,6 +170,17 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
         if self.scene is not None:
             self.scene.update_ik_target(None)
 
+        # ~hand_side / ~same_hand をラウンドごとに読み直す (rosparam で
+        # 切り替えられるようにするため, see
+        # HumanPalmContactBehavior._update_hand_side)。~hand_side が変われば
+        # 次に作る fake 推定器の ~present_hand もそれに揃える必要がある
+        # (create_pose_source 参照)。使う腕が変われば viewer が追う手先座標系
+        # も合わせて張り替える。
+        self.hand = str(rospy.get_param('~hand_side', self.hand)).upper()[:1]
+        self._update_hand_side()
+        if self.scene is not None:
+            self.scene.track_hand('{}arm_end_coords'.format(self.arm))
+
         self.target_palm_pos = None
         self.target_palm_rot = None
         self.target_hand_rot = None
@@ -163,7 +194,7 @@ class HumanPalmContactLoopBehavior(HumanPalmContactBehavior):
         # おく (先に起動すると起動直後の条件チェックで即座に抜けてしまう)。
         self.state = "WAITING"
         self.state_start_time = rospy.Time.now()
-        self.source = create_pose_source(self.source_name)
+        self.source = create_pose_source(self.source_name, self.hand)
         self._source_stopped = False
         self.pose_thread = threading.Thread(target=self.pose_loop)
         self.pose_thread.daemon = True
