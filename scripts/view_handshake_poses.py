@@ -2,8 +2,8 @@
 # -*- coding:utf-8 -*-
 
 """``solve_palm_ik.py`` が出力したロボットの位置姿勢・関節角度 JSON
-(``test_palm_pose_pipeline/handshakes/human_xxx.json``) と、対応する
-SMPL モデル (``test_palm_pose_pipeline/skeletons/human_xxx.json`` の
+(``random_handshake_poses/human_xxx.json``) と、対応する
+SMPL モデル (``random_human_poses/human_xxx.json`` の
 ``smpl.pose``/``betas``/``root_pos``/``gender``) をファイル名で突き合わせ
 て読み込み、scikit-robot の viser ビューアで並べて表示する。
 
@@ -19,9 +19,8 @@ poses.py`` と共有の ``aero_demo.viewer_nav`` を使う。
 
 Usage
 -----
-    rosrun aero_demo solve_palm_ik.py \
-        --input-dir test_palm_pose_pipeline/palms \
-        --output-dir test_palm_pose_pipeline/handshakes
+    rosrun aero_demo generate_random_human_poses.py --num-samples 100
+    rosrun aero_demo solve_palm_ik.py
     rosrun aero_demo view_handshake_poses.py
 
 viser はブラウザで表示するビューアなので、実行するとブラウザが開く
@@ -135,17 +134,17 @@ def main():
                     'だけ)。')
     parser.add_argument(
         '--skeleton-dir', type=str,
-        default=os.path.join(
-            _THIS_DIR, 'test_palm_pose_pipeline', 'skeletons'),
+        default=os.path.join(_THIS_DIR, 'random_human_poses'),
         help='SMPL pose/betas/root_pos を持つ骨格 JSON のディレクトリ '
-            '(既定は test_palm_pose_pipeline/skeletons/)。')
+            '(既定は generate_random_human_poses.py の既定の出力先と '
+            '同じ random_human_poses/)。')
     parser.add_argument(
         '--handshake-dir', type=str,
-        default=os.path.join(
-            _THIS_DIR, 'test_palm_pose_pipeline', 'handshakes'),
+        default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
         help='solve_palm_ik.py が出力した JSON のディレクトリ (既定は '
-            'test_palm_pose_pipeline/handshakes/。skeleton-dir と同じ '
-            'ファイル名で対応させる)。')
+            'solve_palm_ik.py の既定の出力先と同じ '
+            'random_handshake_poses/。skeleton-dir と同じファイル名で '
+            '対応させる)。')
     parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(

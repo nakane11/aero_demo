@@ -86,27 +86,25 @@ SMPL のモデルファイル (`.pkl`) はライセンス上リポジトリに�
 男性モデルのみで続行する。
 
 ```bash
+cd scripts
+
 # 1. ランダムな人物姿勢を 100 体生成 (既定の保存先 scripts/random_human_poses/ に保存)
-rosrun aero_demo generate_random_human_poses.py --num-samples 100
+python3 generate_random_human_poses.py --num-samples 100
 
 # 2. 骨格から左右の掌の位置姿勢を推定 (既定で 1. の出力を読み、scripts/random_palm_poses/ に保存)
-rosrun aero_demo estimate_palm_poses.py
+python3 estimate_palm_poses.py
 
 # 3. viser で表示 (既定で 1./2. の出力を読む)
-rosrun aero_demo draw_random_human_poses.py
+python3 draw_random_human_poses.py
 
 # 4. 人間の左手 (既定) にロボットの右腕 (既定) で触れる全身 IK を解く
 #    (既定の入力先・出力先は scripts/test_palm_pose_pipeline/palms/ と
 #     .../handshakes/ -- 1.-3. で使う random_human_poses/ とは別のディレクトリ
 #     なので、1.-3. の結果を渡したいときは下記のように明示的に指定する)
-rosrun aero_demo solve_palm_ik.py \
-    --input-dir scripts/random_palm_poses \
-    --output-dir scripts/random_handshake_poses
+python3 solve_palm_ik.py
 
 # 5. SMPL メッシュ + ロボットモデルを viser で表示 (4. の結果と、1. の骨格を対応づける)
-rosrun aero_demo view_handshake_poses.py \
-    --skeleton-dir scripts/random_human_poses \
-    --handshake-dir scripts/random_handshake_poses
+python3 view_handshake_poses.py
 ```
 
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
@@ -122,8 +120,8 @@ rosrun aero_demo view_handshake_poses.py \
 palm_poses.py` が書き出す固定サンプル) を使う:
 
 ```bash
-rosrun aero_demo solve_palm_ik.py          # test_palm_pose_pipeline/palms/ -> handshakes/
-rosrun aero_demo view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handshakes/
+python3 solve_palm_ik.py          # test_palm_pose_pipeline/palms/ -> handshakes/
+python3 view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handshakes/
 ```
 
 `draw_random_human_poses.py`/`view_handshake_poses.py` は viser の
