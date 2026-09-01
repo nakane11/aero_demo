@@ -234,7 +234,7 @@ def main():
         if direction == 0:
             print('ブラウザクライアントが切断されました。中断します。')
             break
-        if label is not None:
+        if label is not viewer_nav.NOT_PRESSED:
             viewer_nav.save_label(handshake_path, label)
             print('  -> {} として {} に記録しました。'.format(
                 'Good' if label else 'Bad', handshake_path))

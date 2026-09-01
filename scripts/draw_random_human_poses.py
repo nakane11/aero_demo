@@ -13,11 +13,12 @@ palm_poses.OfferedHandSelector``) も読み、選ばれた手の骨格・ラン�
 描き分ける -- どちらの手も差し出していないと判定された (``offered_hand``
 が ``null``) 人物は両手とも白になる。掌 JSON 自体が無い人物だけは、
 判定結果が存在しないので従来どおりの配色 (右手=赤, 左手=青) で描く。
-``--advance-mode manual`` (既定) では viser 画面に Good/Bad ボタンも表示
-され、押すと表示中の掌の位置姿勢が正しいかどうかの判定結果
-(``human_label``: ``true``: Good/``false``: Bad) が対応する掌 JSON に
-書き込まれる (Next と同様に次の人物へ進む)。書き込まれたラベルは
-viser 画面のテキストパネルにも表示される。
+``--advance-mode manual`` (既定) では viser 画面に Right/Left/Null ボタンも
+表示され、押すと「実際にはどちらの手を差し出しているか」の人手判定結果
+(``human_label``: ``'R'``/``'L'``/``null``, ``estimate_palm_poses.
+PalmPoseEstimator.estimate`` が返す ``offered_hand`` と同じ値) が対応する
+掌 JSON に書き込まれる (Next と同様に次の人物へ進む)。書き込まれたラベル
+は viser 画面のテキストパネルにも表示される。
 
 SMPL メッシュは JSON に保存済みの ``smpl.pose``/``smpl.betas``/``smpl.
 root_pos``/``smpl.gender`` から ``aero_demo.smpl_body.forward_world`` で
@@ -98,6 +99,13 @@ HAND_POINT_COLOR = {'R': [255, 60, 60, 255], 'L': [60, 120, 255, 255]}
 # しないので、この色分けは使わず従来どおりの左右の色分けで描く。
 COLOR_OFFERED_HAND = palm_plane_view.COLOR_BONES['rhand']
 COLOR_NOT_OFFERED_HAND = [255, 255, 255, 255]
+
+# 人手判定 (Right/Left/Null ボタン) の値と表示名。``estimate_palm_poses.
+# PalmPoseEstimator.estimate`` が返す ``offered_hand`` と同じ値
+# (``'R'``/``'L'``/``None``) を使うので、人手判定と自動判定をそのまま
+# 突き合わせられる。
+OFFERED_HAND_BUTTONS = [('Right', 'R'), ('Left', 'L'), ('Null', None)]
+OFFERED_HAND_LABEL_NAMES = {'R': 'Right', 'L': 'Left', None: 'Null'}
 
 # 骨格の関節同士のつながり (関節名のペア)。people_pose_estimator.
 # PeoplePoseEstimator の limb_sequence/index2limbname と同じ骨格の
@@ -432,13 +440,12 @@ def main():
 
     nav = None
     if args.advance_mode == 'manual':
-        nav = viewer_nav.ManualNav(viewer)
-    # 表示中の人物の Good/Bad 判定結果 (掌 JSON の human_label) を出す
-    # テキストパネル。押されたら palm_path 側の JSON にも書き込まれるので
-    # (viewer_nav.save_label)、次に表示するときにここで読み直して見た目にも
-    # 反映する。
-    label_text = viewer._server.gui.add_markdown(
-        viewer_nav.format_label_text(None, title='掌ラベル'))
+        nav = viewer_nav.ManualNav(viewer, buttons=OFFERED_HAND_BUTTONS)
+    # 表示中の人物の Right/Left/Null 判定結果 (掌 JSON の human_label) を
+    # 出すテキストパネル。押されたら palm_path 側の JSON にも書き込まれる
+    # ので (viewer_nav.save_label)、次に表示するときにここで読み直して
+    # 見た目にも反映する。
+    label_text = viewer._server.gui.add_markdown('')
 
     image_module = None
     if args.output_dir:
@@ -477,7 +484,8 @@ def main():
             viewer.add(skeleton_link)
 
         label_text.content = viewer_nav.format_label_text(
-            viewer_nav.load_label(palm_path), title='掌ラベル')
+            viewer_nav.load_label(palm_path, default=viewer_nav.UNLABELED),
+            title='掌ラベル', value_names=OFFERED_HAND_LABEL_NAMES)
         for side, axis in palm_axes.items():
             palm = palms.get(side) if palms else None
             if palm is None:
@@ -532,10 +540,10 @@ def main():
         if direction is None:
             print('ブラウザクライアントが切断されました。中断します。')
             break
-        if label is not None:
+        if label is not viewer_nav.NOT_PRESSED:
             viewer_nav.save_label(palm_path, label)
             print('  -> {} として {} に記録しました。'.format(
-                'Good' if label else 'Bad', palm_path))
+                OFFERED_HAND_LABEL_NAMES[label], palm_path))
         # 先頭で Back を押しても終了しない (0 未満にはしない) よう下限を
         # クランプする。末尾で Next を押した場合は (auto で最後まで
         # 表示し終わったときと同じく) そのままループを抜けて終了する。
