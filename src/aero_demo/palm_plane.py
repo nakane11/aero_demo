@@ -25,20 +25,17 @@ demanding a fixed quadruple, we fit a plane by SVD to whichever of
 ``PLANE_LANDMARKS`` arrived, which both raises the hit rate to ~100% and
 averages out per-landmark jitter.
 
-The module deliberately depends only on numpy and ROS messages (no
-skrobot), so the fitting itself runs on a machine without the robot model.
-The RViz marker helpers below are kept for ``human_palm_contact_behavior``
-and for anyone who still wants markers; the visualiser draws the same
-geometry with skrobot's viewer instead.
+The module depends only on numpy (no ROS messages, no skrobot), so the
+fitting itself runs on a machine without the robot model *and* without a
+ROS install (e.g. estimate_palm_poses.py's synthetic pipeline). RViz
+MarkerArray visualisation used to live here too; it was dropped in favour
+of drawing the same geometry with skrobot's viewer instead (see
+``aero_demo.palm_plane_view`` / ``draw_random_human_poses.py``).
 """
 
-import math
 from collections import namedtuple
 
 import numpy as np
-from geometry_msgs.msg import Point
-from std_msgs.msg import ColorRGBA
-from visualization_msgs.msg import Marker, MarkerArray
 
 # --- MediaPipe hand-landmark indices -------------------------------------
 # published by people_pose_estimation_mediapipe.py as "RHand0".."RHand20"
@@ -60,11 +57,6 @@ PLANE_LANDMARKS = (WRIST_INDEX,) + MCP_INDICES
 # tell the palm side from the back of the hand.  Values only need the
 # right relative order/spacing, not any particular unit.
 MCP_LATERAL_RANK = {5: 1.5, 9: 0.5, 13: -0.5, 17: -1.5}
-
-LANDMARK_LABELS = {
-    0: 'wrist', 1: 'thumb_cmc', 5: 'index_mcp', 9: 'middle_mcp',
-    13: 'ring_mcp', 17: 'pinky_mcp',
-}
 
 # --- fit quality gates ---------------------------------------------------
 # A plane needs 3 non-collinear points.
@@ -310,159 +302,3 @@ def embed_target(plane, depth=EMBED_DEPTH):
     return plane.center - plane.normal * depth
 
 
-def _matrix_to_quaternion_xyzw(m):
-    """3x3 rotation matrix -> [x, y, z, w] (ROS message order)."""
-    trace = m[0, 0] + m[1, 1] + m[2, 2]
-    if trace > 0.0:
-        s = math.sqrt(trace + 1.0) * 2.0
-        w = 0.25 * s
-        x = (m[2, 1] - m[1, 2]) / s
-        y = (m[0, 2] - m[2, 0]) / s
-        z = (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        w = (m[2, 1] - m[1, 2]) / s
-        x = 0.25 * s
-        y = (m[0, 1] + m[1, 0]) / s
-        z = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        w = (m[0, 2] - m[2, 0]) / s
-        x = (m[0, 1] + m[1, 0]) / s
-        y = 0.25 * s
-        z = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-        w = (m[1, 0] - m[0, 1]) / s
-        x = (m[0, 2] + m[2, 0]) / s
-        y = (m[1, 2] + m[2, 1]) / s
-        z = 0.25 * s
-    return [x, y, z, w]
-
-
-def _base_marker(frame_id, stamp, ns, marker_id, m_type, lifetime):
-    m = Marker()
-    m.header.frame_id = frame_id
-    if stamp is not None:
-        m.header.stamp = stamp
-    m.ns = ns
-    m.id = marker_id
-    m.type = m_type
-    m.action = Marker.ADD
-    m.pose.orientation.w = 1.0
-    if lifetime is not None:
-        m.lifetime = lifetime
-    return m
-
-
-def palm_plane_markers(plane, frame_id, stamp=None, ns='palm_plane',
-                       lifetime=None, plate_size=0.12,
-                       contact_offset=CONTACT_OFFSET,
-                       embed_depth=EMBED_DEPTH, label=''):
-    """Build a MarkerArray visualising a fitted palm plane.
-
-    Contents
-    --------
-    0 : translucent plate lying in the fitted plane (the palm surface)
-    1 : green arrow along the palm normal, from the palm centre
-    2 : cyan arrow along the finger direction (in-plane, for orientation)
-    3 : white spheres at the landmarks that were actually fitted
-    4 : blue sphere at the approach target (centre + offset * normal)
-    5 : red sphere at the press target (centre - depth * normal)
-    6 : text with the fit diagnostics
-    """
-    arr = MarkerArray()
-
-    quat = _matrix_to_quaternion_xyzw(plane.rot)
-
-    # 0: the fitted plane, drawn as a thin plate.  Local +Y is -normal
-    # (see palm_plane.fit_palm_plane), so the flat dimensions are x and z.
-    plate = _base_marker(frame_id, stamp, ns, 0, Marker.CUBE, lifetime)
-    plate.pose.position = Point(*plane.center)
-    plate.pose.orientation.x = quat[0]
-    plate.pose.orientation.y = quat[1]
-    plate.pose.orientation.z = quat[2]
-    plate.pose.orientation.w = quat[3]
-    plate.scale.x = plate_size
-    plate.scale.y = 0.002
-    plate.scale.z = plate_size
-    plate.color = ColorRGBA(r=1.0, g=0.55, b=0.15, a=0.55)
-    arr.markers.append(plate)
-
-    # 1: palm normal.
-    normal_arrow = _base_marker(frame_id, stamp, ns, 1, Marker.ARROW, lifetime)
-    normal_arrow.points = [Point(*plane.center),
-                           Point(*(plane.center + plane.normal * 0.15))]
-    normal_arrow.scale.x = 0.008   # shaft diameter
-    normal_arrow.scale.y = 0.02    # head diameter
-    normal_arrow.scale.z = 0.03    # head length
-    normal_arrow.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-    arr.markers.append(normal_arrow)
-
-    # 2: finger direction, so the frame's roll is visible too.
-    finger_arrow = _base_marker(frame_id, stamp, ns, 2, Marker.ARROW, lifetime)
-    finger_arrow.points = [Point(*plane.center),
-                           Point(*(plane.center + plane.finger_dir * 0.08))]
-    finger_arrow.scale.x = 0.005
-    finger_arrow.scale.y = 0.014
-    finger_arrow.scale.z = 0.02
-    finger_arrow.color = ColorRGBA(r=0.0, g=0.8, b=1.0, a=1.0)
-    arr.markers.append(finger_arrow)
-
-    # 4: approach target.
-    approach = _base_marker(frame_id, stamp, ns, 4, Marker.SPHERE, lifetime)
-    approach.pose.position = Point(*contact_target(plane, contact_offset))
-    approach.scale.x = approach.scale.y = approach.scale.z = 0.025
-    approach.color = ColorRGBA(r=0.2, g=0.4, b=1.0, a=1.0)
-    arr.markers.append(approach)
-
-    # 5: press-into-the-palm target.
-    press = _base_marker(frame_id, stamp, ns, 5, Marker.SPHERE, lifetime)
-    press.pose.position = Point(*embed_target(plane, embed_depth))
-    press.scale.x = press.scale.y = press.scale.z = 0.02
-    press.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
-    arr.markers.append(press)
-
-    # 6: diagnostics.
-    text = _base_marker(frame_id, stamp, ns, 6, Marker.TEXT_VIEW_FACING,
-                        lifetime)
-    text.pose.position = Point(*(plane.center + plane.normal * 0.18))
-    text.scale.z = 0.03
-    text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-    used = ','.join(LANDMARK_LABELS.get(i, str(i)) for i in plane.used)
-    text.text = '{}n={} [{}]\nrms={:.1f}mm span={:.0f}mm ratio={:.2f}'.format(
-        label + '\n' if label else '',
-        len(plane.used), used, plane.rms * 1000.0,
-        plane.span * 1000.0, plane.span_ratio)
-    arr.markers.append(text)
-    return arr
-
-
-def palm_landmark_markers(points, frame_id, stamp=None, ns='palm_plane',
-                          marker_id=3, lifetime=None, used=None):
-    """Spheres at the raw palm landmarks (fitted ones white, others grey)."""
-    arr = MarkerArray()
-    if not points:
-        return arr
-    used = set(used or points.keys())
-    fitted = _base_marker(frame_id, stamp, ns, marker_id, Marker.SPHERE_LIST,
-                          lifetime)
-    fitted.scale.x = fitted.scale.y = fitted.scale.z = 0.015
-    fitted.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-    for i in sorted(points):
-        if i in used:
-            fitted.points.append(Point(*points[i]))
-    if fitted.points:
-        arr.markers.append(fitted)
-    return arr
-
-
-def delete_all_marker(frame_id, ns='palm_plane'):
-    """A DELETEALL marker, to clear stale visualisation."""
-    arr = MarkerArray()
-    m = Marker()
-    m.header.frame_id = frame_id
-    m.ns = ns
-    m.action = Marker.DELETEALL
-    arr.markers.append(m)
-    return arr
