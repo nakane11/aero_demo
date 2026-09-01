@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# -*- coding:utf-8 -*-
+
+"""``solve_palm_ik.py`` が出力したロボットの位置姿勢・関節角度 JSON
+(``test_palm_pose_pipeline/handshakes/human_xxx.json``) と、対応する
+SMPL モデル (``test_palm_pose_pipeline/skeletons/human_xxx.json`` の
+``smpl.pose``/``betas``/``root_pos``/``gender``) をファイル名で突き合わせ
+て読み込み、scikit-robot の viser ビューアで並べて表示する。
+
+``draw_random_human_poses.py`` と違い、ビューアには SMPL メッシュとロボット
+モデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマーク球・ワールド
+Axis・カメラは描かない)。viser 画面には Back/Next ボタンに加え Good/Bad
+ボタンも表示され、押すと表示中の IK 結果が正しいかどうかの判定結果
+(``human_label``: ``true``: Good/``false``: Bad) が対応する handshakes
+ディレクトリの JSON に書き込まれる (Next と同様に次の人物へ進む)。書き
+込まれたラベルは viser 画面のテキストパネルにも表示される。共通の
+Back/Next/Good/Bad ボタンや判定結果の読み書きは ``draw_random_human_
+poses.py`` と共有の ``aero_demo.viewer_nav`` を使う。
+
+Usage
+-----
+    rosrun aero_demo solve_palm_ik.py \
+        --input-dir test_palm_pose_pipeline/palms \
+        --output-dir test_palm_pose_pipeline/handshakes
+    rosrun aero_demo view_handshake_poses.py
+
+viser はブラウザで表示するビューアなので、実行するとブラウザが開く
+(WSLg 環境などでは自動で開く)。ブラウザが自動で開かない場合は、標準出力
+に表示される URL を手動で開くこと。画面下の Back/Next/Good/Bad ボタンで
+人物の切り替えと判定を行う。
+"""
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+import numpy as np
+import trimesh
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
+if _PKG_SRC_DIR not in sys.path:
+    sys.path.insert(0, _PKG_SRC_DIR)
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from aero_demo import smpl_body  # noqa: E402  (パス追加後に import)
+from aero_demo import viewer_nav  # noqa: E402
+
+from generate_random_human_poses import load_smpl_models  # noqa: E402
+
+from skrobot.coordinates import Coordinates  # noqa: E402
+from skrobot.coordinates.math import rpy_matrix  # noqa: E402
+from skrobot.model import Link  # noqa: E402
+from skrobot.models import Aero  # noqa: E402
+from skrobot.viewers import ViserViewer  # noqa: E402
+
+# SMPL メッシュの肌色 (RGBA, 0-255)。draw_random_human_poses.py と違い
+# 人物ごとにランダムにはしない (このビューアは IK 結果の確認が目的で、
+# 見た目のバリエーションは不要なため)。
+SKIN_COLOR = [180, 130, 110, 255]
+
+
+def load_skeleton_json(path):
+    """``generate_random_human_poses.build_person_json`` が保存した骨格
+    JSON から SMPL のパラメータだけを読む."""
+    with open(path) as f:
+        data = json.load(f)
+    smpl = data['smpl']
+    return dict(
+        gender=smpl['gender'],
+        betas=np.asarray(smpl['betas'], dtype=np.float64),
+        pose=np.asarray(smpl['pose'], dtype=np.float64),
+        root_pos=np.asarray(smpl['root_pos'], dtype=np.float64))
+
+
+def load_handshake_json(path):
+    """``solve_palm_ik.save_json`` が保存した IK 結果 JSON を読む."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def build_smpl_mesh(model, person):
+    """保存済みの SMPL pose/betas/root_pos からメッシュを作る
+    (``smpl_body.forward_world`` を使うのは draw_random_human_poses.py と
+    同じ)。"""
+    vertices, _joints = smpl_body.forward_world(
+        model, person['pose'], person['betas'], person['root_pos'])
+    mesh = trimesh.Trimesh(vertices=vertices, faces=model.f, process=False)
+    mesh.visual.face_colors = SKIN_COLOR
+    return mesh
+
+
+def apply_robot_pose(robot, handshake):
+    """``solve_palm_ik`` の戻り値 (関節角・台車位置姿勢) をロボットモデル
+    に反映する.
+
+    ``joint_angle_vector``/``joint_names`` は ``solve_palm_ik.py`` が
+    ``use_hand=False`` (指関節なし) のロボットで解いた際の ``robot.joint_list``
+    の角度なので、指関節ありのロボット (``--no-hand`` を付けない既定の表示
+    モデル) とは ``joint_list`` の要素数・並びが異なる。そのため
+    ``robot.angle_vector`` にそのまま渡さず、``joint_names`` で名前を突き
+    合わせて該当する関節だけ角度を反映する (指関節は初期姿勢のまま)。
+    台車の位置・向きは ``base_position``/``base_yaw`` に別で保存されている
+    ので、あわせて反映する (``solve_palm_ik.solve_palm_ik`` 参照)。
+    """
+    robot.reset_pose()
+    name_to_angle = dict(zip(
+        handshake['joint_names'], handshake['joint_angle_vector']))
+    for joint in robot.joint_list:
+        if joint.name in name_to_angle:
+            joint.joint_angle(name_to_angle[joint.name])
+    robot.base_link.newcoords(Coordinates(
+        pos=handshake['base_position'],
+        rot=rpy_matrix(handshake['base_yaw'], 0.0, 0.0)))
+
+
+def iter_common_names(skeleton_dir, handshake_dir):
+    """``skeleton_dir``/``handshake_dir`` の両方に存在するファイル名
+    (basename) をファイル名順に列挙する."""
+    skeleton_names = {os.path.basename(p) for p in
+                      glob.glob(os.path.join(skeleton_dir, '*.json'))}
+    handshake_names = {os.path.basename(p) for p in
+                       glob.glob(os.path.join(handshake_dir, '*.json'))}
+    return sorted(skeleton_names & handshake_names)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='solve_palm_ik.py が出力したロボットの位置姿勢・関節'
+                    '角度と、対応する SMPL モデルを viser で表示する '
+                    '(ビューアに表示するのは SMPL モデルとロボットモデル'
+                    'だけ)。')
+    parser.add_argument(
+        '--skeleton-dir', type=str,
+        default=os.path.join(
+            _THIS_DIR, 'test_palm_pose_pipeline', 'skeletons'),
+        help='SMPL pose/betas/root_pos を持つ骨格 JSON のディレクトリ '
+            '(既定は test_palm_pose_pipeline/skeletons/)。')
+    parser.add_argument(
+        '--handshake-dir', type=str,
+        default=os.path.join(
+            _THIS_DIR, 'test_palm_pose_pipeline', 'handshakes'),
+        help='solve_palm_ik.py が出力した JSON のディレクトリ (既定は '
+            'test_palm_pose_pipeline/handshakes/。skeleton-dir と同じ '
+            'ファイル名で対応させる)。')
+    parser.add_argument(
+        '--model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicmodel_m_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (男性) モデル .pkl のパス。')
+    parser.add_argument(
+        '--female-model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ使う)。')
+    parser.add_argument(
+        '--no-hand', dest='use_hand', action='store_false',
+        help='指関節なしの URDF (solve_palm_ik.py と同じ手なしモデル) を '
+            '使う。既定では指関節ありの URDF (aero_with_feetech_hand) を '
+            '使い、手先にハンドを表示する。')
+    parser.set_defaults(use_hand=True)
+    parser.add_argument('--client-wait-timeout', type=float, default=30.0,
+                        help='ブラウザクライアント接続を待つ 1 回あたりの'
+                             '秒数 (繰り返し待つ)。')
+    parser.add_argument('--no-open-browser', action='store_true',
+                        help='ブラウザの自動起動を無効にする '
+                             '(URL を自分で開く場合)。')
+    args = parser.parse_args()
+
+    names = iter_common_names(args.skeleton_dir, args.handshake_dir)
+    if not names:
+        print('{} と {} の両方に対応するファイルが見つかりません。先に '
+              'solve_palm_ik.py を実行してください。'.format(
+                  args.skeleton_dir, args.handshake_dir))
+        return
+
+    models_by_gender = dict(
+        load_smpl_models(args.model_path, args.female_model_path))
+
+    # r/l_eef_grasp_link (solve_palm_ik.py が使う手先フレーム) は手あり/
+    # なし両方の URDF にあるので、IK 結果自体は --no-hand でも変わらない。
+    # 既定では見た目のために手ありモデルを使う。
+    robot = Aero(use_hand=args.use_hand)
+
+    viewer = ViserViewer(draw_grid=True)
+    viewer.add(robot)
+    viewer.show(open_browser=not args.no_open_browser)
+    viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
+
+    nav = viewer_nav.ManualNav(viewer)
+    label_text = viewer._server.gui.add_markdown('')
+
+    current_mesh_link = None
+    i = 0
+    while 0 <= i < len(names):
+        name = names[i]
+        skeleton_path = os.path.join(args.skeleton_dir, name)
+        handshake_path = os.path.join(args.handshake_dir, name)
+        person = load_skeleton_json(skeleton_path)
+        handshake = load_handshake_json(handshake_path)
+
+        model = models_by_gender.get(
+            person['gender'], models_by_gender['male'])
+        mesh = build_smpl_mesh(model, person)
+        link = Link(visual_mesh=mesh, name='smpl_human')
+        if current_mesh_link is not None:
+            viewer.delete(current_mesh_link)
+        viewer.add(link)
+        current_mesh_link = link
+
+        apply_robot_pose(robot, handshake)
+
+        status = 'solved' if handshake.get('solved') else 'NOT solved'
+        label_text.content = '**{}** ({}/{})  IK: {}\n\n{}'.format(
+            name, i + 1, len(names), status,
+            viewer_nav.format_label_text(handshake.get('human_label')))
+
+        viewer.redraw()
+        print('[{}/{}] displayed {} ({})'.format(
+            i + 1, len(names), name, status))
+
+        direction, label = nav.wait(viewer)
+        if direction == 0:
+            print('ブラウザクライアントが切断されました。中断します。')
+            break
+        if label is not None:
+            viewer_nav.save_label(handshake_path, label)
+            print('  -> {} として {} に記録しました。'.format(
+                'Good' if label else 'Bad', handshake_path))
+        i = max(0, i + direction)
+
+    viewer.close()
+
+
+if __name__ == '__main__':
+    main()

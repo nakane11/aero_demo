@@ -7,6 +7,17 @@ scikit-robot の viser ビューアで重ねて表示する。``estimate_palm_po
 が出力した対応する掌の位置姿勢 JSON (``--palm-dir``、既定では骨格と同じ
 ファイル名で ``random_palm_poses/`` に入っているもの) があれば、左右の掌
 の位置姿勢を Axis として併せて描画する (無ければ黙ってスキップする)。
+その JSON の ``offered_hand`` (手繋ぎに使うと判定された手, ``estimate_
+palm_poses.OfferedHandSelector``) も読み、選ばれた手の骨格・ランドマーク
+を赤 (``palm_plane_view.COLOR_BONES['rhand']``)、選ばれなかった手を白で
+描き分ける -- どちらの手も差し出していないと判定された (``offered_hand``
+が ``null``) 人物は両手とも白になる。掌 JSON 自体が無い人物だけは、
+判定結果が存在しないので従来どおりの配色 (右手=赤, 左手=青) で描く。
+``--advance-mode manual`` (既定) では viser 画面に Good/Bad ボタンも表示
+され、押すと表示中の掌の位置姿勢が正しいかどうかの判定結果
+(``human_label``: ``true``: Good/``false``: Bad) が対応する掌 JSON に
+書き込まれる (Next と同様に次の人物へ進む)。書き込まれたラベルは
+viser 画面のテキストパネルにも表示される。
 
 SMPL メッシュは JSON に保存済みの ``smpl.pose``/``smpl.betas``/``smpl.
 root_pos``/``smpl.gender`` から ``aero_demo.smpl_body.forward_world`` で
@@ -48,8 +59,6 @@ import json
 import math
 import os
 import sys
-import threading
-import time
 
 import numpy as np
 import trimesh
@@ -64,6 +73,7 @@ if _THIS_DIR not in sys.path:
 from aero_demo import palm_plane  # noqa: E402  (パス追加後に import)
 from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import smpl_body  # noqa: E402
+from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.people_pose_types import Bone  # noqa: E402
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
@@ -76,9 +86,18 @@ from skrobot.viewers import ViserViewer  # noqa: E402
 
 # 掌の平面フィットに使ったランドマーク (手首 + 知節/MCP) を示す点の色。
 # palm_plane_view.py の rhand/lhand の配色 (COLOR_BONES) に合わせ、左右を
-# 見分けられるようにする。
+# 見分けられるようにする。掌 JSON がある人物では、この左右の色分けの
+# 代わりに下の COLOR_OFFERED_HAND / COLOR_NOT_OFFERED_HAND を使う。
 HAND_POINT_RADIUS = 0.006
 HAND_POINT_COLOR = {'R': [255, 60, 60, 255], 'L': [60, 120, 255, 255]}
+
+# 手繋ぎに使うと判定された手 (掌 JSON の ``offered_hand``) を見分けるための
+# 色。選ばれた手は palm_plane_view の右手の色 (赤) のまま、選ばれなかった
+# 手は白にする。``offered_hand`` が null (どちらの手も差し出していないと
+# 判定された) なら両手とも白。掌 JSON 自体が無い人物は判定結果が存在
+# しないので、この色分けは使わず従来どおりの左右の色分けで描く。
+COLOR_OFFERED_HAND = palm_plane_view.COLOR_BONES['rhand']
+COLOR_NOT_OFFERED_HAND = [255, 255, 255, 255]
 
 # 骨格の関節同士のつながり (関節名のペア)。people_pose_estimator.
 # PeoplePoseEstimator の limb_sequence/index2limbname と同じ骨格の
@@ -178,15 +197,19 @@ def load_palm_json(path):
     Returns
     -------
     dict or None
-        ``{'R': (position, rot) or None, 'L': (position, rot) or None}``。
-        ``position`` は ``np.ndarray(3,)``、``rot`` は ``np.ndarray(3,3)``
-        (skrobot の ``Coordinates(rot=...)`` にそのまま渡せる)。
+        ``{'R': (position, rot) or None, 'L': (position, rot) or None,
+        'offered_hand': 'R'/'L'/None}``。``position`` は
+        ``np.ndarray(3,)``、``rot`` は ``np.ndarray(3,3)`` (skrobot の
+        ``Coordinates(rot=...)`` にそのまま渡せる)。``offered_hand`` は
+        手繋ぎに使うと判定された手 (``estimate_palm_poses.
+        OfferedHandSelector``)、どちらの手も差し出していなければ
+        ``None``。
     """
     if not os.path.exists(path):
         return None
     with open(path) as f:
         data = json.load(f)
-    palms = {}
+    palms = {'offered_hand': data.get('offered_hand')}
     for side in ('R', 'L'):
         palm = data.get(side)
         if palm is None:
@@ -195,6 +218,31 @@ def load_palm_json(path):
         palms[side] = (np.asarray(palm['position'], dtype=np.float64),
                        np.asarray(palm['rot'], dtype=np.float64))
     return palms
+
+
+def offered_hand_colors(palms):
+    """掌 JSON の ``offered_hand`` から、左右の手を描く色を決める.
+
+    Parameters
+    ----------
+    palms : dict or None
+        ``load_palm_json`` の戻り値。
+
+    Returns
+    -------
+    dict or None
+        ``{'R': rgba, 'L': rgba}``。手繋ぎに使うと判定された側が
+        :data:`COLOR_OFFERED_HAND` (赤)、もう一方が
+        :data:`COLOR_NOT_OFFERED_HAND` (白) になる。``palms`` が ``None``
+        (掌 JSON が無い = 判定結果が存在しない) のときは ``None`` を返し、
+        呼び出し側は従来どおりの左右の色分けで描く。
+    """
+    if palms is None:
+        return None
+    offered = palms.get('offered_hand')
+    return {side: (COLOR_OFFERED_HAND if side == offered
+                   else COLOR_NOT_OFFERED_HAND)
+            for side in ('R', 'L')}
 
 
 SKIN_ALPHA = 150  # SMPL メッシュを半透明にするための alpha (0-255)。
@@ -253,7 +301,7 @@ def build_mesh(model, person, skin_color):
     return mesh
 
 
-def build_skeleton_links(joint_positions):
+def build_skeleton_links(joint_positions, hand_colors=None):
     """骨格を部位ごとに色分けした線 (``skrobot.model.primitives.
     LineString``) のリストにする.
 
@@ -261,6 +309,16 @@ def build_skeleton_links(joint_positions):
     PalmPlaneScene``) が SMPL メッシュに重ねて骨格を描くのと同じ
     ``palm_plane_view.bone_line``/``bone_color`` を使うので、見た目
     (部位ごとの色, ``palm_plane_view.COLOR_BONES``) も同じになる。
+
+    Parameters
+    ----------
+    joint_positions : dict
+        関節名 -> ``np.ndarray([x, y, z])``。
+    hand_colors : dict or None
+        ``offered_hand_colors`` の戻り値 (``{'R': rgba, 'L': rgba}``)。
+        渡すと手のランドマークのボーン (``RHand*``/``LHand*``) だけ
+        ``palm_plane_view`` の左右の色分けの代わりにこの色で描く -- 手繋ぎ
+        に使うと判定された手を見分けるため。``None`` なら従来どおり。
     """
     links = []
     for start_name, end_name in BONE_NAME_PAIRS:
@@ -269,80 +327,12 @@ def build_skeleton_links(joint_positions):
         bone = Bone(name='{}->{}'.format(start_name, end_name),
                    start_point=joint_positions[start_name],
                    end_point=joint_positions[end_name])
-        links.append(palm_plane_view.bone_line(
-            bone, palm_plane_view.bone_color(bone.name)))
+        color = palm_plane_view.bone_color(bone.name)
+        group = palm_plane_view.bone_group(bone.name)
+        if hand_colors is not None and group in ('rhand', 'lhand'):
+            color = hand_colors['R' if group == 'rhand' else 'L']
+        links.append(palm_plane_view.bone_line(bone, color))
     return links
-
-
-def wait_for_client(viewer, timeout):
-    """viser に最低 1 つブラウザクライアントが接続するまで待つ."""
-    print('viser のブラウザ画面が接続するまで待っています '
-          '(タイムアウト {:.0f} 秒ごとに再度待機します)...'.format(timeout))
-    while True:
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            if viewer._server.get_clients():
-                print('クライアントが接続しました。')
-                return
-            time.sleep(0.2)
-        print('ブラウザクライアントがまだ接続していません。上に表示された '
-              'URL を手動で開いてください (Ctrl-C で中断できます)。')
-
-
-class ManualNav(object):
-    """viser の GUI に Back/Next ボタンを追加し、押された向きを ``wait()``
-    で受け取れるようにする (``--advance-mode manual`` 用)。
-
-    Back/Next のどちらを押しても同じ ``threading.Event`` を立てるだけの
-    単純な仕組みで、直近に押されたボタンの向きだけを覚える (連打しても
-    最後の 1 回分しか進まない/戻らない)。
-    """
-
-    def __init__(self, viewer):
-        self._event = threading.Event()
-        self._direction = 0
-        back = viewer._server.gui.add_button('Back')
-        next_ = viewer._server.gui.add_button('Next')
-
-        @back.on_click
-        def _on_back(_):  # noqa: ANN001  (viser の GuiEvent は型を問わない)
-            self._direction = -1
-            self._event.set()
-
-        @next_.on_click
-        def _on_next(_):  # noqa: ANN001
-            self._direction = 1
-            self._event.set()
-
-    def wait(self, viewer):
-        """Back/Next が押されるまで待ち、向き (``-1``/``+1``) を返す.
-
-        ブラウザクライアントが切断されたら ``0`` を返す。
-        """
-        self._event.clear()
-        while not self._event.is_set():
-            if not viewer._server.get_clients():
-                return 0
-            time.sleep(0.05)
-        return self._direction
-
-
-def wait_for_advance(viewer, nav, pause):
-    """次に表示する人物への向きを決める.
-
-    ``nav`` (``ManualNav``) が渡されていれば (``--advance-mode
-    manual``)、Back/Next ボタンが押されるまで待って ``-1``/``+1`` を
-    返す。渡されていなければ (``--advance-mode auto``) ``pause`` 秒だけ
-    待って常に ``+1`` を返す (これまでと同じ動作)。ブラウザクライアント
-    が切断されていれば ``None`` を返す。
-    """
-    if nav is None:
-        time.sleep(pause)
-        if not viewer._server.get_clients():
-            return None
-        return 1
-    direction = nav.wait(viewer)
-    return direction if direction != 0 else None
 
 
 def main():
@@ -425,19 +415,30 @@ def main():
     palm_axes_added = {'R': False, 'L': False}
     # 推定に使った手のランドマーク (wrist + MCP) を色付きの球で表示する。
     # 骨格 JSON に含まれる関節そのものなので、掌 JSON の有無によらず
-    # (推定が None になった側でも) 見えている点はそのまま描く。
+    # (推定が None になった側でも) 見えている点はそのまま描く。色は人物
+    # ごとに変わりうる (offered_hand の判定結果) ので、いま viewer に
+    # 入れてある色を hand_point_color_shown で覚えておき、変わったときだけ
+    # 塗り直す (下のループ参照)。
     hand_point_spheres = {
         (side, i): Sphere(radius=HAND_POINT_RADIUS,
                           color=HAND_POINT_COLOR[side])
         for side in ('R', 'L') for i in palm_plane.PLANE_LANDMARKS}
     hand_point_added = {key: False for key in hand_point_spheres}
+    hand_point_color_shown = {(side, i): HAND_POINT_COLOR[side]
+                              for side, i in hand_point_spheres}
     viewer.show(open_browser=not args.no_open_browser)
-    wait_for_client(viewer, args.client_wait_timeout)
+    viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
     viewer.set_camera(coords_or_transform=_front_view_camera_transform())
 
     nav = None
     if args.advance_mode == 'manual':
-        nav = ManualNav(viewer)
+        nav = viewer_nav.ManualNav(viewer)
+    # 表示中の人物の Good/Bad 判定結果 (掌 JSON の human_label) を出す
+    # テキストパネル。押されたら palm_path 側の JSON にも書き込まれるので
+    # (viewer_nav.save_label)、次に表示するときにここで読み直して見た目にも
+    # 反映する。
+    label_text = viewer._server.gui.add_markdown(
+        viewer_nav.format_label_text(None, title='掌ラベル'))
 
     image_module = None
     if args.output_dir:
@@ -462,14 +463,21 @@ def main():
         viewer.add(link)
         current_link = link
 
+        palm_path = os.path.join(args.palm_dir, os.path.basename(path))
+        palms = load_palm_json(palm_path)
+        # 手繋ぎに使うと判定された手 (offered_hand) を赤、選ばれなかった
+        # 手を白で描くための色。掌 JSON が無い人物は None (判定結果が無い
+        # ので、従来どおり palm_plane_view の左右の色分けのまま)。
+        hand_colors = offered_hand_colors(palms)
+
         for old_link in current_skeleton_links:
             viewer.delete(old_link)
-        current_skeleton_links = build_skeleton_links(joints)
+        current_skeleton_links = build_skeleton_links(joints, hand_colors)
         for skeleton_link in current_skeleton_links:
             viewer.add(skeleton_link)
 
-        palm_path = os.path.join(args.palm_dir, os.path.basename(path))
-        palms = load_palm_json(palm_path)
+        label_text.content = viewer_nav.format_label_text(
+            viewer_nav.load_label(palm_path), title='掌ラベル')
         for side, axis in palm_axes.items():
             palm = palms.get(side) if palms else None
             if palm is None:
@@ -486,14 +494,26 @@ def main():
         for (side, idx), sphere in hand_point_spheres.items():
             key = '{}Hand{}'.format(side, idx)
             present = key in joints
+            color = (HAND_POINT_COLOR[side] if hand_colors is None
+                     else hand_colors[side])
             if present:
                 sphere.newcoords(Coordinates(pos=joints[key]))
-            if present and not hand_point_added[(side, idx)]:
-                viewer.add(sphere)
-                hand_point_added[(side, idx)] = True
-            elif not present and hand_point_added[(side, idx)]:
+            # ViserViewer は Sphere の色を viewer.add したときの
+            # ``visual_mesh.visual.face_colors`` から読む (skrobot.viewers.
+            # _viser.ViserViewer._add_link, palm_plane_view.set_color の
+            # docstring 参照) ので、入れっぱなしのまま塗り直しても画面には
+            # 反映されない。人物が変わって色も変わるときは、いったん外して
+            # から塗り直して足し直す。
+            if hand_point_added[(side, idx)] and (
+                    not present
+                    or hand_point_color_shown[(side, idx)] != color):
                 viewer.delete(sphere)
                 hand_point_added[(side, idx)] = False
+            if present and not hand_point_added[(side, idx)]:
+                palm_plane_view.set_color(sphere, color)
+                viewer.add(sphere)
+                hand_point_added[(side, idx)] = True
+                hand_point_color_shown[(side, idx)] = color
 
         viewer.redraw()
 
@@ -508,10 +528,14 @@ def main():
                 args.output_dir, 'human_{:03d}.jpg'.format(i))
             image_module.fromarray(image).save(out_path)
 
-        direction = wait_for_advance(viewer, nav, args.pause)
+        direction, label = viewer_nav.wait_for_advance(viewer, nav, args.pause)
         if direction is None:
             print('ブラウザクライアントが切断されました。中断します。')
             break
+        if label is not None:
+            viewer_nav.save_label(palm_path, label)
+            print('  -> {} として {} に記録しました。'.format(
+                'Good' if label else 'Bad', palm_path))
         # 先頭で Back を押しても終了しない (0 未満にはしない) よう下限を
         # クランプする。末尾で Next を押した場合は (auto で最後まで
         # 表示し終わったときと同じく) そのままループを抜けて終了する。
