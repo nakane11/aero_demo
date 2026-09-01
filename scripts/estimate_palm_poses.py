@@ -61,11 +61,9 @@ class PalmPoseEstimator(object):
 
     Examples
     --------
-    >>> from generate_random_human_poses import RandomSkeletonGenerator
-    >>> generator = RandomSkeletonGenerator(seed=0)
-    >>> pose = generator.generate()
+    >>> pose = load_skeleton_json('human_000.json')
     >>> estimator = PalmPoseEstimator()
-    >>> palms = estimator.estimate(pose['joint_positions'])
+    >>> palms = estimator.estimate(pose)
     >>> palms['R']['position']
     [0.32, -0.18, 0.95]
     """
@@ -126,10 +124,15 @@ class PalmPoseEstimator(object):
 
 
 def load_skeleton_json(path):
-    """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON を読む."""
+    """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON を読む.
+
+    保存される JSON は骨格 (``skeleton``) と SMPL の人モデル (``smpl``)
+    の両方を持つが、この推定器が要るのは骨格の関節位置だけなので
+    ``skeleton.joint_positions`` だけを取り出す。
+    """
     with open(path) as f:
         data = json.load(f)
-    return data['joint_positions']
+    return data['skeleton']['joint_positions']
 
 
 def save_json(palms, path):

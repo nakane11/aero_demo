@@ -1,46 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""多様な姿勢・体格の人間の骨格 (関節の 3 次元位置) をランダムに生成し、
-MediaPipe と同じ関節名の形式で JSON として保存する。
+"""SMPL の人体モデルをランダムに生成し、その姿勢から MediaPipe と同じ
+関節名の骨格を作って、両方の情報を JSON として保存する。
 
-SMPL には一切依存しない。体格は身長と、身長に対する各部位の比率 (肩幅・
-腰幅・上腕/前腕の長さなど。``fake_people_pose_estimator_ros.
-FakeRosPeoplePoseEstimator._sample_person`` が使っている値と同じ実測
-ベースの比率) からランダムに決め、姿勢は肩・肘・股関節・膝・脊柱・首を
-単純な順運動学 (親関節からの相対回転をボーン方向ベクトルに適用して次の
-関節位置を求める) で組み立てる。
+``RandomSmplHumanGenerator``
+    SMPL (Skinned Multi-Person Linear model) の体型 (``betas``) と姿勢
+    (``pose``, 24 関節の axis-angle) をランダムに決め、``aero_demo.
+    smpl_body`` の順運動学 (``smpl_forward`` / ``forward_world``) で
+    姿勢済みの頂点・関節位置を計算する「人モデル」を作る。肩・肘・股
+    関節・膝の可動域は解剖学的に不自然にならないよう実測ベースの範囲に
+    限る (``generate`` 参照)。「両足が地面についている・重心が安定して
+    いる・頭が上を向いている」という制約を守るため、足首から先と骨盤の
+    傾き (前後・左右) はランダム化せず、股関節の外転と膝の曲げは左右の
+    脚に同じ角度を鏡写しに適用する (旧 ``RandomSkeletonGenerator`` と
+    同じ方針)。
 
-出力される関節名は ``aero_demo.people_pose_types.Person3D`` /
-``fake_people_pose_estimator_ros.py`` の ``index2limbname`` と同じ
-MediaPipe 形式 (``Neck``, ``RShoulder``, ``LShoulder``, ``RElbow``,
-``LElbow``, ``RWrist``, ``LWrist``, ``RHip``, ``LHip``, ``RKnee``,
-``LKnee``, ``RAnkle``, ``LAnkle``, ``Nose``, ``REye``, ``LEye``, ``REar``,
-``LEar``) で、座標はロボット座標系 (x=前, y=左, z=上) 。
+``RandomSkeletonGenerator``
+    ``RandomSmplHumanGenerator`` が作った SMPL の人モデルを入力として
+    受け取り、その姿勢済み関節位置から MediaPipe 形式の骨格 (``aero_
+    demo.people_pose_types.Person3D`` / ``fake_people_pose_estimator_
+    ros.py`` の ``index2limbname`` と同じ関節名, ``Neck``, ``RShoulder``,
+    ``LShoulder``, ``RElbow``, ``LElbow``, ``RWrist``, ``LWrist``,
+    ``RHip``, ``LHip``, ``RKnee``, ``LKnee``, ``RAnkle``, ``LAnkle``,
+    ``Nose``, ``REye``, ``LEye``, ``REar``, ``LEar``) を作る。手首から
+    先は SMPL に関節が無いので、SMPL の前腕 (肘->手首) の実際の姿勢
+    (回転) から手のランドマーク (``include_hand`` 既定 True,
+    ``RHand0``..``RHand20`` / ``LHand0``..``LHand20``, 21 点 x 2 手,
+    ``fake_people_pose_estimator_ros.py`` の ``index2handname`` /
+    ``HAND_LOCAL`` と同じ MediaPipe 形式) を組み立てるので、手首の位置
+    もその向きも SMPL の前腕とちょうど一致する (``_hand_frame`` 参照)。
+    座標はロボット座標系 (x=前, y=左, z=上)。
 
-``include_hand`` (既定 True) を立てると、``fake_people_pose_estimator_
-ros.py`` の ``index2handname`` / ``HAND_LOCAL`` と同じ MediaPipe 形式の
-手のランドマーク (``RHand0``..``RHand20``, ``LHand0``..``LHand20``, 21 点
-x 2 手) も併せて生成する。指先のランドマークは持たないので前腕の向きから
-は分からない手首の捻り (回内/回外) は、握手を差し出す前の中立姿勢
-(親指が上・掌が体の外側を向く) を仮定する (``RandomSkeletonGenerator.
-_hand_frame`` 参照)。
+出力する JSON には、骨格 (``skeleton``, 上記の ``joint_positions`` と
+``height``) と SMPL の人モデル (``smpl``, ``pose``/``betas``/``root_
+pos``/``gender``, ``draw_random_human_poses.py`` が ``aero_demo.
+smpl_body.forward_world`` でメッシュを再構成するのに必要な情報) の両方
+を含める。骨格から SMPL の姿勢を推定し直す処理 (``aero_demo.smpl_body.
+retarget_and_pose``) は不要になったので、描画側ではもう使わない。
 
-肩・肘は解剖学的な可動域を大きく超えたランダム姿勢(腕を棒のように
-真っ直ぐ伸ばした/後方に反り返った不自然な姿勢) にならないよう、
-ヒンジ関節としての肘の曲げと、仰角・方位角で表した肩の可動域 (下ろす
-/前に出す/横に開く/上げる、のすべてをカバーする) を実測ベースで
-定義している (``RandomSkeletonGenerator.generate`` 参照)。
-
-一方で「両足が地面についている・重心が安定している・頭が上を向いて
-いる」という制約を必ず満たすように、足首から先と骨盤の前後・左右の
-傾きはランダム化せず直立のままにする。股関節の開き (外転) と膝の曲げは
-左右の脚に必ず同じ角度を鏡写しに適用するので、両足は常に同じ高さの
-まま (= 生成後の床接地補正で両足が同時に接地する) になる。
-
-このファイルは骨格 (JSON) を作るだけで、描画は一切行わない。生成した
-JSON を読み込み SMPL の人体メッシュを当てはめて viser で表示する部分は
-``draw_random_human_poses.py`` に分割してある。
+SMPL のモデルファイル自体はライセンス上リポジトリに同梱されていないので、
+呼び出し側がローカルパスを渡す (既定値は ``aero_demo.smpl_body`` と同じ
+``~/SMPL_python_v.1.0.0/smpl/models/`` 以下)。
 
 Usage
 -----
@@ -52,10 +53,16 @@ import argparse
 import json
 import math
 import os
+import sys
 
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
+if _PKG_SRC_DIR not in sys.path:
+    sys.path.insert(0, _PKG_SRC_DIR)
+
+from aero_demo import smpl_body  # noqa: E402  (パス追加後に import)
 
 # MediaPipe と同じ関節名 (fake_people_pose_estimator_ros.py の
 # index2limbname と同じ並び, 'Bkg' を除く)。
@@ -98,11 +105,19 @@ HAND_LOCAL = np.array([
     [0.74, -0.25, 0.12],   # 20 pinky tip
 ])
 
-# 前腕 (指) 方向がほぼ真上/真下に近いと、世界の「上」を指方向に垂直投影
-# したベクトルの向きが数値誤差で不安定になる。fake_people_pose_estimator_
-# ros.py の UP_PERP_BLEND_NORM と同じしきい値・同じ理由で、体の左右軸から
-# 作ったフォールバックへ滑らかにブレンドする。
-_UP_PERP_BLEND_NORM = 0.2
+# 手の長さ (SMPL には手のランドマークが無いので、身長比の実測値を流用
+# する。旧 RandomSkeletonGenerator._RATIOS['hand_length'] と同じ値)。
+_HAND_LENGTH_HEIGHT_RATIO = 0.108
+
+# 頭部ランドマーク (Nose/REye/LEye/REar/LEar) を Neck からのオフセット
+# として置く距離 [m] (旧 RandomSkeletonGenerator.generate と同じ値)。
+_HEAD_FORWARD_OFFSET = 0.06
+_NOSE_UP_OFFSET = 0.14
+_EYE_UP_OFFSET = 0.16
+_EYE_FORWARD_OFFSET = 0.05
+_EYE_LATERAL_OFFSET = 0.03
+_EAR_UP_OFFSET = 0.15
+_EAR_LATERAL_OFFSET = 0.08
 
 
 def _unit(v, fallback=None):
@@ -120,41 +135,32 @@ def _rotate(v, axis, angle):
     return v * c + np.cross(axis, v) * s + axis * axis.dot(v) * (1.0 - c)
 
 
-class RandomSkeletonGenerator(object):
-    """MediaPipe 形式の人体骨格 (関節の 3 次元位置) をランダムに生成する.
+class RandomSmplHumanGenerator(object):
+    """SMPL の人体モデル (体型 + 姿勢) をランダムに生成する.
 
-    SMPL / trimesh / skrobot のいずれにも依存しない (純粋な numpy の
-    幾何計算のみ)。``generate()`` を呼ぶたびに、体格 (身長と各部位比率)
-    ・姿勢 (肩/肘/股関節/膝/脊柱/首の角度) を毎回引き直した 1 人分の
-    骨格を返す。
+    ``generate()`` を呼ぶたびに、体型 (``betas``) と姿勢 (``pose``, 24
+    関節の axis-angle) を毎回引き直した 1 人分の SMPL モデルを返す。
+    肩・肘・股関節・膝の可動域はヒンジ関節としての肘の曲げ、仰角・方位角
+    で表した肩の可動域など、解剖学的な可動域を大きく超えないよう実測
+    ベースの範囲に限る (``generate`` 参照) -- 旧 (SMPL 非依存だった頃の)
+    ``RandomSkeletonGenerator`` と同じ方針。
+
+    「両足が地面についている・重心が安定している・頭が上を向いている」
+    という制約を必ず満たすように、足首から先と骨盤の前後・左右の傾きは
+    ランダム化せず直立のままにする (root の向きを単位行列に固定し、脚の
+    pose も左右対称にする)。股関節の外転と膝の曲げは左右の脚に必ず同じ
+    角度を鏡写しに適用するので、両足は常に同じ高さのまま (= 生成後の
+    床接地補正で両足が同時に接地する) になる。
 
     Examples
     --------
-    >>> gen = RandomSkeletonGenerator(seed=0)
-    >>> pose = gen.generate()
-    >>> pose['joint_positions']['Neck']
-    [0.01, -0.03, 1.42]
+    >>> models = [smpl_body.load_smpl_model(male_path)]
+    >>> gen = RandomSmplHumanGenerator(models, seed=0)
+    >>> person = gen.generate()
+    >>> person['pose'].shape
+    (24, 3)
     """
 
-    _HEIGHT_RANGE_M = (1.4, 1.9)
-
-    # 身長に対する各部位の比率。fake_people_pose_estimator_ros.py の
-    # FakeRosPeoplePoseEstimator._sample_person が使っている実測ベースの
-    # 値と同じ (h_* は身長に対する高さの比率、他は長さの比率)。
-    _RATIOS = dict(
-        h_shoulder=0.818, h_hip=0.530, h_knee=0.285, h_ankle=0.039,
-        shoulder_width=0.245, hip_width=0.185,
-        upper_arm=0.186, forearm=0.146, hand_length=0.108,
-    )
-    _RATIO_SPREAD = 0.06  # 個体差 (比率に対する相対的なばらつき)
-
-    # 「両足接地・重心安定・頭が上を向く」という制約を守るため、足首から
-    # 先と骨盤の傾き (前後・左右方向) はランダム化しない (常に直立の
-    # まま)。股関節の開き (足の開き具合) と膝の曲げ方は、左右の脚に必ず
-    # 同じ角度を鏡写しに適用することで、両足が常に同じ高さになる (=
-    # generate() の最後で行う床接地補正で両足が同時に接地する) ように
-    # している。変化させるのは、脚の接地や重心に影響しない上半身 (肩/
-    # 肘) と、ごくわずかな脊柱・首の動きのみに限る。
     _STANCE_ABDUCTION_MAX_DEG = 25.0    # 足の開き (股関節の外転)
     _KNEE_FLEX_MAX_DEG = 45.0           # 膝の曲げ方
     _ELBOW_FLEX_MAX_DEG = 130.0         # 肘の曲げ方 (0=伸展のみ, ヒンジ関節)
@@ -178,79 +184,242 @@ class RandomSkeletonGenerator(object):
     _SHOULDER_ELEVATION_UP_DEG = 90.0
     _SHOULDER_AZIMUTH_DEG_RANGE = (-40.0, 110.0)
 
-    def __init__(self, height_range=None, seed=None, include_hand=True):
+    # SMPL の体型パラメータ (betas) のばらつき。正規分布からサンプルし、
+    # 極端な体型 (メッシュが破綻して見える) にならないようクリップする。
+    _BETAS_STD = 1.5
+    _BETAS_CLIP = 3.0
+
+    def __init__(self, models, seed=None):
         """
         Parameters
         ----------
-        height_range : (float, float), optional
-            身長の生成範囲 [m]。既定 ``_HEIGHT_RANGE_M`` (1.4-1.9 m)。
+        models : list of (gender, smpl_body.SmplModel)
+            使用可能な SMPL モデル。``generate()`` のたびにこの中から
+            1 つをランダムに選ぶ (性別ごとに体型のばらつきが違って
+            見えるように、複数渡しておくとよい)。
         seed : int, optional
             乱数シード (指定すると再現可能になる)。
+        """
+        if not models:
+            raise ValueError('models must be a non-empty list')
+        self.models = list(models)
+        self.rng = np.random.RandomState(seed)
+
+    def _sample_betas(self):
+        return np.clip(
+            self.rng.normal(scale=self._BETAS_STD, size=10),
+            -self._BETAS_CLIP, self._BETAS_CLIP)
+
+    def generate(self):
+        """1 人分のランダムな SMPL 人モデルを生成する.
+
+        Returns
+        -------
+        dict
+            ``gender`` (str), ``model`` (``smpl_body.SmplModel``),
+            ``betas`` ((10,) ndarray), ``pose`` ((24, 3) ndarray),
+            ``root_pos`` ((3,) ndarray, pelvis の位置, 床 z=0 に接地),
+            ``vertices`` ((6890, 3) ndarray), ``joints`` ((24, 3)
+            ndarray, SMPL 関節順序, いずれもロボット座標系), ``wrist_
+            rots`` (``{'L': (3, 3) ndarray, 'R': (3, 3) ndarray}``, 前腕
+            (肘->手首) の T-pose からの累積回転行列)。
+        """
+        rng = self.rng
+        gender, model = self.models[rng.randint(len(self.models))]
+        betas = self._sample_betas()
+
+        xb = np.array([1.0, 0.0, 0.0])  # front
+        yb = np.array([0.0, 1.0, 0.0])  # left
+        zb = np.array([0.0, 0.0, 1.0])  # up
+
+        pose = np.zeros((24, 3))
+        # root (pelvis) の向きは常に単位行列 (常に +x を向いて直立) の
+        # まま固定するので、cumulative[0] は root_rot=eye(3) 相当。脚は
+        # root の直接の子なので、この固定によって足首から先・骨盤の傾き
+        # は常にランダム化されない。
+        cumulative = {0: np.eye(3)}
+
+        def swing(pose_idx, child_idx, obs_dir_world):
+            parent_rot = cumulative[model.parent[pose_idx]]
+            rest_dir_robot = _unit(
+                smpl_body.PERM.dot(model.J[child_idx] - model.J[pose_idx]))
+            obs_dir_local = parent_rot.T.dot(obs_dir_world)
+            R_local = smpl_body.rotation_between(rest_dir_robot, obs_dir_local)
+            pose[pose_idx] = smpl_body.mat_to_axis_angle(
+                smpl_body.to_smpl_rotation(R_local))
+            cumulative[pose_idx] = parent_rot.dot(R_local)
+            return obs_dir_world
+
+        # --- 脚: 股関節の開き (外転) と膝の曲げ。左右対称な角度を使う
+        # ので、両足は常に同じ高さのまま (床接地補正で両足が同時に
+        # 接地する)。---
+        stance = math.radians(rng.uniform(0.0, self._STANCE_ABDUCTION_MAX_DEG))
+        knee_flex = math.radians(rng.uniform(0.0, self._KNEE_FLEX_MAX_DEG))
+        for hip_idx, knee_idx, ankle_idx, sign in (
+                (smpl_body.L_HIP, smpl_body.L_KNEE, smpl_body.L_ANKLE, 1.0),
+                (smpl_body.R_HIP, smpl_body.R_KNEE, smpl_body.R_ANKLE, -1.0)):
+            thigh_dir = _rotate(-zb, xb, stance * sign)
+            swing(hip_idx, knee_idx, thigh_dir)
+            shank_dir = _rotate(thigh_dir, yb, knee_flex)
+            swing(knee_idx, ankle_idx, shank_dir)
+
+        # --- 胴体・首 (ごく僅かにランダムな軸で傾ける)。脚は root の
+        # 直接の子なので、この傾きが脚の直立には影響しない。Spine1 (3)
+        # だけを傾け、Spine2/Spine3/両肩の Collar は pose=0 のまま
+        # Spine1 の傾きをそのまま引き継がせる (肩・首はその先で組み立
+        # てる)。---
+        _SPINE1 = 3
+        spine_axis = _unit(rng.normal(size=3), fallback=xb)
+        spine_angle = math.radians(rng.uniform(0.0, self._SPINE_SWAY_MAX_DEG))
+        spine_rot = smpl_body.rotation_between(zb, _rotate(zb, spine_axis, spine_angle))
+        pose[_SPINE1] = smpl_body.mat_to_axis_angle(smpl_body.to_smpl_rotation(spine_rot))
+        cumulative[_SPINE1] = cumulative[0].dot(spine_rot)
+        for idx in (6, 9, 13, 14):  # Spine2, Spine3, LCollar, RCollar
+            cumulative[idx] = cumulative[model.parent[idx]]
+
+        neck_axis = _unit(rng.normal(size=3), fallback=xb)
+        neck_angle = math.radians(rng.uniform(0.0, self._NECK_SWAY_MAX_DEG))
+        neck_rot = smpl_body.rotation_between(zb, _rotate(zb, neck_axis, neck_angle))
+        pose[smpl_body.NECK] = smpl_body.mat_to_axis_angle(smpl_body.to_smpl_rotation(neck_rot))
+        cumulative[smpl_body.NECK] = cumulative[9].dot(neck_rot)
+
+        # --- 腕: 肩の仰角・方位角 (T-pose = 真横基準) + 肘のヒンジ曲げ。
+        # 左右は独立にランダムな角度を割り当てる (例: 片手だけ前に出す、
+        # 片手だけ下ろす、といった姿勢も許容する)。手首・手先の pose は
+        # 0 のまま (手のランドマークは前腕の向きだけから組み立てるので、
+        # 手首の捻りは中立姿勢を仮定する, RandomSkeletonGenerator._hand_
+        # frame 参照)。---
+        # 前腕 (肘->手首) の T-pose からの累積回転行列 (``cumulative[elbow_
+        # idx]``, swing() が肩の回転もすでに合成した状態で作る full 3x3
+        # 回転行列)。手首・手先の pose は 0 のままなので、この行列が前腕・
+        # 手のボーンの実際の向き (捻り込み) をそのまま表す。手のランド
+        # マークをこの行列で組み立てる (``RandomSkeletonGenerator.
+        # _hand_frame`` 参照) ことで、SMPL メッシュの前腕が肩・肘の回転で
+        # 蓄積する前腕軸まわりの捻りを、手のランドマークにも反映できる
+        # (指方向 + 世界の「上」だけからその場でフレームを作り直す旧方式
+        # だと、この捻りが無視されて指先方向の軸まわりに SMPL メッシュと
+        # ずれて見えていた)。
+        wrist_rots = {}
+        for shoulder_idx, elbow_idx, wrist_idx, side, sign in (
+                (smpl_body.L_SHOULDER, smpl_body.L_ELBOW, smpl_body.L_WRIST,
+                 'L', 1.0),
+                (smpl_body.R_SHOULDER, smpl_body.R_ELBOW, smpl_body.R_WRIST,
+                 'R', -1.0)):
+            rest_dir = yb * sign
+            elevation = math.radians(rng.triangular(
+                self._SHOULDER_ELEVATION_DOWN_DEG,
+                self._SHOULDER_ELEVATION_DOWN_DEG,
+                self._SHOULDER_ELEVATION_UP_DEG))
+            azimuth = math.radians(rng.uniform(*self._SHOULDER_AZIMUTH_DEG_RANGE))
+            raised = _rotate(rest_dir, xb, elevation * sign)
+            upper_dir = _rotate(raised, zb, -azimuth * sign)
+            swing(shoulder_idx, elbow_idx, upper_dir)
+
+            flex = math.radians(rng.uniform(0.0, self._ELBOW_FLEX_MAX_DEG))
+            forearm_dir = _rotate(upper_dir, xb, flex * sign)
+            swing(elbow_idx, wrist_idx, forearm_dir)
+            wrist_rots[side] = cumulative[elbow_idx].copy()
+
+        vertices, joints = smpl_body.forward_world(
+            model, pose, betas, root_pos=np.zeros(3))
+
+        # 姿勢に関わらず、体の最下点が必ず床 (z=0) に接するように上下
+        # 移動する。足の開き・膝の曲げは左右対称なので、両足は常に同じ
+        # 高さのまま床に接地する。
+        min_z = float(vertices[:, 2].min())
+        root_pos = np.array([0.0, 0.0, -min_z])
+        vertices = vertices + root_pos
+        joints = joints + root_pos
+
+        return dict(gender=gender, model=model, betas=betas, pose=pose,
+                   root_pos=root_pos, vertices=vertices, joints=joints,
+                   wrist_rots=wrist_rots)
+
+
+class RandomSkeletonGenerator(object):
+    """SMPL の人モデル (``RandomSmplHumanGenerator.generate()`` の戻り値)
+    から、MediaPipe 形式の人体骨格 (関節の 3 次元位置) を作る.
+
+    骨格の関節位置は SMPL の姿勢済み関節 (``smpl_body.forward_world``)
+    をそのまま読むだけなので、SMPL メッシュと骨格の胴体・四肢の関節位置
+    は常に一致する。手首から先だけは SMPL に関節が無いので、手のランド
+    マークは SMPL の前腕 (肘->手首) の実際の姿勢 (``RandomSmplHuman
+    Generator.generate`` が計算したのと同じ累積回転行列 ``wrist_rots``)
+    から組み立てる -- SMPL の前腕ボーンをそのまま回転させたのと同じ行列
+    を使うので、手首の位置・向き (指先方向の軸まわりの捻りを含む) は
+    SMPL モデルの前腕とちょうど一致する。
+
+    Examples
+    --------
+    >>> smpl_gen = RandomSmplHumanGenerator(models, seed=0)
+    >>> gen = RandomSkeletonGenerator(seed=0)
+    >>> pose = gen.generate(smpl_gen.generate())
+    >>> pose['joint_positions']['Neck']
+    [0.01, -0.03, 1.42]
+    """
+
+    # SMPL 関節順序 (24,) -> MediaPipe 関節名。
+    _SMPL_TO_MEDIAPIPE = {
+        smpl_body.NECK: 'Neck',
+        smpl_body.L_SHOULDER: 'LShoulder', smpl_body.R_SHOULDER: 'RShoulder',
+        smpl_body.L_ELBOW: 'LElbow', smpl_body.R_ELBOW: 'RElbow',
+        smpl_body.L_WRIST: 'LWrist', smpl_body.R_WRIST: 'RWrist',
+        smpl_body.L_HIP: 'LHip', smpl_body.R_HIP: 'RHip',
+        smpl_body.L_KNEE: 'LKnee', smpl_body.R_KNEE: 'RKnee',
+        smpl_body.L_ANKLE: 'LAnkle', smpl_body.R_ANKLE: 'RAnkle',
+    }
+
+    def __init__(self, include_hand=True):
+        """
+        Parameters
+        ----------
         include_hand : bool, optional
             MediaPipe の手のランドマーク (``RHand0``..``RHand20`` /
             ``LHand0``..``LHand20``, 21 点 x 2 手) も生成するか。既定
             True (fake_people_pose_estimator_ros.py の ``~hand/enable``
             と同じ既定値)。
         """
-        self.height_range = tuple(height_range) if height_range \
-            else self._HEIGHT_RANGE_M
         self.include_hand = include_hand
-        self.rng = np.random.RandomState(seed)
-
-    def _sample_body(self):
-        rng = self.rng
-        h = rng.uniform(*self.height_range)
-
-        def r(ratio):
-            return h * ratio * rng.uniform(
-                1.0 - self._RATIO_SPREAD, 1.0 + self._RATIO_SPREAD)
-
-        body = {name: r(ratio) for name, ratio in self._RATIOS.items()}
-        body['height'] = h
-        body['thigh'] = body['h_hip'] - body['h_knee']
-        body['shank'] = body['h_knee'] - body['h_ankle']
-        body['torso'] = body['h_shoulder'] - body['h_hip']
-        return body
 
     @staticmethod
-    def _hand_frame(finger_dir, side, sign, yb, zb):
+    def _hand_frame(wrist_rot, rest_dir_robot, side):
         """手首の局所座標系 (u=指方向, v=親指側, n=掌の向き) を作る.
 
-        指のランドマークは持たないので、手首の捻り (回内/回外) は前腕の
-        向きだけからは分からない。fake_people_pose_estimator_ros.py の
-        ``~present_hand`` の基準姿勢 (wrist_roll=0, 手首を捻らない中立
-        姿勢で親指が上・掌が体の外側を向く) と同じ式で、解剖学的に自然な
-        既定の向きを組み立てる (``FakeRosPeoplePoseEstimator.
-        _body_positions`` の ``n0`` 参照)。
+        指のランドマークは持たないので手首の捻り (回内/回外) を直接は
+        観測できないが、SMPL 側は手首・手先の pose を 0 (捻りなし) の
+        まま生成しているので、前腕ボーン (肘->手首) の T-pose からの
+        累積回転 ``wrist_rot`` (``RandomSmplHumanGenerator.generate`` が
+        返す ``wrist_rots[side]``, 肩・肘の回転をすでに合成した full 3x3
+        回転行列) を T-pose での基準フレームにそのまま適用すれば、SMPL
+        メッシュの前腕とちょうど同じ向き (肩・肘の回転で前腕軸まわりに
+        溜まる捻りも込み) になる。
+
+        T-pose での基準フレームは、u0=前腕の T-pose 方向 (``rest_dir_
+        robot``, ほぼ体の左右軸), n0=T-pose で掌が向く向き (実測により
+        -Z (下), ``smpl_body._REST_PALM_NORMAL`` と同じ値を使う), v0=
+        u0×n0 (または n0×u0) から作る親指方向 (前方 +X, 解剖学的に自然)
+        で決める。以前は現在の指方向 + 世界の「上」だけからその場でフレ
+        ームを作り直していたため、肩・肘の回転で前腕に溜まる捻りが手の
+        ランドマークに反映されず、指先方向の軸まわりに SMPL メッシュと
+        ずれて見えていた。
 
         Parameters
         ----------
-        finger_dir : (3,) array_like
-            指先方向の単位ベクトル (ここでは前腕 = 肘->手首の延長)。
+        wrist_rot : (3, 3) array_like
+            前腕ボーンの T-pose からの累積回転行列 (ロボット座標系)。
+        rest_dir_robot : (3,) array_like
+            前腕の T-pose での向き (肘->手首, 単位ベクトル, ロボット
+            座標系)。
         side : str
             ``'R'`` or ``'L'``。
-        sign : float
-            体の左右方向の符号 (体の左が +1, 右が -1; ``generate`` の
-            腕ループで使っているものと同じ)。
-        yb, zb : (3,) array_like
-            体基準の左方向・上方向の単位ベクトル。
         """
-        u = np.asarray(finger_dir, dtype=np.float64)
-        up_perp_raw = zb - float(np.dot(zb, u)) * u
-        up_perp_norm = np.linalg.norm(up_perp_raw)
-        if up_perp_norm >= _UP_PERP_BLEND_NORM:
-            up_perp = up_perp_raw / up_perp_norm
-        else:
-            hinge = yb * sign
-            hinge_perp = _unit(hinge - float(np.dot(hinge, u)) * u,
-                               fallback=np.zeros(3))
-            weight = up_perp_norm / _UP_PERP_BLEND_NORM
-            up_perp = _unit(weight * up_perp_raw
-                           + (1.0 - weight) * hinge_perp,
-                           fallback=hinge_perp)
-        n = _unit(np.cross(up_perp, u) if side == 'R'
-                 else np.cross(u, up_perp))
-        v = np.cross(u, n) if side == 'R' else np.cross(n, u)
+        wrist_rot = np.asarray(wrist_rot, dtype=np.float64)
+        u0 = np.asarray(rest_dir_robot, dtype=np.float64)
+        n0 = smpl_body._REST_PALM_NORMAL
+        v0 = np.cross(u0, n0) if side == 'R' else np.cross(n0, u0)
+        u = wrist_rot.dot(u0)
+        v = wrist_rot.dot(v0)
+        n = wrist_rot.dot(n0)
         return u, v, n
 
     @staticmethod
@@ -261,8 +430,13 @@ class RandomSkeletonGenerator(object):
         pts = wrist + hand_length * HAND_LOCAL.dot(basis)
         return {'{}Hand{}'.format(side, i): pts[i] for i in range(len(pts))}
 
-    def generate(self):
-        """1 人分のランダムな骨格を生成する.
+    def generate(self, smpl_person):
+        """SMPL の人モデルから 1 人分の骨格を作る.
+
+        Parameters
+        ----------
+        smpl_person : dict
+            ``RandomSmplHumanGenerator.generate()`` の戻り値。
 
         Returns
         -------
@@ -271,130 +445,147 @@ class RandomSkeletonGenerator(object):
             (x=前, y=左, z=上), 床 z=0 に接地) と ``height`` (身長 [m])
             を持つ、JSON にそのままシリアライズできる dict。
         """
-        rng = self.rng
-        b = self._sample_body()
-
-        xb = np.array([1.0, 0.0, 0.0])  # front
         yb = np.array([0.0, 1.0, 0.0])  # left
         zb = np.array([0.0, 0.0, 1.0])  # up
 
-        pelvis = zb * b['h_hip']
-        joints = {}
+        smpl_joints = smpl_person['joints']
+        vertices = smpl_person['vertices']
+        joints = {name: smpl_joints[idx]
+                 for idx, name in self._SMPL_TO_MEDIAPIPE.items()}
 
-        # --- 脚: 股関節の開き (外転) と膝の曲げ。左右対称な角度を使う
-        # ので、両足は常に同じ高さのまま (generate() 末尾の床接地補正で
-        # 両足が同時に接地する)。---
-        stance = math.radians(rng.uniform(0.0, self._STANCE_ABDUCTION_MAX_DEG))
-        knee_flex = math.radians(rng.uniform(0.0, self._KNEE_FLEX_MAX_DEG))
-        for side, sign in (('L', 1.0), ('R', -1.0)):
-            hip = pelvis + yb * (b['hip_width'] / 2.0) * sign
-            thigh_dir = _rotate(-zb, xb, stance * sign)
-            knee = hip + b['thigh'] * thigh_dir
-            shank_dir = _rotate(thigh_dir, yb, knee_flex)
-            ankle = knee + b['shank'] * shank_dir
-            joints['{}Hip'.format(side)] = hip
-            joints['{}Knee'.format(side)] = knee
-            joints['{}Ankle'.format(side)] = ankle
-
-        # --- 胴体・首・頭 (ごく僅かにランダムな軸で傾ける) ---
-        spine_axis = _unit(rng.normal(size=3), fallback=xb)
-        spine_angle = math.radians(rng.uniform(0.0, self._SPINE_SWAY_MAX_DEG))
-        torso_dir = _rotate(zb, spine_axis, spine_angle)
-        neck = pelvis + b['torso'] * torso_dir
-        joints['Neck'] = neck
-
-        neck_axis = _unit(rng.normal(size=3), fallback=xb)
-        neck_angle = math.radians(rng.uniform(0.0, self._NECK_SWAY_MAX_DEG))
-        head_dir = _rotate(torso_dir, neck_axis, neck_angle)
-        head_fwd = _unit(np.cross(yb, head_dir), fallback=xb)
+        neck = joints['Neck']
+        head = smpl_joints[smpl_body.HEAD]
+        head_dir = _unit(head - neck, fallback=zb)
+        head_fwd = _unit(np.cross(yb, head_dir), fallback=np.array([1.0, 0.0, 0.0]))
         head_left = _unit(np.cross(head_dir, head_fwd), fallback=yb)
-        joints['Nose'] = neck + head_dir * 0.14 + head_fwd * 0.06
-        joints['LEye'] = (neck + head_dir * 0.16 + head_fwd * 0.05
-                          + head_left * 0.03)
-        joints['REye'] = (neck + head_dir * 0.16 + head_fwd * 0.05
-                          - head_left * 0.03)
-        joints['LEar'] = neck + head_dir * 0.15 + head_left * 0.08
-        joints['REar'] = neck + head_dir * 0.15 - head_left * 0.08
+        joints['Nose'] = neck + head_dir * _NOSE_UP_OFFSET \
+            + head_fwd * _HEAD_FORWARD_OFFSET
+        joints['LEye'] = (neck + head_dir * _EYE_UP_OFFSET
+                          + head_fwd * _EYE_FORWARD_OFFSET
+                          + head_left * _EYE_LATERAL_OFFSET)
+        joints['REye'] = (neck + head_dir * _EYE_UP_OFFSET
+                          + head_fwd * _EYE_FORWARD_OFFSET
+                          - head_left * _EYE_LATERAL_OFFSET)
+        joints['LEar'] = neck + head_dir * _EAR_UP_OFFSET \
+            + head_left * _EAR_LATERAL_OFFSET
+        joints['REar'] = neck + head_dir * _EAR_UP_OFFSET \
+            - head_left * _EAR_LATERAL_OFFSET
 
-        # --- 腕: 肩の仰角・方位角 (T-pose = 真横基準) + 肘のヒンジ曲げ。
-        # 左右は独立にランダムな角度を割り当てる (例: 片手だけ前に出す、
-        # 片手だけ下ろす、といった姿勢も許容する)。---
-        for side, sign in (('L', 1.0), ('R', -1.0)):
-            shoulder = neck + yb * (b['shoulder_width'] / 2.0) * sign
-            rest_dir = yb * sign
-            elevation = math.radians(rng.triangular(
-                self._SHOULDER_ELEVATION_DOWN_DEG,
-                self._SHOULDER_ELEVATION_DOWN_DEG,
-                self._SHOULDER_ELEVATION_UP_DEG))
-            azimuth = math.radians(rng.uniform(*self._SHOULDER_AZIMUTH_DEG_RANGE))
-            raised = _rotate(rest_dir, xb, elevation * sign)
-            upper_dir = _rotate(raised, zb, -azimuth * sign)
-            elbow = shoulder + b['upper_arm'] * upper_dir
+        height = float(vertices[:, 2].max() - vertices[:, 2].min())
 
-            flex = math.radians(rng.uniform(0.0, self._ELBOW_FLEX_MAX_DEG))
-            forearm_dir = _rotate(upper_dir, xb, flex * sign)
-            wrist = elbow + b['forearm'] * forearm_dir
-
-            joints['{}Shoulder'.format(side)] = shoulder
-            joints['{}Elbow'.format(side)] = elbow
-            joints['{}Wrist'.format(side)] = wrist
-
-            if self.include_hand:
-                u, v, n = self._hand_frame(forearm_dir, side, sign, yb, zb)
+        if self.include_hand:
+            hand_length = height * _HAND_LENGTH_HEIGHT_RATIO
+            model = smpl_person['model']
+            for side, elbow_idx, wrist_idx in (
+                    ('L', smpl_body.L_ELBOW, smpl_body.L_WRIST),
+                    ('R', smpl_body.R_ELBOW, smpl_body.R_WRIST)):
+                wrist = joints['{}Wrist'.format(side)]
+                wrist_rot = smpl_person['wrist_rots'][side]
+                rest_dir_robot = _unit(smpl_body.PERM.dot(
+                    model.J[wrist_idx] - model.J[elbow_idx]))
+                u, v, n = self._hand_frame(wrist_rot, rest_dir_robot, side)
                 joints.update(self._hand_landmarks(
-                    side, wrist, u, v, n, b['hand_length']))
+                    side, wrist, u, v, n, hand_length))
 
-        # --- 人物は常に原点に位置し、正面が x 軸正方向を向くようにする
-        # (骨盤のヨー回転や水平方向のランダムなずらしは行わない)。---
-        positions = joints
-
-        # 姿勢に関わらず、体の最下点 (=両足) が必ず床 (z=0) に接する
-        # ように上下移動する。足の開き・膝の曲げは左右対称なので、両足
-        # は常に同じ高さのまま床に接地する。
-        min_z = min(p[2] for p in positions.values())
-        shift = np.array([0.0, 0.0, -min_z])
         joint_positions = {
-            name: [float(v) for v in (p + shift)]
-            for name, p in positions.items()}
-
-        return dict(joint_positions=joint_positions, height=float(b['height']))
-
-    def generate_many(self, num_samples):
-        """``generate()`` を ``num_samples`` 回呼んだ結果をリストで返す."""
-        return [self.generate() for _ in range(num_samples)]
+            name: [float(x) for x in p] for name, p in joints.items()}
+        return dict(joint_positions=joint_positions, height=height)
 
 
-def save_json(pose, path):
-    """``RandomSkeletonGenerator.generate()`` の戻り値を JSON として保存する."""
+def build_person_json(smpl_person, skeleton):
+    """1 人分の SMPL モデルと骨格を、保存用の 1 つの dict にまとめる.
+
+    Parameters
+    ----------
+    smpl_person : dict
+        ``RandomSmplHumanGenerator.generate()`` の戻り値。
+    skeleton : dict
+        ``RandomSkeletonGenerator.generate()`` の戻り値。
+
+    Returns
+    -------
+    dict
+        ``skeleton`` (``joint_positions``/``height``) と ``smpl``
+        (``gender``/``betas``/``pose``/``root_pos``) を持つ、JSON に
+        そのままシリアライズできる dict。``draw_random_human_poses.py``
+        は ``smpl`` を ``aero_demo.smpl_body.forward_world`` に渡して
+        メッシュを再構成し、``skeleton`` を色付きの線で重ねて描く。
+    """
+    return dict(
+        skeleton=skeleton,
+        smpl=dict(
+            gender=smpl_person['gender'],
+            betas=[float(x) for x in smpl_person['betas']],
+            pose=[[float(x) for x in row] for row in smpl_person['pose']],
+            root_pos=[float(x) for x in smpl_person['root_pos']],
+        ))
+
+
+def save_json(person, path):
+    """``build_person_json`` の戻り値を JSON として保存する."""
     with open(path, 'w') as f:
-        json.dump(pose, f, indent=2)
+        json.dump(person, f, indent=2)
+
+
+def load_smpl_models(male_path, female_path):
+    """使用可能な SMPL モデル (男性/女性) をロードする.
+
+    女性モデルが見つからない場合は男性モデルのみで続行する。
+
+    Returns
+    -------
+    list of (str, smpl_body.SmplModel)
+        ``(gender, model)`` のリスト。
+    """
+    models = [('male', smpl_body.load_smpl_model(male_path))]
+    female_path = os.path.expanduser(female_path)
+    if os.path.exists(female_path):
+        models.append(('female', smpl_body.load_smpl_model(female_path)))
+    else:
+        print('female SMPL model not found at {}, using the male model '
+              'only (--female-model-path で指定できます)'.format(
+                  female_path))
+    return models
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MediaPipe 形式の人体骨格をランダムに生成し、JSON として '
-                    '保存する (SMPL には依存しない)。')
+        description='SMPL の人体モデルをランダムに生成し、そこから '
+                    'MediaPipe 形式の骨格を作って、両方を JSON として '
+                    '保存する。')
     parser.add_argument('--num-samples', type=int, default=100,
                         help='生成する人物 (JSON) の数。')
     parser.add_argument(
         '--output-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_human_poses'),
         help='JSON の保存先ディレクトリ。')
-    parser.add_argument('--height-range', type=float, nargs=2, default=None,
-                        metavar=('MIN_M', 'MAX_M'),
-                        help='身長の生成範囲 [m] (既定 1.4 1.9)。')
+    parser.add_argument(
+        '--model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicmodel_m_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (男性) モデル .pkl のパス。')
+    parser.add_argument(
+        '--female-model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ使う)。')
     parser.add_argument('--seed', type=int, default=None,
                         help='乱数シード (指定すると再現可能になる)。')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    generator = RandomSkeletonGenerator(
-        height_range=args.height_range, seed=args.seed)
+    models = load_smpl_models(args.model_path, args.female_model_path)
+    smpl_generator = RandomSmplHumanGenerator(models, seed=args.seed)
+    skeleton_generator = RandomSkeletonGenerator()
 
     for i in range(args.num_samples):
-        pose = generator.generate()
+        smpl_person = smpl_generator.generate()
+        skeleton = skeleton_generator.generate(smpl_person)
+        person = build_person_json(smpl_person, skeleton)
         out_path = os.path.join(args.output_dir, 'human_{:03d}.json'.format(i))
-        save_json(pose, out_path)
+        save_json(person, out_path)
         print('[{}/{}] saved {}'.format(i + 1, args.num_samples, out_path))
 
 

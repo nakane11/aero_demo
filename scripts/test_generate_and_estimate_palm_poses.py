@@ -30,7 +30,8 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from generate_random_human_poses import (  # noqa: E402
-    RandomSkeletonGenerator, save_json as save_skeleton_json)
+    RandomSmplHumanGenerator, RandomSkeletonGenerator, build_person_json,
+    load_smpl_models, save_json as save_skeleton_json)
 from estimate_palm_poses import (  # noqa: E402
     PalmPoseEstimator, load_skeleton_json, save_json as save_palm_json)
 
@@ -49,14 +50,17 @@ def check_orthonormal_right_handed(axes, atol=1e-6):
         'z_axis != x_axis cross y_axis'
 
 
-def run(num_samples, seed, work_dir):
+def run(num_samples, seed, work_dir, model_path, female_model_path):
     skeleton_dir = os.path.join(work_dir, 'skeletons')
     palm_dir = os.path.join(work_dir, 'palms')
     os.makedirs(skeleton_dir, exist_ok=True)
     os.makedirs(palm_dir, exist_ok=True)
 
-    # ---- RandomSkeletonGenerator のインスタンス: 骨格 (関節位置) を作る側
-    generator = RandomSkeletonGenerator(seed=seed)
+    # ---- RandomSmplHumanGenerator / RandomSkeletonGenerator のインスタンス:
+    # SMPL の人モデルとそこから作る骨格 (関節位置) を作る側
+    models = load_smpl_models(model_path, female_model_path)
+    smpl_generator = RandomSmplHumanGenerator(models, seed=seed)
+    skeleton_generator = RandomSkeletonGenerator()
     # ---- PalmPoseEstimator のインスタンス: 骨格から掌の位置姿勢を推定する側
     estimator = PalmPoseEstimator()
 
@@ -66,10 +70,13 @@ def run(num_samples, seed, work_dir):
         skeleton_path = os.path.join(skeleton_dir, name)
         palm_path = os.path.join(palm_dir, name)
 
-        # generator が作った骨格を、generate_random_human_poses.py と同じ
-        # 形式で一旦 JSON ファイルに書き出す。
-        pose = generator.generate()
-        save_skeleton_json(pose, skeleton_path)
+        # generator が作った SMPL の人モデルと、そこから作った骨格を、
+        # generate_random_human_poses.py と同じ形式で一旦 JSON ファイルに
+        # 書き出す。
+        smpl_person = smpl_generator.generate()
+        skeleton = skeleton_generator.generate(smpl_person)
+        person = build_person_json(smpl_person, skeleton)
+        save_skeleton_json(person, skeleton_path)
 
         # estimator 側は、その JSON ファイルを estimate_palm_poses.py と
         # 同じ手順 (load_skeleton_json) で読み込んで推定する。
@@ -124,8 +131,21 @@ def main():
         '--work-dir', type=str,
         default=os.path.join(_THIS_DIR, 'test_palm_pose_pipeline'),
         help='骨格 JSON / 掌 JSON を書き出す作業ディレクトリ。')
+    parser.add_argument(
+        '--model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicmodel_m_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (男性) モデル .pkl のパス。')
+    parser.add_argument(
+        '--female-model-path', type=str,
+        default=os.path.expanduser(
+            '~/SMPL_python_v.1.0.0/smpl/models/'
+            'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
+        help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ使う)。')
     args = parser.parse_args()
-    run(args.num_samples, args.seed, args.work_dir)
+    run(args.num_samples, args.seed, args.work_dir,
+        args.model_path, args.female_model_path)
 
 
 if __name__ == '__main__':

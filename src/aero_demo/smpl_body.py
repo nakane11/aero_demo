@@ -22,7 +22,7 @@ SMPL のモデルファイル自体はライセンス上リポジトリに同梱
 軸規約 (実測して決定): SMPL のローカル座標系は
 axis0=左(+)/右(-), axis1=上(+)/下(-), axis2=前(+)/後(-) の右手系。
 ロボット座標系 (x=前, y=左, z=上) との対応は
-``robot_x=smpl_z, robot_y=smpl_x, robot_z=smpl_y`` (``_PERM`` 参照)。
+``robot_x=smpl_z, robot_y=smpl_x, robot_z=smpl_y`` (``PERM`` 参照)。
 """
 
 import os
@@ -190,23 +190,25 @@ def smpl_forward(model, pose, betas, trans):
 
 # ロボット座標系 (x=前, y=左, z=上) <- SMPL ローカル座標系
 # (axis0=左, axis1=上, axis2=前) への変換 (実測して決定, モジュール
-# docstring 参照)。
-_PERM = np.array([[0.0, 0.0, 1.0],
-                 [1.0, 0.0, 0.0],
-                 [0.0, 1.0, 0.0]])
+# docstring 参照)。``generate_random_human_poses.py`` の SMPL 姿勢生成
+# クラスも同じ変換を使うので公開名にしてある。
+PERM = np.array([[0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0]])
 
 # SMPL 標準の 24 関節順序 (kintree_table の親子関係と一致することを
-# 確認済み)。
-_PELVIS = 0
-_L_HIP, _R_HIP = 1, 2
-_L_KNEE, _R_KNEE = 4, 5
-_L_ANKLE, _R_ANKLE = 7, 8
-_NECK = 12
-_HEAD = 15
-_L_SHOULDER, _R_SHOULDER = 16, 17
-_L_ELBOW, _R_ELBOW = 18, 19
-_L_WRIST, _R_WRIST = 20, 21
-_L_HAND, _R_HAND = 22, 23
+# 確認済み)。``generate_random_human_poses.py`` からも参照するので公開名
+# にしてある。
+PELVIS = 0
+L_HIP, R_HIP = 1, 2
+L_KNEE, R_KNEE = 4, 5
+L_ANKLE, R_ANKLE = 7, 8
+NECK = 12
+HEAD = 15
+L_SHOULDER, R_SHOULDER = 16, 17
+L_ELBOW, R_ELBOW = 18, 19
+L_WRIST, R_WRIST = 20, 21
+L_HAND, R_HAND = 22, 23
 
 # (pose を設定する関節, その先のボーンの終点関節,
 #  ロボット側の始点関節名, ロボット側の終点関節名)。
@@ -219,20 +221,20 @@ _L_HAND, _R_HAND = 22, 23
 # 手のランドマークのカプセル (実際の手の向き) と SMPL の手先が指す向きが
 # ずれて見える。手首の捻り (wrist_roll, 前腕軸まわり) は、指の付け根
 # (knuckle) のランドマークが 3 点以上あれば ``_hand_plane_normal`` で
-# 掌の向きを推定してそちらに合わせる (下の pose_idx が _L_WRIST/_R_WRIST
+# 掌の向きを推定してそちらに合わせる (下の pose_idx が L_WRIST/R_WRIST
 # の場合の特別扱い、_twist_from_normal 参照)。それも無理なら以前どおり
 # 無視する (曲げのみで捻りは 0)。
 _LIMB_CHAINS = [
-    (_L_HIP, _L_KNEE, 'LHip', 'LKnee'),
-    (_L_KNEE, _L_ANKLE, 'LKnee', 'LAnkle'),
-    (_R_HIP, _R_KNEE, 'RHip', 'RKnee'),
-    (_R_KNEE, _R_ANKLE, 'RKnee', 'RAnkle'),
-    (_L_SHOULDER, _L_ELBOW, 'LShoulder', 'LElbow'),
-    (_L_ELBOW, _L_WRIST, 'LElbow', 'LWrist'),
-    (_R_SHOULDER, _R_ELBOW, 'RShoulder', 'RElbow'),
-    (_R_ELBOW, _R_WRIST, 'RElbow', 'RWrist'),
-    (_L_WRIST, _L_HAND, 'LWrist', 'LHand9'),
-    (_R_WRIST, _R_HAND, 'RWrist', 'RHand9'),
+    (L_HIP, L_KNEE, 'LHip', 'LKnee'),
+    (L_KNEE, L_ANKLE, 'LKnee', 'LAnkle'),
+    (R_HIP, R_KNEE, 'RHip', 'RKnee'),
+    (R_KNEE, R_ANKLE, 'RKnee', 'RAnkle'),
+    (L_SHOULDER, L_ELBOW, 'LShoulder', 'LElbow'),
+    (L_ELBOW, L_WRIST, 'LElbow', 'LWrist'),
+    (R_SHOULDER, R_ELBOW, 'RShoulder', 'RElbow'),
+    (R_ELBOW, R_WRIST, 'RElbow', 'RWrist'),
+    (L_WRIST, L_HAND, 'LWrist', 'LHand9'),
+    (R_WRIST, R_HAND, 'RWrist', 'RHand9'),
 ]
 
 
@@ -332,7 +334,7 @@ def _twist_from_normal(rest_dir, rest_normal, obs_dir, obs_normal):
     return target.dot(source.T)
 
 
-def _rotation_between(a, b):
+def rotation_between(a, b):
     """単位ベクトル ``a`` を ``b`` に重ねる最小回転 (3, 3)."""
     axis = np.cross(a, b)
     n = np.linalg.norm(axis)
@@ -350,7 +352,7 @@ def _rotation_between(a, b):
     return rodrigues(axis * angle)
 
 
-def _mat_to_axis_angle(R):
+def mat_to_axis_angle(R):
     cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
     theta = np.arccos(cos_theta)
     if theta < 1e-8:
@@ -370,16 +372,16 @@ def _mat_to_axis_angle(R):
     return axis * theta
 
 
-def _to_smpl_rotation(R_robot):
+def to_smpl_rotation(R_robot):
     """ロボット座標系の回転行列を SMPL ローカル座標系の回転行列に直す.
 
-    ``_PERM`` は座標成分の並べ替えでしかない (関節ごとの回転ではない)
+    ``PERM`` は座標成分の並べ替えでしかない (関節ごとの回転ではない)
     ので、ロボット座標系の成分で計算した回転 ``R_robot`` をそのまま
     ``smpl_forward`` (SMPL 自身の座標系で ``pose`` を解釈する) に渡すと
-    座標系がずれる。``v_robot = _PERM @ v_smpl`` なので、共役
-    ``R_smpl = _PERM.T @ R_robot @ _PERM`` を取って渡す必要がある。
+    座標系がずれる。``v_robot = PERM @ v_smpl`` なので、共役
+    ``R_smpl = PERM.T @ R_robot @ PERM`` を取って渡す必要がある。
     """
-    return _PERM.T.dot(R_robot).dot(_PERM)
+    return PERM.T.dot(R_robot).dot(PERM)
 
 
 def retarget_and_pose(model, joints, betas=None):
@@ -418,23 +420,23 @@ def retarget_and_pose(model, joints, betas=None):
         hip_center = (joints['RHip'] + joints['LHip']) / 2.0
 
     def permuted_dist(ia, ib):
-        return float(np.linalg.norm(_PERM.dot(model.J[ib] - model.J[ia])))
+        return float(np.linalg.norm(PERM.dot(model.J[ib] - model.J[ia])))
 
     # --- スケール: Neck と 足首(優先)/腰 の観測距離を SMPL 静止時の
     #     同じ距離で割って求める。どちらも無理なら 1.0 のまま。 ---
     scale = 1.0
     if 'LAnkle' in joints or 'RAnkle' in joints:
         if 'LAnkle' in joints:
-            ankle_pos, ankle_idx = joints['LAnkle'], _L_ANKLE
+            ankle_pos, ankle_idx = joints['LAnkle'], L_ANKLE
         else:
-            ankle_pos, ankle_idx = joints['RAnkle'], _R_ANKLE
-        template = permuted_dist(_NECK, ankle_idx)
+            ankle_pos, ankle_idx = joints['RAnkle'], R_ANKLE
+        template = permuted_dist(NECK, ankle_idx)
         if template > 1e-6:
             scale = float(np.linalg.norm(joints['Neck'] - ankle_pos)) \
                 / template
     elif hip_center is not None:
-        hip_template = float(np.linalg.norm(_PERM.dot(
-            model.J[_NECK] - (model.J[_L_HIP] + model.J[_R_HIP]) / 2.0)))
+        hip_template = float(np.linalg.norm(PERM.dot(
+            model.J[NECK] - (model.J[L_HIP] + model.J[R_HIP]) / 2.0)))
         if hip_template > 1e-6:
             scale = float(np.linalg.norm(joints['Neck'] - hip_center)) \
                 / hip_template
@@ -463,7 +465,7 @@ def retarget_and_pose(model, joints, betas=None):
         # 妥協するのと同じ発想で、SMPL 自身の Neck-Pelvis 静止距離
         # (スケール後) だけ Neck から下に置く。
         root_pos = joints['Neck'] \
-            - world_up * (scale * permuted_dist(_NECK, _PELVIS))
+            - world_up * (scale * permuted_dist(NECK, PELVIS))
 
     # --- 四肢の swing (捻りは無視) ---
     pose = np.zeros((24, 3))
@@ -476,16 +478,16 @@ def retarget_and_pose(model, joints, betas=None):
 
     for pose_idx, child_idx, robot_parent, robot_child in _LIMB_CHAINS:
         parent_rot = get_cumulative(model.parent[pose_idx])
-        rest_dir_robot = _unit(_PERM.dot(model.J[child_idx] - model.J[pose_idx]))
+        rest_dir_robot = _unit(PERM.dot(model.J[child_idx] - model.J[pose_idx]))
         matched = False
         if (rest_dir_robot is not None and robot_parent in joints
                 and robot_child in joints):
             obs_dir_world = _unit(joints[robot_child] - joints[robot_parent])
             if obs_dir_world is not None:
                 obs_dir_local = parent_rot.T.dot(obs_dir_world)
-                R_local = _rotation_between(rest_dir_robot, obs_dir_local)
-                if pose_idx in (_L_WRIST, _R_WRIST):
-                    hand = 'L' if pose_idx == _L_WRIST else 'R'
+                R_local = rotation_between(rest_dir_robot, obs_dir_local)
+                if pose_idx in (L_WRIST, R_WRIST):
+                    hand = 'L' if pose_idx == L_WRIST else 'R'
                     normal_world = _hand_plane_normal(
                         joints, hand + 'Hand', hand, obs_dir_world)
                     if normal_world is not None:
@@ -495,7 +497,7 @@ def retarget_and_pose(model, joints, betas=None):
                             obs_dir_local, target_normal_local)
                         if R_local_full is not None:
                             R_local = R_local_full
-                pose[pose_idx] = _mat_to_axis_angle(_to_smpl_rotation(R_local))
+                pose[pose_idx] = mat_to_axis_angle(to_smpl_rotation(R_local))
                 cumulative[pose_idx] = parent_rot.dot(R_local)
                 matched = True
         if not matched:
@@ -503,18 +505,56 @@ def retarget_and_pose(model, joints, betas=None):
 
     # --- 首/頭: Neck -> Nose 方向に合わせる (無ければ中立のまま) ---
     if 'Nose' in joints:
-        parent_rot = get_cumulative(model.parent[_NECK])
-        rest_dir_robot = _unit(_PERM.dot(model.J[_HEAD] - model.J[_NECK]))
+        parent_rot = get_cumulative(model.parent[NECK])
+        rest_dir_robot = _unit(PERM.dot(model.J[HEAD] - model.J[NECK]))
         obs_dir_world = _unit(joints['Nose'] - joints['Neck'])
         if rest_dir_robot is not None and obs_dir_world is not None:
             obs_dir_local = parent_rot.T.dot(obs_dir_world)
-            R_local = _rotation_between(rest_dir_robot, obs_dir_local)
-            pose[_NECK] = _mat_to_axis_angle(_to_smpl_rotation(R_local))
+            R_local = rotation_between(rest_dir_robot, obs_dir_local)
+            pose[NECK] = mat_to_axis_angle(to_smpl_rotation(R_local))
 
     # --- 頂点の生成・配置 ---
     betas = np.zeros(10) if betas is None else np.asarray(betas, dtype=np.float64)
-    v_local, _ = smpl_forward(model, pose, betas, np.zeros(3))
-    v_centered = v_local - model.J[_PELVIS]
-    v_robot_local = v_centered.dot(_PERM.T)
-    v_world = root_pos + scale * v_robot_local.dot(root_rot.T)
+    v_world, _ = forward_world(model, pose, betas, root_pos, root_rot, scale=scale)
     return v_world, model.f
+
+
+def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0):
+    """SMPL の ``pose``/``betas`` から、ワールド (ロボット座標系) に配置
+    した頂点・関節位置を返す.
+
+    ``retarget_and_pose`` (骨格 -> SMPL) と ``generate_random_human_
+    poses.RandomSmplHumanGenerator`` (SMPL をネイティブに乱数生成) の
+    どちらも「pose/betas から姿勢済みの頂点・関節を作り、pelvis を原点に
+    寄せてから ``PERM`` でロボット座標系に変換し、``root_rot``/``root_
+    pos`` で好きな場所へ置く」という同じ手順を踏むので、その共通部分を
+    ここに集約してある。
+
+    Parameters
+    ----------
+    model : SmplModel
+    pose : (24, 3) array_like
+    betas : (10,) array_like
+    root_pos : (3,) array_like
+        pelvis をロボット座標系のどこに置くか。
+    root_rot : (3, 3) array_like, optional
+        pelvis の向き (ロボット座標系)。``None`` (既定) なら単位行列
+        (体は常に +x を向く, ``generate_random_human_poses.py`` と同じ
+        既定の置き方)。
+    scale : float, optional
+        SMPL の頂点・関節をこの倍率で拡大縮小する (``retarget_and_pose``
+        が観測した身長に合わせるのに使う)。既定 1.0 (SMPL 自身の betas
+        が表す実寸のまま使う, ``RandomSmplHumanGenerator`` はこちら)。
+
+    Returns
+    -------
+    (vertices_world, joints_world) : (ndarray(6890, 3), ndarray(24, 3))
+    """
+    if root_rot is None:
+        root_rot = np.eye(3)
+    v_local, joints_local = smpl_forward(model, pose, betas, np.zeros(3))
+    v_robot_local = (v_local - model.J[PELVIS]).dot(PERM.T)
+    joints_robot_local = (joints_local - model.J[PELVIS]).dot(PERM.T)
+    vertices_world = root_pos + scale * v_robot_local.dot(root_rot.T)
+    joints_world = root_pos + scale * joints_robot_local.dot(root_rot.T)
+    return vertices_world, joints_world
