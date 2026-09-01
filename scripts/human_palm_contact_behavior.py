@@ -100,7 +100,6 @@ from collections import namedtuple
 
 import numpy as np
 import rospy
-from visualization_msgs.msg import MarkerArray
 
 from skrobot.coordinates import Coordinates
 from skrobot.coordinates.math import matrix2ypr
@@ -485,9 +484,6 @@ class HumanPalmContactBehavior:
     def __init__(self):
         rospy.init_node('human_palm_contact_behavior')
 
-        self.marker_pub = rospy.Publisher(
-            '~target_markers', MarkerArray, queue_size=1)
-
         # 手のひら平面には手のランドマークが要る。推定クラスは同じ private
         # 名前空間からパラメータを読むので、既定値をここで立てておく。
         rospy.set_param('~hand/enable',
@@ -808,7 +804,7 @@ class HumanPalmContactBehavior:
             return    # 首を動かしたのでこのフレームはここまで
         if plane is None:
             return
-        self._lock_target(plane, palm_points, person, now)
+        self._lock_target(plane, person, now)
 
     def _track_with_neck(self, person, plane, palm_points, now):
         """人の方を向く。指令を出したら True を返す."""
@@ -877,7 +873,7 @@ class HumanPalmContactBehavior:
             pos=[float(foot_xy[0]), float(foot_xy[1]), height / 2.0]))
         return cylinder.sdf
 
-    def _lock_target(self, plane, palm_points, person, now):
+    def _lock_target(self, plane, person, now):
         # target_palm_pos 等は palm_plane_to_ik_targets が人間の掌平面から
         # 作った IK ターゲット。target_palm_rot だけは人間自身の掌姿勢その
         # もの (ロボット側の向きではない) を残す -- データセット生成側が
@@ -902,15 +898,6 @@ class HumanPalmContactBehavior:
             rospy.logwarn('could not build human obstacle model: %s', e)
             self._human_sdf = None
         self._human_foot_sdf = self._build_human_foot_sdf(person)
-
-        # Same geometry the viewer draws, so what you see is what the robot
-        # is about to reach for.
-        marker_array = palm_plane.palm_plane_markers(
-            plane, self.pose_frame, stamp=now, ns="targets", label="target")
-        marker_array.markers.extend(palm_plane.palm_landmark_markers(
-            palm_points, self.pose_frame, stamp=now, ns="targets",
-            used=plane.used).markers)
-        self.marker_pub.publish(marker_array)
 
         rospy.loginfo(
             "Found palm! used=%s rms=%.1fmm. Target locked. "
