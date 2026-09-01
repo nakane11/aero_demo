@@ -187,12 +187,19 @@ def main():
     robot = Aero(use_hand=args.use_hand)
 
     viewer = ViserViewer(draw_grid=True)
+    # Back/Next/Good/Bad ボタンは、ロボットモデルを追加するより前に作る。
+    # ViserViewer は RobotModel を add() すると "Joint Angles" フォルダ
+    # (関節ごとのスライダー) を自動で GUI パネルに追加してしまい
+    # (skrobot.viewers._viser.ViserViewer._ensure_gui_initialized/_add_
+    # joint_sliders)、Aero は関節数が多いためこのボタン群を先に追加
+    # しないと大量のスライダーの下に埋もれて見えなくなる
+    # (draw_random_human_poses.py はロボットモデルを表示しないため
+    # この問題が起きない)。
+    nav = viewer_nav.ManualNav(viewer)
+    label_text = viewer._server.gui.add_markdown('')
     viewer.add(robot)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
-
-    nav = viewer_nav.ManualNav(viewer)
-    label_text = viewer._server.gui.add_markdown('')
 
     current_mesh_link = None
     i = 0
