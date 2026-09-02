@@ -47,6 +47,13 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    対象外として `target: false` の JSON (IK の結果は持たない) を書き出す。
    使う腕は既定で人間の手の反対側 (人の左手ならロボットの右腕。
    `--robot-arm r`/`l` で上書きできる)。
+   IK は 1 人ずつ逐次に解くのではなく、全人物 × 全向き候補の目標姿勢を
+   ロボットの腕ごとに 1 バッチにまとめ、`batch_inverse_kinematics`
+   (複数初期値からの並列 IK) で解く。1 目標あたりの初期値の数は
+   `--attempts-per-pose` (既定 16)、バックエンドは `--backend`
+   (`auto`/`numpy`/`jax`)、台車の移動範囲は
+   `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
+   再現性は `--seed` で指定する。
 
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSON (SMPL の `pose`/`betas`/`root_pos`/`gender`) と、
@@ -86,6 +93,86 @@ poses/` とは別物)。1〜4 を通しで `random_*` ディレクトリに保�
 5 の `view_handshake_poses.py` に渡したい場合は、`--skeleton-dir
 random_human_poses --handshake-dir random_handshake_poses` のように
 明示的に指定する必要がある (詳細は下記使い方を参照)。
+
+## 環境構築 (IK を解くために必要なもの)
+
+手順 4 の `solve_palm_ik.py` (と、同じ IK ロジックを使う
+`human_palm_contact_behavior.py`) は `rospy` を import しないので roscore
+などの ROS の起動は不要だが、skrobot 側に上流には無い機能を要求する。
+動作確認環境は Ubuntu 20.04 + システムの Python 3.8 (ROS Noetic 環境)。
+
+### 1. scikit-robot (fork の `aero` ブランチ) を editable install
+
+IK は skrobot の以下の機能に依存しており、これらは上流
+(`iory/scikit-robot`) には入っていないため fork を使う:
+
+* `skrobot.models.Aero` (`use_hand` 引数付き) と
+  `skrobot.data.aero_urdfpath`
+* `batch_inverse_kinematics` の `use_base='planar'` +
+  `base_limits` (台車の平面移動を含む全身バッチ IK と、その移動範囲の
+  指定 -- `--base-x-range`/`--base-y-range`/`--base-yaw-range` はこれを
+  渡している)
+
+```bash
+cd ~/ros/hand/src
+git clone -b aero git@github.com:nakane11/scikit-robot.git
+# すでに clone 済みなら: cd scikit-robot && git checkout aero
+cd scikit-robot
+pip3 install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入る
+```
+
+**注意**: `base_limits` を受け取る `batch_inverse_kinematics` は
+2026-09-02 時点では `aero` ブランチに push されておらず、ローカルの作業
+ツリーの変更 (`skrobot/model/robot_model.py`) として存在している。clone
+しなおした環境では `base_limits` が無く `TypeError` になるので、先に
+この変更をコミット・push しておく必要がある。
+
+### 2. Aero の URDF
+
+`solve_palm_ik.py` は指の関節が要らないので `Aero(use_hand=False)` =
+`aero_nohand.urdf` を使う。これは初回実行時に `skrobot.data.
+aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
+`~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要
+(初回だけネットワークが必要)。
+
+一方 `view_handshake_poses.py --use-hand` が使う
+`aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
+`feetech_hand` パッケージから自分でコピーする:
+
+```bash
+cp ~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf \
+   ~/.skrobot/aero_description/typeJSK/urdf/
+```
+
+この URDF はメッシュを `package://feetech_hand/meshes` と
+`package://aero_description/typeJSK/meshes` から参照するので、catkin
+ワークスペースを source した状態 (`ROS_PACKAGE_PATH` から
+`feetech_hand` が引ける状態) で実行する。
+
+### 3. バッチ IK のバックエンド (任意)
+
+`--backend auto` は jax が入っていれば jax、無ければ numpy を使う。
+動作確認環境では jax を入れておらず numpy バックエンドで動かしている
+(numpy 1.24.4 / trimesh 4.12.2 / viser 1.1.0)。jax を使いたい場合のみ
+追加で入れる:
+
+```bash
+pip3 install jax jaxlib jaxlie
+```
+
+### 4. 動作確認
+
+```bash
+python3 -c "
+from skrobot.models import Aero
+import inspect
+r = Aero(use_hand=False)   # 初回はここで URDF をダウンロード
+print('base_limits' in inspect.signature(r.batch_inverse_kinematics).parameters)
+"
+```
+
+`True` が出れば IK に必要な環境はそろっている (`False` なら 1. の
+`base_limits` 対応が入っていない skrobot を見ている)。
 
 ## 使い方
 
