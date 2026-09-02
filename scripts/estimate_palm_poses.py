@@ -40,7 +40,10 @@ fit_palm_plane`` で手首 + 知節 (MCP) へ平面を SVD フィットする。
 (``approach``)、「掌が人物自身の胴体からどれだけ離れているか」
 (``separation``)、「指先がどれだけロボットの方を向いているか」
 (``finger_to_robot``)、「掌が x 軸まわりに捻れて親指が下を向いていないか」
-(``thumb_roll``) の 4 つの特徴量だけで行う。距離は腕長・胴長で
+(``thumb_roll``) の 4 つの重み付き和から、「顔がロボットの方を向いて
+いないぶん」(``face_to_robot``, 左右で同じ値なので手の選択ではなく
+「差し出していない」との区別だけに効く) を引いた値だけで行う。
+距離は腕長・胴長で
 正規化せず絶対値 [m] のまま使う -- 低身長の人がロボットの手の高さに
 合わせて腕を上に伸ばすような姿勢を、正規化で潰してしまわないため。
 詳しくは ``OfferedHandSelector`` の docstring を参照。
@@ -101,6 +104,21 @@ OFFER_FEATURE_WEIGHTS = {
     'thumb_roll': 0.15,
 }
 
+# ``face_to_robot`` (顔がロボットの方を向いているか) だけは重み付き和に
+# 足し込まず、「向いていない分」を引く減点として使う
+#     score = sum(重み付き和) - FACE_AWAY_PENALTY * (1 - face_to_robot)
+# 顔は 1 つしか無いので左右で同じ値になり、どちらの手かの順位付けには効かず
+# 「差し出していない」(null) との区別だけに効く -- 重み付き和の一項にすると
+# 他の 4 つの重みを薄める (= どちらの手かの判定を鈍らせる) だけなので、
+# 減点にして「ロボットを見ている人物のスコアはこれまでと完全に同じ」に
+# なるようにする。こうすると OFFER_SCORE_MIN もそのまま使える (人手ラベル
+# 300 件では顔を背けた人物が無く一致率 93.0 % のまま。重み付き和の一項に
+# した場合は過検出が 7 -> 14 件に増えた)。
+# 満点との差が最大でも 0.15 = OFFER_SCORE_MIN との距離ぶんなので、
+# 「顔を背けている」だけで必ず null になるわけではない (ぎりぎり届く姿勢は
+# 残る) -- 基準を緩めにするという方針どおりの効き方。
+FACE_AWAY_PENALTY = 0.15
+
 # 各特徴量のランプ (下限, 上限)。下限以下で 0、上限以上で 1。距離は腕長・
 # 胴長で正規化しない絶対値 [m] なので、ランプの値もそのまま [m]。
 # approach: 脱力して真下に垂れた掌からロボットまでの距離が、実際の掌の
@@ -122,6 +140,14 @@ FINGER_TO_ROBOT_RAMP = (0.0, 0.90)
 #        には差し出している手が 1 本も無い (非差し出しは 28 本) ので、
 #        下限を -1.0 側に寄せて極端な姿勢だけを罰する。
 THUMB_ROLL_RAMP = (-1.00, -0.60)
+# face_to_robot: 顔の前方向と「顔からロボットへの方向」の cos。ロボットを
+#        まっすぐ見ていれば 1、真横を向いていれば 0、背を向けていれば -1。
+#        「握手のときに必ず相手の顔を見ている」とまでは言えない (差し出した
+#        手元を見ている、少し横を向いている) ので基準は緩めに取り、真横から
+#        60 deg ほど内側 (cos 0.5) を向いていれば満点、真横より更に 10 deg
+#        ほど背けた (cos -0.2) ところで 0 にする。顔のランドマークが足りない
+#        フレームでは罰しない (1.0 扱い, ``_face_to_robot``)。
+FACE_TO_ROBOT_RAMP = (-0.20, 0.50)
 
 # ロール角を測る基準の鉛直方向 (ワールド座標系)。「水平より下」は人物の
 # 体軸ではなく世界の水平を基準にした言い方なので、体軸ではなくこれを使う。
@@ -224,6 +250,59 @@ def _body_frame(joints):
                       hip_center=hip_center, torso=torso)
 
 
+def _midpoint(joints, name_a, name_b):
+    """2 関節の中点。どちらかが欠けていれば ``None``."""
+    point_a = joints.get(name_a)
+    point_b = joints.get(name_b)
+    if point_a is None or point_b is None:
+        return None
+    return 0.5 * (point_a + point_b)
+
+
+def _face_frame(joints, body):
+    """顔の前方向と、その基準点 (顔の位置) を返す.
+
+    第一候補は「両耳の中点 -> 鼻」で、首をひねった向き (yaw) だけでなく
+    うつむき・見上げ (pitch) も乗る。鼻か耳が欠けているフレームでは、
+    左右軸 (耳、無ければ目) と体軸の外積 ``前方 = 左 x 上`` で向きだけを
+    作る (この経路では pitch は取れない)。
+
+    Returns
+    -------
+    (forward, position) or None
+        ``forward`` は顔の前方向 (単位ベクトル)、``position`` は顔の位置。
+        顔のランドマークが足りず向きが作れなければ ``None``。
+    """
+    nose = joints.get('Nose')
+    ear_center = _midpoint(joints, 'REar', 'LEar')
+    eye_center = _midpoint(joints, 'REye', 'LEye')
+
+    # 顔の位置。耳の中点 (頭の中心に一番近い) > 目の中点 > 鼻 > 首 の順。
+    position = ear_center
+    for candidate in (eye_center, nose, joints.get('Neck'),
+                      body.shoulder_center):
+        if position is not None:
+            break
+        position = candidate
+
+    forward = None
+    base = ear_center if ear_center is not None else eye_center
+    if nose is not None and base is not None:
+        forward = _unit(nose - base)
+    if forward is None:
+        # 左右軸 (左耳/左目 - 右耳/右目 = 人物の左方向)。
+        lateral = None
+        if 'REar' in joints and 'LEar' in joints:
+            lateral = joints['LEar'] - joints['REar']
+        elif 'REye' in joints and 'LEye' in joints:
+            lateral = joints['LEye'] - joints['REye']
+        if lateral is not None:
+            forward = _unit(np.cross(lateral, body.up))
+    if forward is None or position is None:
+        return None
+    return forward, position
+
+
 def _arm_length(joints, side, torso):
     """上腕 + 前腕の長さ [m]。肘か手首が欠ければ胴長から補う."""
     shoulder = joints.get('{}Shoulder'.format(side))
@@ -241,11 +320,14 @@ class OfferedHandSelector(object):
     """左右の掌のうち、人が手繋ぎのために差し出している方を選ぶ.
 
     掌の位置姿勢 (``PalmPoseEstimator.estimate`` が返すもの) と体の関節
-    だけから、左右それぞれに 0..1 のスコアを付け、``score_min`` を超えた
+    だけから、左右それぞれに 0..1 のスコア (4 つの特徴量の重み付き和から、
+    顔をロボットに向けていない分の減点を引いたもの) を付け、``score_min``
+    を超えた
     側の argmax を採る。どちらも超えなければ「差し出していない」
     (``side`` は ``None``) と判定する。
 
-    特徴量 (4 つ。距離は腕長・胴長で正規化しない絶対値 [m])
+    特徴量 (重み付き和に入る 4 つ + 減点として効く ``face_to_robot``。
+    距離は腕長・胴長で正規化しない絶対値 [m])
     ------------------------------------------------------------------
     ``approach``
         脱力して真下に垂れた掌 (肩から体軸方向に腕長ぶん下げた点) から
@@ -266,6 +348,17 @@ class OfferedHandSelector(object):
         真上なら 1、水平なら 0、真下 -- 掌が体の中心から外を向き、小指が
         親指より上に来る姿勢 -- なら -1。握手として無理な向きに捻れた手を
         落とすための補助。
+    ``face_to_robot``
+        顔の前方向 (両耳の中点 -> 鼻, :func:`_face_frame`) と「顔から
+        ロボットへの方向」の cos。ロボットをまっすぐ見ていれば 1、真横を
+        向いていれば 0、背を向けていれば -1。ロボットに顔を向けていない
+        人物 (よそ見・後ろ向き) を落とすための補助なので基準は緩め
+        (:data:`FACE_TO_ROBOT_RAMP`)。顔は 1 つしか無いので左右で同じ値に
+        なり、どちらの手かの順位付けには効かず「差し出していない」との
+        区別だけに効く -- なので重み付き和の一項ではなく、満点からの不足
+        ぶんをスコアから引く減点 (:data:`FACE_AWAY_PENALTY`) として使う。
+        顔のランドマークが足りないフレーム (実カメラで顔が映っていない等)
+        では罰しない側に倒して 1.0 扱いにする。
 
     距離を身長で正規化しないのは意図的で、低身長の人がロボットの手の高さに
     合わせて腕を上に伸ばすような姿勢を、腕長・胴長での割り算で潰して
@@ -291,7 +384,8 @@ class OfferedHandSelector(object):
 
     def __init__(self, robot_position=None, side_prior=None, weights=None,
                  score_min=OFFER_SCORE_MIN,
-                 ambiguous_margin=AMBIGUOUS_MARGIN):
+                 ambiguous_margin=AMBIGUOUS_MARGIN,
+                 face_away_penalty=FACE_AWAY_PENALTY):
         """
         Parameters
         ----------
@@ -307,11 +401,16 @@ class OfferedHandSelector(object):
             左手の方が正対しやすい、といった事情を入れたい場合に使う。
             データセットに偏りを入れないよう既定では効かせない。
         weights : dict or None
-            特徴量の重み。既定は :data:`OFFER_FEATURE_WEIGHTS`。
+            特徴量の重み。既定は :data:`OFFER_FEATURE_WEIGHTS`
+            (``face_to_robot`` は含まない -- 下記 ``face_away_penalty``)。
         score_min : float
             これを超えるスコアが無ければ ``side`` は ``None``。
         ambiguous_margin : float
             左右のスコア差がこれ未満なら ``ambiguous`` を立てる。
+        face_away_penalty : float
+            顔をロボットに向けていない分 (``1 - face_to_robot``) に掛けて
+            スコアから引く減点の大きさ。既定は
+            :data:`FACE_AWAY_PENALTY`。0.0 にすれば顔向きを一切見なくなる。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -320,6 +419,7 @@ class OfferedHandSelector(object):
         self.weights = dict(weights or OFFER_FEATURE_WEIGHTS)
         self.score_min = float(score_min)
         self.ambiguous_margin = float(ambiguous_margin)
+        self.face_away_penalty = float(face_away_penalty)
 
     def select(self, joint_positions, palms):
         """どちらの手を繋ぐべきかを判定する.
@@ -367,8 +467,11 @@ class OfferedHandSelector(object):
                 continue
             feats = self._features(joints, body, side, palm)
             features[side] = feats
+            # ``face_to_robot`` だけは重み付き和ではなく減点で効かせる
+            # (:data:`FACE_AWAY_PENALTY` のコメント参照)。
             scores[side] = sum(w * feats[key]
                                for key, w in self.weights.items()) \
+                - self.face_away_penalty * (1.0 - feats['face_to_robot']) \
                 + float(self.side_prior.get(side, 0.0))
 
         candidates = {s: v for s, v in scores.items() if v is not None}
@@ -428,9 +531,31 @@ class OfferedHandSelector(object):
                                     *FINGER_TO_ROBOT_RAMP)
         thumb_roll = _ramp(self._thumb_roll(palm, side, finger),
                            *THUMB_ROLL_RAMP)
+        # 顔がどれだけロボットの方を向いているか (左右で同じ値になる)。
+        face_to_robot = _ramp(self._face_to_robot(joints, body, robot),
+                              *FACE_TO_ROBOT_RAMP)
 
         return dict(approach=approach, separation=separation,
-                    finger_to_robot=finger_to_robot, thumb_roll=thumb_roll)
+                    finger_to_robot=finger_to_robot, thumb_roll=thumb_roll,
+                    face_to_robot=face_to_robot)
+
+    @staticmethod
+    def _face_to_robot(joints, body, robot):
+        """顔がどれだけロボットの方を向いているか (-1..1).
+
+        顔の前方向 (:func:`_face_frame`) と「顔からロボットへの方向」の
+        cos。顔のランドマークが足りず向きが作れないときは、罰しない側に
+        倒して 1.0 を返す (実カメラで顔だけロストしたフレームで、差し出して
+        いる手を取り落とさないため)。
+        """
+        face = _face_frame(joints, body)
+        if face is None:
+            return 1.0
+        forward, position = face
+        to_robot = _unit(robot - position)
+        if to_robot is None:
+            return 1.0
+        return float(np.dot(forward, to_robot))
 
     @staticmethod
     def _thumb_roll(palm, side, finger):

@@ -10,11 +10,12 @@
     smpl_body`` の順運動学 (``smpl_forward`` / ``forward_world``) で
     姿勢済みの頂点・関節位置を計算する「人モデル」を作る。肩・肘・股
     関節・膝の可動域は解剖学的に不自然にならないよう実測ベースの範囲に
-    限る (``generate`` 参照)。「両足が地面についている・重心が安定して
-    いる・頭が上を向いている」という制約を守るため、足首から先と骨盤の
-    傾き (前後・左右) はランダム化せず、股関節の外転と膝の曲げは左右の
-    脚に同じ角度を鏡写しに適用する (旧 ``RandomSkeletonGenerator`` と
-    同じ方針)。
+    限る (``generate`` 参照)。腰 (Spine1) と首 (Neck) には僅かな傾き
+    (sway) に加えて鉛直軸まわりのひねり (回旋) も与える。「両足が地面に
+    ついている・重心が安定している・頭が上を向いている」という制約を
+    守るため、足首から先と骨盤の傾き (前後・左右) はランダム化せず、
+    股関節の外転と膝の曲げは左右の脚に同じ角度を鏡写しに適用する
+    (旧 ``RandomSkeletonGenerator`` と同じ方針)。
 
 ``RandomSkeletonGenerator``
     ``RandomSmplHumanGenerator`` が作った SMPL の人モデルを入力として
@@ -152,6 +153,11 @@ class RandomSmplHumanGenerator(object):
     角度を鏡写しに適用するので、両足は常に同じ高さのまま (= 生成後の
     床接地補正で両足が同時に接地する) になる。
 
+    腰 (Spine1) と首 (Neck) には、僅かな傾き (sway) に加えて鉛直軸まわり
+    のひねり (twist, 回旋) も与える (``_SPINE_TWIST_MAX_DEG`` /
+    ``_NECK_TWIST_MAX_DEG``, ``_sway_twist_rotation`` 参照)。どちらも
+    root より先の関節なので、ひねっても両足の接地・向きは変わらない。
+
     Examples
     --------
     >>> models = [smpl_body.load_smpl_model(male_path)]
@@ -166,6 +172,19 @@ class RandomSmplHumanGenerator(object):
     _ELBOW_FLEX_MAX_DEG = 130.0         # 肘の曲げ方 (0=伸展のみ, ヒンジ関節)
     _SPINE_SWAY_MAX_DEG = 6.0           # 脊柱のごく僅かな傾き
     _NECK_SWAY_MAX_DEG = 8.0            # 首のごく僅かな傾き
+
+    # 鉛直軸まわりのひねり (回旋)。傾き (sway) は最小回転
+    # (``smpl_body.rotation_between``) で作るのでヨー成分を持たない
+    # ので、ひねりはこの角度で別に与えて合成する (``generate`` 参照)。
+    # 正の値で左 (+y 側) を向く向きの回旋。
+    #   - 腰 (体幹) の回旋は実測で片側 35-45 度ほどだが、ここでは
+    #     Spine1 の 1 関節だけで表現する (Spine2/Spine3 は pose=0 のまま
+    #     引き継ぐ) ので、1 関節に集中しても不自然に見えない範囲に抑える。
+    #   - 首の回旋は実測で片側 60-70 度ほど。同様に少し余裕を持たせる。
+    # 脚は root (pelvis) の直接の子なので、Spine1 をひねっても両足の
+    # 接地・向きには影響しない。
+    _SPINE_TWIST_MAX_DEG = 25.0         # 腰 (体幹) のひねり
+    _NECK_TWIST_MAX_DEG = 45.0          # 首のひねり
 
     # 肩の可動域を「T-pose (腕を真横に伸ばした状態, 仰角0度・方位角0度)」
     # を基準にした仰角 (上げ下げ) と方位角 (前後の振り) で定義する。
@@ -210,6 +229,40 @@ class RandomSmplHumanGenerator(object):
             self.rng.normal(scale=self._BETAS_STD, size=10),
             -self._BETAS_CLIP, self._BETAS_CLIP)
 
+    def _sway_twist_rotation(self, sway_max_deg, twist_max_deg, xb, zb):
+        """傾き (sway) とひねり (twist) を合成した局所回転行列を作る.
+
+        腰 (Spine1) と首 (Neck) で共通の作り方。親の座標系での「上」
+        ``zb`` まわりのひねりを先に適用し、そのあとで ``zb`` をランダムな
+        軸まわりに少しだけ倒す最小回転 (``smpl_body.rotation_between``)
+        を掛ける。最小回転は定義上ひねり (回転軸まわりのヨー) 成分を
+        持たないので、ひねりはこうして別に与えないと必ず 0 になる
+        (以前はこの合成が無かったため、腰も首も一切ひねられなかった)。
+
+        Parameters
+        ----------
+        sway_max_deg : float
+            傾きの最大角 [deg] (0 から この値まで一様、軸はランダム)。
+        twist_max_deg : float
+            ひねりの最大角 [deg] (``-この値`` から ``+この値`` まで
+            一様、正で左 (+y 側) を向く回旋)。
+        xb, zb : (3,) ndarray
+            親の座標系での前方 (x) と上 (z)。
+
+        Returns
+        -------
+        (3, 3) ndarray
+            親の座標系での局所回転行列 (ロボット座標系)。
+        """
+        rng = self.rng
+        twist_angle = math.radians(
+            rng.uniform(-twist_max_deg, twist_max_deg))
+        twist_rot = smpl_body.rotation_between(xb, _rotate(xb, zb, twist_angle))
+        sway_axis = _unit(rng.normal(size=3), fallback=xb)
+        sway_angle = math.radians(rng.uniform(0.0, sway_max_deg))
+        sway_rot = smpl_body.rotation_between(zb, _rotate(zb, sway_axis, sway_angle))
+        return sway_rot.dot(twist_rot)
+
     def generate(self):
         """1 人分のランダムな SMPL 人モデルを生成する.
 
@@ -222,7 +275,10 @@ class RandomSmplHumanGenerator(object):
             ``vertices`` ((6890, 3) ndarray), ``joints`` ((24, 3)
             ndarray, SMPL 関節順序, いずれもロボット座標系), ``wrist_
             rots`` (``{'L': (3, 3) ndarray, 'R': (3, 3) ndarray}``, 前腕
-            (肘->手首) の T-pose からの累積回転行列)。
+            (肘->手首) の T-pose からの累積回転行列), ``head_rot``
+            ((3, 3) ndarray, 首 (Neck) の T-pose からの累積回転行列 --
+            首のひねりを頭部ランドマークに反映するために使う,
+            ``RandomSkeletonGenerator.generate`` 参照)。
         """
         rng = self.rng
         gender, model = self.models[rng.randint(len(self.models))]
@@ -263,23 +319,23 @@ class RandomSmplHumanGenerator(object):
             shank_dir = _rotate(thigh_dir, yb, knee_flex)
             swing(knee_idx, ankle_idx, shank_dir)
 
-        # --- 胴体・首 (ごく僅かにランダムな軸で傾ける)。脚は root の
-        # 直接の子なので、この傾きが脚の直立には影響しない。Spine1 (3)
-        # だけを傾け、Spine2/Spine3/両肩の Collar は pose=0 のまま
-        # Spine1 の傾きをそのまま引き継がせる (肩・首はその先で組み立
-        # てる)。---
+        # --- 胴体・首 (ごく僅かにランダムな軸で傾け、さらに鉛直軸まわりに
+        # ひねる)。脚は root の直接の子なので、この傾き・ひねりが脚の直立
+        # には影響しない。Spine1 (3) だけを動かし、Spine2/Spine3/両肩の
+        # Collar は pose=0 のまま Spine1 の回転をそのまま引き継がせる
+        # (肩・首はその先で組み立てる) ので、腰をひねると肩・腕・首も
+        # 一緒に回る (解剖学的に正しい: 腕の向き自体はこの後で世界座標
+        # 基準に指定し直すので、肩の位置だけがひねりに従って動く)。---
         _SPINE1 = 3
-        spine_axis = _unit(rng.normal(size=3), fallback=xb)
-        spine_angle = math.radians(rng.uniform(0.0, self._SPINE_SWAY_MAX_DEG))
-        spine_rot = smpl_body.rotation_between(zb, _rotate(zb, spine_axis, spine_angle))
+        spine_rot = self._sway_twist_rotation(
+            self._SPINE_SWAY_MAX_DEG, self._SPINE_TWIST_MAX_DEG, xb, zb)
         pose[_SPINE1] = smpl_body.mat_to_axis_angle(smpl_body.to_smpl_rotation(spine_rot))
         cumulative[_SPINE1] = cumulative[0].dot(spine_rot)
         for idx in (6, 9, 13, 14):  # Spine2, Spine3, LCollar, RCollar
             cumulative[idx] = cumulative[model.parent[idx]]
 
-        neck_axis = _unit(rng.normal(size=3), fallback=xb)
-        neck_angle = math.radians(rng.uniform(0.0, self._NECK_SWAY_MAX_DEG))
-        neck_rot = smpl_body.rotation_between(zb, _rotate(zb, neck_axis, neck_angle))
+        neck_rot = self._sway_twist_rotation(
+            self._NECK_SWAY_MAX_DEG, self._NECK_TWIST_MAX_DEG, xb, zb)
         pose[smpl_body.NECK] = smpl_body.mat_to_axis_angle(smpl_body.to_smpl_rotation(neck_rot))
         cumulative[smpl_body.NECK] = cumulative[9].dot(neck_rot)
 
@@ -333,7 +389,7 @@ class RandomSmplHumanGenerator(object):
 
         return dict(gender=gender, model=model, betas=betas, pose=pose,
                    root_pos=root_pos, vertices=vertices, joints=joints,
-                   wrist_rots=wrist_rots)
+                   wrist_rots=wrist_rots, head_rot=cumulative[smpl_body.NECK])
 
 
 class RandomSkeletonGenerator(object):
@@ -456,7 +512,20 @@ class RandomSkeletonGenerator(object):
         neck = joints['Neck']
         head = smpl_joints[smpl_body.HEAD]
         head_dir = _unit(head - neck, fallback=zb)
-        head_fwd = _unit(np.cross(yb, head_dir), fallback=np.array([1.0, 0.0, 0.0]))
+        # 顔の正面方向は首の累積回転 (``RandomSmplHumanGenerator.generate``
+        # の ``head_rot``) が回した前方 +x を、首->頭の軸に直交する成分だけ
+        # 取り出して使う。以前は世界の左右軸 (yb) との外積から作っていた
+        # ため、首のひねり (鉛直軸まわりの回旋) が鼻・目・耳に反映されず、
+        # SMPL メッシュの顔だけが横を向いて骨格の顔は正面を向いたままに
+        # なってしまう。
+        head_rot = smpl_person.get('head_rot')
+        if head_rot is None:
+            head_fwd_raw = np.cross(yb, head_dir)
+        else:
+            fwd = np.asarray(head_rot, dtype=np.float64).dot(
+                np.array([1.0, 0.0, 0.0]))
+            head_fwd_raw = fwd - head_dir * head_dir.dot(fwd)
+        head_fwd = _unit(head_fwd_raw, fallback=np.array([1.0, 0.0, 0.0]))
         head_left = _unit(np.cross(head_dir, head_fwd), fallback=yb)
         joints['Nose'] = neck + head_dir * _NOSE_UP_OFFSET \
             + head_fwd * _HEAD_FORWARD_OFFSET
