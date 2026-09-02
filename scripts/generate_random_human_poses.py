@@ -573,6 +573,13 @@ def main():
         help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ使う)。')
     parser.add_argument('--seed', type=int, default=None,
                         help='乱数シード (指定すると再現可能になる)。')
+    parser.add_argument(
+        '--start-index', type=int, default=0,
+        help='ファイル名の連番の開始値 (既定 0 -> human_000.json から)。'
+             '既にラベル付けした JSON がある所へ人物を追加したいときに、'
+             '既存のファイルを上書きしないよう続きの番号から書き出す。'
+             'その場合は --seed も既存と違う値にしないと同じ人物が'
+             '生成されるので注意。')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -581,10 +588,16 @@ def main():
     skeleton_generator = RandomSkeletonGenerator()
 
     for i in range(args.num_samples):
+        index = args.start_index + i
+        out_path = os.path.join(args.output_dir,
+                                'human_{:03d}.json'.format(index))
+        if os.path.exists(out_path):
+            print('{} は既にあります。--start-index を大きくしてください。'
+                  .format(out_path))
+            return
         smpl_person = smpl_generator.generate()
         skeleton = skeleton_generator.generate(smpl_person)
         person = build_person_json(smpl_person, skeleton)
-        out_path = os.path.join(args.output_dir, 'human_{:03d}.json'.format(i))
         save_json(person, out_path)
         print('[{}/{}] saved {}'.format(i + 1, args.num_samples, out_path))
 

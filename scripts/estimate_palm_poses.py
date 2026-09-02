@@ -35,10 +35,15 @@ fit_palm_plane`` で手首 + 知節 (MCP) へ平面を SVD フィットする。
 実際に手を繋ぐときは左右どちらか一方を選ぶ必要があるので、
 ``OfferedHandSelector`` が「人がどちらの手を差し出しているか」を判定し、
 ``PalmPoseEstimator.estimate`` の戻り値 (と保存する JSON) に
-``offered_hand`` (``'R'`` / ``'L'`` / ``None``) として入れる。判定に使う
-特徴量は掌の位置姿勢と体の関節だけから作れるものに限り、腕長・胴長で
-正規化してあるので、身長の違う人物にも実カメラ (MediaPipe) 入力にも
-そのまま効く。詳しくは ``OfferedHandSelector`` の docstring を参照。
+``offered_hand`` (``'R'`` / ``'L'`` / ``None``) として入れる。判定は
+「掌が脱力して垂れた位置からどれだけロボットに近づいたか」
+(``approach``)、「掌が人物自身の胴体からどれだけ離れているか」
+(``separation``)、「指先がどれだけロボットの方を向いているか」
+(``finger_to_robot``)、「掌が x 軸まわりに捻れて親指が下を向いていないか」
+(``thumb_roll``) の 4 つの特徴量だけで行う。距離は腕長・胴長で
+正規化せず絶対値 [m] のまま使う -- 低身長の人がロボットの手の高さに
+合わせて腕を上に伸ばすような姿勢を、正規化で潰してしまわないため。
+詳しくは ``OfferedHandSelector`` の docstring を参照。
 
 Usage
 -----
@@ -68,64 +73,72 @@ from aero_demo import palm_plane  # noqa: E402  (パス追加後に import)
 
 
 # --- 差し出している手の判定に使う定数 -------------------------------------
+# ロボット (相手) の位置。人物のいるワールド座標から +x に
+# ROBOT_FORWARD_DISTANCE だけ離れた場所に、握手のために手を出す高さ
+# ROBOT_HAND_HEIGHT で立っていると仮定する (合成骨格では人物が常に原点に
+# 立つので、ロボットの手は概ね [3.0, 0.0, 1.2])。人物の体格からではなく
+# ワールド座標で決めるので、低身長の人がロボットの手の高さに合わせて腕を
+# 上に伸ばした姿勢も「ロボットに近づいた」として拾える。実際のロボットの
+# 位置が分かっているなら ``OfferedHandSelector(robot_position=...)`` で
+# 上書きする。
+ROBOT_FORWARD_DISTANCE = 3.0
+ROBOT_HAND_HEIGHT = 1.2
+
 # 各特徴量 (すべて 0..1 に正規化済み) の重み。合計 1.0 なのでスコアも
-# 0..1 に収まる。``reach`` (体の前にどれだけ手を出しているか) が最も強い
-# 手がかりで、次が掌の向き。腕の挙上・肘の伸び・高さは「明らかに違う
-# 姿勢」を落とすための補助。``reach`` と ``height`` はそれぞれ REACH_MIN
-# / HEIGHT_MIN の足切りにも使う。
+# 0..1 に収まる。``approach`` と ``finger_to_robot`` (ロボットにどれだけ
+# 近づき、どれだけロボットを指しているか) が主な手がかりで、
+# ``separation`` と ``thumb_roll`` は補助。
+# 人手ラベル 300 件 (random_palm_poses/*.json の ``human_label``) での
+# 単独 AUC は approach 0.977 / finger_to_robot 0.973 に対し separation は
+# 0.628 -- 順位付けの情報はほとんど無いので、重みは小さくしておく。
+# ``thumb_roll`` も単独 AUC は 0.5 前後だが、「明らかに親指が下」の範囲
+# だけを罰する形 (THUMB_ROLL_RAMP) にすると、過検出を増やさずに見逃しを
+# 減らせる (同じ過検出 7 件で再現率 0.760 -> 0.813)。
 OFFER_FEATURE_WEIGHTS = {
-    'reach': 0.30,
-    'palm_facing': 0.25,
-    'elevation': 0.15,
-    'extension': 0.15,
-    'height': 0.15,
+    'approach': 0.375,
+    'separation': 0.10,
+    'finger_to_robot': 0.375,
+    'thumb_roll': 0.15,
 }
 
-# 各特徴量のランプ (下限, 上限)。下限以下で 0、上限以上で 1。
-# reach: 肩の中心から掌までの前方距離 / 腕長。腕を下ろしていれば ~0、
-#        まっすぐ前に差し出せば ~0.9。
-REACH_RAMP = (0.10, 0.55)
-# palm_facing: 掌の法線と「相手/上/正中」の最も良い一致度 (cos)。握手の
-#        ように掌が正中を向く場合・受け皿のように上を向く場合も拾う。
-PALM_FACING_RAMP = (0.0, 0.6)
-# elevation: 脱力して真下に垂れた腕からの離れ具合 (1 - cos)。真下なら 0、
-#        水平なら 1。横に上げた手も拾える (reach は前方成分しか見ない)。
-ELEVATION_RAMP = (0.15, 0.90)
-# extension: 肩->手首の距離 / 腕長 (肘の伸展)。
-EXTENSION_RAMP = (0.45, 0.90)
-# height: 腰から掌までの高さ / 胴長 (腰=0, 肩=1) が入っていてほしい帯と、
-#        その外側で 0 に落ちるまでの幅。万歳や膝下の手を落とす。
-HEIGHT_BAND = (0.25, 0.95)
-HEIGHT_BAND_SOFT = 0.35
+# 各特徴量のランプ (下限, 上限)。下限以下で 0、上限以上で 1。距離は腕長・
+# 胴長で正規化しない絶対値 [m] なので、ランプの値もそのまま [m]。
+# approach: 脱力して真下に垂れた掌からロボットまでの距離が、実際の掌の
+#        位置でどれだけ縮んだか [m]。腕を下ろしていれば ~0、ロボットの方へ
+#        まっすぐ差し出せば ~0.5 m。手を後ろに引けば負になる。
+APPROACH_RAMP = (0.0, 0.45)
+# separation: 掌が人物自身の胴体 (腰の中点 -> 肩の中点の線分) からどれだけ
+#        離れているか [m]。体側に下ろした手でも肩幅の半分 (~0.2 m) は離れて
+#        いるので、下限はそれより大きく取る。
+SEPARATION_RAMP = (0.35, 0.55)
+# finger_to_robot: 指先方向と「掌からロボットへの方向」の cos。ロボットを
+#        まっすぐ指していれば 1、真逆を向いていれば -1。
+FINGER_TO_ROBOT_RAMP = (0.0, 0.90)
+# thumb_roll: 掌の x 軸 (指先方向) まわりのロール。親指が真上なら 1、水平
+#        なら 0、真下 (掌が体の外を向き小指が親指より上) なら -1。
+#        「水平より下」全体を罰すると、人が実際に差し出している手まで巻き
+#        込んでしまう -- 人手ラベルでは差し出している手の 24 % が親指を水平
+#        より下に向けている。一方 -0.9 を下回る「明らかに手の甲が上」の範囲
+#        には差し出している手が 1 本も無い (非差し出しは 28 本) ので、
+#        下限を -1.0 側に寄せて極端な姿勢だけを罰する。
+THUMB_ROLL_RAMP = (-1.00, -0.60)
+
+# ロール角を測る基準の鉛直方向 (ワールド座標系)。「水平より下」は人物の
+# 体軸ではなく世界の水平を基準にした言い方なので、体軸ではなくこれを使う。
+WORLD_UP = np.array([0.0, 0.0, 1.0])
 
 # これを下回るスコアしか無ければ「どちらの手も差し出していない」と判定
 # する (``offered_hand`` は None)。腕を下ろしたまま立っている人物 --
 # generate_random_human_poses.py の肩の仰角は「腕を下ろした状態」を最頻値
 # とする三角分布なので最も多いケース -- を argmax で拾ってしまわないため。
-OFFER_SCORE_MIN = 0.50
+# 実機では「差し出していない手を掴みに行く」方が「差し出した手を見送る」
+# より危ないので、迷ったら高めに (取りこぼす側に) 振る。人手ラベル 100 件
+# では 0.86 で一致率 94 %、過検出 1 件・見逃し 5 件になる。
+OFFER_SCORE_MIN = 0.86
 # 左右のスコア差がこれ未満なら曖昧 (``select`` の戻り値の ``ambiguous``)。
 # それでも argmax は返すので、呼び出し側 (右手しか差し出せない Aero の
 # 到達性など、この判定器が知らない事情を持つ側) が覆せる。
 AMBIGUOUS_MARGIN = 0.08
-# 指先が体の後ろを向いている手 (cos がこれ未満) は、掌がどこを向いて
-# いようと差し出しているとは言えないので候補から外す。
-FINGER_BACKWARD_MIN = -0.6
-# ``reach`` (体の前に手を出しているか) がこれ未満の手も候補から外す。
-# 手を差し出すというのは相手と自分の間に手を置くことなので、体の前に
-# 出ていない手は他の特徴量がどれだけ良くても差し出しではない -- 例えば
-# 万歳した手や真横に伸ばした手は、掌が正中を向き肘も伸びているので重み
-# 付き和だけでは閾値を超えうるが、reach は 0 になる。REACH_RAMP と合わせ
-# ると「掌が肩の中心より腕長の約 0.19 倍 (成人で ~10 cm) 以上前」という
-# 条件になる。
-REACH_MIN = 0.20
-# ``height`` (手繋ぎとして無理のない高さか) がこれ未満の手も候補から
-# 外す。reach と同じ理由で、頭より高く上げた手や膝より低い手は手繋ぎの
-# 対象になり得ないのに、重み 0.15 の減点だけでは他の特徴量が良ければ
-# 閾値を超えてしまう (実際に合成骨格で、床から 2.0 m の高さに前へ振り
-# 上げた手が 0.81 を取る)。HEIGHT_BAND / HEIGHT_BAND_SOFT と合わせると
-# 「掌が腰から胴長の約 -0.03 倍〜1.23 倍の高さ (成人で腰の高さ〜肩より
-# 15 cm ほど上)」という条件になる。
-HEIGHT_MIN = 0.20
 
 # 関節が欠測した入力 (実カメラで下半身がフレーム外、など) で胴長・腕長を
 # 補うための人体比。身長 1.7 m の成人で 肩幅 ~0.40 m, 腰->肩 ~0.50 m,
@@ -134,15 +147,14 @@ _TORSO_PER_SHOULDER_WIDTH = 1.25
 _ARM_PER_TORSO = 1.15
 
 
-# 人体基準の座標系。ロボット (原点) との位置関係ではなく人物自身の向きで
-# 特徴量を作るために使う: 合成骨格 (generate_random_human_poses.py) は
-# 人物を常に原点に立たせるので、人物とロボットの位置関係が退化していて
-# 「ロボットの方を向いているか」が使えない (palm_plane.fit_palm_plane が
-# viewpoint を最後の手段にしているのと同じ事情)。
+# 人体基準の座標系。「脱力して真下に垂れた腕」の位置 (体軸 ``up`` と肩) と
+# 「人物自身の胴体」(``hip_center`` -> ``shoulder_center`` の線分) を作るのに
+# 使う。人物の正面方向は要らない -- 相手の方向はロボットのワールド座標
+# (ROBOT_FORWARD_DISTANCE / ROBOT_HAND_HEIGHT) から直接決めるので、人物が
+# ロボットに背を向けている姿勢もそのまま「ロボットを向いていない」として
+# 扱える。
 _BodyFrame = namedtuple('_BodyFrame', [
     'up',               # (3,) 腰 -> 肩 の体軸 (単位ベクトル)
-    'left',             # (3,) 右肩 -> 左肩 (体軸に直交化, 単位ベクトル)
-    'forward',          # (3,) 体の正面 = left cross up
     'shoulder_center',  # (3,) 両肩の中点
     'hip_center',       # (3,) 両腰の中点
     'torso',            # float, 腰 -> 肩 の距離 [m]
@@ -164,10 +176,15 @@ def _ramp(value, low, high):
     return float(min(1.0, max(0.0, (value - low) / (high - low))))
 
 
-def _band(value, low, high, soft):
-    """``[low, high]`` で 1.0、その外側 ``soft`` の幅で 0.0 に落ちる台形."""
-    return float(min(_ramp(value, low - soft, low),
-                     1.0 - _ramp(value, high, high + soft)))
+def _distance_to_segment(point, end_a, end_b):
+    """``point`` から線分 ``end_a``--``end_b`` までの距離 [m]."""
+    along = end_b - end_a
+    length_sq = float(np.dot(along, along))
+    if length_sq < 1e-12:
+        return float(np.linalg.norm(point - end_a))
+    t = float(np.dot(point - end_a, along)) / length_sq
+    t = min(1.0, max(0.0, t))
+    return float(np.linalg.norm(point - (end_a + t * along)))
 
 
 def _body_frame(joints):
@@ -203,27 +220,8 @@ def _body_frame(joints):
         torso = float(np.linalg.norm(shoulder_center - hip_center))
     if torso < 1e-6:
         return None
-
-    across = l_sho - r_sho
-    left = _unit(across - float(np.dot(across, up)) * up)
-    if left is None:
-        return None
-    # ロボット座標系 (x=前, y=左, z=上) なら y cross z = x なので、
-    # 直立した人物では forward がちょうど +x になる。
-    forward = np.cross(left, up)
-    return _BodyFrame(up=up, left=left, forward=forward,
-                      shoulder_center=shoulder_center, hip_center=hip_center,
-                      torso=torso)
-
-
-def _wrist_position(joints, side, default):
-    """手首の位置。``{side}Wrist`` が無ければ手のランドマークの 0 番を使う."""
-    wrist = joints.get('{}Wrist'.format(side))
-    if wrist is None:
-        wrist = joints.get('{}Hand{}'.format(side, palm_plane.WRIST_INDEX))
-    if wrist is None:
-        return default
-    return wrist
+    return _BodyFrame(up=up, shoulder_center=shoulder_center,
+                      hip_center=hip_center, torso=torso)
 
 
 def _arm_length(joints, side, torso):
@@ -247,39 +245,39 @@ class OfferedHandSelector(object):
     側の argmax を採る。どちらも超えなければ「差し出していない」
     (``side`` は ``None``) と判定する。
 
-    特徴量 (すべて腕長・胴長で正規化してあるので身長差に依らない)
+    特徴量 (4 つ。距離は腕長・胴長で正規化しない絶対値 [m])
     ------------------------------------------------------------------
-    ``reach``
-        肩の中心から掌までの距離のうち、体の正面方向の成分 / 腕長。手を
-        差し出すというのは要するに体の前に手を出すことなので、これが最も
-        強い手がかり。
-    ``palm_facing``
-        掌の法線 (``y_axis``, 手の甲 -> 掌) と「相手の方向」「上」「体の
-        正中側」の 3 つの参照方向のうち、最も一致するものの cos。手繋ぎ
-        の掌は、相手に正対する (差し出し)・上を向く (受け皿)・正中を向く
-        (握手のように親指が上) のいずれもあり得るので 3 つの max を採る。
-        逆に背中側や真下を向いた手はどれとも一致せず 0 になる。
-    ``elevation``
-        脱力して真下に垂れた腕からの離れ具合 (1 - cos)。``reach`` が前方
-        成分しか見ないのに対し、横に上げた手も拾う。
-    ``extension``
-        肩 -> 手首の距離 / 腕長 (肘の伸展)。差し出した手は伸びている。
-    ``height``
-        腰から掌までの高さ / 胴長 (腰=0, 肩=1)。手繋ぎとして無理のない
-        高さの帯から外れる (万歳, 膝下) と落ちる。
+    ``approach``
+        脱力して真下に垂れた掌 (肩から体軸方向に腕長ぶん下げた点) から
+        ロボットまでの距離が、実際の掌の位置でどれだけ縮んだか [m]。
+        「手を差し出す」を「垂らした手をロボットに近づける」と読み替えた
+        もので、腕を下ろしていれば ~0、まっすぐ差し出せば ~0.5 m、手を
+        後ろに引けば負になる。
+    ``separation``
+        掌が人物自身の胴体 (腰の中点 -> 肩の中点の線分) からどれだけ
+        離れているか [m]。体に付けたままの手を落とすための補助。
+    ``finger_to_robot``
+        指先方向 (``x_axis``) と「掌からロボットへの方向」の cos。ロボット
+        をまっすぐ指していれば 1、真逆を向いていれば -1。
+    ``thumb_roll``
+        掌の x 軸 (指先方向) まわりのロール姿勢。親指の向きと、鉛直方向を
+        x 軸に直交する平面へ射影した向きとの cos で測る (x 軸まわりの回転
+        だけを見るので、指がどこを向いているかには影響されない)。親指が
+        真上なら 1、水平なら 0、真下 -- 掌が体の中心から外を向き、小指が
+        親指より上に来る姿勢 -- なら -1。握手として無理な向きに捻れた手を
+        落とすための補助。
 
-    「相手の方向」は ``viewpoint`` を渡せばそこへの方向、渡さなければ
-    人物の正面 (相手は人の正面に立っていると仮定) を使う。合成骨格
-    (generate_random_human_poses.py) は人物を常に原点に立たせるので
-    ロボットとの位置関係が退化しており、既定の人体基準でなければならない。
+    距離を身長で正規化しないのは意図的で、低身長の人がロボットの手の高さに
+    合わせて腕を上に伸ばすような姿勢を、腕長・胴長での割り算で潰して
+    しまわないため。ロボットの位置はワールド座標で与える (既定は
+    ``ROBOT_FORWARD_DISTANCE`` / ``ROBOT_HAND_HEIGHT``) ので、人物が
+    ロボットに背を向けている姿勢も「ロボットを向いていない」として自然に
+    扱える。
 
-    指先が体の後ろを向いている手 (``FINGER_BACKWARD_MIN``)、体の前に出て
-    いない手 (``REACH_MIN``)、手繋ぎに使えない高さの手 (``HEIGHT_MIN``)、
-    掌の推定に失敗した手 (``None``) は、重み付き和を計算するまでもなく
-    候補から外す。``reach`` と ``height`` は「そもそも手繋ぎの対象になる
-    姿勢か」という条件であって順位付けの手がかりではないので、重みだけ
-    でなく足切りにも使う (万歳した手のように、他の特徴量が全て良ければ
-    減点だけでは閾値を超えてしまうため)。
+    掌の推定に失敗した側 (``palm`` が ``None``) と、体の座標系が作れない
+    入力 (両肩が無い等) だけは、重み付き和を計算するまでもなく候補から
+    外す。それ以外の足切りは持たず、``score_min`` だけで「差し出して
+    いない」を決める。
 
     Examples
     --------
@@ -291,16 +289,17 @@ class OfferedHandSelector(object):
     {'R': 0.34, 'L': 0.71}
     """
 
-    def __init__(self, viewpoint=None, side_prior=None, weights=None,
+    def __init__(self, robot_position=None, side_prior=None, weights=None,
                  score_min=OFFER_SCORE_MIN,
                  ambiguous_margin=AMBIGUOUS_MARGIN):
         """
         Parameters
         ----------
-        viewpoint : (3,) array_like or None
-            相手 (ロボット) の位置。指定するとスコアの ``palm_facing`` が
-            「掌がそこを向いているか」を見るようになる。``None`` (既定)
-            なら人物の正面方向を相手の方向とみなす。
+        robot_position : (3,) array_like or None
+            相手 (ロボット) の手先のワールド座標。``approach`` と
+            ``finger_to_robot`` の基準になる。``None`` (既定) なら人物の
+            いる位置から +x に :data:`ROBOT_FORWARD_DISTANCE`、高さ
+            :data:`ROBOT_HAND_HEIGHT` の点を人物ごとに使う。
         side_prior : dict or None
             ``{'R': float, 'L': float}``。スコアに直接足し込む事前分布。
             既定 (``None``) は左右とも 0.0。例えば Aero は右手しか差し
@@ -314,8 +313,9 @@ class OfferedHandSelector(object):
         ambiguous_margin : float
             左右のスコア差がこれ未満なら ``ambiguous`` を立てる。
         """
-        self.viewpoint = (None if viewpoint is None
-                          else np.asarray(viewpoint, dtype=np.float64))
+        self.robot_position = (None if robot_position is None
+                               else np.asarray(robot_position,
+                                               dtype=np.float64))
         self.side_prior = dict(side_prior or {})
         self.weights = dict(weights or OFFER_FEATURE_WEIGHTS)
         self.score_min = float(score_min)
@@ -367,15 +367,6 @@ class OfferedHandSelector(object):
                 continue
             feats = self._features(joints, body, side, palm)
             features[side] = feats
-            if feats['finger_forward'] < FINGER_BACKWARD_MIN:
-                veto[side] = 'fingers_point_backward'
-                continue
-            if feats['reach'] < REACH_MIN:
-                veto[side] = 'not_reaching_forward'
-                continue
-            if feats['height'] < HEIGHT_MIN:
-                veto[side] = 'out_of_hold_height'
-                continue
             scores[side] = sum(w * feats[key]
                                for key, w in self.weights.items()) \
                 + float(self.side_prior.get(side, 0.0))
@@ -394,58 +385,77 @@ class OfferedHandSelector(object):
         return dict(side=side, scores=scores, features=features,
                     margin=margin, ambiguous=ambiguous, veto=veto)
 
+    def _robot_position(self, body):
+        """ロボットの手先のワールド座標.
+
+        ``robot_position`` を渡されていればそれを、渡されていなければ人物の
+        いる位置 (腰の中点の x, y) から +x に ``ROBOT_FORWARD_DISTANCE``、
+        高さ ``ROBOT_HAND_HEIGHT`` の点を返す。高さを人物の体格から決めない
+        のがポイントで、こうすると低身長の人にとってロボットの手は「上に
+        腕を伸ばして届かせる相手」になる。
+        """
+        if self.robot_position is not None:
+            return self.robot_position
+        return np.array([body.hip_center[0] + ROBOT_FORWARD_DISTANCE,
+                         body.hip_center[1],
+                         ROBOT_HAND_HEIGHT])
+
     def _features(self, joints, body, side, palm):
         """片手ぶんの特徴量 (クラス docstring 参照) を計算する."""
         center = np.asarray(palm['position'], dtype=np.float64)
-        normal = _unit(palm['y_axis'])    # 手の甲 -> 掌
         finger = _unit(palm['x_axis'])    # 手首 -> 指先
         shoulder = joints.get('{}Shoulder'.format(side), body.shoulder_center)
-        wrist = _wrist_position(joints, side, center)
         arm = _arm_length(joints, side, body.torso)
+        robot = self._robot_position(body)
 
-        partner = None
-        if self.viewpoint is not None:
-            partner = _unit(self.viewpoint - center)
-        if partner is None:
-            partner = body.forward
-        # 体の正中側 (左手なら体の右向き、右手なら体の左向き)。握手のよう
-        # に掌が正中を向く姿勢を拾うための参照方向。
-        medial = -body.left if side == 'L' else body.left
-
-        from_shoulder = center - body.shoulder_center
-        from_shoulder_dir = _unit(from_shoulder)
-
-        reach = _ramp(float(np.dot(from_shoulder, body.forward)) / arm,
-                      *REACH_RAMP)
-        if normal is None:
-            palm_facing = 0.0
+        # 脱力して真下に垂れた掌の位置 (肩から体軸方向へ腕長ぶん下げた点)。
+        # そこからロボットまでの距離が、実際の掌でどれだけ縮んだか。
+        rest = shoulder - arm * body.up
+        approach = _ramp(float(np.linalg.norm(robot - rest))
+                         - float(np.linalg.norm(robot - center)),
+                         *APPROACH_RAMP)
+        # 掌が人物自身の胴体 (腰 -> 肩の線分) からどれだけ離れているか。
+        separation = _ramp(
+            _distance_to_segment(center, body.hip_center,
+                                 body.shoulder_center),
+            *SEPARATION_RAMP)
+        # 指先がどれだけロボットの方を向いているか。
+        to_robot = _unit(robot - center)
+        if finger is None or to_robot is None:
+            finger_to_robot = 0.0
         else:
-            palm_facing = _ramp(max(float(np.dot(normal, partner)),
-                                    float(np.dot(normal, body.up)),
-                                    float(np.dot(normal, medial))),
-                                *PALM_FACING_RAMP)
-        if from_shoulder_dir is None:
-            elevation = 0.0
-        else:
-            # 脱力した腕は肩の真下 (-up) に垂れるので、そこからの離れ具合。
-            elevation = _ramp(1.0 - float(np.dot(from_shoulder_dir, -body.up)),
-                              *ELEVATION_RAMP)
-        extension = _ramp(float(np.linalg.norm(wrist - shoulder)) / arm,
-                          *EXTENSION_RAMP)
-        height = _band(
-            float(np.dot(center - body.hip_center, body.up)) / body.torso,
-            HEIGHT_BAND[0], HEIGHT_BAND[1], HEIGHT_BAND_SOFT)
+            finger_to_robot = _ramp(float(np.dot(finger, to_robot)),
+                                    *FINGER_TO_ROBOT_RAMP)
+        thumb_roll = _ramp(self._thumb_roll(palm, side, finger),
+                           *THUMB_ROLL_RAMP)
 
-        return dict(
-            reach=reach,
-            palm_facing=palm_facing,
-            elevation=elevation,
-            extension=extension,
-            height=height,
-            # 重みは掛からない診断用の値: 指先が体の前を向いているか (cos)。
-            # FINGER_BACKWARD_MIN を下回る手は候補から外す。
-            finger_forward=(0.0 if finger is None
-                            else float(np.dot(finger, body.forward))))
+        return dict(approach=approach, separation=separation,
+                    finger_to_robot=finger_to_robot, thumb_roll=thumb_roll)
+
+    @staticmethod
+    def _thumb_roll(palm, side, finger):
+        """掌の x 軸まわりのロール: 親指がどれだけ上を向いているか (-1..1).
+
+        ``palm_plane.fit_palm_plane`` は親指側の横軸 ``v`` を使って法線の
+        向きを決めており (人差し指 MCP が親指側, 小指 MCP が小指側)、
+        右手では ``normal = v x x``、左手では ``normal = x x v`` になる。
+        これを ``v`` について解くと ``v = x x normal`` (右手) /
+        ``v = normal x x`` (左手)、すなわち掌フレームの ``z_axis``
+        (``= x cross y``, ``y = normal``) がそのまま右手の親指方向、その
+        符号を反転したものが左手の親指方向になる。
+
+        鉛直方向を x 軸に直交する平面へ射影してから測るので、指がどこを
+        向いていても「x 軸まわりの回転」だけを見ることになる。指がちょうど
+        鉛直でロールが定義できないときは、罰しない側に倒して 1.0 を返す。
+        """
+        z_axis = np.asarray(palm['z_axis'], dtype=np.float64)
+        thumb = z_axis if side == 'R' else -z_axis
+        if finger is None:
+            return 1.0
+        up_perp = _unit(WORLD_UP - float(np.dot(WORLD_UP, finger)) * finger)
+        if up_perp is None:
+            return 1.0
+        return float(np.dot(thumb, up_perp))
 
 
 class PalmPoseEstimator(object):
@@ -469,8 +479,8 @@ class PalmPoseEstimator(object):
         ----------
         offered_hand_selector : OfferedHandSelector or None
             手繋ぎに使う手の判定器。``None`` (既定) なら既定設定の
-            :class:`OfferedHandSelector` を作る。ロボットの位置を
-            ``viewpoint`` に入れたい場合などはここで差し替える。
+            :class:`OfferedHandSelector` を作る。実際のロボットの手先位置を
+            ``robot_position`` に入れたい場合などはここで差し替える。
         """
         self.offered_hand_selector = \
             offered_hand_selector or OfferedHandSelector()
@@ -552,14 +562,26 @@ def load_skeleton_json(path):
     return data['skeleton']['joint_positions']
 
 
-def save_json(palms, path):
+def save_json(palms, path, keep_keys=('human_label',)):
     """``PalmPoseEstimator.estimate`` の戻り値を JSON として保存する.
 
     左右の掌 (``R``/``L``) に加えて、手繋ぎに使うべき手
     (``offered_hand``, ``'R'`` / ``'L'`` / ``None``) を含む。
+
+    保存先に既に JSON があり、そこに ``keep_keys`` のキー (既定は
+    ``human_label``, ``draw_random_human_poses.py`` の判定ボタンが書き込む
+    人手ラベル) があれば、その値を引き継ぐ。判定器を直して推定をやり直す
+    たびに、貯めた人手ラベルが消えてしまわないようにするため。
     """
+    saved = dict(palms)
+    if os.path.exists(path):
+        with open(path) as f:
+            previous = json.load(f)
+        for key in keep_keys:
+            if key in previous:
+                saved[key] = previous[key]
     with open(path, 'w') as f:
-        json.dump(palms, f, indent=2)
+        json.dump(saved, f, indent=2)
 
 
 def iter_skeleton_files(input_dir, pattern='*.json'):
