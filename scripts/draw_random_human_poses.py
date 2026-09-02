@@ -57,7 +57,6 @@ viser はブラウザで表示するビューアなので、実行するとブ�
 import argparse
 import glob
 import json
-import math
 import os
 import sys
 
@@ -135,32 +134,6 @@ HAND_SEQUENCE = [
 BONE_NAME_PAIRS = BODY_BONE_PAIRS + [
     ('{}Hand{}'.format(side, a), '{}Hand{}'.format(side, b))
     for side in ('R', 'L') for a, b in HAND_SEQUENCE]
-
-# ワールド座標系 (x=前, y=左, z=上) の -x 方向を向くカメラの姿勢
-# (骨格生成側で人物は常に原点・+x 方向を向いて配置されるので、これで
-# 人物を正面から見ることになる)。わずかに見下ろすよう、少し高い位置から
-# 下向きに傾ける。
-_CAMERA_DISTANCE = 2.5
-_CAMERA_HEIGHT = 1.6
-_CAMERA_TILT_DOWN_DEG = 15.0
-
-
-def _front_view_camera_transform():
-    """人物を原点から +x 方向 (正面) に、わずかに見下ろして見るカメラの
-    世界姿勢 (4x4) を作る."""
-    tilt = math.radians(_CAMERA_TILT_DOWN_DEG)
-    forward = np.array([-math.cos(tilt), 0.0, -math.sin(tilt)])
-    up_world = np.array([0.0, 0.0, 1.0])
-    right = np.cross(forward, up_world)
-    right /= np.linalg.norm(right)
-    up = np.cross(right, forward)
-    transform = np.eye(4)
-    transform[:3, 0] = right
-    transform[:3, 1] = up
-    transform[:3, 2] = -forward
-    transform[:3, 3] = [_CAMERA_DISTANCE, 0.0, _CAMERA_HEIGHT]
-    return transform
-
 
 def load_person_json(path):
     """``generate_random_human_poses.build_person_json`` が保存した 1 人分
@@ -436,7 +409,7 @@ def main():
                               for side, i in hand_point_spheres}
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
-    viewer.set_camera(coords_or_transform=_front_view_camera_transform())
+    viewer_nav.set_front_view(viewer)
 
     nav = None
     if args.advance_mode == 'manual':

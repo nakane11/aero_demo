@@ -12,9 +12,21 @@ PalmPoseEstimator.estimate`` の ``offered_hand`` と同じ値) など)。
 """
 
 import json
+import math
 import os
 import threading
 import time
+
+import numpy as np
+
+
+# ワールド座標系 (x=前, y=左, z=上) の -x 方向を向くカメラの姿勢
+# (骨格生成側で人物は常に原点・+x 方向を向いて配置されるので、これで
+# 人物を正面から見ることになる)。わずかに見下ろすよう、少し高い位置から
+# 下向きに傾ける。
+CAMERA_DISTANCE = 2.5
+CAMERA_HEIGHT = 1.6
+CAMERA_TILT_DOWN_DEG = 15.0
 
 
 # ``ManualNav.wait()``/``wait_for_advance`` が Back/Next (判定なし) を
@@ -44,6 +56,40 @@ def wait_for_client(viewer, timeout):
             time.sleep(0.2)
         print('ブラウザクライアントがまだ接続していません。上に表示された '
               'URL を手動で開いてください (Ctrl-C で中断できます)。')
+
+
+def front_view_camera_transform(distance=CAMERA_DISTANCE,
+                                height=CAMERA_HEIGHT,
+                                tilt_down_deg=CAMERA_TILT_DOWN_DEG):
+    """人物を原点から +x 方向 (正面) に、わずかに見下ろして見るカメラの
+    世界姿勢 (4x4) を作る.
+
+    ``skrobot.viewers.ViserViewer.set_camera`` の
+    ``coords_or_transform`` にそのまま渡せる形 (列が右/上/後ろ、平行移動が
+    カメラ位置) で返す。
+    """
+    tilt = math.radians(tilt_down_deg)
+    forward = np.array([-math.cos(tilt), 0.0, -math.sin(tilt)])
+    up_world = np.array([0.0, 0.0, 1.0])
+    right = np.cross(forward, up_world)
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    transform = np.eye(4)
+    transform[:3, 0] = right
+    transform[:3, 1] = up
+    transform[:3, 2] = -forward
+    transform[:3, 3] = [distance, 0.0, height]
+    return transform
+
+
+def set_front_view(viewer, **kwargs):
+    """``viewer`` のカメラを人物の正面 (-x 方向を見る向き) に合わせる.
+
+    ``kwargs`` は :func:`front_view_camera_transform` にそのまま渡す
+    (``distance``/``height``/``tilt_down_deg``)。
+    """
+    viewer.set_camera(
+        coords_or_transform=front_view_camera_transform(**kwargs))
 
 
 class ManualNav(object):

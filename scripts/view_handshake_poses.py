@@ -242,6 +242,11 @@ def main():
     viewer.add(robot)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
+    # 人物は常に原点で +x 方向を向いて生成されるので、+x 側から -x 方向を
+    # 見るカメラ (draw_random_human_poses.py と同じ視点) で人物を正面から
+    # 見ることになる (ロボットは人物の正面に立つので、カメラと人物の間に
+    # 入る)。
+    viewer_nav.set_front_view(viewer)
 
     current_mesh_link = None
     i = 0
