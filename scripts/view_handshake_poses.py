@@ -25,6 +25,11 @@ poses.py`` と共有の ``aero_demo.viewer_nav`` を使う。
 IK が失敗した人物 (``solved`` が ``false``) では、どちらの手に合わせよう
 としていたのかを確認できるように、人間の差し出した手 (``offered_hand``)
 とロボットが使った腕 (``robot_arm``) をテキストパネルと標準出力に出す。
+さらに、どれくらい届いていないのかが目で見て分かるように、IK の目標姿勢
+(JSON の ``target_position``/``target_rot``) と、解けなかったときの手先
+姿勢 (``hand_position``/``hand_rot``。``solve_palm_ik.unsolved_result``
+が種の姿勢で読んだもの) を Axis としてビューアに描く (目標のほうが長い
+Axis)。IK が成功した人物では手先が目標に一致しているので描かない。
 
 Usage
 -----
@@ -61,6 +66,7 @@ from generate_random_human_poses import load_smpl_models  # noqa: E402
 
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import rpy_matrix  # noqa: E402
+from skrobot.model import Axis  # noqa: E402
 from skrobot.model import Link  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
@@ -69,6 +75,14 @@ from skrobot.viewers import ViserViewer  # noqa: E402
 # 人物ごとにランダムにはしない (このビューアは IK 結果の確認が目的で、
 # 見た目のバリエーションは不要なため)。
 SKIN_COLOR = [180, 130, 110, 255]
+
+# IK が失敗したときに描く Axis の大きさ [m]。Axis の色は 3 軸の RGB で
+# 固定なので目標と手先を色では区別できない。代わりに長さで区別する
+# (長いほうが目標、短いほうが実際の手先)。
+TARGET_AXIS_LENGTH = 0.12
+TARGET_AXIS_RADIUS = 0.005
+HAND_AXIS_LENGTH = 0.06
+HAND_AXIS_RADIUS = 0.005
 
 
 def load_skeleton_json(path):
@@ -126,6 +140,32 @@ def hand_text(handshake):
     return '人間の {} 手 -> ロボットの {}arm'.format(
         {'L': '左', 'R': '右'}.get(offered, '不明 ({})'.format(offered)),
         robot_arm if robot_arm is not None else '不明')
+
+
+def pose_coords(handshake, pos_key, rot_key):
+    """IK 結果 JSON の位置 (``pos_key``) と回転行列 (``rot_key``) から
+    ``Coordinates`` を作る。どちらかが無ければ ``None`` を返す
+    (``target`` が ``false`` の JSON や、これらのキーを持たなかった頃の
+    solve_palm_ik.py の出力のため)。"""
+    position = handshake.get(pos_key)
+    rot = handshake.get(rot_key)
+    if position is None or rot is None:
+        return None
+    return Coordinates(pos=np.asarray(position, dtype=np.float64),
+                       rot=np.asarray(rot, dtype=np.float64))
+
+
+def pose_error_text(target_coords, hand_coords):
+    """目標姿勢と手先姿勢のずれ (位置 [m] と向き [deg]) の文字列.
+
+    向きのずれは相対回転 ``target^-1 * hand`` の回転角 (軸は問わない)。
+    """
+    diff = hand_coords.worldpos() - target_coords.worldpos()
+    rel = np.dot(target_coords.worldrot().T, hand_coords.worldrot())
+    # 数値誤差で arccos の定義域を外れることがあるのでクリップする。
+    angle = np.arccos(np.clip((np.trace(rel) - 1.0) / 2.0, -1.0, 1.0))
+    return '位置ずれ {:.3f} m, 向きずれ {:.1f} deg'.format(
+        float(np.linalg.norm(diff)), float(np.rad2deg(angle)))
 
 
 def apply_robot_pose(robot, handshake):
@@ -248,6 +288,15 @@ def main():
     # 入る)。
     viewer_nav.set_front_view(viewer)
 
+    # IK が失敗した人物のときだけ表示する目標姿勢/手先姿勢の Axis。
+    # draw_random_human_poses.py の掌 Axis と同じく、あらかじめ 1 組だけ
+    # 作っておいて座標を更新して viewer に足す/外す (毎回作り直さない)。
+    target_axis = Axis(axis_length=TARGET_AXIS_LENGTH,
+                       axis_radius=TARGET_AXIS_RADIUS)
+    hand_axis = Axis(axis_length=HAND_AXIS_LENGTH,
+                     axis_radius=HAND_AXIS_RADIUS)
+    axes_added = False
+
     current_mesh_link = None
     i = 0
     while 0 <= i < len(names):
@@ -270,12 +319,40 @@ def main():
 
         # IK が失敗したときは、どちらの手に合わせようとしていたのかが
         # 分かるように人間の手とロボットの腕もあわせて出す。
+        # 失敗したときは、どこに届かなかったのかが目で見て分かるように
+        # 目標姿勢 (長い Axis) と手先姿勢 (短い Axis) も描く。
+        target_coords = pose_coords(
+            handshake, 'target_position', 'target_rot')
+        hand_coords = pose_coords(handshake, 'hand_position', 'hand_rot')
+        show_axes = (not handshake.get('solved')
+                     and target_coords is not None
+                     and hand_coords is not None)
+        if show_axes:
+            target_axis.newcoords(target_coords)
+            hand_axis.newcoords(hand_coords)
+            if not axes_added:
+                viewer.add(target_axis)
+                viewer.add(hand_axis)
+                axes_added = True
+        elif axes_added:
+            viewer.delete(target_axis)
+            viewer.delete(hand_axis)
+            axes_added = False
+
         if handshake.get('solved'):
             status = 'solved'
         else:
             status = 'NOT solved ({})'.format(hand_text(handshake))
-        label_text.content = '**{}** ({}/{})  IK: {}\n\n{}'.format(
-            name, i + 1, len(names), status,
+        # ずれの数値は 1 行に収まらないので、標準出力の 1 行 (status) には
+        # 入れずテキストパネルにだけ出す。
+        detail = ''
+        if show_axes:
+            detail = '\n\n目標 Axis (長い方, 長さ {:.2f} m) と手先 Axis ' \
+                '(短い方, 長さ {:.2f} m): {}'.format(
+                    TARGET_AXIS_LENGTH, HAND_AXIS_LENGTH,
+                    pose_error_text(target_coords, hand_coords))
+        label_text.content = '**{}** ({}/{})  IK: {}{}\n\n{}'.format(
+            name, i + 1, len(names), status, detail,
             viewer_nav.format_label_text(handshake.get('human_label')))
 
         viewer.redraw()
