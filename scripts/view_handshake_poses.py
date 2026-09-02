@@ -17,6 +17,15 @@ Axis・カメラは描かない)。viser 画面には Back/Next ボタンに加�
 Back/Next/Good/Bad ボタンや判定結果の読み書きは ``draw_random_human_
 poses.py`` と共有の ``aero_demo.viewer_nav`` を使う。
 
+人間は、握手のときに実際そうするように、ロボットが触れている手先を見て
+いる姿勢で描く。骨格 JSON の ``smpl.pose`` は顔の向きも乱数で決まって
+いるので、``look_at_pose`` が SMPL の首 (``NECK``) と頭 (``HEAD``) だけを
+回して、顔の正面がロボットの手先 (IK 結果 JSON の ``hand_position``。
+IK が解けなかった人物では触れようとしていた ``target_position``) を向く
+ようにしてから描画する。ロボットの首は ``solve_palm_ik.py`` が保存した
+関節角 (IK は首を動かさないので ``reset_pose`` の値) をそのまま反映する
+だけで、手先を見るようには動かさない。
+
 ``solve_palm_ik.py`` が IK の対象外にした人物 (掌推定の ``offered_hand``
 が ``null``、つまりどちらの手も差し出していないと判定された人物。JSON の
 ``target`` が ``false``) は IK の結果が無いので、ビューアには表示せず
@@ -84,6 +93,28 @@ TARGET_AXIS_RADIUS = 0.005
 HAND_AXIS_LENGTH = 0.06
 HAND_AXIS_RADIUS = 0.005
 
+# 視線 (顔の正面) の回転を SMPL の首 (NECK) と頭 (HEAD) に分ける割合。
+# 首だけを回すと顔だけでなく肩の付け根近くから大きく曲がって見えるので、
+# 首と頭で半分ずつ持つ。
+GAZE_NECK_RATIO = 0.5
+
+# 胸 (SMPL の首の親関節) の正面から顔の正面を離せる最大角度 [deg]。人間の
+# 首がありえない角度までねじれて見えるのを防ぐ (実際の人間の首の可動域は
+# 左右 70-80 度、下 60 度ほど)。生成された人物はほぼ全員この範囲内に手を
+# 差し出しているので、普通は効かない安全弁。届かない向きでは顔が手先を
+# 向ききらないだけで、それ以上は回さない。
+GAZE_MAX_ANGLE_DEG = 80.0
+
+# 視線合わせを何回繰り返すか。首を回すと頭 (視線の始点) 自身も動くので、
+# 1 回では手先の方向から少しずれる。動いた頭の位置で解き直すことで、
+# 2 回でほぼ収束する (残差は 1 度以下)。
+GAZE_ITERATIONS = 2
+
+# SMPL の関節はすべて静止姿勢で回転が単位行列なので、頭の「正面」は
+# 静止姿勢の体の正面と同じ (ロボット座標系の +x, smpl_body の PERM に
+# よる軸対応で SMPL ローカルの +z)。
+GAZE_FORWARD_AXIS = np.array([1.0, 0.0, 0.0])
+
 
 def load_skeleton_json(path):
     """``generate_random_human_poses.build_person_json`` が保存した骨格
@@ -104,12 +135,136 @@ def load_handshake_json(path):
         return json.load(f)
 
 
-def build_smpl_mesh(model, person):
+def smpl_world_rots(model, pose):
+    """SMPL の各関節のワールド (ロボット座標系) 回転行列 ``(24, 3, 3)``.
+
+    ``smpl_body.forward_world`` は頂点と関節位置しか返さないので、視線を
+    合わせるのに要る「頭が今どちらを向いているか」をここで計算する。
+    ``pose`` の各要素は SMPL ローカル座標系の親関節相対 axis-angle なので、
+    ロボット座標系の回転に直して (``smpl_body.PERM`` による軸の対応、
+    ``to_smpl_rotation`` の逆) 根元から掛けていく。root_rot は
+    ``build_smpl_mesh`` (``forward_world`` の既定) と同じく単位行列。
+    """
+    pose = np.asarray(pose, dtype=np.float64).reshape(24, 3)
+    world_rots = np.zeros((24, 3, 3))
+    for i in range(24):
+        local = smpl_body.PERM.dot(smpl_body.rodrigues(pose[i])).dot(
+            smpl_body.PERM.T)
+        parent = model.parent[i]
+        world_rots[i] = local if parent < 0 \
+            else world_rots[parent].dot(local)
+    return world_rots
+
+
+def limit_direction(base, direction, max_angle):
+    """``direction`` を ``base`` から ``max_angle`` [rad] 以内に丸める.
+
+    視線の回転量ではなく目標の「方向」を丸めるので、``look_at_pose`` の
+    繰り返しは丸めた向きに収束する (回転量を毎回クリップすると、次の
+    繰り返しが残差を足してクリップを打ち消してしまう)。
+    """
+    angle = np.arccos(np.clip(float(np.dot(base, direction)), -1.0, 1.0))
+    if angle <= max_angle:
+        return direction
+    axis = np.cross(base, direction)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-9:
+        # 真後ろ (180 度): 回す軸が決まらないので諦めて元の向きのまま。
+        return base
+    return smpl_body.rodrigues(axis / norm * max_angle).dot(base)
+
+
+def look_at_pose(model, person, target_position,
+                 neck_ratio=GAZE_NECK_RATIO,
+                 max_angle_deg=GAZE_MAX_ANGLE_DEG):
+    """人間が ``target_position`` を見るように首/頭を回した pose を返す.
+
+    握手のように手を触れ合わせる動作では、人間は触れている手先を見ている
+    のが自然なので、``generate_random_human_poses.py`` が乱数で決めた顔の
+    向き (骨格 JSON の ``smpl.pose``) を、ロボットの手先 (触れている手先)
+    を向くように上書きして描画する。動かすのは人間の首/頭だけで、ロボット
+    の首は ``solve_palm_ik.py`` が保存した関節角のまま。
+
+    顔の正面 (``GAZE_FORWARD_AXIS``) を頭の関節位置から
+    ``target_position`` へ向ける最小回転を求め、それを首 (``NECK``) と
+    頭 (``HEAD``) に ``neck_ratio`` : ``1 - neck_ratio`` で分けて入れる
+    (2 関節は同じ軸まわりに回すので、合成すると狙った回転になる)。首から
+    上以外の関節は触らないので、体の姿勢は乱数生成されたまま。首を回すと
+    視線の始点である頭の関節自身も動くので、``GAZE_ITERATIONS`` 回だけ
+    解き直して残差を詰める (実測 0.1 度以下まで収束する)。
+
+    Parameters
+    ----------
+    model : smpl_body.SmplModel
+    person : dict
+        ``load_skeleton_json`` の戻り値 (``pose``/``betas``/``root_pos``)。
+    target_position : array_like
+        見てほしい点 (ロボット座標系)。ロボットの手先位置を渡す想定。
+    neck_ratio : float, optional
+        視線の回転を首と頭に分ける割合 (既定 ``GAZE_NECK_RATIO``)。
+    max_angle_deg : float, optional
+        胸の正面から顔の正面を離せる最大角度 [deg]
+        (既定 ``GAZE_MAX_ANGLE_DEG``)。
+
+    Returns
+    -------
+    pose : ndarray(24, 3)
+        首/頭だけ差し替えた新しい pose (``person['pose']`` は変更しない)。
+    """
+    pose = np.array(person['pose'], dtype=np.float64).reshape(24, 3)
+    target_position = np.asarray(target_position, dtype=np.float64)
+    max_angle = np.deg2rad(max_angle_deg)
+
+    for _ in range(GAZE_ITERATIONS):
+        _vertices, joints = smpl_body.forward_world(
+            model, pose, person['betas'], person['root_pos'])
+        world_rots = smpl_world_rots(model, pose)
+        forward = world_rots[smpl_body.HEAD].dot(GAZE_FORWARD_AXIS)
+        # 首をひねれる限界は胸 (首の親関節) の正面から測る -- 首/頭より
+        # 下は動かさないので、この向きは繰り返しても変わらない。
+        chest_forward = world_rots[model.parent[smpl_body.NECK]].dot(
+            GAZE_FORWARD_AXIS)
+
+        direction = target_position - joints[smpl_body.HEAD]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            break
+        direction = limit_direction(
+            chest_forward, direction / norm, max_angle)
+        axis_angle = smpl_body.mat_to_axis_angle(
+            smpl_body.rotation_between(forward, direction))
+        if np.linalg.norm(axis_angle) < 1e-9:
+            break
+
+        # 首 -> 頭の順に、ワールドでの回転を親の座標系に移して入れる。
+        # 首を回すと頭の親 (首) のワールド回転も変わるので、頭の分は
+        # 「首を回した後」の首のワールド回転を親として計算する。
+        parent_world = world_rots[model.parent[smpl_body.NECK]]
+        accumulated = np.eye(3)
+        for joint_index, ratio in ((smpl_body.NECK, neck_ratio),
+                                   (smpl_body.HEAD, 1.0 - neck_ratio)):
+            accumulated = smpl_body.rodrigues(
+                axis_angle * ratio).dot(accumulated)
+            new_world = accumulated.dot(world_rots[joint_index])
+            pose[joint_index] = smpl_body.mat_to_axis_angle(
+                smpl_body.to_smpl_rotation(parent_world.T.dot(new_world)))
+            parent_world = new_world
+
+    return pose
+
+
+def build_smpl_mesh(model, person, pose=None):
     """保存済みの SMPL pose/betas/root_pos からメッシュを作る
     (``smpl_body.forward_world`` を使うのは draw_random_human_poses.py と
-    同じ)。"""
+    同じ)。
+
+    ``pose`` を渡すと ``person['pose']`` の代わりにそれを使う
+    (``look_at_pose`` が首/頭を差し替えた pose を描くため)。
+    """
+    if pose is None:
+        pose = person['pose']
     vertices, _joints = smpl_body.forward_world(
-        model, person['pose'], person['betas'], person['root_pos'])
+        model, pose, person['betas'], person['root_pos'])
     mesh = trimesh.Trimesh(vertices=vertices, faces=model.f, process=False)
     mesh.visual.face_colors = SKIN_COLOR
     return mesh
@@ -153,6 +308,24 @@ def pose_coords(handshake, pos_key, rot_key):
         return None
     return Coordinates(pos=np.asarray(position, dtype=np.float64),
                        rot=np.asarray(rot, dtype=np.float64))
+
+
+def gaze_target_position(handshake):
+    """人間に見せる点 (``look_at_pose`` に渡す注視点) を IK 結果から選ぶ.
+
+    IK が解けた人物では、実際にロボットが触れている手先
+    (``hand_position``) を見る。解けなかった人物の手先は種の姿勢のまま
+    (ロボットの体の近く) でどこにも触れていないので、代わりに触れよう
+    としていた点 (``target_position``、人間の掌の少し手前) を見る --
+    どちらの手を狙っていたのかを目で追えるようにするため。どちらのキーも
+    無い JSON (これらのキーを持たなかった頃の solve_palm_ik.py の出力) は
+    ``None`` を返し、乱数生成された顔の向きをそのまま使う。
+    """
+    key = 'hand_position' if handshake.get('solved') else 'target_position'
+    position = handshake.get(key)
+    if position is None:
+        return None
+    return np.asarray(position, dtype=np.float64)
 
 
 def pose_error_text(target_coords, hand_coords):
@@ -308,7 +481,13 @@ def main():
 
         model = models_by_gender.get(
             person['gender'], models_by_gender['male'])
-        mesh = build_smpl_mesh(model, person)
+        # 触れている手先を人間も見ているように、乱数生成された顔の向きを
+        # 上書きして描く (ロボットの首は apply_robot_pose が保存された
+        # 関節角をそのまま反映するだけ)。
+        gaze_target = gaze_target_position(handshake)
+        pose = None if gaze_target is None \
+            else look_at_pose(model, person, gaze_target)
+        mesh = build_smpl_mesh(model, person, pose)
         link = Link(visual_mesh=mesh, name='smpl_human')
         if current_mesh_link is not None:
             viewer.delete(current_mesh_link)
