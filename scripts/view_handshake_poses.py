@@ -14,19 +14,17 @@ Axis・カメラは描かない)。ただし ``solve_palm_ik.py`` が干渉回�
 obstacles`` の Cylinder) は、SMPL メッシュに重ねて半透明
 (``COLLISION_OBSTACLE_COLOR``) で表示する -- 解けなかった/危なかった
 姿勢が体のどの部位のせいか目で見て確認できるようにするため。同様に、
-``solve_palm_ik.py`` が干渉回避の対象にしたのと同じロボット自身のリンク
-(``solve_palm_ik.collision_link_list_for_arm``) について、実際に干渉回避の
-コスト計算で使われているのと同じ球近似 (``skrobot.planner.trajectory_
-optimization.collision.extract_collision_spheres`` がリンクの
-``collision_mesh`` から求める、リンクあたり ``N_SPHERES_PER_LINK`` 個の
-球。``collision_mesh`` そのもの (指などでは見た目の ``visual_mesh`` と形が
-異なる実メッシュ) をそのまま表示すると、実際の干渉回避が使っている球近似
-とは違う形に見えてしまうため、あえてこの球に変換して見せている) も、通常
-のロボットモデル (不透明) に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、
-``human_palm_contact_behavior.py`` が ``aero_demo.palm_plane_view.
-PalmPlaneScene`` 経由で人体メッシュを半透明に描くのと同じ ``aero_demo.
-palm_plane_view.set_color`` を使い、viser でも alpha が effective になる
-ようにしてある) で表示する。viser 画面には
+``solve_palm_ik.py`` が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
+(box/cylinder/sphere のプリミティブ形状。``solve_palm_ik.apply_collision_
+model`` / ``view_aero_collision_model.py`` と同じ ``skrobot.urdf.
+convert_meshes_to_primitives`` で生成・キャッシュした URDF) も、
+``view_aero_collision_model.py`` と全く同じ方法でもう一体の
+``skrobot.model.RobotModel`` として読み込み、通常のロボットモデル (不透明)
+に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、``human_palm_contact_
+behavior.py`` が ``aero_demo.palm_plane_view.PalmPlaneScene`` 経由で人体
+メッシュを半透明に描くのと同じ ``aero_demo.palm_plane_view.set_color`` を
+使い、viser でも alpha が effective になるようにしてある) で表示する
+(``build_robot_collision_overlay`` 参照)。viser 画面には
 Back/Next ボタンに加え Good/Bad ボタンも表示され、押すと表示中の IK 結果が
 正しいかどうかの判定結果 (``human_label``: ``true``: Good/``false``: Bad)
 が対応する handshakes ディレクトリの JSON に書き込まれる (Next と同様に
@@ -90,7 +88,6 @@ from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
-from solve_palm_ik import collision_link_list_for_arm  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402
 
@@ -98,11 +95,11 @@ from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.model import Link  # noqa: E402
-from skrobot.model.primitives import Sphere  # noqa: E402
+from skrobot.model import RobotModel  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
-from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
-    extract_collision_spheres)
 from skrobot.viewers import ViserViewer  # noqa: E402
+
+from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
 # SMPL メッシュの肌色 (RGBA, 0-255)。draw_random_human_poses.py と違い
 # 人物ごとにランダムにはしない (このビューアは IK 結果の確認が目的で、
@@ -114,25 +111,11 @@ SKIN_COLOR = [180, 130, 110, 255]
 # 円柱の位置関係が見えるようにする (alpha が 255 未満)。
 COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
 
-# solve_palm_ik.collision_link_list_for_arm が干渉回避の対象にしたのと
-# 同じロボット自身のリンクについて、実際に干渉回避で使われている球近似
-# (下記 N_SPHERES_PER_LINK 参照) を表示する色 (RGBA, 0-255)。人体側の
-# COLLISION_OBSTACLE_COLOR (青系) と見分けられるよう、こちらは橙系に
-# してある。
+# solve_palm_ik.py が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
+# (box/cylinder/sphere のプリミティブ形状。build_robot_collision_overlay
+# 参照) を表示する色 (RGBA, 0-255)。人体側の COLLISION_OBSTACLE_COLOR
+# (青系) と見分けられるよう、こちらは橙系にしてある。
 ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
-
-# skrobot.model.RobotModel.batch_inverse_kinematics (backend='jax') が
-# 干渉回避のコスト計算で各リンクを近似する球の個数。solve_palm_ik.py の
-# batch_inverse_kinematics 呼び出しはこの引数を渡していないので、
-# skrobot.model.robot_model.RobotModel._batch_inverse_kinematics_impl の
-# 既定値 (3) がそのまま使われる。当たり判定に実際使われているジオメトリを
-# 見せるため、ここでも同じ既定値を使い、球の位置・半径も
-# skrobot.planner.trajectory_optimization.collision.extract_collision_
-# spheres (collision コスト計算が使うのと同じ関数) でリンクの
-# collision_mesh から求める。collision_mesh 自体 (指などでは見た目の
-# visual_mesh と形が異なることがある実メッシュ) をそのまま表示すると、
-# 実際に干渉回避が使っている球近似とは違う形に見えてしまうため。
-N_SPHERES_PER_LINK = 3
 
 # IK が失敗したときに描く Axis の大きさ [m]。Axis の色は 3 軸の RGB で
 # 固定なので目標と手先を色では区別できない。代わりに長さで区別する
@@ -414,52 +397,55 @@ def apply_robot_pose(robot, handshake):
         rot=rpy_matrix(handshake['base_yaw'], 0.0, 0.0)))
 
 
-def build_robot_collision_sphere_links(robot, robot_arm):
-    """``solve_palm_ik.collision_link_list_for_arm`` が干渉回避の対象に
-    したのと同じロボットリンクそれぞれについて、実際に干渉回避のコスト
-    計算で使われているのと同じ球近似 (``N_SPHERES_PER_LINK`` 個/リンク)
-    を表す半透明の ``Sphere`` を作る。
+def build_robot_collision_overlay(robot, primitive_type=None,
+                                  force_convert=False):
+    """``solve_palm_ik.py`` が干渉回避に使ったのと同じロボット自身の近似
+    ジオメトリを、``view_aero_collision_model.py`` と全く同じ方法でもう
+    一体の ``RobotModel`` として読み込む。
 
-    球の中心・半径は ``extract_collision_spheres`` (skrobot の
-    ``batch_inverse_kinematics`` が collision コストの計算で使うのと同じ
-    関数。各リンクの ``collision_mesh`` から ``trimesh.bounds.
-    minimum_cylinder`` で外接カプセルを求め、その軸上に等間隔に球を並べる)
-    でリンクごとに求める。``collision_mesh`` を持たないリンク (仮想関節
-    など) は ``extract_collision_spheres`` 側のフォールバックでリンク
-    原点・半径 0.05 の球になる (半径が実寸より大きく見えることがあるが、
-    実際の干渉回避もそのフォールバックで動いているので、見た目を合わせる
-    ためあえて除外しない)。
+    ``build_collision_model_urdf`` (``view_aero_collision_model.py`` /
+    ``solve_palm_ik.apply_collision_model`` と共通) が ``robot.urdf_path``
+    から生成した box/cylinder/sphere のプリミティブ近似 URDF をキャッシュ
+    する (既に生成済みならそれを再利用し、``force_convert`` を指定した
+    ときだけ作り直す) ので、``skr convert-urdf-to-primitives`` で見える
+    のと同じ形状がそのまま overlay になる (``solve_palm_ik.py`` の IK が
+    球近似で使っているジオメトリの元でもある)。``robot`` 自体は変更しない。
 
-    球はリンクのローカル座標系で表された中心 (``sphere_centers_local``)
-    しか持たないので、呼び出し側は毎フレーム
-    ``sphere_link.newcoords(Coordinates(pos=source_link.transform_vector(
-    local_center)))`` でロボットの現在の姿勢に追従させる (戻り値の
-    ``local_center`` を使う)。``collision_link_list_for_arm`` は現状
-    ``robot_arm`` によらずロボット全身 (``robot.link_list``) を返すので、
-    球自体も人物をまたいで一度だけ作れば足りる (毎フレーム作り直す必要は
-    ない -- 動くのは各リンクの姿勢だけで、リンクローカルな球の位置・半径
-    は変わらない)。
+    読み込んだ ``collision_robot`` は ``robot`` と全く同じ URDF (ジオメトリ
+    以外) から作られるため、リンク・関節の構成は ``robot`` と同一
+    (``use_hand`` の値によらず ``robot.urdf_path`` を使うので、指ありなし
+    どちらのモデルでも動く)。呼び出し側は毎フレーム
+    ``sync_robot_collision_overlay`` で ``robot`` の現在の姿勢に追従させる。
 
     Returns
     -------
-    list of (skrobot.model.Link, numpy.ndarray(3), skrobot.model.\
-primitives.Sphere)
-        ``(source_link, local_center, overlay_link)`` の組。
+    skrobot.model.RobotModel
+        半透明 (``ROBOT_COLLISION_LINK_COLOR``) に色付け済みの overlay。
     """
-    links = collision_link_list_for_arm(robot, robot_arm)
-    sphere_data = extract_collision_spheres(
-        None, links, n_spheres_per_link=N_SPHERES_PER_LINK)
-    triples = []
-    for local_center, radius, link_index in zip(
-            sphere_data['sphere_centers_local'],
-            sphere_data['sphere_radii'],
-            sphere_data['link_indices']):
-        link = links[link_index]
-        overlay_link = Sphere(
-            radius=float(radius), name=link.name + '_collision_sphere')
-        set_translucent_color(overlay_link, ROBOT_COLLISION_LINK_COLOR)
-        triples.append((link, local_center, overlay_link))
-    return triples
+    collision_urdf_path = build_collision_model_urdf(
+        robot.urdf_path, primitive_type=primitive_type, force=force_convert)
+    collision_robot = RobotModel()
+    collision_robot.load_urdf_file(
+        str(collision_urdf_path), include_mimic_joints=False)
+    for link in collision_robot.link_list:
+        set_translucent_color(link, ROBOT_COLLISION_LINK_COLOR)
+    return collision_robot
+
+
+def sync_robot_collision_overlay(collision_robot, robot):
+    """``build_robot_collision_overlay`` が返した overlay を ``robot`` の
+    現在の姿勢 (関節角・台車位置姿勢) に追従させる.
+
+    ``collision_robot`` は ``robot`` と同じ URDF から作られているので
+    (``build_robot_collision_overlay`` 参照)、関節の構成は完全に一致し、
+    ``angle_vector`` をそのままコピーできる。台車の位置姿勢は
+    ``robot.base_link.copy_worldcoords()`` を ``collision_robot`` に
+    反映する (Aero は ``root_link`` が ``base_link`` そのものなので、
+    ``newcoords`` で台車の移動も含めて反映される。``seed_arm_pose`` の
+    注記を参照)。
+    """
+    collision_robot.angle_vector(robot.angle_vector())
+    collision_robot.newcoords(robot.base_link.copy_worldcoords())
 
 
 def iter_common_names(skeleton_dir, handshake_dir):
@@ -521,6 +507,22 @@ def main():
     parser.add_argument('--no-open-browser', action='store_true',
                         help='ブラウザの自動起動を無効にする '
                              '(URL を自分で開く場合)。')
+    parser.add_argument(
+        '--collision-primitive-type', choices=['box', 'cylinder', 'sphere'],
+        default=None,
+        help='ロボット自身の干渉モデル (オレンジ色の球, '
+            'ROBOT_COLLISION_LINK_COLOR) の元になるジオメトリを、指定した '
+            '形状に全リンク強制変換する (solve_palm_ik.py / '
+            'view_aero_collision_model.py の --collision-primitive-type / '
+            '--primitive-type と同じ。既定 (未指定) はリンクごとに自動選択 '
+            '-- solve_palm_ik.py を同じオプションで実行した場合はそれと '
+            '揃える)。')
+    parser.add_argument(
+        '--force-convert-collision-model', action='store_true',
+        help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
+            'を使わず毎回作り直す (solve_palm_ik.py / '
+            'view_aero_collision_model.py の --force-convert-collision-model '
+            '/ --force-convert と同じ)。')
     args = parser.parse_args()
 
     names = iter_common_names(args.skeleton_dir, args.handshake_dir)
@@ -549,15 +551,38 @@ def main():
     # この問題が起きない)。
     nav = viewer_nav.ManualNav(viewer)
     label_text = viewer._server.gui.add_markdown('')
+
+    # 干渉回避用の半透明モデル (人体の障害物 Cylinder ``current_obstacle_
+    # links`` とロボットの干渉モデル overlay ``robot_collision_overlay``)
+    # の表示/非表示をまとめて切り替えるチェックボックス。viser の
+    # SceneNodeHandle は ``.visible`` を持つので、delete/add をやり直さず
+    # 既に追加済みのオブジェクトの表示だけを切り替えられる
+    # (``ViserViewer.add`` はハンドルを返さないので
+    # ``viewer._linkid_to_handle`` から引く)。
+    show_collision_models_checkbox = viewer._server.gui.add_checkbox(
+        '干渉回避用モデルの表示', initial_value=True)
+
+    def set_link_visible(link, visible):
+        viewer._linkid_to_handle[str(id(link))].visible = visible
+
+    @show_collision_models_checkbox.on_update
+    def _on_toggle_collision_models(_):  # noqa: ANN001
+        visible = show_collision_models_checkbox.value
+        for link in robot_collision_overlay.link_list:
+            set_link_visible(link, visible)
+        for obstacle_link in current_obstacle_links:
+            set_link_visible(obstacle_link, visible)
+
     viewer.add(robot)
-    # collision_link_list_for_arm は robot_arm によらず全身を返すので、
-    # 人物をまたいで一度だけ作る (robot_arm は将来腕ごとに変わっても
-    # 動くようダミー値 'r' を渡すだけで、現状の中身には影響しない)。
-    robot_collision_sphere_links = build_robot_collision_sphere_links(
-        robot, 'r')
-    for _source_link, _local_center, overlay_link in \
-            robot_collision_sphere_links:
-        viewer.add(overlay_link)
+    # solve_palm_ik.py の IK が干渉回避に使ったのと同じプリミティブ近似
+    # ジオメトリ (view_aero_collision_model.py と同じもの) を、人物を
+    # またいで一度だけ作って重ねて表示する (毎フレーム作り直す必要はなく、
+    # sync_robot_collision_overlay で robot の姿勢に追従させるだけでよい)。
+    robot_collision_overlay = build_robot_collision_overlay(
+        robot,
+        primitive_type=args.collision_primitive_type,
+        force_convert=args.force_convert_collision_model)
+    viewer.add(robot_collision_overlay)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
     # 人物は常に原点で +x 方向を向いて生成されるので、+x 側から -x 方向を
@@ -612,16 +637,15 @@ def main():
         for obstacle_link in current_obstacle_links:
             set_translucent_color(obstacle_link, COLLISION_OBSTACLE_COLOR)
             viewer.add(obstacle_link)
+            # 新しく追加した障害物は既定で表示状態になるので、チェック
+            # ボックスで非表示にされていたら合わせる。
+            set_link_visible(obstacle_link,
+                             show_collision_models_checkbox.value)
 
         apply_robot_pose(robot, handshake)
-        # 通常のロボットモデル (不透明) に重ねた半透明の当たり判定用の球
-        # も、動いた各リンクの現在の姿勢に追従させる (球の中心はリンクの
-        # ローカル座標系なので、リンクのワールド座標変換で world 座標に
-        # 直す)。
-        for source_link, local_center, overlay_link in \
-                robot_collision_sphere_links:
-            overlay_link.newcoords(
-                Coordinates(pos=source_link.transform_vector(local_center)))
+        # 通常のロボットモデル (不透明) に重ねた半透明の干渉モデル overlay
+        # も、動いた robot の現在の姿勢 (関節角・台車位置姿勢) に追従させる。
+        sync_robot_collision_overlay(robot_collision_overlay, robot)
 
         # IK が失敗したときは、どちらの手に合わせようとしていたのかが
         # 分かるように人間の手とロボットの腕もあわせて出す。
