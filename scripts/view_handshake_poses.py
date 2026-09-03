@@ -41,6 +41,15 @@ IK が解けなかった人物では触れようとしていた ``target_positio
 関節角 (IK は首を動かさないので ``reset_pose`` の値) をそのまま反映する
 だけで、手先を見るようには動かさない。
 
+``solve_palm_ik.py`` は、骨格 JSON の人物 (生成時は骨盤がほぼワールド原点)
+を、常にワールド原点で IK を開始する Aero の前方 ``--human-front-distance``
+(既定は ``solve_palm_ik.HUMAN_FRONT_DISTANCE``) になるよう平行移動してから
+IK を解いている (``solve_palm_ik.human_translation_offset`` 参照)。この
+ビューアは骨格 JSON を IK 結果と並べて表示するため、SMPL メッシュ・干渉
+回避ジオメトリの元になる骨格の関節位置にも同じ平行移動を適用してから
+描画する (``--human-front-distance`` はこの値を ``solve_palm_ik.py`` 実行時
+と揃えるためのオプション)。
+
 ``solve_palm_ik.py`` が IK の対象外にした人物 (掌推定の ``offered_hand``
 が ``null``、つまりどちらの手も差し出していないと判定された人物。JSON の
 ``target`` が ``false``) は IK の結果が無いので、ビューアには表示せず
@@ -88,14 +97,18 @@ from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
+from solve_palm_ik import HUMAN_FRONT_DISTANCE  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
+from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402
+from solve_palm_ik import translate_joint_positions  # noqa: E402
 
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.model import Link  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
+from skrobot.model.primitives import Box  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
@@ -116,6 +129,17 @@ COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
 # 参照) を表示する色 (RGBA, 0-255)。人体側の COLLISION_OBSTACLE_COLOR
 # (青系) と見分けられるよう、こちらは橙系にしてある。
 ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
+
+# solve_palm_ik.base_movable_region が JSON に書き出す台車の可動範囲
+# (x_range/y_range, ワールド座標の平面矩形) を表示する色 (RGBA, 0-255)。
+# 薄い赤の半透明平面にする (alpha が小さいのでグリッド・ロボット越しでも
+# 範囲が見える)。
+BASE_MOVABLE_REGION_COLOR = [220, 40, 40, 60]
+
+# 台車の可動範囲を表す平面 (Box) の厚み [m]。ごく薄くして床面のグリッドの
+# 少し上に置く (z-fighting を避けるため 0 ちょうどにはしない)。
+BASE_MOVABLE_REGION_HEIGHT = 0.005
+BASE_MOVABLE_REGION_Z = 0.005
 
 # IK が失敗したときに描く Axis の大きさ [m]。Axis の色は 3 軸の RGB で
 # 固定なので目標と手先を色では区別できない。代わりに長さで区別する
@@ -342,6 +366,27 @@ def pose_coords(handshake, pos_key, rot_key):
                        rot=np.asarray(rot, dtype=np.float64))
 
 
+def build_base_movable_region_link(handshake):
+    """``solve_palm_ik.base_movable_region`` が JSON に保存した台車の可動
+    範囲 (``base_movable_region`` の ``x_range``/``y_range``, ワールド座標)
+    から、薄い半透明の赤い平面 (``Box``) を作る。``base_movable_region``
+    キーを持たない JSON (これを保存する前の solve_palm_ik.py の出力) では
+    ``None`` を返す。yaw の可動範囲 (``yaw_range``) は平面では表せないので
+    可視化しない。
+    """
+    region = handshake.get('base_movable_region')
+    if region is None:
+        return None
+    x_min, x_max = region['x_range']
+    y_min, y_max = region['y_range']
+    extents = [x_max - x_min, y_max - y_min, BASE_MOVABLE_REGION_HEIGHT]
+    center = [(x_min + x_max) / 2.0, (y_min + y_max) / 2.0,
+             BASE_MOVABLE_REGION_Z]
+    link = Box(extents=extents, pos=center, name='base_movable_region')
+    set_translucent_color(link, BASE_MOVABLE_REGION_COLOR)
+    return link
+
+
 def gaze_target_position(handshake):
     """人間に見せる点 (``look_at_pose`` に渡す注視点) を IK 結果から選ぶ.
 
@@ -484,6 +529,17 @@ def main():
             'random_handshake_poses/。skeleton-dir と同じファイル名で '
             '対応させる)。')
     parser.add_argument(
+        '--human-front-distance', type=float,
+        default=HUMAN_FRONT_DISTANCE,
+        help='solve_palm_ik.py の --human-front-distance と同じ値を渡す '
+            '(既定 {:.1f})。solve_palm_ik.py は骨格 JSON の人物を、Aero '
+            '(常にワールド原点で IK を開始する) の前方この距離になるよう '
+            '平行移動してから IK を解いている (human_translation_offset '
+            '参照) ため、ここでも骨格 JSON (SMPL メッシュ・干渉回避 '
+            'ジオメトリの元) に同じ平行移動を適用しないと、IK 結果の '
+            'ロボットと SMPL メッシュの位置がずれて表示されてしまう。'
+            .format(HUMAN_FRONT_DISTANCE))
+    parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
             '~/SMPL_python_v.1.0.0/smpl/models/'
@@ -562,6 +618,12 @@ def main():
     show_collision_models_checkbox = viewer._server.gui.add_checkbox(
         '干渉回避用モデルの表示', initial_value=True)
 
+    # 台車の可動範囲 (赤い半透明平面, base_movable_region_link) の表示/
+    # 非表示を切り替えるチェックボックス。干渉回避用モデルとは別の情報
+    # なので、上のチェックボックスとは独立させてある。
+    show_base_region_checkbox = viewer._server.gui.add_checkbox(
+        '台車の可動範囲の表示', initial_value=True)
+
     def set_link_visible(link, visible):
         viewer._linkid_to_handle[str(id(link))].visible = visible
 
@@ -572,6 +634,12 @@ def main():
             set_link_visible(link, visible)
         for obstacle_link in current_obstacle_links:
             set_link_visible(obstacle_link, visible)
+
+    @show_base_region_checkbox.on_update
+    def _on_toggle_base_region(_):  # noqa: ANN001
+        if current_base_region_link is not None:
+            set_link_visible(current_base_region_link,
+                             show_base_region_checkbox.value)
 
     viewer.add(robot)
     # solve_palm_ik.py の IK が干渉回避に使ったのと同じプリミティブ近似
@@ -602,6 +670,7 @@ def main():
 
     current_mesh_link = None
     current_obstacle_links = []
+    current_base_region_link = None
     i = 0
     while 0 <= i < len(names):
         name = names[i]
@@ -609,6 +678,23 @@ def main():
         handshake_path = os.path.join(args.handshake_dir, name)
         person = load_skeleton_json(skeleton_path)
         handshake = load_handshake_json(handshake_path)
+
+        # solve_palm_ik.py は、骨格 JSON の人物を Aero (常にワールド原点で
+        # IK を開始する) の前方 --human-front-distance になるよう平行
+        # 移動してから IK を解いている (human_translation_offset 参照)。
+        # ここで読む骨格 JSON (SMPL の root_pos, 干渉回避ジオメトリの元の
+        # joint_positions) は平行移動前のものなので、IK 結果 (ロボットの
+        # 位置姿勢) と揃えるために同じ平行移動を適用する。
+        joint_positions = load_joint_positions(skeleton_path)
+        offset = human_translation_offset(
+            joint_positions, front_distance=args.human_front_distance)
+        joint_positions = translate_joint_positions(joint_positions, offset)
+        if offset != (0.0, 0.0):
+            person = dict(person)
+            root_pos = np.array(person['root_pos'], dtype=np.float64)
+            root_pos[0] += offset[0]
+            root_pos[1] += offset[1]
+            person['root_pos'] = root_pos
 
         model = models_by_gender.get(
             person['gender'], models_by_gender['male'])
@@ -632,8 +718,7 @@ def main():
         # どの部位のせいか目で見て確認できるようにするため。
         for obstacle_link in current_obstacle_links:
             viewer.delete(obstacle_link)
-        current_obstacle_links = human_body_obstacles(
-            load_joint_positions(skeleton_path))
+        current_obstacle_links = human_body_obstacles(joint_positions)
         for obstacle_link in current_obstacle_links:
             set_translucent_color(obstacle_link, COLLISION_OBSTACLE_COLOR)
             viewer.add(obstacle_link)
@@ -641,6 +726,19 @@ def main():
             # ボックスで非表示にされていたら合わせる。
             set_link_visible(obstacle_link,
                              show_collision_models_checkbox.value)
+
+        # solve_palm_ik.py がこの人物の IK で使った台車の可動範囲
+        # (base_movable_region) を、薄い赤の半透明平面として表示する。
+        # 人物ごとに範囲が変わる (台車の IK 開始位置に依存する) ので、
+        # 障害物と同じく人物を切り替えるたびに作り直す。
+        if current_base_region_link is not None:
+            viewer.delete(current_base_region_link)
+            current_base_region_link = None
+        current_base_region_link = build_base_movable_region_link(handshake)
+        if current_base_region_link is not None:
+            viewer.add(current_base_region_link)
+            set_link_visible(current_base_region_link,
+                             show_base_region_checkbox.value)
 
         apply_robot_pose(robot, handshake)
         # 通常のロボットモデル (不透明) に重ねた半透明の干渉モデル overlay

@@ -39,19 +39,32 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    手順 2 の JSON (掌の位置姿勢) を入力とし、人間の手にロボット (Aero)
    の腕が触れる全身 IK (台車の平面移動 `use_base='planar'` を含む) を
    解いて、結果 (台車位置・全関節角・実際の手先姿勢) を JSON として保存
-   する。干渉回避や `rotation_axis` を段階的に緩める再試行など、実機を
-   安全に動かすための機能は持たない簡易版 (詳細はスクリプト内の
-   docstring 参照)。
+   する。人体 (体幹・頭部・四肢を円柱で近似したもの) を障害物とした
+   干渉回避付き (台車を含むロボットの各リンクが対象。
+   `batch_inverse_kinematics` の `collision_link_list`/
+   `collision_obstacles`)。ソフトな制約 (コストへのペナルティ) なので、
+   干渉のない解が必ず得られるとは限らない。`rotation_axis` を段階的に
+   緩める再試行など、他の実機安全機能は持たない簡易版 (詳細はスクリプト
+   内の docstring 参照)。
    IK を解く対象は、手順 2 の `offered_hand` が `"L"`/`"R"` になった
    (人がその手を差し出していると判定された) 人物だけで、`null` の人物は
    対象外として `target: false` の JSON (IK の結果は持たない) を書き出す。
    使う腕は既定で人間の手の反対側 (人の左手ならロボットの右腕。
    `--robot-arm r`/`l` で上書きできる)。
-   IK は 1 人ずつ逐次に解くのではなく、全人物 × 全向き候補の目標姿勢を
-   ロボットの腕ごとに 1 バッチにまとめ、`batch_inverse_kinematics`
-   (複数初期値からの並列 IK) で解く。1 目標あたりの初期値の数は
-   `--attempts-per-pose` (既定 16)、バックエンドは `--backend`
-   (`auto`/`numpy`/`jax`)、台車の移動範囲は
+   干渉回避の障害物 (その人物の全身の関節位置) は `--skeleton-dir`
+   (既定は手順 1 の出力先と同じ `random_human_poses/`。`--input-dir` と
+   同じファイル名で対応づける) から読む。差し出している側の腕自体は
+   ロボットの手先目標のすぐそばにあるため、障害物からは除く。
+   IK は 1 人ずつ、その人の全向き候補の目標姿勢を 1 バッチにまとめて
+   `batch_inverse_kinematics` (複数初期値からの並列 IK) で解く。
+   `collision_obstacles` はバッチ呼び出し全体で 1 つの集合しか渡せない
+   (人物ごとに障害物である「その人自身の身体」が変わる) ため、旧版
+   (全人物をまとめた 1 回の高速なバッチ) と異なり人物をまたいでバッチを
+   まとめることはできず、人数分だけ低速になる。干渉回避は
+   `backend='jax'` の勾配降下法でしか使えないため、バックエンドは
+   常に jax を使う (`--backend` オプションは廃止)。1 目標あたりの初期値
+   の数は `--attempts-per-pose` (既定 16)、干渉回避ペナルティの重み・
+   マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
 
@@ -96,10 +109,32 @@ random_human_poses --handshake-dir random_handshake_poses` のように
 
 ## 環境構築 (IK を解くために必要なもの)
 
-手順 4 の `solve_palm_ik.py` (と、同じ IK ロジックを使う
-`human_palm_contact_behavior.py`) は `rospy` を import しないので roscore
-などの ROS の起動は不要だが、skrobot 側に上流には無い機能を要求する。
-動作確認環境は Ubuntu 20.04 + システムの Python 3.8 (ROS Noetic 環境)。
+手順 4 の `solve_palm_ik.py`はskrobot 側に上流には無い機能を要求する。
+動作確認環境は Ubuntu 20.04 + Python 3.10 以上 (ROS 非依存、`--no-hand`
+を使う限り ROS の起動やワークスペースの source も不要)。バッチ IK の
+バックエンドには jax を使う (jax は Python 3.10 以上が必要なため、
+Ubuntu 20.04 のシステム Python 3.8 では動かない。deadsnakes PPA や
+pyenv などで別途 Python 3.10 以上を用意する)。
+
+```bash
+# 例: deadsnakes PPA で Python 3.10 を追加する場合
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install python3.10 python3.10-venv
+```
+
+### 0. venv を作る
+
+システムの Python にはインストールせず、venv を切って隔離する
+(既存の catkin ワークスペースの Python 環境とは独立)。
+
+```bash
+python3.10 -m venv ~/venv/aero-py310
+source ~/venv/aero-py310/bin/activate
+pip install -U pip setuptools wheel
+```
+
+以降の `pip install`/`python` はこの venv を activate した状態で実行する。
 
 ### 1. scikit-robot (fork の `aero` ブランチ) を editable install
 
@@ -112,20 +147,24 @@ IK は skrobot の以下の機能に依存しており、これらは上流
   `base_limits` (台車の平面移動を含む全身バッチ IK と、その移動範囲の
   指定 -- `--base-x-range`/`--base-y-range`/`--base-yaw-range` はこれを
   渡している)
+* `batch_inverse_kinematics` の `collision_link_list`/
+  `collision_obstacles` (人体を障害物とした干渉回避付きバッチ IK。
+  `backend='jax'` の勾配降下法でしか使えない)
 
 ```bash
 cd ~/ros/hand/src
 git clone -b aero git@github.com:nakane11/scikit-robot.git
 # すでに clone 済みなら: cd scikit-robot && git checkout aero
 cd scikit-robot
-pip3 install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入る
+pip install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入る
 ```
 
-**注意**: `base_limits` を受け取る `batch_inverse_kinematics` は
-2026-09-02 時点では `aero` ブランチに push されておらず、ローカルの作業
-ツリーの変更 (`skrobot/model/robot_model.py`) として存在している。clone
-しなおした環境では `base_limits` が無く `TypeError` になるので、先に
-この変更をコミット・push しておく必要がある。
+**注意**: `base_limits`/`collision_link_list`/`collision_obstacles` を
+受け取る `batch_inverse_kinematics` は 2026-09-03 時点ではローカルの
+`base_limit` ブランチにしかなく、`nakane11/scikit-robot` のどのリモート
+ブランチにも push されていない。clone しなおした環境ではこれらの引数が
+無く `TypeError` になるので、先にこのブランチをコミット・push しておく
+必要がある。
 
 ### 2. Aero の URDF
 
@@ -135,7 +174,7 @@ aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
 `~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要
 (初回だけネットワークが必要)。
 
-一方 `view_handshake_poses.py --use-hand` が使う
+一方 `view_handshake_poses.py` が既定で使う (`--no-hand` を付けない場合の)
 `aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
 `feetech_hand` パッケージから自分でコピーする:
 
@@ -147,32 +186,31 @@ cp ~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf \
 この URDF はメッシュを `package://feetech_hand/meshes` と
 `package://aero_description/typeJSK/meshes` から参照するので、catkin
 ワークスペースを source した状態 (`ROS_PACKAGE_PATH` から
-`feetech_hand` が引ける状態) で実行する。
+`feetech_hand` が引ける状態) で実行する必要がある。ROS 非依存で使いたい
+場合は `view_handshake_poses.py --no-hand` を使う (指関節なしの URDF で
+表示、IK の結果自体は同じ)。
 
-### 3. バッチ IK のバックエンド (任意)
+### 3. バッチ IK のバックエンド (jax)
 
-`--backend auto` は jax が入っていれば jax、無ければ numpy を使う。
-動作確認環境では jax を入れておらず numpy バックエンドで動かしている
-(numpy 1.24.4 / trimesh 4.12.2 / viser 1.1.0)。jax を使いたい場合のみ
-追加で入れる:
-
-```bash
-pip3 install jax jaxlib jaxlie
-```
-
-### 4. 動作確認
+干渉回避付きバッチ IK (`collision_link_list`/`collision_obstacles`) は
+`backend='jax'` の勾配降下法でしか使えず、`solve_palm_ik.py` は常に
+`backend='jax'` を指定する (バックエンドを選べる `--backend` オプションは
+無い)。venv (Python 3.10 以上) に jax を追加でインストールする:
 
 ```bash
-python3 -c "
-from skrobot.models import Aero
-import inspect
-r = Aero(use_hand=False)   # 初回はここで URDF をダウンロード
-print('base_limits' in inspect.signature(r.batch_inverse_kinematics).parameters)
-"
+pip install -U jax jaxlib
 ```
 
-`True` が出れば IK に必要な環境はそろっている (`False` なら 1. の
-`base_limits` 対応が入っていない skrobot を見ている)。
+GPU が使える環境では `jax[cuda12]` など CUDA 対応の jaxlib を入れると
+バッチ IK がさらに速くなる (詳細は jax 公式のインストール手順を参照)。
+
+`solve_palm_ik.py` は jax の永続コンパイルキャッシュ (既定で
+`~/.cache/jax_compilation_cache`) を有効にした状態で起動するので、
+干渉回避付きバッチ IK の重い JIT コンパイル (初回は数分かかる) の結果が
+ディスクに残り、次回以降スクリプトを起動し直してもディスクのキャッシュを
+再利用できる (プロセスを終了するたびにコンパイルからやり直しになる問題を
+解消する)。キャッシュ先を変えたい場合は、スクリプトを実行する前に
+`JAX_COMPILATION_CACHE_DIR` 環境変数を設定しておけば上書きできる。
 
 ## 使い方
 
@@ -230,8 +268,9 @@ python3 view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handsha
 `--output-dir` を指定すると表示した各姿勢の画像をその都度保存する)。
 `view_handshake_poses.py` はビューアに SMPL メッシュとロボット (Aero)
 モデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマークなどは描かない)。
-ロボットは既定で `solve_palm_ik.py` と同じ指関節なしの URDF を使うが、
-`--use-hand` を付けると指関節ありの URDF で表示する。
+ロボットは既定で指関節ありの URDF (`aero_with_feetech_hand.urdf`) を使う
+(catkin ワークスペースの source が必要)。`solve_palm_ik.py` と同じ
+指関節なしの URDF (ROS 非依存) で表示したい場合は `--no-hand` を付ける。
 
 ## 座標系
 
