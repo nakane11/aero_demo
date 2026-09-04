@@ -33,6 +33,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from aero_demo.vector_utils import unit as _unit
+
 
 @dataclass
 class SmplModel:
@@ -236,13 +238,6 @@ _LIMB_CHAINS = [
     (L_WRIST, L_HAND, 'LWrist', 'LHand9'),
     (R_WRIST, R_HAND, 'RWrist', 'RHand9'),
 ]
-
-
-def _unit(v):
-    n = np.linalg.norm(v)
-    if n < 1e-9:
-        return None
-    return v / n
 
 
 # 掌の向き (捻り) 推定に使う手のランドマーク: 手首 + 4 knuckle。符号解決

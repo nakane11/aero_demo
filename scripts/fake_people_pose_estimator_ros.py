@@ -3,13 +3,13 @@
 
 """カメラ入力を持たず、偽の人物姿勢を生成して返すクラス.
 
-people_pose_estimator_ros.RosPeoplePoseEstimator の入力なし版。
-向こうが「カラー画像 + 深度画像 + CameraInfo を購読して推定する」のに対し、
-こちらは何も購読せず ``~rate`` [Hz] で偽の姿勢を生成する。カメラも bag も
+カラー画像 + 深度画像 + CameraInfo を購読する実推定ノードの代わりに、
+何も購読せず ``~rate`` [Hz] で偽の姿勢を生成する。カメラも bag も
 MediaPipe も要らないので、下流ノード (human_tracker, palm_plane,
 gaze/following behaviors ...) を人が居ない状態でテストできる。
 
-publish は一切行わない。結果は本物と同じ ``EstimationResult`` で
+publish は一切行わない。結果は ``EstimationResult`` (``aero_demo.
+people_pose_types``) で
 
   * ``wait_for_result(timeout)`` … 新しい結果が来るまで待って受け取る
   * ``last_result`` … 最後の結果をその場で参照する
@@ -30,8 +30,8 @@ Assumptions
   offered-handshake posture -- thumb up, little-finger side toward the
   ground, palm facing sideways -- tilted by up to
   ``~present_wrist_roll_deg_range`` (default +-30 deg) around the forearm
-  axis, which is the posture ``palm_plane_visualizer.py`` /
-  ``human_palm_contact_behavior.py`` are meant to be tested against.
+  axis, which is the offered-handshake posture the palm-pose pipeline
+  (``estimate_palm_poses.py`` / ``solve_palm_ik.py``) is meant to handle.
 * The person stands within arm's reach (``~distance_range``, default
   0.75-0.95 m), so the offered palm can be touched without driving the
   base.  At that distance the camera only sees the upper body: the legs,
@@ -72,9 +72,12 @@ import numpy as np
 
 import rospy
 
-# EstimationResult は本物 (people_pose_estimator_ros.py) と共有する
 from aero_demo.people_pose_types import (Bone, CameraIntrinsics,
                                          EstimationResult, Person3D)
+from aero_demo.people_pose_types import HAND_LOCAL_LANDMARKS
+from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2HANDNAME
+from aero_demo.people_pose_types import INDEX2LIMBNAME, LIMB_SEQUENCE
+from aero_demo.vector_utils import rotate, unit
 
 try:
     import cv2
@@ -83,33 +86,7 @@ except ImportError:  # EstimationResult.image is optional
     HAS_CV = False
 
 
-# Hand landmark model, MediaPipe order (0 wrist, 1-4 thumb, 5-8 index,
-# 9-12 middle, 13-16 ring, 17-20 pinky), in units of hand length.
-# Axes: u = wrist -> finger tips, v = thumb side, n = palm facing direction.
-# The n component encodes the slight curl of a relaxed hanging hand.
-HAND_LOCAL = np.array([
-    [0.00,  0.00, 0.00],   # 0  wrist
-    [0.11,  0.13, 0.02],   # 1  thumb CMC
-    [0.25,  0.26, 0.05],   # 2  thumb MCP
-    [0.36,  0.34, 0.08],   # 3  thumb IP
-    [0.45,  0.40, 0.10],   # 4  thumb tip
-    [0.47,  0.17, 0.00],   # 5  index MCP
-    [0.66,  0.18, 0.04],   # 6  index PIP
-    [0.78,  0.18, 0.10],   # 7  index DIP
-    [0.88,  0.18, 0.15],   # 8  index tip
-    [0.48,  0.05, 0.00],   # 9  middle MCP
-    [0.69,  0.05, 0.04],   # 10 middle PIP
-    [0.82,  0.05, 0.11],   # 11 middle DIP
-    [0.93,  0.05, 0.17],   # 12 middle tip
-    [0.46, -0.08, 0.00],   # 13 ring MCP
-    [0.65, -0.09, 0.04],   # 14 ring PIP
-    [0.77, -0.10, 0.11],   # 15 ring DIP
-    [0.87, -0.10, 0.16],   # 16 ring tip
-    [0.43, -0.21, 0.00],   # 17 pinky MCP
-    [0.57, -0.23, 0.03],   # 18 pinky PIP
-    [0.67, -0.24, 0.08],   # 19 pinky DIP
-    [0.74, -0.25, 0.12],   # 20 pinky tip
-])
+HAND_LOCAL = HAND_LOCAL_LANDMARKS
 
 # Probability that a hand landmark has no valid depth.  Roughly reproduces
 # the per-landmark rates measured on real data (see palm_plane.py header:
@@ -181,24 +158,10 @@ class FakeRosPeoplePoseEstimator(object):
     """
 
     # Same definitions as people_pose_estimator.PeoplePoseEstimator
-    limb_sequence = [[2, 1], [1, 16], [1, 15], [6, 18], [3, 17],
-                     [2, 3], [2, 6], [3, 4], [4, 5], [6, 7],
-                     [7, 8], [2, 9], [9, 10], [10, 11], [2, 12],
-                     [12, 13], [13, 14], [15, 17], [16, 18]]
-
-    index2limbname = ["Nose", "Neck", "RShoulder", "RElbow", "RWrist",
-                      "LShoulder", "LElbow", "LWrist", "RHip", "RKnee",
-                      "RAnkle", "LHip", "LKnee", "LAnkle", "REye",
-                      "LEye", "REar", "LEar", "Bkg"]
-
-    index2handname = ["RHand{}".format(i) for i in range(21)] + \
-                     ["LHand{}".format(i) for i in range(21)]
-
-    hand_sequence = [[0, 1],   [1, 2],   [2, 3],   [3, 4],
-                     [0, 5],   [5, 6],   [6, 7],   [7, 8],
-                     [0, 9],   [9, 10],  [10, 11], [11, 12],
-                     [0, 13],  [13, 14], [14, 15], [15, 16],
-                     [0, 17],  [17, 18], [18, 19], [19, 20]]
+    limb_sequence = LIMB_SEQUENCE
+    index2limbname = INDEX2LIMBNAME
+    index2handname = INDEX2HANDNAME
+    hand_sequence = HAND_SEQUENCE
 
     def __init__(self, start=True):
         """
@@ -218,8 +181,8 @@ class FakeRosPeoplePoseEstimator(object):
         self.use_hand = rospy.get_param('~hand/enable', True)
         # '' : both arms hanging down, 'R'/'L' : that hand held out towards
         # the robot, fingertips down and the index-finger side facing the
-        # robot (handshake-like), which is what
-        # palm_plane_visualizer.py / human_palm_contact_behavior.py expect.
+        # robot (handshake-like), which is what the palm-pose pipeline
+        # expects.
         self.present_hand = str(
             rospy.get_param('~present_hand', '')).upper()[:1]
         # ~present_hand の腕の構え方 (肩の挙上/開き、肘の曲げ、手首の曲げ/
@@ -235,8 +198,8 @@ class FakeRosPeoplePoseEstimator(object):
         # 傾きのオフセットとして乗る。既定値は握手の基準姿勢のまわりの
         # 小さな個人差の範囲。
         # 85 deg 近くまで許すと肩/手首まわりが可動域限界に張り付いて IK が
-        # 届かないことが多い (human_palm_contact_behavior_loop.py のログを
-        # 集計すると shoulder_elevation が 50 deg を超えたあたりから成功率
+        # 届かないことが多い (実機ログの集計では shoulder_elevation が
+        # 50 deg を超えたあたりから成功率
         # が急落し、70 deg 以上ではほぼ全滅していた)。ロボット腕が現実的に
         # 追従できる範囲に絞る。
         self.present_shoulder_elevation_range = rospy.get_param(
@@ -517,8 +480,7 @@ class FakeRosPeoplePoseEstimator(object):
         # ~present_hand の腕の構え (shoulder/elbow/wrist の角度, deg)。
         # _body_positions がこれを使って毎フレームの姿勢を作る。人が変わる
         # たびに 1 回だけ引き直すので、その人が差し出す構え自体は動作中
-        # 一定 (揺れ・呼吸などの微小な動きだけが乗る)。consumer 側
-        # (human_palm_contact_behavior_loop.py) がこの値を viewer に出す。
+        # 一定 (揺れ・呼吸などの微小な動きだけが乗る)。
         self.presented_arm_angles = None
         if self.present_hand in ('R', 'L'):
             self.presented_arm_angles = dict(
@@ -647,20 +609,20 @@ class FakeRosPeoplePoseEstimator(object):
                 # ~present_shoulder_elevation_deg_range's default so the
                 # wrist doesn't get pushed above the camera's vertical FOV
                 # at the close ~distance_range this person stands at.
-                raise_dir = self._unit(
+                raise_dir = unit(
                     xh * math.cos(azim) + hinge * math.sin(azim))
-                upper_dir = self._unit(
+                upper_dir = unit(
                     -zh * math.cos(elev) + raise_dir * math.sin(elev))
                 elbow = shoulder + b['upper_arm'] * upper_dir + xh * 0.3 * swing
 
                 # elbow_flex: 0 deg = forearm continues the upper arm;
                 # positive bends it back up toward the shoulder.
-                fdir = self._unit(self._rotate(upper_dir, hinge, flex))
+                fdir = unit(rotate(upper_dir, hinge, flex))
                 wrist = elbow + b['forearm'] * fdir
 
                 # wrist_pitch: bend of the hand relative to the forearm
                 # (0 deg = fingers continue the forearm direction).
-                u = self._unit(self._rotate(fdir, hinge, wpitch))
+                u = unit(rotate(fdir, hinge, wpitch))
                 # baseline palm normal (wrist_roll == 0 deg): the "offered
                 # handshake" reference, thumb up / little-finger side down
                 # (palm facing sideways rather than up, down, or at the
@@ -693,17 +655,17 @@ class FakeRosPeoplePoseEstimator(object):
                     # so the reference direction turns smoothly through the
                     # near-vertical region instead of snapping in and out
                     # of trusting an unstable unit vector at a hard cutoff.
-                    hinge_perp = self._unit(hinge - float(np.dot(hinge, u)) * u)
+                    hinge_perp = unit(hinge - float(np.dot(hinge, u)) * u)
                     if hinge_perp is None:
                         hinge_perp = np.zeros(3)
                     weight = up_perp_norm / UP_PERP_BLEND_NORM
-                    up_perp = self._unit(
+                    up_perp = unit(
                         weight * up_perp_raw + (1.0 - weight) * hinge_perp)
                     if up_perp is None:
                         up_perp = hinge_perp
-                n0 = self._unit(np.cross(up_perp, u) if hand == 'R'
+                n0 = unit(np.cross(up_perp, u) if hand == 'R'
                                 else np.cross(u, up_perp))
-                n = self._unit(self._rotate(n0, u, wroll))
+                n = unit(rotate(n0, u, wroll))
             else:
                 # relaxed hanging arm: fingers down, palm facing the thigh
                 elbow = p(b['elbow_fwd'] + swing,
@@ -721,17 +683,6 @@ class FakeRosPeoplePoseEstimator(object):
             v = np.cross(u, n) if hand == 'R' else np.cross(n, u)
             hand_frames[hand] = (wrist, u, v, n)
         return pos, hand_frames
-
-    @staticmethod
-    def _unit(v):
-        return v / np.linalg.norm(v)
-
-    @staticmethod
-    def _rotate(v, axis, angle):
-        """Rodrigues' rotation formula: rotate ``v`` by ``angle`` [rad]
-        around the unit vector ``axis``."""
-        c, s = math.cos(angle), math.sin(angle)
-        return v * c + np.cross(axis, v) * s + axis * axis.dot(v) * (1.0 - c)
 
     def _hand_bone_pairs(self, hand):
         """Bones of one hand, wrist -> Hand0 plus the 20 finger links."""

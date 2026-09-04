@@ -3,9 +3,7 @@
 
 """手のひら平面・人物骨格・ロボットを skrobot の viewer に描く部品.
 
-``scripts/palm_plane_visualizer.py`` (平面フィットの検証だけをする) と
-``scripts/human_palm_contact_behavior.py`` (実際に手を伸ばす) が同じ絵を
-描くための共通部分。
+``scripts/draw_random_human_poses.py`` が使う。
 
 rospy は import しない。描けなかったことは例外ではなく戻り値で返すので、
 ログをどう出すかは呼び出し側が決める。
@@ -25,6 +23,7 @@ from skrobot.model.primitives import Sphere
 
 from aero_demo import palm_plane
 from aero_demo import smpl_body
+from aero_demo.vector_utils import rotation_from_z, unit
 
 # 色 (RViz のマーカーと合わせる), RGBA 0-255
 COLOR_PLATE = [255, 140, 40, 140]
@@ -124,28 +123,6 @@ def dim_color(rgba, alpha=70, gray=200, gray_mix=0.5):
     """
     mixed = [int(c * (1.0 - gray_mix) + gray * gray_mix) for c in rgba[:3]]
     return mixed + [alpha]
-
-
-def unit(v):
-    n = float(np.linalg.norm(v))
-    if n < 1e-9:
-        return None
-    return np.asarray(v, dtype=np.float64) / n
-
-
-def rotation_from_z(z_axis):
-    """+Z が z_axis を向く回転行列 (円柱は +Z 方向に伸びる)."""
-    z = unit(z_axis)
-    if z is None:
-        return np.eye(3)
-    ref = np.array([0.0, 0.0, 1.0])
-    if abs(float(z[2])) > 0.9:
-        ref = np.array([1.0, 0.0, 0.0])
-    x = unit(np.cross(ref, z))
-    if x is None:
-        return np.eye(3)
-    y = np.cross(z, x)
-    return np.column_stack([x, y, z])
 
 
 def set_color(link, rgba):
@@ -336,10 +313,8 @@ def nose_sphere(joints, rgba):
 def build_skeleton_links(people, smpl_model=None):
     """1 フレーム分の骨格の描画物 (Link のリスト) を作る.
 
-    ``PalmPlaneScene.update_skeleton`` と、オフスクリーンで 1 枚だけ
-    撮る ``human_palm_contact_dataset_generator.py`` の両方が、同じ
-    絵 (SMPL が読み込めていれば実体メッシュ + 細線の骨格、無ければ
-    カプセル/胴体板/頭球の骨格) を描けるよう、その組み立てだけを
+    SMPL が読み込めていれば実体メッシュ + 細線の骨格、無ければ
+    カプセル/胴体板/頭球の骨格を描く。組み立てだけを
     ``PalmPlaneScene`` の add/delete の状態管理から切り離してある
     (呼び出し側が毎フレーム作り直して viewer に足す/消す)。
 
@@ -738,9 +713,7 @@ class PalmPlaneScene(object):
         なる (SMPL 未読み込みのときは常にこちら)。
 
         実際の組み立ては ``build_skeleton_links`` (このモジュールの自由
-        関数) に委ねてある -- オフスクリーンで 1 枚だけ撮る
-        ``human_palm_contact_dataset_generator.py`` も同じ関数を呼んで
-        まったく同じ絵を描くため。ここでは毎フレームの add/delete の
+        関数) に委ねてある。ここでは毎フレームの add/delete の
         状態管理だけをする。
 
         カプセル/胴体の板/頭・鼻の球/SMPL メッシュを作れなかったときは

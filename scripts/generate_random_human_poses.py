@@ -63,7 +63,10 @@ _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 
-from aero_demo import smpl_body  # noqa: E402  (パス追加後に import)
+from aero_demo import json_io  # noqa: E402  (パス追加後に import)
+from aero_demo import people_pose_types  # noqa: E402
+from aero_demo import smpl_body  # noqa: E402
+from aero_demo import vector_utils  # noqa: E402
 
 # MediaPipe と同じ関節名 (fake_people_pose_estimator_ros.py の
 # index2limbname と同じ並び, 'Bkg' を除く)。
@@ -78,33 +81,7 @@ BODY_JOINT_NAMES = [
 HAND_JOINT_NAMES = ['{}Hand{}'.format(side, i)
                     for side in ('R', 'L') for i in range(21)]
 
-# 手のランドマークの局所座標 (手の長さを単位とする), MediaPipe の並び
-# (0 wrist, 1-4 thumb, 5-8 index, 9-12 middle, 13-16 ring, 17-20 pinky)。
-# fake_people_pose_estimator_ros.py の HAND_LOCAL と同じ値
-# (軸: u=手首->指先, v=親指側, n=掌の向き)。
-HAND_LOCAL = np.array([
-    [0.00,  0.00, 0.00],   # 0  wrist
-    [0.11,  0.13, 0.02],   # 1  thumb CMC
-    [0.25,  0.26, 0.05],   # 2  thumb MCP
-    [0.36,  0.34, 0.08],   # 3  thumb IP
-    [0.45,  0.40, 0.10],   # 4  thumb tip
-    [0.47,  0.17, 0.00],   # 5  index MCP
-    [0.66,  0.18, 0.04],   # 6  index PIP
-    [0.78,  0.18, 0.10],   # 7  index DIP
-    [0.88,  0.18, 0.15],   # 8  index tip
-    [0.48,  0.05, 0.00],   # 9  middle MCP
-    [0.69,  0.05, 0.04],   # 10 middle PIP
-    [0.82,  0.05, 0.11],   # 11 middle DIP
-    [0.93,  0.05, 0.17],   # 12 middle tip
-    [0.46, -0.08, 0.00],   # 13 ring MCP
-    [0.65, -0.09, 0.04],   # 14 ring PIP
-    [0.77, -0.10, 0.11],   # 15 ring DIP
-    [0.87, -0.10, 0.16],   # 16 ring tip
-    [0.43, -0.21, 0.00],   # 17 pinky MCP
-    [0.57, -0.23, 0.03],   # 18 pinky PIP
-    [0.67, -0.24, 0.08],   # 19 pinky DIP
-    [0.74, -0.25, 0.12],   # 20 pinky tip
-])
+HAND_LOCAL = people_pose_types.HAND_LOCAL_LANDMARKS
 
 # 手の長さ (SMPL には手のランドマークが無いので、身長比の実測値を流用
 # する。旧 RandomSkeletonGenerator._RATIOS['hand_length'] と同じ値)。
@@ -122,18 +99,16 @@ _EAR_LATERAL_OFFSET = 0.08
 
 
 def _unit(v, fallback=None):
-    n = np.linalg.norm(v)
-    if n < 1e-9:
-        return fallback if fallback is not None else np.array([1.0, 0.0, 0.0])
-    return v / n
+    if fallback is None:
+        fallback = np.array([1.0, 0.0, 0.0])
+    return vector_utils.unit(v, fallback=fallback)
 
 
 def _rotate(v, axis, angle):
     """Rodrigues の回転公式: ``v`` を単位ベクトル ``axis`` まわりに
     ``angle`` [rad] だけ回転する。"""
     axis = _unit(np.asarray(axis, dtype=np.float64))
-    c, s = math.cos(angle), math.sin(angle)
-    return v * c + np.cross(axis, v) * s + axis * axis.dot(v) * (1.0 - c)
+    return vector_utils.rotate(v, axis, angle)
 
 
 class RandomSmplHumanGenerator(object):
@@ -592,8 +567,7 @@ def build_person_json(smpl_person, skeleton):
 
 def save_json(person, path):
     """``build_person_json`` の戻り値を JSON として保存する."""
-    with open(path, 'w') as f:
-        json.dump(person, f, indent=2)
+    json_io.save_json(path, person)
 
 
 def load_smpl_models(male_path, female_path):

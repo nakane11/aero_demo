@@ -162,7 +162,6 @@ random_human_poses/ -> random_palm_poses/ -> random_handshake_poses/ を
 """
 
 import argparse
-import glob
 import json
 import math
 import os
@@ -173,6 +172,11 @@ import numpy as np
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
+_PKG_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'src')
+if _PKG_SRC_DIR not in sys.path:
+    sys.path.insert(0, _PKG_SRC_DIR)
+
+from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 
 # jax の永続コンパイルキャッシュを有効にする。skrobot は backend='jax' の
 # バッチ IK を呼ぶ際に jax.jit したソルバをプロセス内 (``RobotModel.
@@ -292,6 +296,32 @@ POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 # 収束は速いはずだが、``human_palm_contact_behavior.py`` の実機向け
 # ``_solve_palm_ik`` と同じ余裕を持った値にしておく。
 DEFAULT_POST_PROCESS_IK_STOP = 200
+
+# 後処理判定の腕 IK の収束閾値 (位置[m]/姿勢[rad])。指定しなければ skrobot
+# 既定の位置 1mm・姿勢 1度という厳しい基準になるが、この後処理はあくまで
+# 「実際に押し付けられそうか」のラフな確認であり、干渉回避付きバッチ IK
+# (事前段階) 自体が ``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_COLLISION_IK_
+# RTHRE`` (3cm/8度) というずっと緩い閾値で「収束」と判定した候補を初期値に
+# 使う (=その分のずれが残ったまま渡ってくる) ため、既定の厳しい基準では
+# 実際には十分実用的な解でも収束できず後処理が失敗しやすい
+# (run_pipeline_test.py で確認: 干渉回避込み IK が解けた人物のほとんどで、
+# 既定の厳しい基準だと後処理が失敗していた)。
+DEFAULT_POST_PROCESS_IK_THRE = 0.005  # [m]
+DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
+
+# 後処理判定の視線 IK (自分の手を見る首 3 関節) の最大反復回数・収束閾値
+# (姿勢のみ, ``rotation_mask='xy'`` で視線軸まわりの回転は見ない)。
+# ``RobotModel.look_at`` はこれらを外部から指定する手段が無く、内部で
+# 呼ぶ ``inverse_kinematics_loop_for_look_at`` もキーワード引数
+# ``stop`` を実質無視して (中身で使われず) skrobot 既定の 50 回に、
+# ``rthre`` も既定 0.001rad (約 0.057 度) という極めて厳しい値になる
+# ため、必要な首振り角度が数十度あるような (人体の干渉回避で台車・肩が
+# 大きく振られた) 姿勢からはまず収束しない。この後処理も
+# ``solve_post_process`` と同じく合否ではなくラフな確認なので、
+# ``look_at`` を経由せず ``inverse_kinematics_loop_for_look_at`` を
+# 直接呼び、反復回数・閾値をここで明示的に緩める。
+DEFAULT_POST_PROCESS_GAZE_IK_STOP = 300
+DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 肘関節 (``{r,l}_elbow_joint``) の可動域制限 [deg]。この関節は 0 度が
 # 腕をまっすぐ伸ばした状態、負方向が肘を曲げる方向で、URDF 上の可動域は
@@ -803,13 +833,6 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     return min_dist
 
 
-def load_skeleton_json(path):
-    """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON
-    を読み、干渉回避の障害物化に使う ``joint_positions`` を返す。"""
-    with open(path) as f:
-        data = json.load(f)
-    return data['skeleton']['joint_positions']
-
 
 def apply_collision_model(robot, primitive_type=None, force_convert=False,
                           collision_urdf_path=None):
@@ -1020,7 +1043,11 @@ def build_collision_verification_pairs(robot, robot_arm):
 
 def solve_post_process(robot, robot_arm, palm, target_rot,
                        offset=POST_PROCESS_TARGET_HOVER_OFFSET,
-                       stop=DEFAULT_POST_PROCESS_IK_STOP):
+                       stop=DEFAULT_POST_PROCESS_IK_STOP,
+                       thre=DEFAULT_POST_PROCESS_IK_THRE,
+                       rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
+                       gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
+                       gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE):
     """``pick_verified_candidate`` が干渉検証まで通した候補について、
     人間にロボットが実際に掌を押し付けられることを確認する後処理判定を
     行う (``POST_PROCESS_TARGET_HOVER_OFFSET`` 参照)。
@@ -1031,19 +1058,32 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     ``TARGET_HOVER_OFFSET`` (掌の上空 0.08m) の代わりに ``offset`` (既定
     ``POST_PROCESS_TARGET_HOVER_OFFSET``、掌へわずかにめり込む位置) に
     した腕の IK を解く。向きは採用しようとしている候補と同じ
-    ``target_rot`` を厳密に (``rotation_axis=True``) 使う。
+    ``target_rot`` を厳密に (``rotation_axis=True``) 使う。収束閾値
+    ``thre``/``rthre`` は skrobot 既定 (位置 1mm・姿勢 1度) より緩めた値
+    (``DEFAULT_POST_PROCESS_IK_THRE``/``DEFAULT_POST_PROCESS_IK_RTHRE``)
+    を明示的に渡す -- 事前段階の干渉回避付きバッチ IK 自体がそれよりずっと
+    緩い閾値 (``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_COLLISION_IK_RTHRE``,
+    3cm/8度) で「収束」と判定した候補を初期値として渡ってくるため、既定の
+    厳しい閾値では実用上問題ない解でも収束できず後処理が失敗しやすい。
 
     同時に、ロボットが自分の手 (``move_target``, 上記の腕 IK の結果) を
-    見るように首を向けることも目標に入れる -- ``robot.look_at`` (skrobot
-    組み込みの視線 IK, ``inverse_transform``ではなくヤコビアン法) で
-    ``robot.head.link_list`` (首の 3 関節) だけを動かして解く。腕・視線の
-    どちらの IK も収束して初めて後処理判定は成功とする。
+    見るように首を向けることも目標に入れる。``RobotModel.look_at`` は
+    使わず ``inverse_kinematics_loop_for_look_at`` を直接呼ぶ --
+    ``look_at`` 経由だと反復回数 (``stop``) を指定する手段が無く (内部の
+    ``inverse_kinematics_loop_for_look_at`` が ``stop`` キーワード引数を
+    実質使わずに捨てるため skrobot 既定の 50 回に固定される)、収束閾値
+    (``rthre``) も既定 0.001rad (約 0.057 度) と極めて厳しいままになり、
+    人体との干渉回避で肩や台車が大きく振られた姿勢からは必要な首振り角度
+    (数十度) に対してまず収束しない。``rotation_mask='xy'`` (視線軸周りの
+    回転は見ない) はそのまま踏襲し、``rthre`` だけ ``gaze_ik_rthre``
+    (既定 ``DEFAULT_POST_PROCESS_GAZE_IK_RTHRE``) に、反復回数を
+    ``gaze_ik_stop`` (既定 ``DEFAULT_POST_PROCESS_GAZE_IK_STOP``) に緩める。
+    腕・視線のどちらの IK も収束して初めて後処理判定は成功とする。
 
     ``robot`` は呼び出し前の姿勢 (``pick_verified_candidate`` が反映した
     干渉検証済みの候補の姿勢、台車位置を含む) を初期値として直接書き換え
-    て解く (``revert_if_fail=False``)。判定に失敗した場合も ``robot`` は
-    最後に試した (収束しなかった) 姿勢のままになる -- 呼び出し側は失敗した
-    候補を採用しないので問題ない。
+    て解く。``revert_if_fail=True`` で解くので、判定に失敗した場合
+    ``robot`` は呼び出し前の姿勢に戻る。
 
     Returns
     -------
@@ -1062,7 +1102,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     try:
         arm_result = whole_body.inverse_kinematics(
             target_coords, rotation_axis=True, stop=stop,
-            revert_if_fail=True)
+            thre=thre, rthre=rthre, revert_if_fail=True)
     except Exception as e:
         print('  [post-process] 押し付け確認の腕 IK で例外が発生したため '
               '棄却します: {}'.format(e))
@@ -1070,8 +1110,15 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     if arm_result is False:
         return None
 
+    head_target = Coordinates(
+        pos=move_target.worldpos().tolist()).align_axis_to_direction(
+            move_target.worldpos() - robot.head_end_coords.worldpos())
     try:
-        gaze_result = robot.look_at(move_target)
+        gaze_result = robot.inverse_kinematics(
+            head_target, move_target=robot.head_end_coords,
+            link_list=robot.head.link_list,
+            position_mask=False, rotation_mask='xy',
+            stop=gaze_ik_stop, rthre=gaze_ik_rthre, revert_if_fail=True)
     except Exception as e:
         print('  [post-process] 自分の手を見る視線 IK で例外が発生した '
               'ため棄却します: {}'.format(e))
@@ -1411,13 +1458,11 @@ def load_palm_json(path):
 
 def save_json(result, path):
     """IK の結果 dict を JSON として保存する."""
-    with open(path, 'w') as f:
-        json.dump(result, f, indent=2)
+    json_io.save_json(path, result)
 
 
-def iter_palm_files(input_dir, pattern='*.json'):
-    """``input_dir`` 内の掌の位置姿勢 JSON をファイル名順に列挙する."""
-    return sorted(glob.glob(os.path.join(input_dir, pattern)))
+iter_palm_files = json_io.iter_json_files
+load_skeleton_json = json_io.load_skeleton_json
 
 
 def main():

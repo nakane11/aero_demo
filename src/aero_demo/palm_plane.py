@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Least-squares palm plane estimation from MediaPipe hand landmarks.
 
-Shared by ``human_palm_contact_behavior.py`` (which reaches for the palm)
-and ``palm_plane_visualizer.py`` (which only draws the result in a
-scikit-robot viewer), so both agree on exactly what "the palm plane" means.
+Used by ``estimate_palm_poses.py`` (offered-hand estimation) and
+``aero_demo.palm_plane_view`` (drawing the result in a scikit-robot
+viewer), so both agree on exactly what "the palm plane" means.
 
 Why a least-squares fit instead of one cross product
 ----------------------------------------------------
@@ -36,6 +36,8 @@ of drawing the same geometry with skrobot's viewer instead (see
 from collections import namedtuple
 
 import numpy as np
+
+from aero_demo.vector_utils import unit as _unit
 
 # --- MediaPipe hand-landmark indices -------------------------------------
 # published by people_pose_estimation_mediapipe.py as "RHand0".."RHand20"
@@ -94,13 +96,6 @@ PalmPlane = namedtuple('PalmPlane', [
     'span',         # in-plane extent of the point cloud (2nd sing. value)
     'span_ratio',   # S1/S0, the conditioning measure gated by MIN_SPAN_RATIO
 ])
-
-
-def _unit(v):
-    n = float(np.linalg.norm(v))
-    if n < 1e-9:
-        return None
-    return np.asarray(v, dtype=np.float64) / n
 
 
 def collect_palm_points(person, hand='R', min_score=0.1,
@@ -227,8 +222,8 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
     # resolved by guessing "whichever side faces the robot": that breaks
     # down whenever the palm is presented edge-on / sideways to the robot
     # rather than flat-on (exactly the case for a natural handshake
-    # posture, see fake_people_pose_estimator_ros.py's
-    # ~present_wrist_roll_deg_range), where a small pose change can flip
+    # posture, see ``fake_people_pose_estimator_ros.py``'s
+    # ``~present_wrist_roll_deg_range``), where a small pose change can flip
     # which side that heuristic calls "facing the robot".
     #
     # What is anatomically fixed regardless of viewing angle is MediaPipe's
@@ -269,8 +264,7 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
 
     # --- build a full frame: +X = fingers, +Y = palm normal --------------
     # Checked directly against Aero's r/l_eef_grasp_link frame (built by
-    # loading the URDF in skrobot and probing it -- see the analysis in
-    # scripts/human_palm_contact_behavior.py's IK-target comment): local
+    # loading the URDF in skrobot and probing it): local
     # +X is the wrist -> fingertip direction (confirmed by how far along
     # +X the fingertip links sit), and local +Y is the *dorsum -> palm*
     # direction -- confirmed by driving the finger-curl joints and

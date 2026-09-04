@@ -6,9 +6,9 @@
 推定して JSON として保存する。
 
 ``RandomSkeletonGenerator`` (``generate_random_human_poses.py``) が出力
-する合成骨格でも、``people_pose_estimator_ros.RosPeoplePoseEstimator`` /
-``fake_people_pose_estimator_ros.FakeRosPeoplePoseEstimator`` のような
-実カメラ (MediaPipe) ベースの推定を骨格の生成元として使う場合でも、同じ
+する合成骨格でも、``fake_people_pose_estimator_ros.
+FakeRosPeoplePoseEstimator`` のような実カメラ (MediaPipe) ベースの
+推定を骨格の生成元として使う場合でも、同じ
 ``PalmPoseEstimator.estimate(joint_positions)`` で掌の位置姿勢を求められる
 ようにしてある。骨格の生成元が変わっても入力形式 (関節名 -> [x, y, z] の
 dict) は変わらないので、この推定器は生成元を一切区別しない。
@@ -17,8 +17,8 @@ dict) は変わらないので、この推定器は生成元を一切区別し�
 ``RandomSkeletonGenerator(include_hand=True)`` や実際の MediaPipe 推定が
 出力する) が 3 点以上揃っている側だけ、``aero_demo.palm_plane.
 fit_palm_plane`` で手首 + 知節 (MCP) へ平面を SVD フィットする。
-``human_palm_contact_behavior.py`` が実際にロボットを動かすときと同じ
-関数・同じ判定 (点がほぼ一直線でないか等) を使うので、実カメラの推定結果
+実際にロボットを動かすときと同じ関数・同じ判定 (点がほぼ一直線でないか
+等) を使うので、実カメラの推定結果
 (関節ごとに欠測がある、本物の手首の捻りが乗っている、等) に対しても同じ
 ロジックで動く。手のランドマークが 3 点未満の側 (体の関節だけの入力、
 または実推定でその手が丸ごとロストしたフレーム) は推定しない
@@ -58,7 +58,6 @@ Usage
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -72,7 +71,13 @@ _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 
-from aero_demo import palm_plane  # noqa: E402  (パス追加後に import)
+from aero_demo import json_io  # noqa: E402  (パス追加後に import)
+from aero_demo import palm_plane  # noqa: E402
+from aero_demo import vector_utils  # noqa: E402
+
+_unit = vector_utils.unit
+load_skeleton_json = json_io.load_skeleton_json
+iter_skeleton_files = json_io.iter_json_files
 
 
 # --- 差し出している手の判定に使う定数 -------------------------------------
@@ -185,14 +190,6 @@ _BodyFrame = namedtuple('_BodyFrame', [
     'hip_center',       # (3,) 両腰の中点
     'torso',            # float, 腰 -> 肩 の距離 [m]
 ])
-
-
-def _unit(v):
-    v = np.asarray(v, dtype=np.float64)
-    n = float(np.linalg.norm(v))
-    if n < 1e-9:
-        return None
-    return v / n
 
 
 def _ramp(value, low, high):
@@ -675,28 +672,12 @@ class PalmPoseEstimator(object):
             rot=[[float(v) for v in row] for row in rot])
 
 
-def load_skeleton_json(path):
-    """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON を読む.
-
-    保存される JSON は骨格 (``skeleton``) と SMPL の人モデル (``smpl``)
-    の両方を持つが、この推定器が要るのは骨格の関節位置だけなので
-    ``skeleton.joint_positions`` だけを取り出す。
-    """
-    with open(path) as f:
-        data = json.load(f)
-    return data['skeleton']['joint_positions']
-
-
 def save_json(palms, path, keep_keys=('human_label',)):
     """``PalmPoseEstimator.estimate`` の戻り値を JSON として保存する.
 
-    左右の掌 (``R``/``L``) に加えて、手繋ぎに使うべき手
-    (``offered_hand``, ``'R'`` / ``'L'`` / ``None``) を含む。
-
     保存先に既に JSON があり、そこに ``keep_keys`` のキー (既定は
     ``human_label``, ``draw_random_human_poses.py`` の判定ボタンが書き込む
-    人手ラベル) があれば、その値を引き継ぐ。判定器を直して推定をやり直す
-    たびに、貯めた人手ラベルが消えてしまわないようにするため。
+    人手ラベル) があれば、その値を引き継ぐ。
     """
     saved = dict(palms)
     if os.path.exists(path):
@@ -705,13 +686,7 @@ def save_json(palms, path, keep_keys=('human_label',)):
         for key in keep_keys:
             if key in previous:
                 saved[key] = previous[key]
-    with open(path, 'w') as f:
-        json.dump(saved, f, indent=2)
-
-
-def iter_skeleton_files(input_dir, pattern='*.json'):
-    """``input_dir`` 内の骨格 JSON をファイル名順に列挙する."""
-    return sorted(glob.glob(os.path.join(input_dir, pattern)))
+    json_io.save_json(path, saved)
 
 
 def main():

@@ -18,7 +18,6 @@ Usage
 """
 
 import argparse
-import glob
 import json
 import os
 import subprocess
@@ -26,6 +25,11 @@ import sys
 import tempfile
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
+if _PKG_SRC_DIR not in sys.path:
+    sys.path.insert(0, _PKG_SRC_DIR)
+
+from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 
 
 def run_step(label, script_name, extra_args):
@@ -47,7 +51,7 @@ def run_step(label, script_name, extra_args):
 
 
 def load_json_files(directory):
-    for path in sorted(glob.glob(os.path.join(directory, '*.json'))):
+    for path in json_io.iter_json_files(directory):
         with open(path) as f:
             yield path, json.load(f)
 
@@ -109,7 +113,7 @@ def main():
     if args.seed is not None:
         gen_args += ['--seed', str(args.seed)]
     run_step('1/5', 'generate_random_human_poses.py', gen_args)
-    n_generated = len(glob.glob(os.path.join(skeleton_dir, '*.json')))
+    n_generated = len(json_io.iter_json_files(skeleton_dir))
     print('[1/5] generate_random_human_poses.py: 骨格 JSON を {} 件生成 '
           '({})'.format(n_generated, skeleton_dir))
 

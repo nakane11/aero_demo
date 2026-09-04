@@ -60,25 +60,19 @@ estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: ran
         ├──▶ draw_random_human_poses.py  (既定の入力先: random_human_poses/, 掌: random_palm_poses/)
         │        (viserで表示)
         ▼
-solve_palm_ik.py  (既定の入力先: test_palm_pose_pipeline/palms/, 出力先: test_palm_pose_pipeline/handshakes/)
+solve_palm_ik.py  (既定の入力先: random_palm_poses/, skeleton: random_human_poses/, 出力先: random_handshake_poses/)
         │  (IK 後の台車位置/全関節角/手先姿勢)
         ▼
-view_handshake_poses.py  (骨格: test_palm_pose_pipeline/skeletons/, IK 結果: test_palm_pose_pipeline/handshakes/)
+view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handshake_poses/)
          (SMPL メッシュ + ロボットモデルを viserで表示)
 ```
 
 `generate_random_human_poses.py`/`estimate_palm_poses.py`/`draw_random_
-human_poses.py` の `--input-dir`/`--output-dir`/`--palm-dir` は
-`scripts/` 直下の `random_human_poses/`/`random_palm_poses/` が既定値に
-なっているため、指定を省略すればこの区間はそのままつながる。一方
-`solve_palm_ik.py`/`view_handshake_poses.py` は既定で `scripts/
-test_palm_pose_pipeline/` 以下の `palms/`/`skeletons/`/`handshakes/` を
-読み書きする (`scripts/test_generate_and_estimate_palm_poses.py` が書き出す
-固定サンプル用のディレクトリで、`random_palm_poses/`/`random_human_
-poses/` とは別物)。1〜4 を通しで `random_*` ディレクトリに保存したまま
-5 の `view_handshake_poses.py` に渡したい場合は、`--skeleton-dir
-random_human_poses --handshake-dir random_handshake_poses` のように
-明示的に指定する必要がある (詳細は下記使い方を参照)。
+human_poses.py`/`solve_palm_ik.py`/`view_handshake_poses.py` の
+`--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
+`--handshake-dir` は、いずれも `scripts/` 直下の
+`random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/` が
+既定値になっているため、指定を省略すれば 1〜5 はそのままつながる。
 
 ## 環境構築 (IK を解くために必要なもの)
 
@@ -150,7 +144,7 @@ aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
 `package://feetech_hand/meshes` と `package://aero_description/typeJSK/
 meshes` から参照するが、`aero_demo.aero_urdf_setup.load_aero` (`view_
 handshake_poses.py`/`view_aero_collision_model.py`/`palm_plane_
-visualizer.py`/`human_palm_contact_behavior.py` が `Aero(...)` の代わりに
+visualizer.py` が `Aero(...)` の代わりに
 使う) が初回呼び出し時に自動で
 
 * `~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf` を
@@ -244,17 +238,6 @@ python3 view_handshake_poses.py
 する人間の手は掌 JSON の `offered_hand` で決まる。
 使うロボットの腕は `--robot-arm` で変更できる (既定のは人間の手の
 反対側)。
-
-`solve_palm_ik.py`/`view_handshake_poses.py` を `--input-dir`/
-`--output-dir`/`--skeleton-dir`/`--handshake-dir` を省略してそのまま実行
-すると、既定値である `scripts/test_palm_pose_pipeline/` 以下の
-`palms/`/`skeletons/`/`handshakes/` (`scripts/test_generate_and_estimate_
-palm_poses.py` が書き出す固定サンプル) を使う:
-
-```bash
-python3 solve_palm_ik.py          # test_palm_pose_pipeline/palms/ -> handshakes/
-python3 view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handshakes/
-```
 
 `draw_random_human_poses.py`/`view_handshake_poses.py` は viser の
 ブラウザビューアを起動する。どちらも viser 画面の Back/Next

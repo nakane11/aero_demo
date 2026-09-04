@@ -166,15 +166,11 @@ catkin_install_python(PROGRAMS
   scripts/human_following_control.py
   scripts/human_gaze_control.py
   scripts/human_handover_behavior.py
-  scripts/human_palm_contact_behavior.py
-  scripts/human_palm_contact_behavior_loop.py
-  scripts/human_palm_contact_dataset_generator.py
   scripts/human_parallel_planner.py
   scripts/human_tracker.py
   scripts/neck_tracker.py
   scripts/palm_plane_visualizer.py
   scripts/people_pose_estimation_mediapipe.py
-  scripts/people_pose_estimator_ros.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

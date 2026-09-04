@@ -24,9 +24,9 @@ SMPL メッシュは JSON に保存済みの ``smpl.pose``/``smpl.betas``/``smpl
 root_pos``/``smpl.gender`` から ``aero_demo.smpl_body.forward_world`` で
 直接組み立てる。骨格 (``generate_random_human_poses.RandomSkeletonGen
 erator`` が作ったもの、既に SMPL と同じ関節位置から作られているので手の
-位置もメッシュの手と一致する) は、``human_palm_contact_behavior.py`` が
-使っているのと同じ骨格描画 (``aero_demo.palm_plane_view`` の
-``bone_line``/``bone_color``, 部位ごとに色分けした線) で重ねて描く。以前
+位置もメッシュの手と一致する) は、共通の骨格描画 (``aero_demo.
+palm_plane_view`` の ``bone_line``/``bone_color``, 部位ごとに色分けした
+線) で重ねて描く。以前
 あった「(SMPL に依存しない) 骨格から SMPL の姿勢を推定し直す」処理
 (``aero_demo.smpl_body.retarget_and_pose``) はもう要らないので、この
 ファイルはそれを一切使わない。
@@ -55,7 +55,6 @@ viser はブラウザで表示するビューアなので、実行するとブ�
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -70,7 +69,8 @@ if _PKG_SRC_DIR not in sys.path:
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from aero_demo import palm_plane  # noqa: E402  (パス追加後に import)
+from aero_demo import json_io  # noqa: E402  (パス追加後に import)
+from aero_demo import palm_plane  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import smpl_body  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
@@ -161,9 +161,7 @@ def load_person_json(path):
         root_pos=np.asarray(smpl['root_pos'], dtype=np.float64))
 
 
-def iter_pose_files(input_dir, pattern='*.json'):
-    """``input_dir`` 内の骨格 JSON をファイル名順に列挙する."""
-    return sorted(glob.glob(os.path.join(input_dir, pattern)))
+iter_pose_files = json_io.iter_json_files
 
 
 def load_palm_json(path):
@@ -286,10 +284,10 @@ def build_skeleton_links(joint_positions, hand_colors=None):
     """骨格を部位ごとに色分けした線 (``skrobot.model.primitives.
     LineString``) のリストにする.
 
-    ``human_palm_contact_behavior.py`` (``aero_demo.palm_plane_view.
-    PalmPlaneScene``) が SMPL メッシュに重ねて骨格を描くのと同じ
-    ``palm_plane_view.bone_line``/``bone_color`` を使うので、見た目
-    (部位ごとの色, ``palm_plane_view.COLOR_BONES``) も同じになる。
+    ``aero_demo.palm_plane_view.PalmPlaneScene`` が SMPL メッシュに重ねて
+    骨格を描くのと同じ ``palm_plane_view.bone_line``/``bone_color`` を
+    使うので、見た目 (部位ごとの色, ``palm_plane_view.COLOR_BONES``) も
+    同じになる。
 
     Parameters
     ----------

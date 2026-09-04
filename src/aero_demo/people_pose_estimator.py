@@ -21,6 +21,8 @@ import matplotlib.cm
 
 # 結果の型は偽推定 (scripts/fake_people_pose_estimator_ros.py) と共有する
 from aero_demo.people_pose_types import Bone, CameraIntrinsics, Person3D
+from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2HANDNAME
+from aero_demo.people_pose_types import INDEX2LIMBNAME, LIMB_SEQUENCE
 
 __all__ = ['Bone', 'CameraIntrinsics', 'Person3D', 'PeoplePoseEstimator']
 
@@ -39,24 +41,10 @@ class PeoplePoseEstimator(object):
     >>> estimator.close()
     """
 
-    limb_sequence = [[2,  1], [1, 16], [1, 15], [6, 18], [3, 17],
-                     [2,  3], [2,  6], [3,  4], [4,  5], [6,  7],
-                     [7,  8], [2,  9], [9, 10], [10, 11], [2, 12],
-                     [12, 13], [13, 14], [15, 17], [16, 18]]
-
-    index2limbname = ["Nose", "Neck", "RShoulder", "RElbow", "RWrist",
-                      "LShoulder", "LElbow", "LWrist", "RHip", "RKnee",
-                      "RAnkle", "LHip", "LKnee", "LAnkle", "REye",
-                      "LEye", "REar", "LEar", "Bkg"]
-
-    index2handname = ["RHand{}".format(i) for i in range(21)] + \
-                     ["LHand{}".format(i) for i in range(21)]
-
-    hand_sequence = [[0, 1],   [1, 2],   [2, 3],   [3, 4],
-                     [0, 5],   [5, 6],   [6, 7],   [7, 8],
-                     [0, 9],   [9, 10],  [10, 11], [11, 12],
-                     [0, 13],  [13, 14], [14, 15], [15, 16],
-                     [0, 17],  [17, 18], [18, 19], [19, 20]]
+    limb_sequence = LIMB_SEQUENCE
+    index2limbname = INDEX2LIMBNAME
+    index2handname = INDEX2HANDNAME
+    hand_sequence = HAND_SEQUENCE
 
     mp_indices = {
         "Nose": 0,
