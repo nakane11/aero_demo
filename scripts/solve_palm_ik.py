@@ -46,9 +46,14 @@ collision_model.py`` と同じ方法で生成・キャッシュした box/cylind
 浮かせた目標に届いたというだけでは実際に人間に掌を押し付けられる保証は
 無いため、``pick_verified_candidate`` は候補ごとに最後に後処理判定
 (``solve_post_process``) を行う。台車を動かさず (人体との干渉回避も外した)
-通常のヤコビアン法 IK で、目標位置を掌へわずかにめり込む位置
-(``POST_PROCESS_TARGET_HOVER_OFFSET``) まで詰め直し、同時にロボットが
-自分の手を見るよう首も向ける。後処理判定に失敗した候補は棄却し、
+通常のヤコビアン法 IK で、腕を目標位置が掌へわずかにめり込む位置
+(``POST_PROCESS_TARGET_HOVER_OFFSET``) まで詰め直すのと、ロボットが人間の
+差し出している手 (掌) を見るよう首を向けるのを、``robot.inverse_
+kinematics`` に ``move_target``/``target_coords`` 等をリストで渡す 1 回の
+呼び出しで同時に解く (``solve_post_process`` 参照)。視線の目標は人間の
+掌の位置 (IK を解く前から分かっている固定点) であり、ロボット自身の手先の
+収束後の位置には依存しないため、腕と首を別々の呼び出しに分けて逐次解く
+必要が無い。後処理判定に失敗した候補は棄却し、
 ``TURN_CANDIDATES_DEG`` の次の向き (干渉回避付きバッチ IK は既に全向きを
 一括で解いてあるので、やり直すのは干渉検証・後処理判定だけ) を試す。
 全ての向きで後処理判定に失敗した場合のみ、干渉検証を通過した最初の候補を
@@ -132,7 +137,7 @@ os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS', '0')
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 
 from skrobot.coordinates import Coordinates  # noqa: E402
-from skrobot.coordinates.math import matrix2ypr  # noqa: E402
+from skrobot.coordinates.math import matrix2ypr, normalize_mask  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
@@ -216,10 +221,10 @@ DEFAULT_POST_PROCESS_IK_STOP = 200
 # RTHRE`` というずっと緩い閾値で「収束」と判定した候補を初期値に使うため、
 # skrobot 既定の厳しい基準 (位置 1mm・姿勢 1度) では後処理が失敗しやすく、
 # それに合わせて緩めてある。
-DEFAULT_POST_PROCESS_IK_THRE = 0.005  # [m]
+DEFAULT_POST_PROCESS_IK_THRE = 0.025  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
-# 後処理判定の視線 IK (自分の手を見る首 3 関節) の最大反復回数・収束閾値
+# 後処理判定の視線 IK (人間の手を見る首 3 関節) の最大反復回数・収束閾値
 # (姿勢のみ, ``rotation_mask='xy'`` で視線軸まわりの回転は見ない)。
 # ``RobotModel.look_at`` はこれらを外部から指定する手段が無く、内部で
 # 呼ぶ ``inverse_kinematics_loop_for_look_at`` もキーワード引数
@@ -228,8 +233,9 @@ DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 # ため、必要な首振り角度が数十度あるような (人体の干渉回避で台車・肩が
 # 大きく振られた) 姿勢からはまず収束しない。この後処理も
 # ``solve_post_process`` と同じく合否ではなくラフな確認なので、
-# ``look_at`` を経由せず ``inverse_kinematics_loop_for_look_at`` を
-# 直接呼び、反復回数・閾値をここで明示的に緩める。
+# ``look_at`` を経由せず ``robot.inverse_kinematics`` (腕の押し付け目標と
+# 同じ呼び出しに ``move_target``/``target_coords`` 等をリストで渡す) を
+# 直接使い、反復回数・閾値をここで明示的に緩める。
 DEFAULT_POST_PROCESS_GAZE_IK_STOP = 300
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 
@@ -996,31 +1002,43 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 
     台車を動かさない (``inverse_kinematics`` に ``use_base`` を渡さない
     既定の挙動、``rarm_whole_body``/``larm_whole_body`` は台車を含まない)
-    通常のヤコビアン法 IK (干渉回避なし) で、掌の目標位置を
-    ``TARGET_HOVER_OFFSET`` (掌の上空 0.08m) の代わりに ``offset`` (既定
-    ``POST_PROCESS_TARGET_HOVER_OFFSET``、掌へわずかにめり込む位置) に
-    した腕の IK を解く。向きは採用しようとしている候補と同じ
-    ``target_rot`` を厳密に (``rotation_axis=True``) 使う。収束閾値
-    ``thre``/``rthre`` は skrobot 既定 (位置 1mm・姿勢 1度) より緩めた値
-    (``DEFAULT_POST_PROCESS_IK_THRE``/``DEFAULT_POST_PROCESS_IK_RTHRE``)
-    を明示的に渡す -- 事前段階の干渉回避付きバッチ IK 自体がそれよりずっと
-    緩い閾値 (``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_COLLISION_IK_RTHRE``,
-    3cm/8度) で「収束」と判定した候補を初期値として渡ってくるため、既定の
-    厳しい閾値では実用上問題ない解でも収束できず後処理が失敗しやすい。
+    通常のヤコビアン法 IK (干渉回避なし) で、以下の 2 つを ``robot.
+    inverse_kinematics`` 1 回の呼び出しで同時に解く。``inverse_
+    kinematics`` は ``move_target``/``target_coords``/``link_list``/
+    ``position_mask``/``rotation_mask`` 等をそれぞれリストで渡すと、複数の
+    エンドエフェクタを 1 つのヤコビアンにまとめて同時に解ける。
 
-    同時に、ロボットが自分の手 (``move_target``, 上記の腕 IK の結果) を
-    見るように首を向けることも目標に入れる。``RobotModel.look_at`` は
-    使わず ``inverse_kinematics_loop_for_look_at`` を直接呼ぶ --
-    ``look_at`` 経由だと反復回数 (``stop``) を指定する手段が無く (内部の
-    ``inverse_kinematics_loop_for_look_at`` が ``stop`` キーワード引数を
-    実質使わずに捨てるため skrobot 既定の 50 回に固定される)、収束閾値
-    (``rthre``) も既定 0.001rad (約 0.057 度) と極めて厳しいままになり、
-    人体との干渉回避で肩や台車が大きく振られた姿勢からは必要な首振り角度
-    (数十度) に対してまず収束しない。``rotation_mask='xy'`` (視線軸周りの
-    回転は見ない) はそのまま踏襲し、``rthre`` だけ ``gaze_ik_rthre``
-    (既定 ``DEFAULT_POST_PROCESS_GAZE_IK_RTHRE``) に、反復回数を
-    ``gaze_ik_stop`` (既定 ``DEFAULT_POST_PROCESS_GAZE_IK_STOP``) に緩める。
-    腕・視線のどちらの IK も収束して初めて後処理判定は成功とする。
+    1. 腕: 掌の目標位置を ``TARGET_HOVER_OFFSET`` (掌の上空 0.04m) の
+       代わりに ``offset`` (既定 ``POST_PROCESS_TARGET_HOVER_OFFSET``、
+       掌へわずかにめり込む位置) にした位置・姿勢 (``target_rot`` を
+       ``rotation_mask=True`` で厳密に使う)。
+    2. 首 (``robot.head.link_list``, 3 関節): 人間の差し出している手
+       (掌, ``palm['position']``) の方向をロボットの頭部エンドエフェクタ
+       (``robot.head_end_coords``) の +Z が向くように (``rotation_mask=
+       'xy'`` で視線軸周りの回転は見ない、``align_axis_to_direction``
+       参照)。位置は制約しない (``position_mask=False``)。
+
+    視線の目標が人間自身の掌の位置 (IK を解く前から分かっている固定点) で
+    あって、ロボット自身の手先の収束後の位置ではないため、腕の収束を待って
+    から視線目標を作る (逐次に 2 回解く) 必要が無く、1 回の呼び出しで同時に
+    解ける。``inverse_kinematics`` は全タスクが収束したときのみ成功を返す
+    ため、腕・視線のどちらも収束して初めて後処理判定は成功とする。
+
+    収束閾値 ``thre``/``rthre`` (腕) は skrobot 既定 (位置 1mm・姿勢 1度)
+    より緩めた値 (``DEFAULT_POST_PROCESS_IK_THRE``/``DEFAULT_POST_PROCESS_
+    IK_RTHRE``) を明示的に渡す -- 事前段階の干渉回避付きバッチ IK 自体が
+    それよりずっと緩い閾値 (``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_
+    COLLISION_IK_RTHRE``, 2cm/8度) で「収束」と判定した候補を初期値として
+    渡ってくるため、既定の厳しい閾値では実用上問題ない解でも収束できず
+    後処理が失敗しやすい。視線 (位置は制約しないため ``thre`` は使われず、
+    ``rthre`` だけが効く) は ``gaze_ik_rthre`` (既定 ``DEFAULT_POST_
+    PROCESS_GAZE_IK_RTHRE``) を渡す -- skrobot 既定の ``rthre`` (0.001rad
+    ≈ 0.057度) では、人体との干渉回避で肩や台車が大きく振られた姿勢から
+    必要な首振り角度 (数十度) に対してまず収束しない。反復回数は、腕・視線
+    の両タスクが同じループで一緒に反復される (タスクごとに分けられない)
+    ため、それぞれの既定 (``stop``/``gaze_ik_stop``) の大きい方を呼び出し
+    全体の反復回数として使う -- 先に収束したタスクは誤差 0 のまま、もう
+    一方の収束を待つだけなので安全。
 
     ``robot`` は呼び出し前の姿勢 (``pick_verified_candidate`` が反映した
     干渉検証済みの候補の姿勢、台車位置を含む) を初期値として直接書き換え
@@ -1042,31 +1060,32 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+    head_move_target = robot.head_end_coords
+    head_target = Coordinates(
+        pos=position.tolist()).align_axis_to_direction(
+            position - head_move_target.worldpos())
+
     try:
-        arm_result = whole_body.inverse_kinematics(
-            target_coords, rotation_axis=True, stop=stop,
-            thre=thre, rthre=rthre, revert_if_fail=True)
+        # position_mask/rotation_mask はタスクごと (腕/首) に別のマスクを
+        # 使いたいので、ここで normalize_mask により 3 要素配列へ解決済みの
+        # リストにしてから渡す -- robot_model._resolve_mask_params は
+        # 「既に解決済みの 3 要素配列のリスト」だけをタスクごとのマスクの
+        # リストとして認識し、そうでない (bool/str が直接並んだ) リストは
+        # 1 つのマスク指定そのものとして誤って解釈してしまうため。
+        result = robot.inverse_kinematics(
+            target_coords=[target_coords, head_target],
+            move_target=[move_target, head_move_target],
+            link_list=[whole_body.link_list, robot.head.link_list],
+            position_mask=[normalize_mask(True), normalize_mask(False)],
+            rotation_mask=[normalize_mask(True), normalize_mask('xy')],
+            stop=max(stop, gaze_ik_stop),
+            thre=[thre, thre], rthre=[rthre, gaze_ik_rthre],
+            revert_if_fail=True)
     except Exception as e:
-        print('  [post-process] 押し付け確認の腕 IK で例外が発生したため '
+        print('  [post-process] 押し付け/視線 IK で例外が発生したため '
               '棄却します: {}'.format(e))
         return None
-    if arm_result is False:
-        return None
-
-    head_target = Coordinates(
-        pos=move_target.worldpos().tolist()).align_axis_to_direction(
-            move_target.worldpos() - robot.head_end_coords.worldpos())
-    try:
-        gaze_result = robot.inverse_kinematics(
-            head_target, move_target=robot.head_end_coords,
-            link_list=robot.head.link_list,
-            position_mask=False, rotation_mask='xy',
-            stop=gaze_ik_stop, rthre=gaze_ik_rthre, revert_if_fail=True)
-    except Exception as e:
-        print('  [post-process] 自分の手を見る視線 IK で例外が発生した '
-              'ため棄却します: {}'.format(e))
-        return None
-    if gaze_result is False:
+    if result is False:
         return None
 
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
