@@ -78,19 +78,18 @@ pairs`` 参照。各ペアの 2 要素目がロボットのリンク名なら自
 
 向きを 0/±90 度 (``TURN_CANDIDATES_DEG``) ずらした目標を、それぞれ
 ``--attempts-per-pose`` 個の初期値 (初期値 0 が「肩を開いた種の姿勢」+
-台車はワールド原点、残りは関節範囲・台車可動範囲の一様乱数。
-``batch_ik_initial_angles`` 参照) から解き、そうしてできる
-``len(TURN_CANDIDATES_DEG) * --attempts-per-pose`` 個の解 **すべて** を
-候補として順に試して、干渉回避付きバッチ IK が解けて (収束・事後の干渉
-検証を通過して)、かつ後処理判定 (``solve_post_process``) にも成功した
-最初のものを採用する (``pick_verified_candidate`` 参照)。初期値ごとの解を
-1 つに集約せず全部後処理に回すのは、``batch_inverse_kinematics`` が
-1 目標につき最良の 1 解しか返さない (``attempts_per_pose`` の中で誤差
-最小のものを選ぶ) ため -- 位置・姿勢誤差が最小の解が後処理判定にも通る
-とは限らないので、目標 1 つにつき初期値 1 つの「1 目標」として展開して
-呼び、初期値ごとの解を個別に受け取る (``solve_person_ik`` 参照。バッチの
-大きさ (目標数 × 初期値数) は展開の前後で変わらないので、計算時間・JAX の
-コンパイル結果は従来と同じ)。IK は 1 目標ずつ逐次に解くのではなく、
+台車はワールド原点、残りは関節範囲・台車可動範囲の一様乱数) から解き、
+そうしてできる ``len(TURN_CANDIDATES_DEG) * --attempts-per-pose`` 個の解
+**すべて** を候補として順に試して、干渉回避付きバッチ IK が解けて
+(収束・事後の干渉検証を通過して)、かつ後処理判定
+(``solve_post_process``) にも成功した最初のものを採用する
+(``pick_verified_candidate`` 参照)。``batch_inverse_kinematics`` は既定
+では 1 目標につき最良の 1 解しか返さない (``attempts_per_pose`` の中で
+誤差最小のものを選ぶ) が、位置・姿勢誤差が最小の解が後処理判定にも通る
+とは限らないので、``return_all_attempts=True`` を渡して集約させず、
+初期値ごとの解を全て受け取る (``solve_person_ik`` 参照。捨てられていた
+解も元々解かれてはいるので、計算時間・JAX のコンパイル結果は変わらない)。
+IK は 1 目標ずつ逐次に解くのではなく、
 ``batch_inverse_kinematics`` で **人物 1 人ごとに 1 回** 解く (その人の
 全向き × 全初期値を 1 バッチにまとめる)。``collision_obstacles`` は
 1 回のバッチ呼び出し全体で 1 つの集合しか渡せない (skrobot 側の制約) ため、
@@ -190,19 +189,11 @@ DEFAULT_BASE_X_RANGE = (HUMAN_FRONT_DISTANCE - BASE_MOVABLE_HALF_RANGE,
 DEFAULT_BASE_Y_RANGE = (-BASE_MOVABLE_HALF_RANGE, BASE_MOVABLE_HALF_RANGE)
 DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 
-# 1 目標姿勢あたりに振る初期値の数。初期値 0 は seed_arm_pose の種の姿勢
-# (台車はワールド原点)、残りは関節範囲・台車の可動範囲の一様乱数
-# (``batch_ik_initial_angles`` 参照)。初期値ごとの解を個別に受け取るため、
-# ``batch_inverse_kinematics`` には ``attempts_per_pose`` としてではなく、
-# 「同じ目標を初期値の数だけ並べたバッチ」として渡す (``solve_person_ik``
-# 参照)。
+# 1 目標姿勢あたりに振る初期値の数 (バッチ IK の attempts_per_pose)。
+# 初期値 0 は seed_arm_pose の種の姿勢 (台車はワールド原点)、残りは関節
+# 範囲・台車の可動範囲の一様乱数。初期値ごとの解は集約させずに全て受け取る
+# (``return_all_attempts``。``solve_person_ik`` 参照)。
 DEFAULT_ATTEMPTS_PER_POSE = 16
-
-# ``use_base='planar'`` でバッチ IK に追加される台車の仮想関節の数
-# (x, y, yaw の 3 つ)。``batch_inverse_kinematics`` は仮想関節をリンク列
-# (``link_list``) の先頭に挿入するため、初期値ベクトルの先頭 3 要素も
-# この 3 自由度になる (``batch_ik_initial_angles`` 参照)。
-BASE_VIRTUAL_DOF = 3
 
 # 干渉回避 (collision_obstacles) 付きバッチ IK の収束判定。勾配降下法は
 # 通常のヤコビアン法より収束が遅いため、既定よりも反復回数を増やし閾値を
@@ -459,8 +450,7 @@ def translate_palm(palm, offset):
 
 
 def seed_arm_pose(robot, robot_arm):
-    """バッチ IK の初期値 0 に使う「種の姿勢」をロボットに作る
-    (``batch_ik_initial_angles`` がこの姿勢の関節角を読む).
+    """バッチ IK の初期値 0 (attempt 0) に使う「種の姿勢」をロボットに作る.
 
     向かい合わず、人間と同じ方向を向いて手を繋ぐ構え (肩を横に開き、
     手首はひねらないニュートラルな姿勢)。種のままだと目標との姿勢差が
@@ -499,8 +489,7 @@ def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
     ``min_angle_deg`` まで緩める (``ELBOW_MIN_ANGLE_DEG`` 参照)。
 
     ``batch_inverse_kinematics`` は各関節の ``min_angle``/``max_angle`` を
-    呼び出しのたびに読み直して最適化の範囲を決め、``batch_ik_initial_
-    angles`` も同じ値から乱数初期値を引くので、
+    呼び出しのたびに読み直して最適化の範囲・乱数初期値の範囲を決めるので、
     ここで書き換えておけば以降の全人物の IK に効く (``use_base='planar'``
     を渡す呼び出しはリンク単位の識別子でソルバをキャッシュしないため、
     毎回この制限が反映される)。``rarm_whole_body``/``larm_whole_body`` も
@@ -564,82 +553,6 @@ def restrict_joint_range_margin(link_list, margin_ratio):
             joint.max_angle = hi
 
     return restore
-
-
-def _finite_limit_pair(limit_pair):
-    """``(下限, 上限)`` を有限な値に解決する.
-
-    ``batch_inverse_kinematics`` (バッチ IK) は非有限の関節可動域を
-    ``-pi``/``+pi`` で置き換えて最適化・乱数初期値の範囲にする
-    (``base_limits`` の docstring 参照)。``batch_ik_initial_angles`` が
-    作る乱数初期値の範囲をそれに合わせるための解決処理。``limit_pair``
-    自体が ``None`` (台車のその自由度に制限なし) の場合も同じ扱いにする。
-    """
-    lo, hi = (None, None) if limit_pair is None else limit_pair
-    lo = -math.pi if lo is None or not np.isfinite(lo) else float(lo)
-    hi = math.pi if hi is None or not np.isfinite(hi) else float(hi)
-    return lo, hi
-
-
-def batch_ik_link_list_joints(robot, whole_body):
-    """``batch_inverse_kinematics`` に ``use_base='planar'`` を渡したとき、
-    台車の仮想関節 (先頭 ``BASE_VIRTUAL_DOF`` 個) の後ろに並ぶ関節を、
-    バッチ IK の初期値ベクトルと同じ順序で返す。
-
-    バッチ IK は ``use_base`` を渡されると、渡された ``link_list`` の
-    前に台車の仮想関節のリンク列を挿入し、``link_list`` 中の root リンク
-    (Aero では ``base_link``。仮想関節の子になるので重複する) を取り除いた
-    ものを解く (skrobot の ``RobotModel._attach_batch_virtual_base_chain``
-    参照)。``initial_angles`` に ``(目標数, リンク数)`` の配列を渡すときの
-    列の並びもこれと同じなので、ここで同じ規則のリストを作る。mimic
-    ジョイントのリンクも (バッチ IK 側が列を読み飛ばすだけで、列自体は
-    存在するので) 取り除かずそのまま含める。
-    """
-    root_link = robot._find_fullbody_root_link()
-    return [link.joint for link in whole_body.link_list
-            if link is not root_link]
-
-
-def batch_ik_initial_angles(robot, whole_body, base_limits, n_targets,
-                            attempts_per_pose):
-    """バッチ IK に明示的に渡す初期値の配列
-    ``(n_targets * attempts_per_pose, 台車 3 自由度 + 関節数)`` を作る。
-
-    ``solve_person_ik`` は「1 目標 × ``attempts_per_pose`` 個の初期値」で
-    はなく「同じ目標を ``attempts_per_pose`` 個並べた別々の目標」として
-    バッチ IK を呼ぶ (初期値ごとの解を個別に受け取るため。モジュール
-    docstring 参照)。その場合 ``attempts_per_pose=1`` になり skrobot 側は
-    乱数初期値を作らないので、skrobot が ``attempts_per_pose > 1`` のときに
-    内部で作るのと同じ初期値をここで自前で作って渡す:
-
-    * 初期値 0 (各目標の先頭) は ``seed_arm_pose`` が作った現在の関節角
-      (種の姿勢) と、台車のワールド原点 (仮想関節の角度 0)。
-    * 残りは各関節・各台車自由度の可動域からの一様乱数。関節の可動域は
-      ``restrict_elbow_range``/``restrict_joint_range_margin`` を適用した
-      後の値を読む (この関数はバッチ IK 呼び出しの直前、可動域を制限した
-      状態で呼ばれる想定) ので、skrobot 側が同じ制限付き可動域から乱数を
-      引くのと一致する。台車は ``base_limits`` の範囲から引く。
-
-    返す配列は目標優先の並び (目標 0 の初期値 0..N-1, 目標 1 の初期値
-    0..N-1, ...) で、``solve_person_ik`` が ``target_coords`` を同じ順序で
-    並べる (``numpy.repeat`` と同じ並べ方) ことで対応づく。
-    """
-    joints = batch_ik_link_list_joints(robot, whole_body)
-    limits = [_finite_limit_pair(
-        None if base_limits is None else base_limits[i])
-        for i in range(BASE_VIRTUAL_DOF)]
-    limits += [_finite_limit_pair((joint.min_angle, joint.max_angle))
-               for joint in joints]
-    lower = np.array([lo for lo, _ in limits])
-    upper = np.array([hi for _, hi in limits])
-    # 初期値 0 の台車はワールド原点 (仮想関節の角度 0) -- seed_arm_pose が
-    # ロボットをワールド原点に戻すのと対応する。
-    seed = np.array([0.0] * BASE_VIRTUAL_DOF
-                    + [float(joint.joint_angle()) for joint in joints])
-    initial = np.random.uniform(
-        lower, upper, size=(n_targets, attempts_per_pose, len(seed)))
-    initial[:, 0, :] = seed
-    return initial.reshape(n_targets * attempts_per_pose, len(seed))
 
 
 def _cylinder_between(p0, p1, radius):
@@ -1212,8 +1125,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
 
     候補は「向き (``TURN_CANDIDATES_DEG``) × 初期値 (``attempts_per_
     pose``)」の全組み合わせで、添字は向き優先の並び (向き 0 の初期値
-    0..N-1, 向き 1 の初期値 0..N-1, ...。``solve_person_ik`` がバッチ IK に
-    渡した ``target_coords``/``initial_angles`` の並びと同じ) になっている
+    0..N-1, 向き 1 の初期値 0..N-1, ...。``batch_inverse_kinematics`` に
+    ``return_all_attempts=True`` を渡したときの並び) になっている
     -- つまり ``向きの添字 = 添字 // attempts_per_pose``。同じ向きでも
     初期値が違えば別の解になりうるので、初期値ごとの解を 1 つに集約せず
     全てここで検証する (モジュール docstring 参照)。優先順位は「向きが
@@ -1429,33 +1342,26 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         whole_body.link_list, collision_joint_limit_margin_ratio)
     collision_ik_start = time.time()
     try:
-        # batch_inverse_kinematics は 1 目標につき解を 1 つしか返さない
-        # (attempts_per_pose 個の初期値の中から誤差最小の 1 つを選ぶ) が、
-        # 誤差最小の解が後処理判定 (solve_post_process) にも通るとは限らず、
-        # 初期値ごとの別の解なら通ることがある。そこで「同じ目標を初期値の
-        # 数だけ並べた目標列」+「attempts_per_pose=1」+「初期値を明示的に
-        # 渡す」形に展開して呼び、初期値ごとの解を個別に受け取る
-        # (batch_ik_initial_angles / pick_verified_candidate 参照)。
-        # 実際に解かれる (目標, 初期値) の組の総数・その並び順は展開の前後
-        # で同じ (skrobot 側も内部で numpy.repeat による同じ展開をしてから
-        # 解き、最後に選ぶだけ) なので、計算時間も JAX のコンパイル結果
-        # (バッチの形状) も変わらない。
-        expanded_target_coords = [coords for coords in target_coords
-                                  for _ in range(attempts_per_pose)]
-        initial_angles = batch_ik_initial_angles(
-            robot, whole_body, base_limits, len(target_coords),
-            attempts_per_pose)
+        # return_all_attempts=True: 既定では 1 目標につき初期値の中で誤差
+        # 最小の 1 解しか返らないが、誤差最小の解が後処理判定 (solve_post_
+        # process) にも通るとは限らず、初期値ごとの別の解なら通ることが
+        # ある。そのため集約させず、(目標, 初期値) の全組み合わせの解を
+        # そのまま受け取って全部候補にする (pick_verified_candidate 参照)。
+        # 返る解は目標優先の並び (目標 0 の初期値 0..N-1, 目標 1 の初期値
+        # 0..N-1, ...)。捨てられていた解も元々解かれてはいるので、この
+        # 指定で計算時間は変わらない。
         angle_vectors, base_poses, success_flags, _ = \
             robot.batch_inverse_kinematics(
-                target_coords=expanded_target_coords,
+                target_coords=target_coords,
                 move_target=move_target,
                 link_list=whole_body.link_list,
                 position_mask=True, rotation_mask=True,
                 stop=collision_ik_stop,
                 thre=collision_ik_thre,
                 rthre=collision_ik_rthre,
-                initial_angles=initial_angles,
-                attempts_per_pose=1,
+                initial_angles='current',
+                attempts_per_pose=attempts_per_pose,
+                return_all_attempts=True,
                 backend='jax',
                 use_base='planar', base_limits=base_limits,
                 collision_obstacles=collision_obstacles,
