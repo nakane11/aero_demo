@@ -17,10 +17,11 @@
    組み合わせを 1 つだけ選んで追加する (一度に全候補を追加するのではなく
    1 反復 1 組ずつ)。
 5. 4. で更新した ``collision_pairs.json`` を使って全員の IK を解き直し、
-   その所要時間を人数で割った「1 人あたりの IK 計算時間」を測る。この
-   時間が ``--max-ik-seconds-per-person`` を超えた場合はここで終了する。
-   超えていなければ 5. の結果を 4. に戻して繰り返す。新たな干渉ペアの
-   候補が見つからなくなった場合もそこで終了する (収束)。
+   その所要時間を (掌が見つからず IK 対象外だった人物を除いた) 人数で
+   割った「1 人あたりの IK 計算時間」を測る。この時間が ``--max-ik-
+   seconds-per-person`` を超えた場合はここで終了する。超えていなければ
+   5. の結果を 4. に戻して繰り返す。新たな干渉ペアの候補が見つからなく
+   なった場合もそこで終了する (収束)。
 
 ``solve_palm_ik.py`` は「``--collision-pairs`` に指定した JSON が存在
 しなければ、自己干渉・人体との干渉の両方を無効にする」という仕様
@@ -67,6 +68,20 @@ def save_pairs(pairs, path):
     with open(path, 'w') as f:
         json.dump([list(pair) for pair in sorted(pairs)], f,
                   indent=2, ensure_ascii=False)
+
+
+def count_ik_targets(handshake_dir):
+    """``handshake_dir`` の IK 結果のうち、掌が見つからず (``offered_hand``
+    が null 等で) IK をスキップされた人物を除いた、実際に IK を解いた
+    人数を返す (``solve_palm_ik.not_target_result`` が保存する ``target:
+    false`` の人物を除外する)。"""
+    n_targets = 0
+    for path in glob.glob(os.path.join(handshake_dir, '*.json')):
+        with open(path) as f:
+            result = json.load(f)
+        if result.get('target', True):
+            n_targets += 1
+    return n_targets
 
 
 def find_collision_candidates(handshake_dir, skeleton_dir,
@@ -163,10 +178,11 @@ def main():
     parser.add_argument(
         '--max-ik-seconds-per-person', type=float, required=True,
         help='干渉ペアを 1 組追加するたびに干渉回避ありで IK を解き直し、'
-            'その所要時間を人数で割った「1 人あたりの IK 計算時間」を '
-            '測る。干渉ペアが増えてこの時間 [秒] を超えたら、そこで反復を '
-            '終了する (新たな干渉ペアの候補が見つからなくなった場合は '
-            'それより前に収束して終了する)。')
+            'その所要時間を (掌が見つからず IK 対象外だった人物を除いた) '
+            '人数で割った「1 人あたりの IK 計算時間」を測る。干渉ペアが '
+            '増えてこの時間 [秒] を超えたら、そこで反復を終了する (新たな '
+            '干渉ペアの候補が見つからなくなった場合はそれより前に収束して '
+            '終了する)。')
     parser.add_argument(
         '--human-front-distance', type=float, default=HUMAN_FRONT_DISTANCE,
         help='solve_palm_ik.py に渡すのと同じ --human-front-distance '
@@ -234,6 +250,18 @@ def main():
                  args.handshake_dir, nonexistent_collision_pairs,
                  args.robot_arm, args.seed, args.solve_args)
 
+        # 掌が見つからず (offered_hand が null 等で) IK をスキップされた
+        # 人物は、以降の「1 人あたりの IK 計算時間」の母数から除外する。
+        n_ik_people = count_ik_targets(args.handshake_dir)
+        if n_ik_people == 0:
+            print('{} に IK 対象の人物 (掌が見つかった人物) が見つかりません。'
+                 .format(args.handshake_dir))
+            sys.exit(1)
+        if n_ik_people != n_people:
+            print('{} 人中 {} 人は掌が見つからず IK 対象外だったため、1 人 '
+                  'あたりの IK 計算時間の母数は {} 人とします。'.format(
+                      n_people, n_people - n_ik_people, n_ik_people))
+
         iteration = 0
         while True:
             iteration_start = time.time()
@@ -254,7 +282,7 @@ def main():
             save_pairs(pairs, args.output)
             print('\n=== 反復 {}: 干渉ペアを 1 組追加 ==='.format(iteration))
             print('新規 1 組を追加: {} ({} / {} 人で干渉) (合計 {} 組) -> {}'
-                 .format(best_pair, best_count, n_people, len(pairs),
+                 .format(best_pair, best_count, n_ik_people, len(pairs),
                          args.output))
 
             print('干渉回避ありで IK を解き直します (現在 {} 組)。'.format(
@@ -263,9 +291,9 @@ def main():
                 args.python, args.human_poses_dir, args.palm_poses_dir,
                 args.handshake_dir, args.output, args.robot_arm, args.seed,
                 args.solve_args)
-            per_person = elapsed / n_people
+            per_person = elapsed / n_ik_people
             print('IK 計算時間: {:.2f} 秒 ({:.3f} 秒/人 x {} 人)。'.format(
-                elapsed, per_person, n_people))
+                elapsed, per_person, n_ik_people))
 
             iteration_elapsed = time.time() - iteration_start
             print('反復 {} の所要時間: {:.2f} 秒。'.format(
