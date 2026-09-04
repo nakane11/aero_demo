@@ -934,9 +934,16 @@ def main():
             axes_added = False
 
         if handshake.get('solved'):
-            status = 'solved'
+            pre_status = 'solved'
         else:
-            status = 'NOT solved ({})'.format(hand_text(handshake))
+            pre_status = 'NOT solved ({})'.format(hand_text(handshake))
+        if not handshake.get('solved'):
+            post_status = '-'
+        elif handshake.get('post_process') is not None:
+            post_status = 'solved'
+        else:
+            post_status = 'NOT solved'
+        status = '後処理前 {} / 後処理後 {}'.format(pre_status, post_status)
         # ずれの数値は 1 行に収まらないので、標準出力の 1 行 (status) には
         # 入れずテキストパネルにだけ出す。
         detail = ''
