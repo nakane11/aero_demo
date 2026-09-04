@@ -56,86 +56,9 @@ from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
     create_self_collision_pairs)
 
 from solve_palm_ik import (  # noqa: E402
-    HAND_FINGER_LANDMARKS, HAND_FINGER_RADIUS, HAND_PALM_LANDMARKS,
-    HAND_PALM_RADIUS, HUMAN_COLLISION_SEGMENTS, HUMAN_FRONT_DISTANCE,
-    apply_collision_model, collision_link_list_for_arm,
-    human_translation_offset, load_skeleton_json, translate_joint_positions)
-
-# human_body_obstacles (solve_palm_ik.py) が骨格の関節が欠けているときに
-# 埋めるダミー距離と同じ値。ここでも「欠けている部位は遠くにある」ものと
-# して扱うのに使う (実際の干渉回避と同じ意味づけ)。
-_DUMMY_DISTANCE = 100.0
-
-_FINGER_LABELS = ('thumb', 'index', 'middle', 'ring', 'pinky')
-
-
-def human_capsules(joint_positions):
-    """``solve_palm_ik.human_body_obstacles`` と同じ順序・同じ部位の
-    カプセル (線分 2 端点 + 半径) のリストと、対応する名前のリストを返す。
-    骨格の関節が欠けている部位は ``_DUMMY_DISTANCE`` だけ離れた点に潰す
-    (半径だけの球として扱われるので十分遠ければ干渉回避のコストに
-    影響しないのは human_body_obstacles と同じ)。
-    """
-    caps = []
-    names = []
-    dummy = np.array([_DUMMY_DISTANCE] * 3)
-    for name_a, name_b, radius in HUMAN_COLLISION_SEGMENTS:
-        if name_a in joint_positions and name_b in joint_positions:
-            p0 = np.asarray(joint_positions[name_a], dtype=np.float64)
-            p1 = np.asarray(joint_positions[name_b], dtype=np.float64)
-        else:
-            p0 = p1 = dummy
-        caps.append((p0, p1, radius))
-        names.append('{}-{}'.format(name_a, name_b))
-    for side in ('R', 'L'):
-        palm_names = ['{}Hand{}'.format(side, idx)
-                     for idx in HAND_PALM_LANDMARKS]
-        if all(name in joint_positions for name in palm_names):
-            pts = np.array([joint_positions[name] for name in palm_names],
-                           dtype=np.float64)
-            center = pts.mean(axis=0)
-        else:
-            center = dummy
-        caps.append((center, center, HAND_PALM_RADIUS))
-        names.append('{}_palm'.format(side))
-        for (base_idx, tip_idx), label in zip(
-                HAND_FINGER_LANDMARKS, _FINGER_LABELS):
-            base_name = '{}Hand{}'.format(side, base_idx)
-            tip_name = '{}Hand{}'.format(side, tip_idx)
-            if base_name in joint_positions and tip_name in joint_positions:
-                p0 = np.asarray(joint_positions[base_name], dtype=np.float64)
-                p1 = np.asarray(joint_positions[tip_name], dtype=np.float64)
-            else:
-                p0 = p1 = dummy
-            caps.append((p0, p1, HAND_FINGER_RADIUS))
-            names.append('{}_{}'.format(side, label))
-    return caps, names
-
-
-def segment_point_distance(p0, p1, c):
-    """線分 ``p0``-``p1`` と点 ``c`` の最短距離。"""
-    d = p1 - p0
-    denom = float(np.dot(d, d))
-    if denom < 1e-12:
-        t = 0.0
-    else:
-        t = np.clip(float(np.dot(c - p0, d)) / denom, 0.0, 1.0)
-    closest = p0 + t * d
-    return float(np.linalg.norm(c - closest))
-
-
-def segment_points_distance(p0, p1, points):
-    """線分 ``p0``-``p1`` と、複数の点 ``points`` (``(N, 3)``) それぞれとの
-    最短距離 (``(N,)``)。``segment_point_distance`` のベクトル化版
-    (メッシュ頂点をまとめて処理するのに使う)。"""
-    d = p1 - p0
-    denom = float(np.dot(d, d))
-    if denom < 1e-12:
-        t = np.zeros(len(points))
-    else:
-        t = np.clip((points - p0) @ d / denom, 0.0, 1.0)
-    closest = p0 + t[:, np.newaxis] * d
-    return np.linalg.norm(points - closest, axis=1)
+    HUMAN_FRONT_DISTANCE, apply_collision_model, collision_link_list_for_arm,
+    human_capsules, human_translation_offset, load_skeleton_json,
+    segment_points_distance, translate_joint_positions)
 
 
 def load_result(path):

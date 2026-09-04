@@ -57,7 +57,14 @@ model`` 参照)。人体側・ロボット側のどちらも
 触れる姿勢が要る用途では、この offline スクリプトの出力に別途アプローチ
 動作を足すことを想定している)。これはハードな制約ではなく IK のコストに
 加える soft なペナルティ項なので、干渉のない解が必ず得られるとは限らない
-(skrobot 側の ``batch_inverse_kinematics`` の docstring 参照)。
+(skrobot 側の ``batch_inverse_kinematics`` の docstring 参照)。加えて
+``batch_inverse_kinematics`` の収束判定 (``success_flags``) は位置・姿勢
+誤差だけを見ており、この干渉ペナルティの残差を一切見ない (ペナルティが
+どれだけ残っていても位置・姿勢さえ収束すれば成功扱いになる) ため、
+``solve_person_ik`` は収束した候補について採用前に必ず
+``collision_pairs_min_distance`` で厳密な形状による事後検証を行い、
+``collision_pairs`` に指定した組み合わせが実際には貫通したままの解は
+棄却する (``--collision-verify-tolerance`` 参照)。
 
 人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉。例えば解いて
 いる腕が胴体・反対側の腕・台車にぶつかる) も既定で回避する
@@ -176,6 +183,8 @@ from skrobot.coordinates.math import matrix2ypr  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
+from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
+    create_self_collision_pairs)
 
 from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
@@ -248,7 +257,16 @@ DEFAULT_SELF_COLLISION_MARGIN = 0.02
 # どの部分も除外せずに干渉回避の対象にできる (実際に握手のように触れる
 # 姿勢が要る用途では、この offline スクリプトの出力をそのまま実機に使わず、
 # 別途アプローチ動作を足すことを想定している)。
-TARGET_HOVER_OFFSET = 0.05  # [m]
+TARGET_HOVER_OFFSET = 0.08  # [m]
+
+# 肘関節 (``{r,l}_elbow_joint``) の可動域制限 [deg]。この関節は 0 度が
+# 腕をまっすぐ伸ばした状態、負方向が肘を曲げる方向で、URDF 上の可動域は
+# 0 度 〜 -172 度弱 (機械的なストッパーの手前で前腕がほぼ上腕と平行に
+# 折り畳まれる直前まで許容している)。この可動域いっぱいまで曲げた IK 解は
+# 前腕と上腕が平行に近づく不自然な姿勢になりやすいため、IK を解く前に
+# 下限だけこの値まで緩め、そこまでは曲がらないようにする
+# (``restrict_elbow_range`` 参照)。上限 (0 度, まっすぐ) は変更しない。
+ELBOW_MIN_ANGLE_DEG = -120.0
 
 # 人体の干渉回避用ジオメトリ: (骨格の関節名 A, 関節名 B, 半径[m]) の
 # タプルの並び。BODY_JOINT_NAMES (generate_random_human_poses.py) の
@@ -480,6 +498,23 @@ def seed_arm_pose(robot, robot_arm):
     getattr(robot, '{}_wrist_r_joint'.format(robot_arm)).joint_angle(0.0)
 
 
+def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
+    """``r_elbow_joint``/``l_elbow_joint`` の下限 (最大屈曲角) を
+    ``min_angle_deg`` まで緩める (``ELBOW_MIN_ANGLE_DEG`` 参照)。
+
+    ``batch_inverse_kinematics`` は各関節の ``min_angle``/``max_angle`` を
+    呼び出しのたびに読み直して最適化の範囲・乱数初期値の範囲を決めるので、
+    ここで書き換えておけば以降の全人物の IK に効く (``use_base='planar'``
+    を渡す呼び出しはリンク単位の識別子でソルバをキャッシュしないため、
+    毎回この制限が反映される)。``rarm_whole_body``/``larm_whole_body`` も
+    ``robot`` と同じ ``Joint`` オブジェクトを共有しているので、``robot``
+    側だけ書き換えれば両方に反映される。
+    """
+    min_angle = math.radians(min_angle_deg)
+    for arm in ('r', 'l'):
+        getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
+
+
 def _cylinder_between(p0, p1, radius):
     """``p0``-``p1`` を結ぶ線分を近似する ``Cylinder`` (骨格の 1 本の骨)
     を作る。円柱のローカル +Z が線分の向きになるよう回転させる。"""
@@ -604,6 +639,136 @@ def human_obstacle_names():
     return names
 
 
+def segment_points_distance(p0, p1, points):
+    """線分 ``p0``-``p1`` と、複数の点 ``points`` (``(N, 3)``) それぞれとの
+    最短距離 (``(N,)``)。``analyze_collision_pairs.py`` の集計処理と
+    ``collision_pairs_min_distance`` (事後の厳密な干渉検証) の両方から
+    使う共通処理なのでここに置く。"""
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    d = p1 - p0
+    denom = float(np.dot(d, d))
+    if denom < 1e-12:
+        t = np.zeros(len(points))
+    else:
+        t = np.clip((points - p0) @ d / denom, 0.0, 1.0)
+    closest = p0 + t[:, np.newaxis] * d
+    return np.linalg.norm(points - closest, axis=1)
+
+
+def human_capsules(joint_positions):
+    """``human_body_obstacles`` と同じ順序・同じ部位のカプセル (線分 2 端点
+    + 半径) のリストと、対応する名前 (``human_obstacle_names`` と同じ) の
+    リストを返す。骨格の関節が欠けている部位は ``DUMMY_OBSTACLE_DISTANCE``
+    だけ離れた点に潰す (``human_body_obstacles`` のダミー障害物と同じ意味
+    づけ)。``analyze_collision_pairs.py`` (干渉ペア候補の分析) と
+    ``collision_pairs_min_distance`` (採用しようとしている IK 解の事後
+    検証) の両方が、``human_body_obstacles`` が作る ``Cylinder`` の代わりに
+    素の (線分, 半径) を使いたいときに使う。"""
+    caps = []
+    names = []
+    dummy = np.array([DUMMY_OBSTACLE_DISTANCE] * 3)
+    for name_a, name_b, radius in HUMAN_COLLISION_SEGMENTS:
+        if name_a in joint_positions and name_b in joint_positions:
+            p0 = np.asarray(joint_positions[name_a], dtype=np.float64)
+            p1 = np.asarray(joint_positions[name_b], dtype=np.float64)
+        else:
+            p0 = p1 = dummy
+        caps.append((p0, p1, radius))
+        names.append('{}-{}'.format(name_a, name_b))
+    for side in ('R', 'L'):
+        palm_names = ['{}Hand{}'.format(side, idx)
+                     for idx in HAND_PALM_LANDMARKS]
+        if all(name in joint_positions for name in palm_names):
+            pts = np.array([joint_positions[name] for name in palm_names],
+                           dtype=np.float64)
+            center = pts.mean(axis=0)
+        else:
+            center = dummy
+        caps.append((center, center, HAND_PALM_RADIUS))
+        names.append('{}_palm'.format(side))
+        for (base_idx, tip_idx), label in zip(
+                HAND_FINGER_LANDMARKS, HAND_FINGER_LABELS):
+            base_name = '{}Hand{}'.format(side, base_idx)
+            tip_name = '{}Hand{}'.format(side, tip_idx)
+            if base_name in joint_positions and tip_name in joint_positions:
+                p0 = np.asarray(joint_positions[base_name], dtype=np.float64)
+                p1 = np.asarray(joint_positions[tip_name], dtype=np.float64)
+            else:
+                p0 = p1 = dummy
+            caps.append((p0, p1, HAND_FINGER_RADIUS))
+            names.append('{}_{}'.format(side, label))
+    return caps, names
+
+
+# collision_pairs_min_distance が「実際には貫通していた」と判定するかどうか
+# の許容誤差 [m]。プリミティブ近似形状 (円柱等) は有限個の頂点を持つ
+# collision_mesh (trimesh) として近似されており、曲面を折れ線で近似する
+# 誤差がわずかに乗る。この誤差より大きい貫通だけを「棄却すべき干渉」として
+# 扱うためのマージン (既定 1mm。collision_margin/self_collision_margin
+# (cm オーダー) や、実際に観測された貫通量 (2〜13mm 程度) に比べれば十分
+# 小さい)。
+DEFAULT_COLLISION_VERIFY_TOLERANCE = 0.001  # [m]
+
+
+def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
+    """``robot`` の現在の姿勢 (``angle_vector``/``base_pose`` 適用済み) で、
+    ``collision_pairs`` (``load_collision_pairs`` が返す ``(Link, Link)``/
+    ``(Link, int)`` 混在のリスト) の中で最も干渉している (最小の) 距離
+    [m] を返す。負の値は貫通していることを意味する。``collision_pairs`` が
+    空/``None`` のときは ``float('inf')`` を返す (検証対象なし)。
+
+    ``batch_inverse_kinematics`` (``backend='jax'`` の勾配降下法) の
+    ``success_flags`` は位置・姿勢誤差の収束だけで決まり、
+    ``collision_weight``/``self_collision_weight`` による干渉ペナルティの
+    残差を一切見ない (ペナルティは損失関数に足し込まれ勾配降下の駆動力に
+    なるだけで、収束判定 (``check_converged``) には使われない。加えて
+    勾配降下法自体もリンクを少数の球へ粗く近似した形状でペナルティを計算
+    するため、その近似上ペナルティがほぼ 0 になっていても実形状では
+    貫通が残り得る)。そのため「IK は収束 (成功) と判定されたが、
+    ``collision_pairs`` に明示的に含めた組み合わせが実際には貫通したまま」
+    という解が起こり得る (``solve_person_ik`` 参照)。
+
+    ここでは ``analyze_collision_pairs.py`` が干渉ペア候補を洗い出すのに
+    使ったのと同じ厳密な形状 (``apply_collision_model`` が差し替えた
+    ``collision_mesh`` の頂点そのもの。勾配降下法内部が使う粗い球近似では
+    ない) を使って、採用しようとしている解を事後検証する。
+    """
+    if not collision_pairs:
+        return float('inf')
+    caps = human_capsules(joint_positions)[0] if joint_positions else None
+    min_dist = float('inf')
+    world_vertices_by_link = {}
+
+    def _world_vertices(link):
+        if link not in world_vertices_by_link:
+            local = np.asarray(link.collision_mesh.vertices, dtype=np.float64)
+            world_vertices_by_link[link] = (
+                local @ link.worldrot().T + link.worldpos())
+        return world_vertices_by_link[link]
+
+    for link_a, other in collision_pairs:
+        verts_a = _world_vertices(link_a)
+        if isinstance(other, int):
+            if caps is None:
+                # collision_obstacles が空 (骨格 JSON が無い) のときに
+                # ここに来ることはない (solve_person_ik が effective_
+                # collision_pairs で人体セグメント参照を除外済み) が、
+                # 念のため検証をスキップする (呼び出し側の責務にしない)。
+                continue
+            p0, p1, radius = caps[other]
+            dist = float(segment_points_distance(p0, p1, verts_a).min()) \
+                - radius
+        else:
+            verts_b = _world_vertices(other)
+            dist = float(np.linalg.norm(
+                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
+                axis=-1).min())
+        if dist < min_dist:
+            min_dist = dist
+    return min_dist
+
+
 def load_skeleton_json(path):
     """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON
     を読み、干渉回避の障害物化に使う ``joint_positions`` を返す。"""
@@ -713,16 +878,19 @@ def collision_link_list_for_arm(robot, robot_arm):
     (``[collision-model] N 個のリンクの干渉ジオメトリを...`` のログの数と
     一致する) なので、この除外をしても干渉回避の判定結果は変わらない。
 
-    ``solve_person_ik`` (実際の IK) はこの関数を使わない -- 干渉回避で
-    実際にチェックする組み合わせは常に ``collision_pairs``
+    干渉回避付きバッチ IK (``batch_inverse_kinematics``) 自体はこの関数を
+    使わない -- 最適化でチェックする組み合わせは常に ``collision_pairs``
     (``load_collision_pairs`` が返す明示的なペアのリスト) だけで決まり、
     ``batch_inverse_kinematics`` の ``collision_link_list`` (全リンクの
-    集合を丸ごと渡す引数) 自体を渡さない。この関数は
-    ``analyze_collision_pairs.py`` が「実際にどの組み合わせが干渉し
-    うるか」を全リンク×全セグメントで総当たり分析する (``collision_
-    pairs.json`` を作るための素材を集める) ときにだけ使う。各リンクの
-    干渉ジオメトリは ``apply_collision_model`` によりプリミティブ近似
-    形状に差し替え済みであることを前提とする。
+    集合を丸ごと渡す引数) 自体を渡さない (勾配降下法の 1 反復ごとのコストを
+    抑えるため、組み合わせを事前に絞り込む必要がある)。一方
+    ``build_collision_verification_pairs`` (IK が収束した**後**の事後検証
+    用。勾配降下法を回さず姿勢確定後に厳密な距離を計算するだけなので
+    組み合わせを絞る必要がない) と ``analyze_collision_pairs.py`` (``
+    collision_pairs.json`` を作るための素材集め) は、この関数で全リンクを
+    集めてから総当たりの組み合わせを作る。各リンクの干渉ジオメトリは
+    ``apply_collision_model`` によりプリミティブ近似形状に差し替え済みで
+    あることを前提とする。
     """
     return [link for link in robot.link_list
            if getattr(link, 'collision_mesh', None) is not None]
@@ -776,6 +944,90 @@ def load_collision_pairs(path, robot):
     return pairs
 
 
+def build_collision_verification_pairs(robot, robot_arm):
+    """事後検証 (``pick_verified_candidate``/``collision_pairs_min_
+    distance``) で使う、干渉しうる組み合わせを総当たりで網羅したペアの
+    リストを作る (``(Link, Link)``/``(Link, int)`` 混在、``load_collision_
+    pairs`` が返す形式と同じ)。
+
+    ``--collision-pairs`` (JSON) は勾配降下法の 1 反復あたりのコストを
+    抑えるために事前に絞り込んだ組み合わせだが、事後検証は姿勢確定後に
+    厳密な距離を 1 回計算するだけなので絞り込む必要がなく、むしろ絞り込む
+    と (JSON に無い組み合わせで) 実際に貫通していても見逃してしまう。その
+    ため検証はここで作る全組み合わせに対して行う。
+
+    * 自己干渉: ``collision_link_list_for_arm`` (干渉ジオメトリを持つ
+      ロボット全リンク) 同士の全組み合わせから、``create_self_collision_
+      pairs`` (``ignore_adjacent=True``。``analyze_collision_pairs.py`` が
+      干渉ペア候補を洗い出すのに使っているのと同じ) が除く「間に他の
+      リンクを挟まず隣接する (共通の関節で直接つながっている) 組み合わせ」
+      を除いたもの。隣接リンクは可動範囲によらず幾何学的に常に接した
+      ままなので、そもそも「干渉」として検出する意味が無い (常に非常に
+      近い/接触した距離になり、閾値判定が無意味になる)。
+    * 人体との干渉: 同じ ``collision_link_list_for_arm`` の各リンクと
+      ``human_obstacle_names`` の全人体セグメントの組み合わせ (除外なし --
+      差し出している側の腕を含め、人体側はロボットのどのリンクとも幾何
+      学的には干渉しうるため)。
+
+    ロボットの構造 (干渉ジオメトリを持つリンクの集合・隣接関係) だけで
+    決まり、人物ごとの骨格やその時点の姿勢には依存しないので、``main``
+    から人物ループの外で 1 回だけ計算すればよい。
+    """
+    collision_link_list = collision_link_list_for_arm(robot, robot_arm)
+    self_pairs = create_self_collision_pairs(
+        collision_link_list, ignore_adjacent=True)
+    pairs = [(collision_link_list[link_i], collision_link_list[link_j])
+            for link_i, link_j in self_pairs]
+    for link in collision_link_list:
+        for obstacle_index in range(len(human_obstacle_names())):
+            pairs.append((link, obstacle_index))
+    return pairs
+
+
+def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
+                            verification_pairs, joint_positions,
+                            collision_verify_tolerance):
+    """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
+    ``angle_vectors``/``base_poses``。全て同じ添字 (``TURN_CANDIDATES_DEG``
+    の添字) で対応する) の中から、IK が収束していて (``success_flags``)
+    かつ ``verification_pairs`` を実際には貫通していない
+    (``collision_pairs_min_distance`` による事後検証、
+    ``collision_verify_tolerance`` [m] まで許容) 候補を、添字最小 (最優先)
+    のものから探して返す (``solve_person_ik`` の docstring 参照 -- IK の
+    収束判定は干渉ペナルティの残差を見ないため、この事後検証が別途必要)。
+    ``verification_pairs`` には最適化で使った (絞り込み済みの)
+    ``collision_pairs`` ではなく、``build_collision_verification_pairs``
+    が作る総当たりの組み合わせ (``solve_person_ik`` 側で ``collision_
+    obstacles`` の有無に応じてフィルタ済みのもの) を渡す想定。
+
+    候補を採用するにはロボットにその候補の姿勢を反映する必要がある
+    (``collision_pairs_min_distance`` はロボットの現在の姿勢を見る) ため、
+    検証のたびに ``robot`` を書き換える -- 呼び出し後の ``robot`` は最後に
+    調べた候補 (採用した候補、またはどれも採用できなければ最後の候補) の
+    姿勢のままになる。
+
+    Returns
+    -------
+    tuple or None
+        ``(candidate_index, angle_vector, base_pose)``。見つからなければ
+        ``None``。
+    """
+    for candidate_index, ok in enumerate(success_flags):
+        if not ok:
+            continue
+        robot.angle_vector(angle_vectors[candidate_index])
+        robot.newcoords(base_poses[candidate_index])
+        min_dist = collision_pairs_min_distance(
+            robot, verification_pairs, joint_positions)
+        if min_dist >= -collision_verify_tolerance:
+            return (candidate_index, angle_vectors[candidate_index],
+                    base_poses[candidate_index])
+        print('  [collision-verify] turn={:.0f}deg の候補は IK は収束した'
+              'が、事後検証で {:.4f} m 貫通していたため棄却します。'.format(
+                  TURN_CANDIDATES_DEG[candidate_index], min_dist))
+    return None
+
+
 def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                     attempts_per_pose=DEFAULT_ATTEMPTS_PER_POSE,
                     base_limits=None,
@@ -787,7 +1039,11 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                     self_collision_margin=DEFAULT_SELF_COLLISION_MARGIN,
                     collision_ik_stop=DEFAULT_COLLISION_IK_STOP,
                     collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
-                    collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE):
+                    collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
+                    joint_positions=None,
+                    verification_pairs=None,
+                    collision_verify_tolerance=(
+                        DEFAULT_COLLISION_VERIFY_TOLERANCE)):
     """1 人分について、``TURN_CANDIDATES_DEG`` の全候補を、その人の身体
     (``collision_obstacles``) を障害物とした干渉回避付きバッチ IK で
     まとめて解く。``self_collision=True`` (既定) のときは、それに加えて
@@ -828,12 +1084,29 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     バッチ IK 自体はロボットを動かさないので、戻り値は「解を反映
     するための材料」であり、``robot`` は呼び出し後も種の姿勢のまま。
 
+    ``success_flags`` (収束判定) は位置・姿勢誤差だけを見ており、
+    干渉ペナルティが実際に解消しているかは保証しない (``collision_pairs_
+    min_distance`` の docstring 参照)。そのため収束した候補ごとに、採用
+    する前に ``collision_pairs_min_distance`` で厳密な形状を使った事後
+    検証を行い、``collision_verify_tolerance`` を超えて貫通している候補は
+    棄却して次の候補を試す -- 「IK が収束したかどうか」と「実際に干渉して
+    いないか」は独立な条件として両方満たす候補だけを採用する。この事後
+    検証は最適化で使った ``collision_pairs`` (勾配降下法のコストを抑える
+    ために絞り込んだ組み合わせ) ではなく、``verification_pairs``
+    (``build_collision_verification_pairs`` が作る、隣接リンクの組み合わせ
+    だけを除いた総当たりの組み合わせ) に対して行う -- ``collision_pairs``
+    に無い組み合わせで実際には貫通している解を見逃さないため。
+    ``joint_positions`` (``main`` 側で平行移動済みのものを渡す想定) は
+    人体セグメントとの干渉検証に使う (``None`` なら人体との干渉は検証
+    しない -- 骨格 JSON が無い場合。この場合 ``effective_verification_
+    pairs`` はそもそも人体セグメント参照を含まない)。
+
     Returns
     -------
     tuple or None
         ``(candidate_index, angle_vector, base_pose)``。
-        ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、最優先) に解けた
-        ものを返す。どの候補も解けなければ ``None``。
+        ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、最優先) に、収束かつ
+        事後の干渉検証の両方を満たしたものを返す。無ければ ``None``。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -873,11 +1146,18 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
             collision_pairs=effective_collision_pairs,
             self_collision_weight=self_collision_weight,
             self_collision_margin=self_collision_margin)
-    for candidate_index, ok in enumerate(success_flags):
-        if ok:
-            return (candidate_index, angle_vectors[candidate_index],
-                    base_poses[candidate_index])
-    return None
+    # verification_pairs 中の人体セグメントへの参照 (int) も、
+    # effective_collision_pairs と同じ理由 (collision_obstacles が空だと
+    # 対応する障害物が存在しない) でここで除く。
+    effective_verification_pairs = verification_pairs
+    if verification_pairs is not None and not collision_obstacles:
+        effective_verification_pairs = [
+            (link_a, other) for link_a, other in verification_pairs
+            if not isinstance(other, int)]
+    return pick_verified_candidate(
+        robot, success_flags, angle_vectors, base_poses,
+        effective_verification_pairs, joint_positions,
+        collision_verify_tolerance)
 
 
 def base_movable_region(base_limits):
@@ -1117,6 +1397,17 @@ def main():
         help='干渉回避付きバッチ IK の姿勢収束閾値 [rad] (既定 {:.4f})。'
             .format(DEFAULT_COLLISION_IK_RTHRE))
     parser.add_argument(
+        '--collision-verify-tolerance', type=float,
+        default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
+        help='IK の収束判定 (success_flags) は位置・姿勢誤差だけを見ており '
+            'collision_pairs の干渉ペナルティの残差を見ないため、収束した '
+            '候補について採用前に厳密な形状で干渉を再計算し (collision_'
+            'pairs_min_distance)、この距離 [m] を超えて貫通していれば '
+            'その候補を棄却し次の候補を試す (どの候補も満たさなければ '
+            'unsolved 扱いになる)。既定 {} は collision_mesh のポリゴン近似 '
+            '誤差を吸収する程度の小さな値。'.format(
+                DEFAULT_COLLISION_VERIFY_TOLERANCE))
+    parser.add_argument(
         '--base-x-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
         default=list(DEFAULT_BASE_X_RANGE),
         help='台車の前後方向 (x) の移動範囲 [m]。IK 開始時の台車位置を '
@@ -1178,6 +1469,7 @@ def main():
     # ある (Aero.__init__ 参照) ので、指の関節が要らないこのスクリプトでは
     # 手なしモデルを使う。
     robot = Aero(use_hand=False)
+    restrict_elbow_range(robot)
     apply_collision_model(
         robot,
         primitive_type=args.collision_primitive_type,
@@ -1192,10 +1484,22 @@ def main():
     # 法の) IK にフォールバックする -- collision_link_list を使った
     # 「ロボット全身の全組み合わせ」への暗黙のフォールバックはしない。
     collision_pairs = None
+    verification_pairs = None
     if os.path.exists(args.collision_pairs):
         collision_pairs = load_collision_pairs(args.collision_pairs, robot)
         print('[collision-pairs] {} 組の干渉ペアを {} から読み込みました。'
               .format(len(collision_pairs), args.collision_pairs))
+        # IK の収束判定 (success_flags) は位置・姿勢誤差だけを見ており、
+        # collision_pairs の干渉ペナルティが実際に解消したかは保証しない
+        # ため、solve_person_ik は候補を採用する前に事後検証を行う
+        # (pick_verified_candidate 参照)。この検証は collision_pairs
+        # (最適化のコストを抑えるために絞り込んだ組み合わせ) ではなく、
+        # 隣接リンクの組み合わせだけを除いた総当たりの組み合わせに対して
+        # 行う -- collision_pairs に無い組み合わせで実際には貫通している
+        # 解を見逃さないため。ロボットの構造だけで決まるので人物ループの
+        # 外で 1 回だけ計算する (robot_arm 引数は collision_link_list_for_
+        # arm と同じくプレースホルダで結果に影響しない)。
+        verification_pairs = build_collision_verification_pairs(robot, 'r')
     else:
         print('[collision-pairs] {} が見つからないため、干渉回避 (自己干渉'
               '・人体との干渉の両方) を無効にして IK を解きます。'.format(
@@ -1250,6 +1554,7 @@ def main():
             print('  {} に骨格 JSON が無いため、この人物は人体との干渉回避 '
                   'なしで解きます。'.format(skeleton_path))
             collision_obstacles = []
+            joint_positions = None
 
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, robot_arm)
@@ -1265,7 +1570,10 @@ def main():
             self_collision_margin=args.self_collision_margin,
             collision_ik_stop=args.collision_ik_stop,
             collision_ik_thre=args.collision_ik_thre,
-            collision_ik_rthre=args.collision_ik_rthre)
+            collision_ik_rthre=args.collision_ik_rthre,
+            joint_positions=joint_positions,
+            verification_pairs=verification_pairs,
+            collision_verify_tolerance=args.collision_verify_tolerance)
         if picked is None:
             result = unsolved_result(robot, robot_arm, target_pos, rots[-1],
                                      base_limits)
