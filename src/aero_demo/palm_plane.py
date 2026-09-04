@@ -5,32 +5,11 @@ Used by ``estimate_palm_poses.py`` (offered-hand estimation) and
 ``aero_demo.palm_plane_view`` (drawing the result in a scikit-robot
 viewer), so both agree on exactly what "the palm plane" means.
 
-Why a least-squares fit instead of one cross product
-----------------------------------------------------
-The original behavior required RHand{0,5,9,17} (wrist + index/middle/pinky
-MCP) and took a single cross product.  Measured against a 34-frame sample
-of ``/people_pose_estimation_mediapipe/pose``, that AND-condition held in
-only 76.5% of frames: RHand5 (index MCP) is published in just 79.4%, and
-the thumb landmarks are worse still.  The palm-fixed landmarks rank
-
-    RHand0  wrist       100.0%
-    RHand9  middle MCP  100.0%
-    RHand13 ring MCP    100.0%
-    RHand17 pinky MCP    97.1%
-    RHand1  thumb CMC    88.2%
-    RHand5  index MCP    79.4%
-
-and at least 3 of them were present in 100% of frames.  So instead of
-demanding a fixed quadruple, we fit a plane by SVD to whichever of
-``PLANE_LANDMARKS`` arrived, which both raises the hit rate to ~100% and
-averages out per-landmark jitter.
-
-The module depends only on numpy (no ROS messages, no skrobot), so the
-fitting itself runs on a machine without the robot model *and* without a
-ROS install (e.g. estimate_palm_poses.py's synthetic pipeline). RViz
-MarkerArray visualisation used to live here too; it was dropped in favour
-of drawing the same geometry with skrobot's viewer instead (see
-``aero_demo.palm_plane_view`` / ``draw_random_human_poses.py``).
+A plane is fit by SVD to whichever of ``PLANE_LANDMARKS`` (wrist + MCP
+knuckles) is present, rather than requiring a fixed quadruple and a single
+cross product, since not every landmark is reliably tracked; this both
+raises the effective hit rate and averages out per-landmark jitter.  The
+module depends only on numpy (no ROS messages, no skrobot).
 """
 
 from collections import namedtuple
@@ -217,28 +196,16 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
         return None
 
     # --- orient the normal using the hand's own anatomy -------------------
-    # The SVD normal's sign is ambiguous (palm or back of hand -- both
-    # surfaces are parallel to the same fitted plane), and it must not be
-    # resolved by guessing "whichever side faces the robot": that breaks
-    # down whenever the palm is presented edge-on / sideways to the robot
-    # rather than flat-on (exactly the case for a natural handshake
-    # posture, see ``fake_people_pose_estimator_ros.py``'s
-    # ``~present_wrist_roll_deg_range``), where a small pose change can flip
-    # which side that heuristic calls "facing the robot".
-    #
-    # What is anatomically fixed regardless of viewing angle is MediaPipe's
-    # knuckle layout: index MCP (5) is always on the thumb side and pinky
-    # MCP (17) always on the little-finger side (MCP_LATERAL_RANK).  A
-    # lateral axis built from that ordering, combined with the fixed
-    # left/right handedness of an R or L hand, pins down the normal's sign
-    # without needing to know where the robot is at all.
-    #
-    # This mirrors fake_people_pose_estimator_ros.py's own hand frame
-    # convention (u=finger_dir, v=thumb-side, n=palm normal), where the
-    # (u, v, n) triple is left-handed for the right hand and right-handed
-    # for the left one -- see that module's ``_body_positions`` -- i.e.
-    # v = u x n for R, v = n x u for L, which inverted for n gives the
-    # formulas below.
+    # The SVD normal's sign is ambiguous (palm or back of hand), and can't
+    # be resolved by guessing "whichever side faces the robot" -- that
+    # breaks down whenever the palm is presented edge-on to the robot
+    # rather than flat-on. Instead we use what's anatomically fixed
+    # regardless of viewing angle: MediaPipe's knuckle layout, where index
+    # MCP (5) is always on the thumb side and pinky MCP (17) always on the
+    # little-finger side (MCP_LATERAL_RANK). A lateral axis built from that
+    # ordering, combined with the fixed left/right handedness of an R or L
+    # hand, pins down the normal's sign (v = u x n for R, v = n x u for L,
+    # inverted for n below) without needing to know where the robot is.
     lateral = np.zeros(3)
     n_ranked = 0
     for i, rank in MCP_LATERAL_RANK.items():
@@ -255,7 +222,7 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
     else:
         # Fewer than 2 knuckles with distinct thumb/pinky ranks survived
         # tracking -- not enough to tell the palm side from the layout, so
-        # fall back to the old "faces the robot" guess.
+        # fall back to a "faces the robot" guess.
         if viewpoint is None:
             viewpoint = np.zeros(3)
         viewpoint = np.asarray(viewpoint, dtype=np.float64)
@@ -263,20 +230,10 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
             normal = -normal
 
     # --- build a full frame: +X = fingers, +Y = palm normal --------------
-    # Checked directly against Aero's r/l_eef_grasp_link frame (built by
-    # loading the URDF in skrobot and probing it): local
-    # +X is the wrist -> fingertip direction (confirmed by how far along
-    # +X the fingertip links sit), and local +Y is the *dorsum -> palm*
-    # direction -- confirmed by driving the finger-curl joints and
-    # watching the fingertips move toward +Y as they close, which is
-    # exactly the side "the palm" is on.  +Z (thumb <-> pinky width)
-    # completes the right-handed frame.
-    #
-    # A robot palm pressed flat against the human's must face the human,
-    # i.e. point roughly opposite the human normal (which itself points
-    # out of the human's palm -- see above).  So the robot's local +Y
-    # (dorsum -> palm) must equal -normal, which is the same thing as
-    # saying local -Y (palm -> dorsum, "back of the hand") equals +normal.
+    # Matches Aero's r/l_eef_grasp_link axes: local +X is wrist->fingertip,
+    # local +Y is dorsum->palm, +Z (thumb<->pinky) completes the
+    # right-handed frame. A robot palm pressed against the human's must
+    # face them, i.e. point opposite the human normal, so local +Y = -normal.
     y_axis = -normal
     z_axis = np.cross(x_axis, y_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])

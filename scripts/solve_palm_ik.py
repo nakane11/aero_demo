@@ -4,151 +4,83 @@
 """人間の掌の位置姿勢 JSON (``estimate_palm_poses.py`` の出力) を入力とし、
 ベース移動型ロボット (Aero) が全身 IK (台車の平面移動を含む) を解いて手を
 繋ぐ姿勢を求め、その結果 (関節角・台車位置・手先姿勢) を JSON として保存
-する。
+する。``rospy`` は import せず、保存済みの JSON を読んで 1 回だけ IK を
+解くオフライン処理。
 
-``human_palm_contact_behavior.py`` (ROS ノード。カメラからリアルタイムに
-掌を追跡し、実機を実際に動かす) の IK 周りのロジックを参考にしたオフライン
-版。``rospy`` は import せず、``estimate_palm_poses.py`` が保存した JSON を
-そのまま読んで 1 回だけ IK を解く。同ファイルにあった、以下のような実機を
-安全に動かすための機能は持たないシンプル版であることに注意:
+対象にするのは、掌推定が「人がこの手を差し出している」と判定した手
+(掌 JSON の ``offered_hand`` が ``'L'``/``'R'``) を持つ人物だけ。
+``offered_hand`` が ``null`` の人物は IK を解かず、入力と同じファイル名で
+``target: false`` の JSON (IK の結果は持たない) を書き出す
+(``view_handshake_poses.py`` が「対象外」として表示できるようにするため)。
+使うロボットの腕は既定で人間の手の反対側 (``--robot-arm`` で上書き可)。
+向かい合う握手ではなく人間と同じ方向を向いて反対側の手で繋ぐ想定なので、
+掌の向きは鏡写しにせずそのまま使う。
 
-* IK が 3 軸厳密な解 (``rotation_axis=True``) で収束しないとき、条件を
-  段階的に緩めて (``'y'`` -> ``False``) 再試行することはしない。
-* IK が解いた**結果**の台車位置が人間の足元に寄りすぎていないかの押し出し
-  処理 (``human_palm_contact_behavior._clear_cart_from_foot``) はしない。
+Aero は常にワールド原点・台車位置固定で IK を開始する (``seed_arm_pose``
+参照) ため、人物側 (骨格の全関節位置・掌の目標位置) を x/y 方向に平行移動
+し、その人物の立ち位置がちょうど Aero の前方 ``HUMAN_FRONT_DISTANCE`` [m]
+に来るようにしてから IK を解く (``human_translation_offset``/
+``translate_joint_positions``/``translate_palm`` 参照)。台車の移動範囲は
+``--base-x-range``/``--base-y-range``/``--base-yaw-range`` (既定はこの
+立ち位置を中心とした ``BASE_MOVABLE_HALF_RANGE`` m の正方形) で指定する。
 
-一方、IK を**開始する前**の台車位置については、このスクリプトでは常に
-ワールド原点 (``seed_arm_pose`` の既定の挙動そのまま) に固定する。台車を
-原点から動かさない代わりに、人物側 (骨格の全関節位置・掌の目標位置) を
-x/y 方向に平行移動し、その人物の立ち位置がちょうど Aero の前方
-``HUMAN_FRONT_DISTANCE`` [m] に来るようにしてから IK を解く
-(``human_translation_offset``/``translate_joint_positions``/
-``translate_palm`` 参照)。``generate_random_human_poses.py`` が生成する
-人物は骨盤がほぼワールド原点に置かれる (台車の開始位置ともほぼ重なる) ため、
-この平行移動をしないと干渉回避付きバッチ IK が常に「台車が人間の胴体と
-ほぼ完全に重なった状態」から始まってしまい、干渉回避のペナルティ勾配と
-目標位置へ向かう勾配がせめぎ合って、既定の反復回数内では位置誤差が収束せず
-IK が軒並み失敗する (``batch_inverse_kinematics`` の収束判定は位置・姿勢
-誤差だけを見ており、干渉ペナルティが残っていても収束扱いになり得るが、
-逆に言えば干渉ペナルティの勾配が支配的な間は位置誤差が閾値を切れない)。
-``HUMAN_FRONT_DISTANCE`` (既定 3m) は上記の干渉回避に最低限必要な距離
-よりも十分大きいので、台車側を押し出す処理は不要になる。
-
-一方、人体を障害物とした干渉回避は行う。``--skeleton-dir`` (既定は
-``generate_random_human_poses.py`` の骨格 JSON と同じファイル名で揃う
-ディレクトリ) から人物ごとの全身の関節位置を読み、体幹・頭部・四肢
-(差し出している側の腕・手も含めて全身) を ``skrobot.model.primitives.
-Cylinder`` (骨格の各ボーンを結ぶ線分を近似する円柱。skrobot 内部では
-両端に半球を持つ Capsule として扱われる。手首から先は掌を平たい円柱、
-各指を細い円柱で近似する)
-で近似したものを障害物として ``batch_inverse_kinematics`` の
-``collision_obstacles`` に渡す。干渉を避ける対象のロボットリンク
-(``collision_link_list``) も
-台車 (``base_link``)・胴体・頭部・両腕を含むロボットの全身
-(``collision_link_list_for_arm`` 参照)。ロボット側の干渉ジオメトリは
-実メッシュそのものではなく、``view_aero_collision_model.py`` と同じ方法
-(``skrobot.urdf.convert_meshes_to_primitives``) で生成・キャッシュした
-box/cylinder/sphere のプリミティブ近似形状を使う (``apply_collision_
-model`` 参照)。人体側・ロボット側のどちらも
-部位による除外はしない -- 代わりに IK の目標位置を掌から
-``TARGET_HOVER_OFFSET`` だけ浮かせることで、目標そのものが人体の干渉
-回避ジオメトリと重ならないようにしている (実機の初期アプローチ用オフセット
-``palm_plane.CONTACT_OFFSET``, 2cm よりだいぶ浮く。実際に握手のように
-触れる姿勢が要る用途では、この offline スクリプトの出力に別途アプローチ
-動作を足すことを想定している)。これはハードな制約ではなく IK のコストに
-加える soft なペナルティ項なので、干渉のない解が必ず得られるとは限らない
-(skrobot 側の ``batch_inverse_kinematics`` の docstring 参照)。加えて
-``batch_inverse_kinematics`` の収束判定 (``success_flags``) は位置・姿勢
-誤差だけを見ており、この干渉ペナルティの残差を一切見ない (ペナルティが
-どれだけ残っていても位置・姿勢さえ収束すれば成功扱いになる) ため、
-``solve_person_ik`` は収束した候補について採用前に必ず
+人体を障害物とした干渉回避も行う。``--skeleton-dir`` から人物ごとの全身の
+関節位置を読み、体幹・頭部・四肢 (差し出している側の腕・手も含めて全身)
+を ``skrobot.model.primitives.Cylinder`` で近似し、``batch_inverse_
+kinematics`` の ``collision_obstacles`` に渡す。干渉を避ける対象のロボット
+リンクは台車・胴体・頭部・両腕を含む全身 (``collision_link_list_for_arm``
+参照)。ロボット側の干渉ジオメトリは実メッシュではなく、``view_aero_
+collision_model.py`` と同じ方法で生成・キャッシュした box/cylinder/sphere
+のプリミティブ近似形状を使う (``apply_collision_model`` 参照)。人体側・
+ロボット側のどちらも部位による除外はせず、代わりに IK の目標位置を掌から
+``TARGET_HOVER_OFFSET`` だけ浮かせることで、目標そのものが人体の干渉回避
+ジオメトリと重ならないようにしている。これはソフトなペナルティ項なので、
+干渉のない解が必ず得られるとは限らない上、``batch_inverse_kinematics`` の
+収束判定 (``success_flags``) は位置・姿勢誤差だけを見て干渉ペナルティの
+残差を見ないため、``solve_person_ik`` は収束した候補について採用前に必ず
 ``collision_pairs_min_distance`` で厳密な形状による事後検証を行い、
 ``collision_pairs`` に指定した組み合わせが実際には貫通したままの解は
 棄却する (``--collision-verify-tolerance`` 参照)。
 
 さらに、干渉検証まで通った候補についても、``TARGET_HOVER_OFFSET`` で
 浮かせた目標に届いたというだけでは実際に人間に掌を押し付けられる保証は
-無いため、``pick_verified_candidate`` は最後に後処理判定
+無いため、``pick_verified_candidate`` は候補ごとに最後に後処理判定
 (``solve_post_process``) を行う。台車を動かさず (人体との干渉回避も外した)
 通常のヤコビアン法 IK で、目標位置を掌へわずかにめり込む位置
 (``POST_PROCESS_TARGET_HOVER_OFFSET``) まで詰め直し、同時にロボットが
-自分の手を見るよう首も向ける。ただしこの後処理 IK の成否は候補の採用/
-棄却そのものには影響しない -- 干渉検証まで通った (=``TARGET_HOVER_
-OFFSET`` の目標に干渉なく届いている) 後処理前の解自体はそれとは独立に
-有効な解のため、後処理が失敗しても候補は ``solved`` のまま採用される
-(出力 JSON の ``post_process`` キーが ``null`` になるだけ)。採用された
-候補は、後処理前 (干渉回避付きバッチ IK がそのまま解いた姿勢) の位置姿勢
-に加え、後処理に成功していれば後処理後 (上記の後処理判定が解いた、掌に
-押し付け自分の手を見た姿勢) の位置姿勢も ``post_process`` キーに持つ
-(``solved_result`` 参照)。
+自分の手を見るよう首も向ける。後処理判定に失敗した候補は棄却し、
+``TURN_CANDIDATES_DEG`` の次の向き (干渉回避付きバッチ IK は既に全向きを
+一括で解いてあるので、やり直すのは干渉検証・後処理判定だけ) を試す。
+全ての向きで後処理判定に失敗した場合のみ、干渉検証を通過した最初の候補を
+後処理前のまま (``post_process`` キーを ``null`` にして) 採用する
+フォールバックを行う (``pick_verified_candidate`` 参照)。採用された候補
+は、後処理前の位置姿勢に加え、後処理に成功していれば後処理後の位置姿勢も
+``post_process`` キーに持つ (``solved_result`` 参照)。
 
-人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉。例えば解いて
-いる腕が胴体・反対側の腕・台車にぶつかる) も既定で回避する
-(``batch_inverse_kinematics`` の ``self_collision=True``、``--no-self-
-collision`` で無効化できる)。
+人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉) も既定で回避
+する (``batch_inverse_kinematics`` の ``self_collision=True``、``--no-
+self-collision`` で無効化できる)。チェックする組み合わせ (自己干渉の
+ロボットリンク同士、および人体との干渉のロボットリンク×人体セグメント)
+は、常に ``--collision-pairs`` (JSON: 2 要素の名前のリストのリスト。
+``build_collision_pairs.py`` が ``analyze_collision_pairs.py`` の出力から
+生成する) で明示的に指定した組み合わせだけに限る (``load_collision_
+pairs`` 参照。各ペアの 2 要素目がロボットのリンク名なら自己干渉ペア、
+``human_obstacle_names`` の人体セグメント名なら人体との干渉ペアとして
+扱われる)。このファイルが既定のパスに無ければ、干渉回避 (自己干渉・
+人体との干渉の両方) を丸ごと無効にして、通常のヤコビアン法の IK に
+フォールバックする。
 
-チェックする組み合わせ (自己干渉のロボットリンク同士、および人体との
-干渉のロボットリンク×人体セグメント) は、常に ``--collision-pairs``
-(JSON: 2 要素の名前のリストのリスト。``build_collision_pairs.py`` が
-``analyze_collision_pairs.py`` の出力 (``collision_pair_analysis.json``)
-から生成する) で明示的に指定した組み合わせだけに限る (``load_
-collision_pairs``/``skrobot`` 側の ``batch_inverse_kinematics`` の
-``collision_pairs`` 引数を参照。各ペアの 2 要素目がロボットのリンク名
-なら自己干渉ペア、``human_obstacle_names`` の人体セグメント名なら人体
-との干渉ペアとして扱われる -- 1 つの JSON に両方を混在できる)。
-「対象リンクの集合」を指定する ``collision_link_list`` という概念は使わ
-ない -- 干渉ジオメトリを計算する対象は ``collision_pairs`` に現れる
-リンクだけで、リンクの全組み合わせ・人体セグメントの全組み合わせを機械的
-に生成することはしない。このファイルが既定のパスに無ければ、干渉回避
-(自己干渉・人体との干渉の両方) を丸ごと無効にして、通常のヤコビアン法の
-IK にフォールバックする (「ロボット全身の全組み合わせ」への暗黙の
-フォールバックはしない)。ソフトなペナルティ項なので、干渉のない解が
-必ず得られるとは限らない。
-
-一方、向きを ±90 度ずらした候補を順に試す処理 (``human_palm_contact_
-behavior.py`` の ``MIRROR_TURN_CANDIDATES_DEG`` と同じ考え方) だけは残して
-ある -- 平面フィットの誤差次第で、特定の向きのままだと IK が解けないことが
-あるため。
-
-IK は 1 目標ずつ逐次に解くのではなく、``batch_inverse_kinematics``
-(複数の目標姿勢 × 複数初期値を並列に解くバッチ IK) で **人物 1 人ごとに
-1 回** 解く (``TURN_CANDIDATES_DEG`` の全候補をその人の 1 バッチにまとめる)。
-1 目標あたり ``--attempts-per-pose`` 個の初期値 (attempt 0 が下記の
-「肩を開いた種の姿勢」、残りは関節範囲の一様乱数) から同時に解く。
-
-全人物 × 全候補をまとめて 1 回で解いていた旧版と異なり人物ごとに呼び出す
-のは、``collision_obstacles`` (干渉回避の障害物) が 1 回のバッチ呼び出し
-全体で 1 つの集合しか渡せず、バッチの要素 (目標姿勢) ごとに切り替えられ
-ないという skrobot 側の制約のため -- 人物ごとに「その人自身の身体」を
-障害物にする必要があるので、人物をまたいでバッチをまとめることができない。
-``use_base`` を指定するとソルバキャッシュが効かない (仮想リンクが毎回
-作り直される) 上に干渉回避は ``backend='jax'`` の勾配降下法を使うため、
-旧版 (全人物をまとめた高速なバッチ) に比べて人数分だけ遅くなる。
-
-台車の移動範囲は ``batch_inverse_kinematics`` の ``base_limits``
-(``--base-x-range``/``--base-y-range``/``--base-yaw-range``) で明示的に
-指定する。バッチ IK は ``base_limits`` を渡さないと非有限リミットを
-±π に丸めてしまい、台車が暗黙に原点 ±3.14 m に拘束されるため、既定でも
-明示的な箱を渡している。既定の x/y 範囲 (``DEFAULT_BASE_X_RANGE``/
-``DEFAULT_BASE_Y_RANGE``) は、常に Aero の前方 ``HUMAN_FRONT_DISTANCE``
-に固定される人物の立ち位置を中心とした、前後左右 ``BASE_MOVABLE_HALF_
-RANGE`` m の正方形の箱にしてある。
-
-対象にするのは、``estimate_palm_poses.py`` が「人がこの手を差し出して
-いる」と判定した手 (掌 JSON の ``offered_hand`` が ``'L'`` / ``'R'``) を
-持つ人物だけ。``offered_hand`` が ``null`` (どちらの手も差し出していない
-と判定された) 人物は IK を解かない -- 差し出していない手を掴みに行く姿勢
-はそもそも実機で取りたい姿勢ではないため。ただし対象外の人物についても、
-入力と同じファイル名で ``offered_hand`` が ``null`` / ``solved`` が
-``false`` の JSON (IK の結果は持たない) を書き出す。
-``view_handshake_poses.py`` が骨格 JSON と突き合わせて「対象外」と表示
-できるようにするため。
-
-使うロボットの腕は既定で人間の手の反対側 (人の左手ならロボットの右腕、
-``--robot-arm`` で上書きできる)。同じ側の手で向き合う握手ではなく、人間と
-同じ方向を向いて反対側の手で繋ぐ想定 (``human_palm_contact_behavior.py``
-の ``~same_hand=False`` に相当) なので、掌の向きは鏡写しにせずそのまま
-使う。
+向きを 0/±90 度 (``TURN_CANDIDATES_DEG``) ずらした候補を順に試し、干渉
+回避付きバッチ IK が解けて (収束・事後の干渉検証を通過して)、かつ後処理
+判定 (``solve_post_process``) にも成功した最初のものを採用する
+(``pick_verified_candidate`` 参照)。IK は 1 目標ずつ逐次に解くのではなく、
+``batch_inverse_kinematics`` で **人物 1 人ごとに 1 回** 解く
+(``TURN_CANDIDATES_DEG`` の全候補をその人の 1 バッチにまとめる)。
+1 目標あたり ``--attempts-per-pose`` 個の初期値 (attempt 0 が「肩を開いた
+種の姿勢」、残りは関節範囲の一様乱数) から同時に解く。``collision_
+obstacles`` は 1 回のバッチ呼び出し全体で 1 つの集合しか渡せない (skrobot
+側の制約) ため、人物ごとに「その人自身の身体」を障害物にする必要があり、
+人物をまたいでバッチをまとめることはできない。
 
 Usage
 -----
@@ -211,9 +143,8 @@ from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
 # 掌のローカル +Y (甲->掌方向) まわりにこの角度ずつ向きをずらした候補を
 # 順に試し、IK が解けた最初のものを採用する。0 度 (掌の向きをそのまま
-# 使う) を最初に試し、それで解けなければ ±90 度を試す
-# (human_palm_contact_behavior.py の MIRROR_TURN_CANDIDATES_DEG と同じ
-# 考え方。この用途では鏡写しはしないので 0 度も候補に含めている)。
+# 使う) を最初に試し、それで解けなければ ±90 度を試す (平面フィットの
+# 誤差次第で、特定の向きのままだと IK が解けないことがあるため)。
 TURN_CANDIDATES_DEG = (0.0, 90.0, -90.0)
 
 # 人間の手 (掌 JSON の ``offered_hand``) に対して既定で使うロボットの腕
@@ -249,11 +180,8 @@ DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 DEFAULT_ATTEMPTS_PER_POSE = 16
 
 # 干渉回避 (collision_obstacles) 付きバッチ IK の収束判定。勾配降下法は
-# 通常のヤコビアン法より収束が遅く、干渉回避のペナルティ項と位置・姿勢誤差
-# の間でトレードオフになる (skrobot 側の batch_ik_collision_avoidance_demo.py
-# も既定よりゆるい閾値を使っている) 上、干渉回避の対象をロボット全身
-# (``collision_link_list_for_arm`` 参照) にしているぶん 1 回の反復が
-# 重いため、既定よりさらに反復回数を増やし閾値をゆるめている。
+# 通常のヤコビアン法より収束が遅いため、既定よりも反復回数を増やし閾値を
+# ゆるめている。
 DEFAULT_COLLISION_IK_STOP = 500
 DEFAULT_COLLISION_IK_THRE = 0.03  # [m]
 DEFAULT_COLLISION_IK_RTHRE = math.radians(8.0)  # [rad]
@@ -269,44 +197,25 @@ DEFAULT_COLLISION_MARGIN = 0.05
 # (``self_collision_weight=None`` のときの skrobot 側の既定挙動)。
 DEFAULT_SELF_COLLISION_MARGIN = 0.02
 
-# IK のターゲットを掌からどれだけ浮かせるか (法線方向) [m]。干渉回避の
-# 対象をロボットの全身にする (``collision_link_list_for_arm`` 参照) ため、
-# 実機の初期アプローチ用オフセット (``palm_plane.CONTACT_OFFSET``, 2cm)
-# のままでは目標そのものが人体側の干渉回避ジオメトリ (特に掌分の余裕を
-# 持たせた ``HAND_PALM_RADIUS``) と重なってしまい、除外なしでは
-# 解けない。掌の少し上空を目標にすることで、ロボットのどのリンクも人体の
-# どの部分も除外せずに干渉回避の対象にできる (実際に握手のように触れる
-# 姿勢が要る用途では、この offline スクリプトの出力をそのまま実機に使わず、
-# 別途アプローチ動作を足すことを想定している)。
+# IK のターゲットを掌からどれだけ浮かせるか (法線方向) [m]。目標そのものが
+# 人体の干渉回避ジオメトリと重ならないようにするためのオフセット。
 TARGET_HOVER_OFFSET = 0.08  # [m]
 
 # 事後の後処理判定 (``solve_post_process``) で使う、掌からのオフセット
-# [m]。``pick_verified_candidate`` が干渉検証まで通した候補について、
-# 「人間にロボットが実際に掌を押し付けられるか」を追加で確認するための
-# 目標位置に使う。``TARGET_HOVER_OFFSET`` (0.08m、掌の上空) はあくまで
-# 干渉回避の目標を人体ジオメトリから逃がすためのソフトな仕掛けであり、
-# その目標に届く解が見つかったからといって、実際に掌へ手を近づけられる
-# (押し付けられる) 保証にはならない。負の値 (掌の内側にわずかにめり込む
-# 位置) にすることで、実機の初期アプローチ用オフセット
-# (``palm_plane.CONTACT_OFFSET``, 2cm) よりさらに踏み込んで、確実に
-# 触れられる姿勢が (台車を動かさずに) 取れるかを検証する。
+# [m]。負の値 (掌の内側にわずかにめり込む位置) にすることで、実際に掌へ
+# 手を近づけられる (押し付けられる) 姿勢が取れるかを検証する。
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
 # 後処理判定の腕 IK (通常のヤコビアン法, 干渉回避なし・台車なし) の最大
 # 反復回数。干渉回避付きバッチ IK が採用した姿勢からの微小な追い込みなので
-# 収束は速いはずだが、``human_palm_contact_behavior.py`` の実機向け
-# ``_solve_palm_ik`` と同じ余裕を持った値にしておく。
+# 収束は速いはずだが、余裕を持った値にしておく。
 DEFAULT_POST_PROCESS_IK_STOP = 200
 
-# 後処理判定の腕 IK の収束閾値 (位置[m]/姿勢[rad])。指定しなければ skrobot
-# 既定の位置 1mm・姿勢 1度という厳しい基準になるが、この後処理はあくまで
-# 「実際に押し付けられそうか」のラフな確認であり、干渉回避付きバッチ IK
+# 後処理判定の腕 IK の収束閾値 (位置[m]/姿勢[rad])。干渉回避付きバッチ IK
 # (事前段階) 自体が ``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_COLLISION_IK_
-# RTHRE`` (3cm/8度) というずっと緩い閾値で「収束」と判定した候補を初期値に
-# 使う (=その分のずれが残ったまま渡ってくる) ため、既定の厳しい基準では
-# 実際には十分実用的な解でも収束できず後処理が失敗しやすい
-# (run_pipeline_test.py で確認: 干渉回避込み IK が解けた人物のほとんどで、
-# 既定の厳しい基準だと後処理が失敗していた)。
+# RTHRE`` というずっと緩い閾値で「収束」と判定した候補を初期値に使うため、
+# skrobot 既定の厳しい基準 (位置 1mm・姿勢 1度) では後処理が失敗しやすく、
+# それに合わせて緩めてある。
 DEFAULT_POST_PROCESS_IK_THRE = 0.005  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
@@ -334,26 +243,13 @@ DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 ELBOW_MIN_ANGLE_DEG = -120.0
 
 # 干渉回避付きバッチ IK (``solve_person_ik``) だけに適用する、関節可動域の
-# 上下マージン比率。可動域の上限・下限それぞれこの割合 (既定 5%) だけ
-# 内側に制限した範囲で解かせる (``restrict_joint_range_margin`` 参照)。
-#
-# 干渉回避のペナルティ勾配は「目標に近づく」勾配とせめぎ合うため、収束した
-# 候補が肩・手首など複数の関節で可動域の端 (ハード上下限) ぴったりに
-# 張り付いた姿勢になりやすい (実測でも 13 関節中 4〜7 関節が上下限ちょうど
-# という例が多数見られた)。この状態だと当該関節はこれ以上その方向へ動けず
-# 実質的な自由度を失っているのと同じで、``solve_post_process`` が続けて
-# 解く「掌にわずかにめり込む位置への追い込み」IK が (可動域を使い切って
-# いるぶん) 収束しにくくなる一因になっている。可動域の端そのものを事前に
-# 使用禁止にしておけば、干渉回避付きバッチ IK が採用する解は常に各関節の
-# ハード上下限から ``margin_ratio`` 分だけ内側の余裕を残したものになり、
-# 後段の後処理 IK がその余裕を使って追い込みやすくなる。
-#
-# 干渉回避付きバッチ IK (``solve_person_ik`` 内の ``batch_inverse_
-# kinematics`` 呼び出し) にのみ適用し、その前後で ``restrict_elbow_range``
-# などで設定された元の可動域に戻す -- 後処理 (``solve_post_process``) や
-# 事後の干渉検証 (``collision_pairs_min_distance``) は本来のロボットの
-# 可動域全体を使ってよい (むしろ後処理はこのマージン分の余裕を使うために
-# 追い込むのが目的なので、後処理側まで制限すると意味が無くなる)。
+# 上下マージン比率。可動域の上限・下限それぞれこの割合だけ内側に制限した
+# 範囲で解かせる (``restrict_joint_range_margin`` 参照)。干渉回避のペナル
+# ティに引っ張られて関節が可動域の端に張り付いた解になりやすく、それが
+# 後段の後処理 IK (``solve_post_process``) の収束を妨げる一因になるため、
+# あらかじめ端を使用禁止にしておく。``solve_person_ik`` 内のバッチ IK
+# 呼び出しにのみ適用し、その前後で元の可動域に戻す -- 後処理・事後の干渉
+# 検証は本来の可動域全体を使ってよい。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
 
 # 人体の干渉回避用ジオメトリ: (骨格の関節名 A, 関節名 B, 半径[m]) の
@@ -404,28 +300,16 @@ HAND_PALM_RADIUS = 0.05  # [m] 掌の円柱の半径
 HAND_PALM_HEIGHT = 0.02  # [m] 掌の円柱の厚み (平たくする)
 HAND_FINGER_RADIUS = 0.008  # [m] 指の円柱の半径 (細くする)
 
-# ``human_body_obstacles`` が返す障害物の個数を人物によらず常に固定
-# (``len(HUMAN_COLLISION_SEGMENTS) + 2 * (1 + len(HAND_FINGER_LANDMARKS))``
-# 個, 手 1 つあたり掌 1 個・指 5 個) にするために、骨格の関節が欠けている
-# 骨・手をこの距離だけ離れたダミーの
-# 障害物で埋める際に使う距離 [m]。``batch_inverse_kinematics`` は
-# 干渉回避 (``collision_obstacles``) を使うと呼び出すたびに JAX が
-# ゼロからコンパイルし直す (1 回あたり 2 分以上) ため、人物ごとに障害物の
-# 個数が変わるとその都度この重いコンパイルが走ってしまう。個数を固定
-# しておけば、将来 skrobot 側で「同じ形状のコンパイル結果を人物間で
-# 使い回す」キャッシュに対応したときにヒットするようになる (現時点では
-# skrobot 側が干渉回避時のキャッシュを未対応のため、このパディングだけ
-# では速度は変わらない)。``DEFAULT_BASE_X_RANGE``/``DEFAULT_BASE_Y_RANGE``
-# (台車の可動範囲, 最大 2m 程度) と ``DEFAULT_COLLISION_MARGIN``
-# (0.05m) のどちらよりも十分離しているので、ダミーが干渉回避のコストに
-# 影響することはない。
+# ``human_body_obstacles`` が返す障害物の個数を人物によらず常に固定にする
+# ため (JAX の再コンパイルを避けるため)、骨格の関節が欠けている骨・手を
+# 埋めるダミー障害物をこの距離だけ離れた位置に置く [m] (干渉回避のコストに
+# 影響しない十分な距離)。
 DUMMY_OBSTACLE_DISTANCE = 100.0  # [m]
 
 
 def _turn_about_y(rot, turn_deg):
     """``rot`` の局所 +X/+Z を、+Y 軸まわりに ``turn_deg`` 度だけ回す
-    (+Y はそのまま)。``human_palm_contact_behavior._mirror_target_
-    rotation`` の回転部分と同じ計算。"""
+    (+Y はそのまま)。"""
     x_axis, y_axis, z_axis = rot[:, 0], rot[:, 1], rot[:, 2]
     phi = math.radians(turn_deg)
     turned_x = math.cos(phi) * x_axis + math.sin(phi) * z_axis
@@ -438,8 +322,7 @@ def _correct_grasp_frame(rot, arm):
 
     ``l_eef_grasp_link`` は ``r_eef_grasp_link`` に対して +X (指方向)
     まわりに 180 度ずれている (URDF が左右ミラーで作られているため) ので、
-    右腕用に組んだ ``rot`` を左腕で使うにはこの補正が要る。詳細は
-    ``human_palm_contact_behavior._correct_grasp_frame`` を参照。
+    右腕用に組んだ ``rot`` を左腕で使うにはこの補正が要る。
     """
     if arm != 'l':
         return rot
@@ -453,8 +336,7 @@ def palm_to_target_rots(palm, robot_arm):
     (``TURN_CANDIDATES_DEG`` の数だけ) を返す。
 
     向かい合う握手ではなく、人間と同じ方向を向いて反対側の手で繋ぐ想定
-    (``human_palm_contact_behavior.py`` の ``~same_hand=False``) なので、
-    指方向 (+X) は鏡写しにせずそのまま使う。掌の法線 (``y_axis``, 手の甲
+    なので、指方向 (+X) は鏡写しにせずそのまま使う。掌の法線 (``y_axis``, 手の甲
     ->掌方向, 体の外側を向く) に対し、ロボットの掌は人間の掌に正対する
     向きにしたいので、ロボットの +Y は ``-y_axis``。
     """
@@ -555,8 +437,7 @@ def seed_arm_pose(robot, robot_arm):
 
     向かい合わず、人間と同じ方向を向いて手を繋ぐ構え (肩を横に開き、
     手首はひねらないニュートラルな姿勢)。種のままだと目標との姿勢差が
-    大きすぎて IK が迷走しやすいため (``human_palm_contact_behavior.py``
-    の ``~same_hand=False`` の種と同じ)。台車は常にワールド原点に置く
+    大きすぎて IK が迷走しやすいため。台車は常にワールド原点に置く
     (``base_limits`` はこの原点を基準にした範囲になる)。人物側を
     ``HUMAN_FRONT_DISTANCE`` だけ Aero の前方に平行移動しておくことで
     (``human_translation_offset`` 参照)、台車を人物から離す必要が無くなる
@@ -843,13 +724,8 @@ def human_capsules(joint_positions):
     return caps, names
 
 
-# collision_pairs_min_distance が「実際には貫通していた」と判定するかどうか
-# の許容誤差 [m]。プリミティブ近似形状 (円柱等) は有限個の頂点を持つ
-# collision_mesh (trimesh) として近似されており、曲面を折れ線で近似する
-# 誤差がわずかに乗る。この誤差より大きい貫通だけを「棄却すべき干渉」として
-# 扱うためのマージン (既定 1mm。collision_margin/self_collision_margin
-# (cm オーダー) や、実際に観測された貫通量 (2〜13mm 程度) に比べれば十分
-# 小さい)。
+# collision_pairs_min_distance が「実際には貫通していた」と判定する際の
+# 許容誤差 [m] (プリミティブ形状のポリゴン近似誤差を吸収する程度の値)。
 DEFAULT_COLLISION_VERIFY_TOLERANCE = 0.001  # [m]
 
 
@@ -860,21 +736,9 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     [m] を返す。負の値は貫通していることを意味する。``collision_pairs`` が
     空/``None`` のときは ``float('inf')`` を返す (検証対象なし)。
 
-    ``batch_inverse_kinematics`` (``backend='jax'`` の勾配降下法) の
-    ``success_flags`` は位置・姿勢誤差の収束だけで決まり、
-    ``collision_weight``/``self_collision_weight`` による干渉ペナルティの
-    残差を一切見ない (ペナルティは損失関数に足し込まれ勾配降下の駆動力に
-    なるだけで、収束判定 (``check_converged``) には使われない。加えて
-    勾配降下法自体もリンクを少数の球へ粗く近似した形状でペナルティを計算
-    するため、その近似上ペナルティがほぼ 0 になっていても実形状では
-    貫通が残り得る)。そのため「IK は収束 (成功) と判定されたが、
-    ``collision_pairs`` に明示的に含めた組み合わせが実際には貫通したまま」
-    という解が起こり得る (``solve_person_ik`` 参照)。
-
-    ここでは ``analyze_collision_pairs.py`` が干渉ペア候補を洗い出すのに
-    使ったのと同じ厳密な形状 (``apply_collision_model`` が差し替えた
-    ``collision_mesh`` の頂点そのもの。勾配降下法内部が使う粗い球近似では
-    ない) を使って、採用しようとしている解を事後検証する。
+    ``analyze_collision_pairs.py`` が干渉ペア候補を洗い出すのに使ったのと
+    同じ厳密な形状 (``apply_collision_model`` が差し替えた
+    ``collision_mesh`` の頂点そのもの) を使って距離を計算する。
     """
     if not collision_pairs:
         return float('inf')
@@ -1226,7 +1090,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字 (``TURN_CANDIDATES_DEG``
-    の添字) で対応する) の中から、以下を両方満たす候補を、添字最小
+    の添字) で対応する) の中から、以下を全て満たす候補を、添字最小
     (最優先) のものから探して返す。
 
     1. IK が収束している (``success_flags``)。
@@ -1235,40 +1099,45 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
        ``collision_verify_tolerance`` [m] まで許容, ``solve_person_ik`` の
        docstring 参照 -- IK の収束判定は干渉ペナルティの残差を見ないため、
        この事後検証が別途必要)。
+    3. 後処理判定 (``solve_post_process``: 台車を動かさない干渉なしの腕
+       IK で掌に押し付けられ、かつロボットが自分の手を見られるか) にも
+       成功している。
 
     ``verification_pairs`` には最適化で使った (絞り込み済みの)
     ``collision_pairs`` ではなく、``build_collision_verification_pairs``
     が作る総当たりの組み合わせ (``solve_person_ik`` 側で ``collision_
     obstacles`` の有無に応じてフィルタ済みのもの) を渡す想定。
 
-    上記 1・2 を満たした (=採用が決まった) 候補についてのみ、後処理判定
-    (``solve_post_process``: 台車を動かさない干渉なしの腕 IK で掌に押し
-    付けられ、かつロボットが自分の手を見られるか) も試みる。ただし
-    後処理判定の成否は候補の採用/棄却そのものには影響しない -- 後処理は
-    あくまで「実際に押し付けられるか」の追加情報であり、``TARGET_HOVER_
-    OFFSET`` の目標に干渉なく届いている後処理前の解自体はそれとは独立に
-    有効な解のため、後処理が失敗しても viewer で「後処理前の姿勢」として
-    表示できるよう ``solved`` のまま返す (``post_process_result`` だけ
-    ``None`` になる)。判定の順序は 1 -> 2 -> 後処理 (干渉判定の後に後処理
-    の干渉なし IK)。
+    1・2 を満たすが 3 (後処理判定) に失敗した候補は棄却し、次の添字
+    (``TURN_CANDIDATES_DEG`` の次の向き) を試す -- 干渉回避付きバッチ IK
+    (``solve_person_ik``) 自体は既に全ての向きを 1 回のバッチで解いて
+    あるので、ここでやり直すのは事後の干渉検証・後処理判定だけで済む。
+    1・2・3 を全て満たす候補が見つからなかった場合のみ、1・2 を満たした
+    最初の候補 (``fallback``) を後処理前のまま (``post_process_result`` を
+    ``None`` にして) 採用するフォールバックを行う -- ``TARGET_HOVER_
+    OFFSET`` の目標に干渉なく届いている後処理前の解自体は後処理とは独立に
+    有効な解であり、全滅させて ``unsolved`` にしてしまうより、viewer で
+    「後処理前の姿勢」として表示できる解を残す方が有用なため。
 
-    候補を採用するにはロボットにその候補の姿勢を反映する必要がある
+    候補を検証するにはロボットにその候補の姿勢を反映する必要がある
     (``collision_pairs_min_distance``/``solve_post_process`` はロボットの
     現在の姿勢を見る/書き換える) ため、検証のたびに ``robot`` を書き換える
-    -- 呼び出し後の ``robot`` は最後に調べた候補 (採用した候補、または
-    どれも採用できなければ最後の候補) の姿勢のままになる (後処理判定の
-    成否に関わらず、後処理 IK を試みた後の姿勢になっている点に注意 --
-    呼び出し側の ``solved_result`` は ``angle_vector``/``base_pose`` を
-    改めて反映し直すので、後処理前の姿勢に戻ることを保証するのはそちら)。
+    -- 呼び出し後の ``robot`` は最後に調べた候補の姿勢のままになる点に
+    注意 (後処理判定に成功して即採用した場合を除き、これは呼び出し側が
+    最終的に採用する候補の姿勢と一致しない可能性がある -- ``solved_
+    result``/``unsolved_result`` は ``angle_vector``/``base_pose`` を
+    改めて反映し直すので、最終的な姿勢を保証するのはそちら)。
 
     Returns
     -------
     tuple or None
         ``(candidate_index, angle_vector, base_pose, post_process_result)``。
         ``post_process_result`` は ``solve_post_process`` が返した後処理後
-        の結果 dict、後処理判定に失敗していれば ``None``。1・2 を満たす
-        候補が無ければ ``None`` を返す。
+        の結果 dict、後処理判定に失敗した候補をフォールバックで採用した
+        場合は ``None``。1・2 を満たす候補が 1 つも無ければ ``None`` を
+        返す。
     """
+    fallback = None
     for candidate_index, ok in enumerate(success_flags):
         if not ok:
             continue
@@ -1285,14 +1154,21 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         post_result = solve_post_process(
             robot, robot_arm, palm, rots[candidate_index],
             stop=post_process_ik_stop)
-        if post_result is None:
-            print('  [post-process] turn={:.0f}deg の候補は干渉検証を通過'
-                  'したが、後処理判定 (押し付け/視線 IK) には失敗しました '
-                  '(後処理前の解として採用します)。'.format(
-                      TURN_CANDIDATES_DEG[candidate_index]))
-        return (candidate_index, angle_vectors[candidate_index],
-                base_poses[candidate_index], post_result)
-    return None
+        if post_result is not None:
+            return (candidate_index, angle_vectors[candidate_index],
+                    base_poses[candidate_index], post_result)
+        print('  [post-process] turn={:.0f}deg の候補は干渉検証を通過した '
+              'が、後処理判定 (押し付け/視線 IK) には失敗したため、次の '
+              '向きの候補を試します。'.format(
+                  TURN_CANDIDATES_DEG[candidate_index]))
+        if fallback is None:
+            fallback = (candidate_index, angle_vectors[candidate_index],
+                       base_poses[candidate_index], None)
+    if fallback is not None:
+        print('  [post-process] 全ての向きの候補で後処理判定に失敗した '
+              'ため、turn={:.0f}deg の候補を後処理前の解として採用 '
+              'します。'.format(TURN_CANDIDATES_DEG[fallback[0]]))
+    return fallback
 
 
 def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
@@ -1386,12 +1262,14 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         ``(picked, collision_ik_time)``。``picked`` は
         ``(candidate_index, angle_vector, base_pose, post_process_result)``
         または ``None`` -- ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、
-        最優先) に、収束・事後の干渉検証 (``pick_verified_candidate``
-        参照) の両方を満たしたものを返す。無ければ ``None``。後処理判定
-        (``solve_post_process``) の成否はこの採用/棄却には影響しない
-        (失敗すれば ``post_process_result`` が ``None`` になるだけ)。
-        ``collision_ik_time`` は干渉回避付きバッチ IK (``batch_inverse_
-        kinematics`` の呼び出し) 自体の計算時間 [秒]。
+        最優先) に、収束・事後の干渉検証・後処理判定の全てを満たしたもの
+        を返す (``pick_verified_candidate`` 参照)。後処理判定に失敗した
+        候補は棄却して次の向きを試す。どの向きも後処理判定に成功しなかった
+        場合のみ、収束・事後の干渉検証を満たした最初の候補を後処理前の
+        まま (``post_process_result`` を ``None`` にして) フォールバック
+        採用する。収束・事後の干渉検証すら満たす候補が 1 つも無ければ
+        ``None``。``collision_ik_time`` は干渉回避付きバッチ IK
+        (``batch_inverse_kinematics`` の呼び出し) 自体の計算時間 [秒]。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))

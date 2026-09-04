@@ -6,14 +6,11 @@
 ``palm_plane_view.PalmPlaneScene`` が人物の胴体・頭を実体メッシュで描く
 のに使う。skrobot / rospy には依存しない (``palm_plane.py`` と同じ方針)。
 
-公式配布の SMPL v1.0.0 ``.pkl`` (``smpl_webuser`` 付属) は付属コードが
-``chumpy`` でシリアライズしており、``shapedirs`` フィールドが
+公式配布の SMPL v1.0.0 ``.pkl`` は ``shapedirs`` フィールドが
 ``chumpy.ch.Ch`` として pickle されているため、素の ``pickle.load`` は
-``ModuleNotFoundError: chumpy`` で失敗する。本物の chumpy は
-(numpy>=1.24 で削除された ``np.bool``/``np.int`` 等の別名に依存して
-いて) この環境の numpy と非互換なのでインストールしない。代わりに
-``chumpy.ch.Ch`` の pickle プロトコル (``__setstate__`` が
-``self.__dict__.update(d)`` するだけ) を模した最小限の shim を使う。
+``ModuleNotFoundError: chumpy`` で失敗する。chumpy は numpy と非互換
+(numpy>=1.24 で削除された別名に依存) なのでインストールせず、代わりに
+``chumpy.ch.Ch`` の pickle プロトコルを模した最小限の shim を使う。
 
 SMPL のモデルファイル自体はライセンス上リポジトリに同梱できないので、
 呼び出し側がローカルパスを渡す (例:

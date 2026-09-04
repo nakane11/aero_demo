@@ -20,10 +20,9 @@ model`` / ``view_aero_collision_model.py`` と同じ ``skrobot.urdf.
 convert_meshes_to_primitives`` で生成・キャッシュした URDF) も、
 ``view_aero_collision_model.py`` と全く同じ方法でもう一体の
 ``skrobot.model.RobotModel`` として読み込み、通常のロボットモデル (不透明)
-に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、``human_palm_contact_
-behavior.py`` が ``aero_demo.palm_plane_view.PalmPlaneScene`` 経由で人体
-メッシュを半透明に描くのと同じ ``aero_demo.palm_plane_view.set_color`` を
-使い、viser でも alpha が effective になるようにしてある) で表示する
+に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、``aero_demo.palm_plane_
+view.set_color`` を使い、viser でも alpha が effective になるように
+してある) で表示する
 (``build_robot_collision_overlay`` 参照)。viser 画面には
 Back/Next ボタンに加え Good/Bad ボタンも表示され、押すと表示中の IK 結果が
 正しいかどうかの判定結果 (``human_label``: ``true``: Good/``false``: Bad)

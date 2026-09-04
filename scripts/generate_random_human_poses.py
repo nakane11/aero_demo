@@ -183,6 +183,11 @@ class RandomSmplHumanGenerator(object):
     _BETAS_STD = 1.5
     _BETAS_CLIP = 3.0
 
+    # 生成する人物の身長の上限 [m]。これを超えた場合は betas を引き直す
+    # (``generate`` 参照)。
+    _MAX_HEIGHT_M = 1.7
+    _MAX_HEIGHT_RESAMPLE_ATTEMPTS = 100
+
     def __init__(self, models, seed=None):
         """
         Parameters
@@ -353,6 +358,19 @@ class RandomSmplHumanGenerator(object):
 
         vertices, joints = smpl_body.forward_world(
             model, pose, betas, root_pos=np.zeros(3))
+
+        # 身長 (``_MAX_HEIGHT_M``) を超える場合は betas (体型) だけを
+        # 引き直す (姿勢 ``pose`` は betas にほぼ依存しないのでそのまま
+        # 使う)。滅多に外れ値が続くことは無いはずだが、念のため試行回数
+        # に上限を設け、それでも収まらなければ最後に引いた体型を諦めて
+        # 使う。
+        for _ in range(self._MAX_HEIGHT_RESAMPLE_ATTEMPTS):
+            height = float(vertices[:, 2].max() - vertices[:, 2].min())
+            if height <= self._MAX_HEIGHT_M:
+                break
+            betas = self._sample_betas()
+            vertices, joints = smpl_body.forward_world(
+                model, pose, betas, root_pos=np.zeros(3))
 
         # 姿勢に関わらず、体の最下点が必ず床 (z=0) に接するように上下
         # 移動する。足の開き・膝の曲げは左右対称なので、両足は常に同じ
