@@ -103,8 +103,16 @@ def find_collision_candidates(handshake_dir, skeleton_dir,
 
 
 def run(cmd):
+    """``cmd`` を実行する。呼び出し先 (generate_random_human_poses.py/
+    estimate_palm_poses.py/solve_palm_ik.py) が標準出力に print した文字列
+    は、このスクリプト自身の進捗表示と混ざらないよう表示しない。呼び出し
+    先がエラー終了した場合のみ、原因調査のためその出力を表示する。"""
     print('+ {}'.format(' '.join(cmd)))
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        sys.stdout.buffer.write(result.stdout)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
 def solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
