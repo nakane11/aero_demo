@@ -62,13 +62,25 @@ model`` 参照)。人体側・ロボット側のどちらも
 人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉。例えば解いて
 いる腕が胴体・反対側の腕・台車にぶつかる) も既定で回避する
 (``batch_inverse_kinematics`` の ``self_collision=True``、``--no-self-
-collision`` で無効化できる)。対象リンクは人体との干渉回避と同じ
-``collision_link_list`` (ロボット全身)。隣接リンク同士 (関節でもともと
-接している対) は ``ignore_adjacent_self_collision`` の既定値により
-誤検出から除外される。人体との干渉回避と同じくソフトなペナルティ項なので、
-こちらも自己干渉のない解が必ず得られるとは限らない。骨格 JSON が無い人物
-(人体との干渉回避が働かない場合) でも、自己干渉の回避は既定で引き続き
-働く。
+collision`` で無効化できる)。
+
+チェックする組み合わせ (自己干渉のロボットリンク同士、および人体との
+干渉のロボットリンク×人体セグメント) は、常に ``--collision-pairs``
+(JSON: 2 要素の名前のリストのリスト。``build_collision_pairs.py`` が
+``analyze_collision_pairs.py`` の出力 (``collision_pair_analysis.json``)
+から生成する) で明示的に指定した組み合わせだけに限る (``load_
+collision_pairs``/``skrobot`` 側の ``batch_inverse_kinematics`` の
+``collision_pairs`` 引数を参照。各ペアの 2 要素目がロボットのリンク名
+なら自己干渉ペア、``human_obstacle_names`` の人体セグメント名なら人体
+との干渉ペアとして扱われる -- 1 つの JSON に両方を混在できる)。
+「対象リンクの集合」を指定する ``collision_link_list`` という概念は使わ
+ない -- 干渉ジオメトリを計算する対象は ``collision_pairs`` に現れる
+リンクだけで、リンクの全組み合わせ・人体セグメントの全組み合わせを機械的
+に生成することはしない。このファイルが既定のパスに無ければ、干渉回避
+(自己干渉・人体との干渉の両方) を丸ごと無効にして、通常のヤコビアン法の
+IK にフォールバックする (「ロボット全身の全組み合わせ」への暗黙の
+フォールバックはしない)。ソフトなペナルティ項なので、干渉のない解が
+必ず得られるとは限らない。
 
 一方、向きを ±90 度ずらした候補を順に試す処理 (``human_palm_contact_
 behavior.py`` の ``MIRROR_TURN_CANDIDATES_DEG`` と同じ考え方) だけは残して
@@ -278,6 +290,10 @@ HAND_FINGER_LANDMARKS = (
     (13, 16),  # 薬指: MCP -> 指先
     (17, 20),  # 小指: MCP -> 指先
 )
+# ``HAND_FINGER_LANDMARKS`` の各指に対応する名前 (``--collision-pairs``
+# JSON で人体側のオブジェクトを指すのに使う、``human_obstacle_names``
+# 参照)。``analyze_collision_pairs.py`` の ``_FINGER_LABELS`` と同じ順序。
+HAND_FINGER_LABELS = ('thumb', 'index', 'middle', 'ring', 'pinky')
 HAND_PALM_RADIUS = 0.05  # [m] 掌の円柱の半径
 HAND_PALM_HEIGHT = 0.02  # [m] 掌の円柱の厚み (平たくする)
 HAND_FINGER_RADIUS = 0.008  # [m] 指の円柱の半径 (細くする)
@@ -565,6 +581,29 @@ def human_body_obstacles(joint_positions):
     return obstacles
 
 
+def human_obstacle_names():
+    """``human_body_obstacles`` が返すリストと同じ順序・同じ個数の名前の
+    リストを返す (``joint_positions`` の中身に依存しない構造だけの情報)。
+
+    ``--collision-pairs`` (JSON) で人体側のオブジェクトを指定するときの
+    名前、および ``analyze_collision_pairs.py`` が書き出す
+    ``collision_pair_analysis.json`` の ``human_collision_min_dist`` の
+    キー (``"{ロボットリンク名}|{この関数が返す名前}"``) の後半と対応する
+    (``analyze_collision_pairs.human_capsules`` が同じ順序・同じ命名規則で
+    作る名前のリストと一致させてある)。``load_collision_pairs`` がこの
+    リストを使い、JSON 中の名前がロボットのリンク名でなければ人体
+    セグメント名とみなして ``human_body_obstacles`` の出力中の対応する
+    インデックスに解決する。
+    """
+    names = ['{}-{}'.format(name_a, name_b)
+            for name_a, name_b, _ in HUMAN_COLLISION_SEGMENTS]
+    for side in ('R', 'L'):
+        names.append('{}_palm'.format(side))
+        for label in HAND_FINGER_LABELS:
+            names.append('{}_{}'.format(side, label))
+    return names
+
+
 def load_skeleton_json(path):
     """``generate_random_human_poses.save_json`` が保存した 1 人分の JSON
     を読み、干渉回避の障害物化に使う ``joint_positions`` を返す。"""
@@ -573,7 +612,8 @@ def load_skeleton_json(path):
     return data['skeleton']['joint_positions']
 
 
-def apply_collision_model(robot, primitive_type=None, force_convert=False):
+def apply_collision_model(robot, primitive_type=None, force_convert=False,
+                          collision_urdf_path=None):
     """``robot`` (実メッシュの Aero) の各リンクの ``collision_mesh`` を、
     ``view_aero_collision_model.py`` と同じ方法 (``skrobot.urdf.
     convert_meshes_to_primitives``) で生成したプリミティブ近似形状に
@@ -596,9 +636,37 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False):
     load_urdf_file`` でロボット全体を作り直すのではない) ため、Aero
     クラスが提供する ``rarm_end_coords``/``rarm_whole_body`` などの
     キネマティクス関連の属性やジョイント名はそのまま使える。
+
+    Parameters
+    ----------
+    collision_urdf_path : str or None
+        指定すると、``build_collision_model_urdf`` によるプリミティブ近似
+        URDF の自動生成・キャッシュを使わず、このパスの URDF から干渉
+        ジオメトリを読み込む (``primitive_type``/``force_convert`` とは
+        併用できない)。リンク名で ``robot`` 側と対応づけるので、ロボット
+        本体 (IK を解く実際のキネマティクス) はそのままに、干渉回避
+        (``collision_link_list_for_arm``) が使うジオメトリ・対象リンクの
+        集合だけを差し替えられる -- 干渉計算を高速化する目的で手動で
+        間引いた/単純化した独自の干渉用 URDF を使いたい場合などに使う。
+        既定の自動生成モードと異なり、このモードでは指定した URDF に
+        存在しない (対応するリンク名が見つからない、またはメッシュを
+        持たない) リンクは干渉回避の対象から明示的に外す
+        (``collision_mesh`` を ``None`` にする。``collision_link_list_
+        for_arm`` はメッシュを持たないリンクを自動で除外する) ので、
+        既定の自動生成モードでは残ってしまう実メッシュ (プリミティブ
+        変換対象外・重い) のリンクが紛れ込まない。
     """
-    collision_urdf_path = build_collision_model_urdf(
-        robot.urdf_path, primitive_type=primitive_type, force=force_convert)
+    if collision_urdf_path is not None:
+        if primitive_type is not None or force_convert:
+            raise ValueError(
+                'collision_urdf_path (--collision-urdf) は '
+                'primitive_type (--collision-primitive-type) / '
+                'force_convert (--force-convert-collision-model) と '
+                '併用できません。')
+    else:
+        collision_urdf_path = build_collision_model_urdf(
+            robot.urdf_path, primitive_type=primitive_type,
+            force=force_convert)
 
     collision_robot = RobotModel()
     collision_robot.load_urdf_file(
@@ -606,32 +674,106 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False):
     collision_links_by_name = {
         link.name: link for link in collision_robot.link_list}
 
+    # --collision-urdf 指定時は「このURDFが干渉回避の対象を規定する」
+    # ものとして扱い、対応するリンクが見つからない/メッシュが無い場合は
+    # 実メッシュを残さず明示的に None にして除外する (既定の自動生成
+    # モードでは、常に robot 全リンクをカバーするプリミティブ URDF が
+    # 生成されるので、この違いは表面化しない)。
+    explicit_exclude = collision_urdf_path is not None
+
     n_replaced = 0
+    n_excluded = 0
     for link in robot.link_list:
         collision_link = collision_links_by_name.get(link.name)
-        if collision_link is None:
-            continue
-        mesh = getattr(collision_link, 'collision_mesh', None)
-        if mesh is None:
-            continue
-        link.collision_mesh = mesh
-        n_replaced += 1
-    print('[collision-model] {} 個のリンクの干渉ジオメトリをプリミティブ '
-          '近似形状に差し替えました ({})'.format(
-              n_replaced, collision_urdf_path))
+        mesh = (getattr(collision_link, 'collision_mesh', None)
+               if collision_link is not None else None)
+        if mesh is not None:
+            link.collision_mesh = mesh
+            n_replaced += 1
+        elif explicit_exclude:
+            link.collision_mesh = None
+            n_excluded += 1
+    print('[collision-model] {} 個のリンクの干渉ジオメトリを ({}) から '
+          '差し替えました{}。'.format(
+              n_replaced, collision_urdf_path,
+              ' ({} 個のリンクを干渉回避の対象から除外)'.format(n_excluded)
+              if explicit_exclude else ''))
 
 
 def collision_link_list_for_arm(robot, robot_arm):
-    """干渉回避の対象にするロボットリンクの一覧を作る (``collision_
-    link_list``)。解く腕・反対側の腕・台車を含め、ロボットの全身
-    (``robot.link_list``) を対象にする。``TARGET_HOVER_OFFSET`` により
-    IK の目標そのものは人体の干渉回避ジオメトリと重ならないので、除外
-    すべきリンクは無い (``robot_arm`` 引数は将来腕ごとに調整したくなった
-    場合のためのプレースホルダで、現状はどちらの腕でも同じ全身リストを
-    返す)。各リンクの干渉ジオメトリは ``apply_collision_model`` により
-    プリミティブ近似形状に差し替え済みであることを前提とする。
+    """干渉ジオメトリを持つロボットリンクの一覧を作る。解く腕・反対側の
+    腕・台車を含め、ロボットの全身 (``robot.link_list``) を対象にする
+    (``robot_arm`` 引数は将来腕ごとに調整したくなった場合のための
+    プレースホルダで、現状はどちらの腕でも同じリストを返す)。
+
+    ``collision_mesh`` を持たない (中間フレーム・mimic ジョイント用の
+    ダミーリンクなど、実体のジオメトリが無い) リンクは、原理的に何とも
+    干渉し得ないので除外する。``apply_collision_model`` がプリミティブ
+    形状に差し替えるのも ``collision_mesh`` を持つリンクだけ
+    (``[collision-model] N 個のリンクの干渉ジオメトリを...`` のログの数と
+    一致する) なので、この除外をしても干渉回避の判定結果は変わらない。
+
+    ``solve_person_ik`` (実際の IK) はこの関数を使わない -- 干渉回避で
+    実際にチェックする組み合わせは常に ``collision_pairs``
+    (``load_collision_pairs`` が返す明示的なペアのリスト) だけで決まり、
+    ``batch_inverse_kinematics`` の ``collision_link_list`` (全リンクの
+    集合を丸ごと渡す引数) 自体を渡さない。この関数は
+    ``analyze_collision_pairs.py`` が「実際にどの組み合わせが干渉し
+    うるか」を全リンク×全セグメントで総当たり分析する (``collision_
+    pairs.json`` を作るための素材を集める) ときにだけ使う。各リンクの
+    干渉ジオメトリは ``apply_collision_model`` によりプリミティブ近似
+    形状に差し替え済みであることを前提とする。
     """
-    return list(robot.link_list)
+    return [link for link in robot.link_list
+           if getattr(link, 'collision_mesh', None) is not None]
+
+
+def load_collision_pairs(path, robot):
+    """``--collision-pairs`` (JSON) を読み、``batch_inverse_kinematics``
+    の ``collision_pairs`` にそのまま渡せる ``(Link, Link)`` /
+    ``(Link, int)`` のタプルのリストに変換する。
+
+    JSON の形式は 2 要素のリストのリスト (``[[名前A, 名前B], ...]``)。
+    各ペアの 1 要素目は常にロボットのリンク名。2 要素目は:
+
+    * ロボットのリンク名なら自己干渉ペア (``(Link, Link)``) として扱う。
+    * ``human_obstacle_names`` が返す人体セグメント名 (``human_body_
+      obstacles`` が同じ順序で作る障害物のリストに対応する) なら、その
+      セグメントとの干渉ペア (``(Link, int)``、int はそのセグメントの
+      ``collision_obstacles`` 中のインデックス) として扱う。
+
+    ``build_collision_pairs.py`` が ``analyze_collision_pairs.py`` の出力
+    (``collision_pair_analysis.json``) の ``self_collision_min_dist``/
+    ``human_collision_min_dist`` の両方からこの形式で生成する (キー
+    ``"{リンクA}|{リンクB または人体セグメント名}"`` を分解したもの)。
+
+    ``robot`` (``apply_collision_model`` 適用済みを想定) のリンク名と
+    突き合わせる。どちらの解釈にも当てはまらない名前が含まれていた場合は
+    ``ValueError`` にする -- 黙って無視すると、そのペアだけ干渉チェックから
+    漏れたことに気付けないため。
+    """
+    with open(path) as f:
+        pair_names = json.load(f)
+    links_by_name = {link.name: link for link in robot.link_list}
+    obstacle_index_by_name = {
+        name: idx for idx, name in enumerate(human_obstacle_names())}
+    pairs = []
+    for name_a, name_b in pair_names:
+        if name_a not in links_by_name:
+            raise ValueError(
+                '{} (--collision-pairs) に含まれるリンク名 {!r} が ロボット'
+                'に見つかりません。'.format(path, name_a))
+        link_a = links_by_name[name_a]
+        if name_b in links_by_name:
+            pairs.append((link_a, links_by_name[name_b]))
+        elif name_b in obstacle_index_by_name:
+            pairs.append((link_a, obstacle_index_by_name[name_b]))
+        else:
+            raise ValueError(
+                '{} (--collision-pairs) に含まれる名前 {!r} が、ロボットの '
+                'リンク名にも human_obstacle_names() の人体セグメント名にも '
+                '一致しません。'.format(path, name_b))
+    return pairs
 
 
 def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
@@ -640,6 +782,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                     collision_weight=DEFAULT_COLLISION_WEIGHT,
                     collision_margin=DEFAULT_COLLISION_MARGIN,
                     self_collision=True,
+                    collision_pairs=None,
                     self_collision_weight=None,
                     self_collision_margin=DEFAULT_SELF_COLLISION_MARGIN,
                     collision_ik_stop=DEFAULT_COLLISION_IK_STOP,
@@ -649,10 +792,19 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     (``collision_obstacles``) を障害物とした干渉回避付きバッチ IK で
     まとめて解く。``self_collision=True`` (既定) のときは、それに加えて
     ロボット自身のリンク同士の干渉 (例えば解いている腕が胴体・反対側の腕・
-    台車にぶつかる) も同じ ``collision_link_list`` (ロボット全身) を対象に
-    ソフトなペナルティとして回避する (``ignore_adjacent_self_collision``
-    の既定 ``True`` により、隣接リンク同士 (関節でもともと接している対)
-    は誤検出しないよう除外される)。
+    台車にぶつかる) もソフトなペナルティとして回避する。
+
+    チェックする組み合わせ (自己干渉のロボットリンク同士、人体との干渉の
+    ロボットリンク×人体セグメント) は ``collision_pairs`` (``load_
+    collision_pairs`` が返す ``(Link, Link)``/``(Link, int)`` 混在の
+    リスト) で明示的に指定したものだけに限る -- ``collision_link_list``
+    という「対象リンクの集合」は持たず (``batch_inverse_kinematics`` には
+    渡さない)、``collision_pairs`` に現れるリンクだけが干渉ジオメトリの
+    計算対象になる。``main`` は ``collision_pairs`` が ``None`` (``--
+    collision-pairs`` に指定した JSON が無い) のときに ``self_collision``/
+    ``collision_obstacles`` の両方を無効にしてこの関数を呼ぶので、ここで
+    「全組み合わせにフォールバックする」ことはない -- 干渉回避を行うなら
+    必ず ``collision_pairs`` を経由する。
 
     ``collision_ik_stop`` (最大反復回数) は、干渉回避付きバッチ IK
     (``backend='jax'`` の勾配降下法) が ``lax.fori_loop`` で固定回数
@@ -690,7 +842,17 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     rots = palm_to_target_rots(palm, robot_arm)
     target_coords = [Coordinates(pos=target_pos.tolist(), rot=rot)
                      for rot in rots]
-    collision_link_list = collision_link_list_for_arm(robot, robot_arm)
+    # collision_pairs 中の人体セグメントへの参照 (int) は
+    # human_obstacle_names() の固定された並びを指しており、
+    # collision_obstacles が空 (骨格 JSON が無い/--no-human-collision) の
+    # ときは対応する障害物が存在しないので、そのまま渡すと
+    # batch_inverse_kinematics 側でインデックス範囲外のエラーになる。
+    # その場合は自己干渉ペア (Link 同士) だけを残す。
+    effective_collision_pairs = collision_pairs
+    if collision_pairs is not None and not collision_obstacles:
+        effective_collision_pairs = [
+            (link_a, other) for link_a, other in collision_pairs
+            if not isinstance(other, int)]
     angle_vectors, base_poses, success_flags, _ = \
         robot.batch_inverse_kinematics(
             target_coords=target_coords,
@@ -704,11 +866,11 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
             attempts_per_pose=attempts_per_pose,
             backend='jax',
             use_base='planar', base_limits=base_limits,
-            collision_link_list=collision_link_list,
             collision_obstacles=collision_obstacles,
             collision_weight=collision_weight,
             collision_margin=collision_margin,
             self_collision=self_collision,
+            collision_pairs=effective_collision_pairs,
             self_collision_weight=self_collision_weight,
             self_collision_margin=self_collision_margin)
     for candidate_index, ok in enumerate(success_flags):
@@ -894,8 +1056,34 @@ def main():
         '--no-self-collision', dest='self_collision', action='store_false',
         help='ロボット自身のリンク同士の干渉 (解いている腕が胴体・反対側の '
             '腕・台車にぶつかる等) を回避するペナルティを無効にする '
-            '(既定は有効)。人体との干渉回避 (--skeleton-dir) の有無に '
-            '関わらず働く。')
+            '(既定は有効。--collision-pairs が使えない場合は指定に '
+            '関わらずどのみち無効になる)。人体との干渉回避 (--skeleton-'
+            'dir) の有無に関わらず働く。')
+    parser.add_argument(
+        '--collision-pairs', type=str,
+        default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
+        help='干渉回避で実際にチェックする組み合わせ (自己干渉のロボット '
+            'リンク同士、および人体との干渉のロボットリンク×人体セグメント '
+            '(human_obstacle_names 参照)) を指定する JSON (2 要素の名前の '
+            'リストのリスト。既定 collision_pairs.json。build_collision_'
+            'pairs.py が analyze_collision_pairs.py の出力 (collision_'
+            'pair_analysis.json) から生成する)。干渉回避で対象にする組み '
+            '合わせは常にこの JSON だけで決まり、collision_link_list の '
+            'ような「対象リンク一覧への暗黙のフォールバック」は無い -- '
+            '既定のパスにファイルが無ければ、自己干渉・人体との干渉の両方 '
+            'を無効にして (通常のヤコビアン法の) IK を解く。片方の種類 '
+            '(自己干渉/人体との干渉) のペアが JSON に 1 つも無い場合も '
+            '同様に、その種類の干渉チェックだけが丸ごと働かなくなる '
+            '(load_collision_pairs/solve_person_ik 参照)。')
+    parser.add_argument(
+        '--no-human-collision', action='store_true',
+        help='人体を障害物とした干渉回避を無効にする (既定は --skeleton-dir '
+            'に骨格 JSON があれば有効)。骨格 JSON 自体は読み込むので '
+            '(--skeleton-dir が指す先に無ければ従来どおりエラーなく '
+            'スキップされる)、人物の立ち位置の平行移動は従来どおり働く。 '
+            'どのリンクの組み合わせが実際によく干渉するかを分析する '
+            '目的で、干渉回避なしの (速いが干渉を考慮しない) IK 結果を '
+            '大量に得たいときに使う (analyze_collision_pairs.py 参照)。')
     parser.add_argument(
         '--self-collision-weight', type=float, default=None,
         help='自己干渉回避ペナルティの重み (既定は --collision-weight と '
@@ -959,6 +1147,20 @@ def main():
         help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
             'を使わず毎回作り直す (view_aero_collision_model.py の '
             '--force-convert と同じ)。')
+    parser.add_argument(
+        '--collision-urdf', type=str, default=None,
+        help='干渉回避 (collision_link_list) のジオメトリ・対象リンクの '
+            '読み込み元 URDF を明示的に指定する (既定は view_aero_'
+            'collision_model.py と同じ方法で自動生成・キャッシュされる '
+            'プリミティブ近似 URDF)。--collision-primitive-type/'
+            '--force-convert-collision-model とは併用できない。IK を '
+            '解くロボット本体のキネマティクスは変えず (常に Aero(use_'
+            'hand=False))、干渉回避に使うリンクの集合・ジオメトリだけを '
+            '(リンク名で対応づけて) このURDFのものに差し替える -- 干渉 '
+            '計算を高速化する目的で手動で間引いた/単純化した独自の干渉用 '
+            'URDF を使いたい場合などに使う。このURDFに対応するリンクが '
+            '見つからない robot 側のリンクは、干渉回避の対象から明示的に '
+            '除外される (apply_collision_model 参照)。')
     args = parser.parse_args()
 
     files = iter_palm_files(args.input_dir)
@@ -979,7 +1181,25 @@ def main():
     apply_collision_model(
         robot,
         primitive_type=args.collision_primitive_type,
-        force_convert=args.force_convert_collision_model)
+        force_convert=args.force_convert_collision_model,
+        collision_urdf_path=args.collision_urdf)
+
+    # collision_link_list (対象リンクの集合を丸ごと指定する概念) は
+    # 使わない -- 干渉回避で実際にチェックする組み合わせは常に
+    # collision_pairs (--collision-pairs の JSON) だけで決める。JSON が
+    # 無ければ、自己干渉・人体との干渉のどちらを対象にすればよいかを
+    # 決める手段が無いので、干渉回避そのものを無効にして (通常のヤコビアン
+    # 法の) IK にフォールバックする -- collision_link_list を使った
+    # 「ロボット全身の全組み合わせ」への暗黙のフォールバックはしない。
+    collision_pairs = None
+    if os.path.exists(args.collision_pairs):
+        collision_pairs = load_collision_pairs(args.collision_pairs, robot)
+        print('[collision-pairs] {} 組の干渉ペアを {} から読み込みました。'
+              .format(len(collision_pairs), args.collision_pairs))
+    else:
+        print('[collision-pairs] {} が見つからないため、干渉回避 (自己干渉'
+              '・人体との干渉の両方) を無効にして IK を解きます。'.format(
+                  args.collision_pairs))
 
     base_limits = [tuple(args.base_x_range), tuple(args.base_y_range),
                    tuple(args.base_yaw_range)]
@@ -1004,32 +1224,31 @@ def main():
                      if args.robot_arm == 'auto' else args.robot_arm)
 
         # この人物の身体を干渉回避の障害物にする。骨格 JSON (全身の関節
-        # 位置) が --skeleton-dir に無ければ、人体との干渉回避なしのバッチ
-        # IK にフォールバックする (collision_obstacles が空でも、
-        # self_collision=True (既定) であれば自己干渉 (ロボット自身のリンク
-        # 同士の干渉) 回避の勾配降下法は引き続き使われる。self_collision も
-        # collision_obstacles も無効なときだけ、skrobot 側が干渉回避を行わ
-        # ないヤコビアン法にフォールバックする)。
+        # 位置) が --skeleton-dir に無い、または collision_pairs が
+        # 使えない (--collision-pairs の JSON が無い) ときは、人体との
+        # 干渉回避なしのバッチ IK にフォールバックする。
         skeleton_path = os.path.join(args.skeleton_dir,
                                      os.path.basename(path))
         # Aero は常にワールド原点で IK を開始する (seed_arm_pose 参照) ので、
         # 骨格 JSON があれば、人物の立ち位置がちょうど Aero の前方
         # --human-front-distance になるよう、骨格の全関節位置と掌の目標
         # 位置を平行移動してから IK を解く (human_translation_offset 参照)。
-        # 骨格 JSON が無ければ平行移動できない (collision_obstacles も空に
-        # なり、そもそも干渉回避自体が働かない) ので、掌の位置はそのまま
-        # 使う。
+        # この平行移動は干渉回避の有無に関わらず常に行う (台車と人物が
+        # 重ならない開始位置にするため)。骨格 JSON が無ければ平行移動
+        # できないので、掌の位置はそのまま使う。
         if os.path.exists(skeleton_path):
             joint_positions = load_skeleton_json(skeleton_path)
             offset = human_translation_offset(
                 joint_positions, front_distance=args.human_front_distance)
             joint_positions = translate_joint_positions(
                 joint_positions, offset)
-            collision_obstacles = human_body_obstacles(joint_positions)
+            collision_obstacles = (
+                [] if (args.no_human_collision or collision_pairs is None)
+                else human_body_obstacles(joint_positions))
             palm = translate_palm(palm, offset)
         else:
-            print('  {} に骨格 JSON が無いため、この人物は干渉回避なしで '
-                  '解きます。'.format(skeleton_path))
+            print('  {} に骨格 JSON が無いため、この人物は人体との干渉回避 '
+                  'なしで解きます。'.format(skeleton_path))
             collision_obstacles = []
 
         target_pos = palm_target_position(palm)
@@ -1040,7 +1259,8 @@ def main():
             base_limits=base_limits,
             collision_weight=args.collision_weight,
             collision_margin=args.collision_margin,
-            self_collision=args.self_collision,
+            self_collision=(args.self_collision and collision_pairs is not None),
+            collision_pairs=collision_pairs,
             self_collision_weight=args.self_collision_weight,
             self_collision_margin=args.self_collision_margin,
             collision_ik_stop=args.collision_ik_stop,
