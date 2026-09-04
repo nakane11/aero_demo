@@ -332,6 +332,29 @@ DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 # (``restrict_elbow_range`` 参照)。上限 (0 度, まっすぐ) は変更しない。
 ELBOW_MIN_ANGLE_DEG = -120.0
 
+# 干渉回避付きバッチ IK (``solve_person_ik``) だけに適用する、関節可動域の
+# 上下マージン比率。可動域の上限・下限それぞれこの割合 (既定 5%) だけ
+# 内側に制限した範囲で解かせる (``restrict_joint_range_margin`` 参照)。
+#
+# 干渉回避のペナルティ勾配は「目標に近づく」勾配とせめぎ合うため、収束した
+# 候補が肩・手首など複数の関節で可動域の端 (ハード上下限) ぴったりに
+# 張り付いた姿勢になりやすい (実測でも 13 関節中 4〜7 関節が上下限ちょうど
+# という例が多数見られた)。この状態だと当該関節はこれ以上その方向へ動けず
+# 実質的な自由度を失っているのと同じで、``solve_post_process`` が続けて
+# 解く「掌にわずかにめり込む位置への追い込み」IK が (可動域を使い切って
+# いるぶん) 収束しにくくなる一因になっている。可動域の端そのものを事前に
+# 使用禁止にしておけば、干渉回避付きバッチ IK が採用する解は常に各関節の
+# ハード上下限から ``margin_ratio`` 分だけ内側の余裕を残したものになり、
+# 後段の後処理 IK がその余裕を使って追い込みやすくなる。
+#
+# 干渉回避付きバッチ IK (``solve_person_ik`` 内の ``batch_inverse_
+# kinematics`` 呼び出し) にのみ適用し、その前後で ``restrict_elbow_range``
+# などで設定された元の可動域に戻す -- 後処理 (``solve_post_process``) や
+# 事後の干渉検証 (``collision_pairs_min_distance``) は本来のロボットの
+# 可動域全体を使ってよい (むしろ後処理はこのマージン分の余裕を使うために
+# 追い込むのが目的なので、後処理側まで制限すると意味が無くなる)。
+DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
+
 # 人体の干渉回避用ジオメトリ: (骨格の関節名 A, 関節名 B, 半径[m]) の
 # タプルの並び。BODY_JOINT_NAMES (generate_random_human_poses.py) の
 # 関節を結ぶ主要な骨を、成人の平均的な太さを目安にした半径の円柱
@@ -577,6 +600,60 @@ def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
     min_angle = math.radians(min_angle_deg)
     for arm in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
+
+
+def restrict_joint_range_margin(link_list, margin_ratio):
+    """``link_list`` 中の各関節の可動域を、上下限それぞれ全域幅の
+    ``margin_ratio`` だけ内側に一時的に制限する
+    (``DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO`` 参照)。
+
+    ``batch_inverse_kinematics`` は各関節の ``min_angle``/``max_angle`` を
+    呼び出しのたびに読み直す (``restrict_elbow_range`` の docstring 参照)
+    ため、この関数で書き換えてから呼べば効く。可動域が有限でない関節
+    (``min_angle``/``max_angle`` が ``-inf``/``inf``。台車の仮想関節等)
+    や、全域幅が非正の関節は対象外とする -- マージン比率を掛ける基準の
+    「全域幅」が定義できない/意味を持たないため。
+
+    Parameters
+    ----------
+    link_list : list[skrobot.model.Link]
+        対象のリンク (``link.joint`` が対象の関節)。``batch_inverse_
+        kinematics`` に渡す ``link_list`` と同じものを渡す想定。
+    margin_ratio : float
+        上下限それぞれ全域幅に掛けるマージンの比率 (0 以上 0.5 未満)。
+
+    Returns
+    -------
+    callable
+        呼び出すと各関節の可動域を書き換え前の値に戻す関数
+        (``try``/``finally`` で呼び出し側が必ず呼ぶ想定)。
+    """
+    joints = []
+    seen_ids = set()
+    for link in link_list:
+        joint = link.joint
+        if joint is None or id(joint) in seen_ids:
+            continue
+        seen_ids.add(id(joint))
+        joints.append(joint)
+
+    originals = []
+    for joint in joints:
+        lo, hi = float(joint.min_angle), float(joint.max_angle)
+        width = hi - lo
+        if not np.isfinite(lo) or not np.isfinite(hi) or width <= 0:
+            continue
+        originals.append((joint, lo, hi))
+        margin = width * margin_ratio
+        joint.min_angle = lo + margin
+        joint.max_angle = hi - margin
+
+    def restore():
+        for joint, lo, hi in originals:
+            joint.min_angle = lo
+            joint.max_angle = hi
+
+    return restore
 
 
 def _cylinder_between(p0, p1, radius):
@@ -1227,6 +1304,8 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                     collision_ik_stop=DEFAULT_COLLISION_IK_STOP,
                     collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
                     collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
+                    collision_joint_limit_margin_ratio=(
+                        DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
                     joint_positions=None,
                     verification_pairs=None,
                     collision_verify_tolerance=(
@@ -1288,6 +1367,16 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     しない -- 骨格 JSON が無い場合。この場合 ``effective_verification_
     pairs`` はそもそも人体セグメント参照を含まない)。
 
+    ``collision_joint_limit_margin_ratio`` (既定 ``DEFAULT_COLLISION_IK_
+    JOINT_LIMIT_MARGIN_RATIO``) は、この関数内の干渉回避付きバッチ IK
+    だけに適用する関節可動域の上下マージン比率 (``restrict_joint_range_
+    margin`` 参照)。干渉回避のペナルティに引っ張られて複数の関節が可動域
+    の端に張り付いた解になりやすく、それが後段の ``solve_post_process``
+    の収束を妨げる一因になっているため、あらかじめ上下限それぞれこの
+    比率だけ内側を使用禁止にして解かせる。バッチ IK 呼び出しの前後だけで
+    適用・復元するので、``pick_verified_candidate`` 以降 (事後の干渉検証・
+    後処理 IK) は本来の可動域のまま使われる。
+
     Returns
     -------
     tuple or None
@@ -1316,26 +1405,31 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         effective_collision_pairs = [
             (link_a, other) for link_a, other in collision_pairs
             if not isinstance(other, int)]
-    angle_vectors, base_poses, success_flags, _ = \
-        robot.batch_inverse_kinematics(
-            target_coords=target_coords,
-            move_target=move_target,
-            link_list=whole_body.link_list,
-            position_mask=True, rotation_mask=True,
-            stop=collision_ik_stop,
-            thre=collision_ik_thre,
-            rthre=collision_ik_rthre,
-            initial_angles='current',
-            attempts_per_pose=attempts_per_pose,
-            backend='jax',
-            use_base='planar', base_limits=base_limits,
-            collision_obstacles=collision_obstacles,
-            collision_weight=collision_weight,
-            collision_margin=collision_margin,
-            self_collision=self_collision,
-            collision_pairs=effective_collision_pairs,
-            self_collision_weight=self_collision_weight,
-            self_collision_margin=self_collision_margin)
+    restore_joint_range = restrict_joint_range_margin(
+        whole_body.link_list, collision_joint_limit_margin_ratio)
+    try:
+        angle_vectors, base_poses, success_flags, _ = \
+            robot.batch_inverse_kinematics(
+                target_coords=target_coords,
+                move_target=move_target,
+                link_list=whole_body.link_list,
+                position_mask=True, rotation_mask=True,
+                stop=collision_ik_stop,
+                thre=collision_ik_thre,
+                rthre=collision_ik_rthre,
+                initial_angles='current',
+                attempts_per_pose=attempts_per_pose,
+                backend='jax',
+                use_base='planar', base_limits=base_limits,
+                collision_obstacles=collision_obstacles,
+                collision_weight=collision_weight,
+                collision_margin=collision_margin,
+                self_collision=self_collision,
+                collision_pairs=effective_collision_pairs,
+                self_collision_weight=self_collision_weight,
+                self_collision_margin=self_collision_margin)
+    finally:
+        restore_joint_range()
     # verification_pairs 中の人体セグメントへの参照 (int) も、
     # effective_collision_pairs と同じ理由 (collision_obstacles が空だと
     # 対応する障害物が存在しない) でここで除く。
@@ -1593,6 +1687,17 @@ def main():
         help='干渉回避付きバッチ IK の姿勢収束閾値 [rad] (既定 {:.4f})。'
             .format(DEFAULT_COLLISION_IK_RTHRE))
     parser.add_argument(
+        '--collision-joint-limit-margin', type=float,
+        default=DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO,
+        help='干渉回避付きバッチ IK だけに適用する関節可動域の上下 '
+            'マージン比率 (既定 {})。可動域の上限・下限それぞれ全域幅の '
+            'この割合だけ内側に一時的に制限してから解く -- 干渉回避の '
+            'ペナルティに引っ張られて関節が可動域の端に張り付いた解に '
+            'なりやすく、それが後段の後処理 IK (solve_post_process) の '
+            '収束を妨げる一因になっているため。0 を指定すると制限しない '
+            '(従来と同じ挙動)。'.format(
+                DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO))
+    parser.add_argument(
         '--collision-verify-tolerance', type=float,
         default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
         help='IK の収束判定 (success_flags) は位置・姿勢誤差だけを見ており '
@@ -1767,6 +1872,8 @@ def main():
             collision_ik_stop=args.collision_ik_stop,
             collision_ik_thre=args.collision_ik_thre,
             collision_ik_rthre=args.collision_ik_rthre,
+            collision_joint_limit_margin_ratio=(
+                args.collision_joint_limit_margin),
             joint_positions=joint_positions,
             verification_pairs=verification_pairs,
             collision_verify_tolerance=args.collision_verify_tolerance)
