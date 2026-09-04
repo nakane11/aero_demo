@@ -6,64 +6,41 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
 ## パイプライン
 
 1. **`scripts/generate_random_human_poses.py`**
-   SMPL (Skinned Multi-Person Linear model) の体型・姿勢をランダムに生成し、
-   その姿勢済み関節位置から MediaPipe と同じ関節名の骨格 (手のランドマーク
-   `RHand0`..`RHand20` / `LHand0`..`LHand20` を含む) を組み立てる。SMPL の
+   SMPL（https://smpl.is.tue.mpg.de/）の体型・姿勢をランダムに生成し、
+   MediaPipe と同じ関節名の骨格 (手のランドマークを含む) を組み立てる。SMPLの
    人モデル (`pose`/`betas`/`root_pos`/`gender`) と骨格 (`joint_positions`/
-   `height`) の両方を 1 人分 1 ファイルの JSON として保存する。
+   `height`) を 1 人分 1 ファイルの JSON として保存する。
 
 2. **`scripts/estimate_palm_poses.py`**
-   手順 1 の JSON (骨格の `joint_positions`) を入力とし、手首・知節 (MCP)
-   のランドマークから左右それぞれの掌の位置姿勢 (位置と回転行列) を推定して
-   JSON として保存する。手のランドマークが 3 点未満の側は `None` になる。
-   骨格の生成元 (合成骨格でも実カメラの MediaPipe 推定でも) を問わず同じ
-   ロジックで動く。
-   あわせて、実際に手を繋ぐときにどちらの手を取るべきか (人がどちらの手を
-   差し出しているか) を `OfferedHandSelector` が判定し、`offered_hand`
-   (`"R"` / `"L"` / `null`) として同じ JSON に入れる。判定は「脱力して
-   垂れた位置からロボットにどれだけ近づいたか」「掌が人物自身の胴体から
-   どれだけ離れているか」「指先がどれだけロボットの方を向いているか」
-   「親指が下を向くほど捻れていないか」「顔がロボットの方を向いているか」
-   の重み付き和で、どちらの手も基準に届かなければ `null`
-   (差し出していない)。
+   手順 1 の JSON (`joint_positions`) を入力とし、手のランドマークから
+   左右それぞれの掌の位置姿勢を推定してJSON として保存する。
+   あわせて、人がどちらの手を差し出しているかを `OfferedHandSelector` 
+   が判定し、`offered_hand` (`"R"` / `"L"` / `null`) として同じ JSON
+   に入れる。判定は「脱力して垂れた位置からロボットにどれだけ近づいたか」
+   「掌が人物自身の胴体からどれだけ離れているか」「指先がどれだけロボットの方を向いているか」「親指が下を向くほど捻れていないか」「顔がロボットの方を向いているか」の重み付き和で、どちらの手も基準に届かなければ `null`。
 
 3. **`scripts/draw_random_human_poses.py`**
-   手順 1・2 で生成した JSON を読み込み、SMPL の人体メッシュ・骨格・
-   (あれば) 左右の掌の座標系を viser ビューアで重ねて表示する。
-   掌 JSON があれば `offered_hand` も読み、手繋ぎに使うと判定された手の
-   骨格・ランドマークを赤、選ばれなかった手を白で描き分ける
-   (`offered_hand` が `null` の人物は両手とも白、掌 JSON が無い人物だけ
-   従来どおり右手=赤・左手=青)。
+   手順 1・2 で生成した JSON を読み込み、SMPLの人体メッシュ・骨格・
+   左右の掌の座標系をビューアで表示する。`offered_hand` を読み、手繋ぎに
+   使うと判定された手を赤で描く。
 
 4. **`scripts/solve_palm_ik.py`**
-   手順 2 の JSON (掌の位置姿勢) を入力とし、人間の手にロボット (Aero)
-   の腕が触れる全身 IK (台車の平面移動 `use_base='planar'` を含む) を
+   手順 2 の JSON (掌の位置姿勢) を入力とし、人間の手にロボットが触れる
+   全身 IK (台車の平面移動 `use_base='planar'` を含む) を
    解いて、結果 (台車位置・全関節角・実際の手先姿勢) を JSON として保存
-   する。人体 (体幹・頭部・四肢を円柱で近似したもの) を障害物とした
-   干渉回避付き (台車を含むロボットの各リンクが対象。
-   `batch_inverse_kinematics` の `collision_link_list`/
-   `collision_obstacles`)。ソフトな制約 (コストへのペナルティ) なので、
-   干渉のない解が必ず得られるとは限らない。`rotation_axis` を段階的に
-   緩める再試行など、他の実機安全機能は持たない簡易版 (詳細はスクリプト
-   内の docstring 参照)。
-   IK を解く対象は、手順 2 の `offered_hand` が `"L"`/`"R"` になった
-   (人がその手を差し出していると判定された) 人物だけで、`null` の人物は
-   対象外として `target: false` の JSON (IK の結果は持たない) を書き出す。
-   使う腕は既定で人間の手の反対側 (人の左手ならロボットの右腕。
-   `--robot-arm r`/`l` で上書きできる)。
+   する。人体を近似した円柱を障害物とした干渉回避付き。ソフトな制約なので、
+   干渉のない解が必ず得られるとは限らない。
+   IK を解く対象は、手順 2 の `offered_hand` が `"L"`/`"R"` になった人物だけで、使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
    干渉回避の障害物 (その人物の全身の関節位置) は `--skeleton-dir`
    (既定は手順 1 の出力先と同じ `random_human_poses/`。`--input-dir` と
    同じファイル名で対応づける) から読む。差し出している側の腕自体は
    ロボットの手先目標のすぐそばにあるため、障害物からは除く。
-   IK は 1 人ずつ、その人の全向き候補の目標姿勢を 1 バッチにまとめて
-   `batch_inverse_kinematics` (複数初期値からの並列 IK) で解く。
+   IK は 1 人ずつ、`batch_inverse_kinematics` (複数初期値からの並列 IK) 
+   で解く。
    `collision_obstacles` はバッチ呼び出し全体で 1 つの集合しか渡せない
-   (人物ごとに障害物である「その人自身の身体」が変わる) ため、旧版
-   (全人物をまとめた 1 回の高速なバッチ) と異なり人物をまたいでバッチを
-   まとめることはできず、人数分だけ低速になる。干渉回避は
+   ため、人数分だけ低速になる。干渉回避は
    `backend='jax'` の勾配降下法でしか使えないため、バックエンドは
-   常に jax を使う (`--backend` オプションは廃止)。1 目標あたりの初期値
-   の数は `--attempts-per-pose` (既定 16)、干渉回避ペナルティの重み・
+   常に jax を使う。1 目標あたりの初期値の数は `--attempts-per-pose` (既定 16)、干渉回避ペナルティの重み・
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
@@ -71,12 +48,8 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSON (SMPL の `pose`/`betas`/`root_pos`/`gender`) と、
    手順 4 の IK 結果 JSON (`joint_angle_vector`/`base_position`/
-   `base_yaw`) をファイル名で対応づけて読み込み、SMPL の人体メッシュと
-   ロボット (Aero) モデルの 2 つだけを viser ビューアで並べて表示する
-   (`draw_random_human_poses.py` と違い、骨格線・掌 Axis・ランドマーク
-   などは描かない)。手順 4 で対象外になった人物 (`target: false`) も
-   表示するが、IK の結果が無いのでロボットは初期姿勢・原点に置き、
-   テキストパネルに `IK: 対象外 (掌推定の offered_hand: null)` と出す。
+   `base_yaw`) を読み込み、SMPL の人体メッシュと
+   ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
 
 ```
 generate_random_human_poses.py  (既定の出力先: random_human_poses/)
@@ -85,13 +58,13 @@ generate_random_human_poses.py  (既定の出力先: random_human_poses/)
 estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: random_palm_poses/)
         │  (左右の掌の position/rot (または None) + offered_hand)
         ├──▶ draw_random_human_poses.py  (既定の入力先: random_human_poses/, 掌: random_palm_poses/)
-        │        (viser ブラウザビューアで表示)
+        │        (viserで表示)
         ▼
 solve_palm_ik.py  (既定の入力先: test_palm_pose_pipeline/palms/, 出力先: test_palm_pose_pipeline/handshakes/)
         │  (IK 後の台車位置/全関節角/手先姿勢)
         ▼
 view_handshake_poses.py  (骨格: test_palm_pose_pipeline/skeletons/, IK 結果: test_palm_pose_pipeline/handshakes/)
-         (SMPL メッシュ + ロボットモデルを viser ブラウザビューアで表示)
+         (SMPL メッシュ + ロボットモデルを viserで表示)
 ```
 
 `generate_random_human_poses.py`/`estimate_palm_poses.py`/`draw_random_
@@ -109,12 +82,8 @@ random_human_poses --handshake-dir random_handshake_poses` のように
 
 ## 環境構築 (IK を解くために必要なもの)
 
-手順 4 の `solve_palm_ik.py`はskrobot 側に上流には無い機能を要求する。
-動作確認環境は Ubuntu 20.04 + Python 3.10 以上 (ROS 非依存、`--no-hand`
-を使う限り ROS の起動やワークスペースの source も不要)。バッチ IK の
-バックエンドには jax を使う (jax は Python 3.10 以上が必要なため、
-Ubuntu 20.04 のシステム Python 3.8 では動かない。deadsnakes PPA や
-pyenv などで別途 Python 3.10 以上を用意する)。
+動作確認環境は Ubuntu 20.04 + Python 3.10 以上。バッチIKの
+バックエンドには jax を使う。
 
 ```bash
 # 例: deadsnakes PPA で Python 3.10 を追加する場合
@@ -125,8 +94,7 @@ sudo apt install python3.10 python3.10-venv
 
 ### 0. venv を作る
 
-システムの Python にはインストールせず、venv を切って隔離する
-(既存の catkin ワークスペースの Python 環境とは独立)。
+システムの Python にはインストールせず、venv を切って隔離する。
 
 ```bash
 python3.10 -m venv ~/venv/aero-py310
@@ -134,7 +102,17 @@ source ~/venv/aero-py310/bin/activate
 pip install -U pip setuptools wheel
 ```
 
-以降の `pip install`/`python` はこの venv を activate した状態で実行する。
+uv を使う場合 (`uv` は Python 本体のダウンロード・インストールも
+自動でやってくれるため、事前に deadsnakes PPA 等で Python 3.10 以上を
+用意しなくてもよい):
+
+```bash
+uv venv --python 3.11 ~/venv/aero-uv
+source ~/venv/aero-uv/bin/activate
+```
+
+以降の `pip install`/`python` (uv の venv では `uv pip install` でもよい)
+はこの venv を activate した状態で実行する。
 
 ### 1. scikit-robot (fork の `aero` ブランチ) を editable install
 
@@ -148,7 +126,7 @@ IK は skrobot の以下の機能に依存しており、これらは上流
   指定 -- `--base-x-range`/`--base-y-range`/`--base-yaw-range` はこれを
   渡している)
 * `batch_inverse_kinematics` の `collision_link_list`/
-  `collision_obstacles` (人体を障害物とした干渉回避付きバッチ IK。
+  `collision_obstacles` (干渉回避付きバッチ IK。
   `backend='jax'` の勾配降下法でしか使えない)
 
 ```bash
@@ -159,20 +137,12 @@ cd scikit-robot
 pip install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入る
 ```
 
-**注意**: `base_limits`/`collision_link_list`/`collision_obstacles` を
-受け取る `batch_inverse_kinematics` は 2026-09-03 時点ではローカルの
-`base_limit` ブランチにしかなく、`nakane11/scikit-robot` のどのリモート
-ブランチにも push されていない。clone しなおした環境ではこれらの引数が
-無く `TypeError` になるので、先にこのブランチをコミット・push しておく
-必要がある。
-
 ### 2. Aero の URDF
 
 `solve_palm_ik.py` は指の関節が要らないので `Aero(use_hand=False)` =
 `aero_nohand.urdf` を使う。これは初回実行時に `skrobot.data.
 aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
-`~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要
-(初回だけネットワークが必要)。
+`~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要。
 
 一方 `view_handshake_poses.py` が既定で使う (`--no-hand` を付けない場合の)
 `aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
@@ -187,30 +157,50 @@ cp ~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf \
 `package://aero_description/typeJSK/meshes` から参照するので、catkin
 ワークスペースを source した状態 (`ROS_PACKAGE_PATH` から
 `feetech_hand` が引ける状態) で実行する必要がある。ROS 非依存で使いたい
-場合は `view_handshake_poses.py --no-hand` を使う (指関節なしの URDF で
-表示、IK の結果自体は同じ)。
+場合は `view_handshake_poses.py --no-hand` を使う。
 
 ### 3. バッチ IK のバックエンド (jax)
 
-干渉回避付きバッチ IK (`collision_link_list`/`collision_obstacles`) は
-`backend='jax'` の勾配降下法でしか使えず、`solve_palm_ik.py` は常に
-`backend='jax'` を指定する (バックエンドを選べる `--backend` オプションは
-無い)。venv (Python 3.10 以上) に jax を追加でインストールする:
+干渉回避付きバッチ IKは`backend='jax'` の勾配降下法を指定する。
+venv (Python 3.10 以上) に jax を追加でインストールする:
 
 ```bash
 pip install -U jax jaxlib
 ```
 
-GPU が使える環境では `jax[cuda12]` など CUDA 対応の jaxlib を入れると
-バッチ IK がさらに速くなる (詳細は jax 公式のインストール手順を参照)。
+GPU が使える環境では CUDA 対応の jaxlib (`pip install -U "jax[cuda12]"`)
+を入れるとバッチ IK がさらに速くなる。GPU 版 jax は起動時にデバイスメモリの確保を試み、大きいサイズから
+確保に失敗するたびに `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の
+警告を出しながら要求サイズを段階的に縮小していくことがある。警告が出ていても最終的に確保・続行できて
+いれば動作・速度に問題はない (気になる場合は `XLA_PYTHON_CLIENT_
+PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
+抑えられる)。
 
-`solve_palm_ik.py` は jax の永続コンパイルキャッシュ (既定で
-`~/.cache/jax_compilation_cache`) を有効にした状態で起動するので、
-干渉回避付きバッチ IK の重い JIT コンパイル (初回は数分かかる) の結果が
-ディスクに残り、次回以降スクリプトを起動し直してもディスクのキャッシュを
-再利用できる (プロセスを終了するたびにコンパイルからやり直しになる問題を
-解消する)。キャッシュ先を変えたい場合は、スクリプトを実行する前に
-`JAX_COMPILATION_CACHE_DIR` 環境変数を設定しておけば上書きできる。
+#### jax の永続コンパイルキャッシュ
+
+`solve_palm_ik.py` は起動時に jax の永続コンパイルキャッシュ (既定で
+`~/.cache/jax_compilation_cache`, `JAX_COMPILATION_CACHE_DIR` 環境変数で
+変更できる) を有効にする。干渉回避付きバッチ IK の JIT コンパイルは
+(`--collision-ik-stop`/`--attempts-per-pose`/`--skeleton-dir` の有無/
+使う腕 (`--robot-arm`) などで決まる計算グラフの**形状**ごとに) 1 回だけ
+必要な重い処理 (数分〜十数分かかることがある) で、コンパイル結果はこの
+ディスクキャッシュに保存される。キャッシュのキーは jax/jaxlib のバージョン
+やこの計算グラフの形状であって、プロセスや Python オブジェクトの識別子
+(`id()`) にはよらないため、以下のことが成り立つ :
+
+* **プロセスを再起動しても再コンパイルされない。** 一度ディスクに保存
+  されれば、`solve_palm_ik.py` を何度起動し直しても (venv/jax のバージョン
+  が同じ限り) 同じ形状の計算は即座にキャッシュから読み込まれる。
+* **右腕・左腕を混在させても再コンパイルされない。** 右腕用・左腕用の
+  計算グラフはそれぞれ別のキャッシュエントリとして独立に保存されるため、
+  両方を一度ずつ計算してキャッシュを作ってしまえば、以降は人物ごとに
+  どちらの腕を使っても再コンパイルは起きない。
+* **人物ごとに障害物 (その人の身体の位置) が
+  変わっても再コンパイルされない。** 障害物の値はコンパイル済みの
+  ソルバに実行時引数として渡されるだけで、コンパイル自体に焼き込まれない。
+  ただし**障害物の個数と型の並びは形状の一部**なので、人物によって
+  骨格の欠けている部位が違っても常に固定個数の
+  障害物 (欠けている部位はダミーで埋める) を渡すようにしている。
 
 ## 使い方
 
@@ -233,9 +223,6 @@ python3 draw_random_human_poses.py
 
 # 4. 人が差し出していると判定された手 (2. の offered_hand) に、その反対側の
 #    ロボットの腕で触れる全身 IK を解く (offered_hand が null の人物は対象外)
-#    (既定の入力先・出力先は scripts/test_palm_pose_pipeline/palms/ と
-#     .../handshakes/ -- 1.-3. で使う random_human_poses/ とは別のディレクトリ
-#     なので、1.-3. の結果を渡したいときは下記のように明示的に指定する)
 python3 solve_palm_ik.py
 
 # 5. SMPL メッシュ + ロボットモデルを viser で表示 (4. の結果と、1. の骨格を対応づける)
@@ -245,8 +232,8 @@ python3 view_handshake_poses.py
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
 `--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
 (例: `--output-dir /tmp/random_human_poses`)。`solve_palm_ik.py` が対象に
-する人間の手は掌 JSON の `offered_hand` で決まる (オプションでは選べない)。
-使うロボットの腕は `--robot-arm` で変更できる (既定の `auto` は人間の手の
+する人間の手は掌 JSON の `offered_hand` で決まる。
+使うロボットの腕は `--robot-arm` で変更できる (既定のは人間の手の
 反対側)。
 
 `solve_palm_ik.py`/`view_handshake_poses.py` を `--input-dir`/
@@ -261,13 +248,11 @@ python3 view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handsha
 ```
 
 `draw_random_human_poses.py`/`view_handshake_poses.py` は viser の
-ブラウザビューアを起動する (WSLg 環境などでは自動でブラウザが開く。開かない
-場合は標準出力の URL を手動で開く)。どちらも viser 画面の Back/Next
+ブラウザビューアを起動する。どちらも viser 画面の Back/Next
 ボタンで人物を切り替える (`draw_random_human_poses.py` は加えて
 `--advance-mode auto` にすると `--pause` 秒ごとに自動で次の人物へ進み、
 `--output-dir` を指定すると表示した各姿勢の画像をその都度保存する)。
-`view_handshake_poses.py` はビューアに SMPL メッシュとロボット (Aero)
-モデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマークなどは描かない)。
+`view_handshake_poses.py` はビューアに SMPL メッシュとロボットモデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマークなどは描かない)。
 ロボットは既定で指関節ありの URDF (`aero_with_feetech_hand.urdf`) を使う
 (catkin ワークスペースの source が必要)。`solve_palm_ik.py` と同じ
 指関節なしの URDF (ROS 非依存) で表示したい場合は `--no-hand` を付ける。
