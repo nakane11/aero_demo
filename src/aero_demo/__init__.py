@@ -14,6 +14,9 @@ ROS ノードはパッケージ直下の scripts/ に置き、このパッケー
   palm_plane_view            … 手のひら平面・骨格・ロボットを skrobot の
                                viewer に描く部品 (scripts/ の可視化ノードと
                                接触動作ノードが共有する)
+  aero_urdf_setup            … 手あり Aero URDF (aero_with_feetech_hand.urdf)
+                               を ROS を source していなくても読み込めるよう
+                               準備する (load_aero)
 
 カメラ無しで偽の姿勢を生成する版は rospy を使うので
 scripts/fake_people_pose_estimator_ros.py にある。

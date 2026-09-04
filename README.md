@@ -146,18 +146,27 @@ aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
 
 一方 `view_handshake_poses.py` が既定で使う (`--no-hand` を付けない場合の)
 `aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
-`feetech_hand` パッケージから自分でコピーする:
+`feetech_hand` パッケージから持ってくる必要がある。この URDF はメッシュを
+`package://feetech_hand/meshes` と `package://aero_description/typeJSK/
+meshes` から参照するが、`aero_demo.aero_urdf_setup.load_aero` (`view_
+handshake_poses.py`/`view_aero_collision_model.py`/`palm_plane_
+visualizer.py`/`human_palm_contact_behavior.py` が `Aero(...)` の代わりに
+使う) が初回呼び出し時に自動で
 
-```bash
-cp ~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf \
-   ~/.skrobot/aero_description/typeJSK/urdf/
-```
+* `~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf` を
+  `~/.skrobot/aero_description/typeJSK/urdf/` にコピーし、
+* `~/.skrobot/feetech_hand` を `~/ros/hand/src/feetech_hand` への
+  シンボリックリンクとして作る
 
-この URDF はメッシュを `package://feetech_hand/meshes` と
-`package://aero_description/typeJSK/meshes` から参照するので、catkin
-ワークスペースを source した状態 (`ROS_PACKAGE_PATH` から
-`feetech_hand` が引ける状態) で実行する必要がある。ROS 非依存で使いたい
-場合は `view_handshake_poses.py --no-hand` を使う。
+ことで、`aero_description` と同じ仕組み (scikit-robot が `package://` を
+URDF の祖先ディレクトリから探すフォールバック,
+`skrobot.utils.urdf.search_up`) だけで両方のメッシュが解決できるように
+しており、**catkin ワークスペースの source や `ROS_PACKAGE_PATH` は不要**。
+`feetech_hand` パッケージが `aero_demo` と同じワークスペースの `src/` 直下
+にない場合は、`FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
+
+指関節そのものが不要なら (`solve_palm_ik.py` と同じく) `--no-hand` で
+`aero_nohand.urdf` を使うこともできる。
 
 ### 3. バッチ IK のバックエンド (jax)
 
@@ -254,8 +263,8 @@ python3 view_handshake_poses.py   # test_palm_pose_pipeline/skeletons/ + handsha
 `--output-dir` を指定すると表示した各姿勢の画像をその都度保存する)。
 `view_handshake_poses.py` はビューアに SMPL メッシュとロボットモデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマークなどは描かない)。
 ロボットは既定で指関節ありの URDF (`aero_with_feetech_hand.urdf`) を使う
-(catkin ワークスペースの source が必要)。`solve_palm_ik.py` と同じ
-指関節なしの URDF (ROS 非依存) で表示したい場合は `--no-hand` を付ける。
+(上記「2. Aero の URDF」の通り ROS 非依存で読み込める)。`solve_palm_ik.py`
+と同じ指関節なしの URDF で表示したい場合は `--no-hand` を付ける。
 
 ## 座標系
 

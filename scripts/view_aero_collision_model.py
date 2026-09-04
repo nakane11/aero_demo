@@ -8,12 +8,19 @@ box/cylinder/sphereなどのプリミティブ形状に近似変換したURDFを
 半透明で表示することで、干渉モデルの形状を確認できる。
 """
 import argparse
+import os
+import sys
 from pathlib import Path
 
-from skrobot.models import Aero
-from skrobot.model import RobotModel
-from skrobot.urdf import convert_meshes_to_primitives
-from skrobot.viewers import ViserViewer
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
+if _PKG_SRC_DIR not in sys.path:
+    sys.path.insert(0, _PKG_SRC_DIR)
+
+from aero_demo.aero_urdf_setup import load_aero  # noqa: E402  (パス追加後に import)
+from skrobot.model import RobotModel  # noqa: E402
+from skrobot.urdf import convert_meshes_to_primitives  # noqa: E402
+from skrobot.viewers import ViserViewer  # noqa: E402
 
 
 def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
@@ -77,7 +84,7 @@ def main():
     use_hand = not args.no_hand
 
     # 元のAero(見た目そのままの通常モデル)
-    robot = Aero(use_hand=use_hand)
+    robot = load_aero(use_hand=use_hand)
     robot.reset_pose()
 
     # 元のURDFファイルパスを取得し、干渉モデル(プリミティブ近似)URDFを生成

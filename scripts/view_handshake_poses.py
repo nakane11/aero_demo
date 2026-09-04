@@ -94,6 +94,7 @@ if _THIS_DIR not in sys.path:
 
 from aero_demo import smpl_body  # noqa: E402  (パス追加後に import)
 from aero_demo import viewer_nav  # noqa: E402
+from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
@@ -114,7 +115,6 @@ from skrobot.model import Axis  # noqa: E402
 from skrobot.model import Link  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Box  # noqa: E402
-from skrobot.models import Aero  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
 from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
@@ -711,7 +711,7 @@ def main():
     # r/l_eef_grasp_link (solve_palm_ik.py が使う手先フレーム) は手あり/
     # なし両方の URDF にあるので、IK 結果自体は --no-hand でも変わらない。
     # 既定では見た目のために手ありモデルを使う。
-    robot = Aero(use_hand=args.use_hand)
+    robot = load_aero(use_hand=args.use_hand)
 
     viewer = ViserViewer(draw_grid=True)
     # Back/Next/Good/Bad ボタンは、ロボットモデルを追加するより前に作る。
