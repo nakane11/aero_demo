@@ -166,6 +166,7 @@ import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -1169,6 +1170,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         関節角を持つ結果 dict (``solved_result`` と同じキー構成の一部)。
         どちらか一方でも収束しなければ ``None``。
     """
+    start_time = time.time()
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
     target_pos = position + normal * offset
@@ -1213,6 +1215,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         base_yaw=float(yaw),
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
+        compute_time=time.time() - start_time,
     )
 
 
@@ -1379,13 +1382,16 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
 
     Returns
     -------
-    tuple or None
-        ``(candidate_index, angle_vector, base_pose, post_process_result)``。
-        ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、最優先) に、収束・
-        事後の干渉検証 (``pick_verified_candidate`` 参照) の両方を満たした
-        ものを返す。無ければ ``None``。後処理判定 (``solve_post_process``)
-        の成否はこの採用/棄却には影響しない (失敗すれば
-        ``post_process_result`` が ``None`` になるだけ)。
+    tuple
+        ``(picked, collision_ik_time)``。``picked`` は
+        ``(candidate_index, angle_vector, base_pose, post_process_result)``
+        または ``None`` -- ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、
+        最優先) に、収束・事後の干渉検証 (``pick_verified_candidate``
+        参照) の両方を満たしたものを返す。無ければ ``None``。後処理判定
+        (``solve_post_process``) の成否はこの採用/棄却には影響しない
+        (失敗すれば ``post_process_result`` が ``None`` になるだけ)。
+        ``collision_ik_time`` は干渉回避付きバッチ IK (``batch_inverse_
+        kinematics`` の呼び出し) 自体の計算時間 [秒]。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -1407,6 +1413,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
             if not isinstance(other, int)]
     restore_joint_range = restrict_joint_range_margin(
         whole_body.link_list, collision_joint_limit_margin_ratio)
+    collision_ik_start = time.time()
     try:
         angle_vectors, base_poses, success_flags, _ = \
             robot.batch_inverse_kinematics(
@@ -1430,6 +1437,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                 self_collision_margin=self_collision_margin)
     finally:
         restore_joint_range()
+    collision_ik_time = time.time() - collision_ik_start
     # verification_pairs 中の人体セグメントへの参照 (int) も、
     # effective_collision_pairs と同じ理由 (collision_obstacles が空だと
     # 対応する障害物が存在しない) でここで除く。
@@ -1438,10 +1446,11 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         effective_verification_pairs = [
             (link_a, other) for link_a, other in verification_pairs
             if not isinstance(other, int)]
-    return pick_verified_candidate(
+    picked = pick_verified_candidate(
         robot, success_flags, angle_vectors, base_poses,
         effective_verification_pairs, joint_positions,
         collision_verify_tolerance, robot_arm, palm, rots)
+    return picked, collision_ik_time
 
 
 def base_movable_region(base_limits):
@@ -1462,7 +1471,8 @@ def base_movable_region(base_limits):
 
 
 def solved_result(robot, robot_arm, target_pos, target_rot, candidate_index,
-                  angle_vector, base_pose, base_limits, post_process_result):
+                  angle_vector, base_pose, base_limits, post_process_result,
+                  collision_ik_time):
     """採用した解をロボットに反映し、結果 dict を組む.
 
     バッチ IK はロボットを動かさないので、``angle_vector`` と
@@ -1475,6 +1485,10 @@ def solved_result(robot, robot_arm, target_pos, target_rot, candidate_index,
     組んだ「後処理前」の位置姿勢と区別できるよう ``post_process`` キーに
     そのまま格納する。``view_handshake_poses.py`` はこの 2 つを切り替えて
     表示する。
+
+    ``collision_ik_time`` (``solve_person_ik`` が計測した干渉回避付き
+    バッチ IK 自体の計算時間 [秒]) はそのまま ``collision_ik_time`` キーに
+    格納する (``run_pipeline_test.py`` が平均計算時間の集計に使う)。
     """
     robot.angle_vector(angle_vector)
     robot.newcoords(base_pose)
@@ -1493,6 +1507,7 @@ def solved_result(robot, robot_arm, target_pos, target_rot, candidate_index,
         base_movable_region=base_movable_region(base_limits),
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
+        collision_ik_time=collision_ik_time,
     )
     result['post_process'] = post_process_result
     return result
@@ -1859,7 +1874,7 @@ def main():
 
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, robot_arm)
-        picked = solve_person_ik(
+        picked, collision_ik_time = solve_person_ik(
             robot, palm, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
             base_limits=base_limits,
@@ -1886,7 +1901,7 @@ def main():
             result = solved_result(
                 robot, robot_arm, target_pos, rots[candidate_index],
                 candidate_index, angle_vector, base_pose,
-                base_limits, post_process_result)
+                base_limits, post_process_result, collision_ik_time)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1

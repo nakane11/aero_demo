@@ -68,6 +68,8 @@ def summarize_palms(palm_dir):
 
 def summarize_handshakes(handshake_dir):
     n_total = n_target = n_solved = n_post_process = 0
+    collision_ik_times = []
+    post_process_times = []
     for _, data in load_json_files(handshake_dir):
         n_total += 1
         if not data.get('target'):
@@ -75,10 +77,21 @@ def summarize_handshakes(handshake_dir):
         n_target += 1
         if data.get('solved'):
             n_solved += 1
-            if data.get('post_process') is not None:
+            if data.get('collision_ik_time') is not None:
+                collision_ik_times.append(data['collision_ik_time'])
+            post_process = data.get('post_process')
+            if post_process is not None:
                 n_post_process += 1
+                if post_process.get('compute_time') is not None:
+                    post_process_times.append(post_process['compute_time'])
     return dict(n_total=n_total, n_target=n_target, n_solved=n_solved,
-               n_post_process=n_post_process)
+               n_post_process=n_post_process,
+               avg_collision_ik_time=(
+                   sum(collision_ik_times) / len(collision_ik_times)
+                   if collision_ik_times else None),
+               avg_post_process_time=(
+                   sum(post_process_times) / len(post_process_times)
+                   if post_process_times else None))
 
 
 def main():
@@ -136,6 +149,20 @@ def main():
               summary['n_target'], summary['n_solved'],
               summary['n_total'] - summary['n_target']))
 
+    print()
+    print('=== 結果 ===')
+    print('生成した骨格人数: {}'.format(n_generated))
+    print('干渉回避まで解けた人数 (solved): {} / {}'.format(
+        summary['n_solved'], n_generated))
+    if summary['avg_collision_ik_time'] is not None:
+        print('  干渉回避 IK の平均計算時間: {:.2f} 秒'.format(
+            summary['avg_collision_ik_time']))
+    print('後処理まで含めて成功した人数: {} / {}'.format(
+        summary['n_post_process'], n_generated))
+    if summary['avg_post_process_time'] is not None:
+        print('  後処理の平均計算時間: {:.2f} 秒'.format(
+            summary['avg_post_process_time']))
+
     # 5. view_handshake_poses.py (--viewer のときだけ実際に起動する)
     if args.viewer:
         print('[5/5] view_handshake_poses.py の viser ビューアを起動 '
@@ -149,12 +176,6 @@ def main():
     else:
         print('[5/5] view_handshake_poses.py: --viewer 未指定のため '
               'スキップしました。')
-
-    print()
-    print('=== 結果 ===')
-    print('生成した骨格人数: {}'.format(n_generated))
-    print('後処理まで含めて成功した人数: {} / {}'.format(
-        summary['n_post_process'], n_generated))
 
 
 if __name__ == '__main__':
