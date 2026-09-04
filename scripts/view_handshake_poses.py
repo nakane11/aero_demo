@@ -97,10 +97,15 @@ from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
+from solve_palm_ik import DEFAULT_COLLISION_VERIFY_TOLERANCE  # noqa: E402
 from solve_palm_ik import HUMAN_FRONT_DISTANCE  # noqa: E402
+from solve_palm_ik import build_collision_verification_pairs  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
+from solve_palm_ik import human_capsules  # noqa: E402
+from solve_palm_ik import human_obstacle_names  # noqa: E402
 from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402
+from solve_palm_ik import segment_points_distance  # noqa: E402
 from solve_palm_ik import translate_joint_positions  # noqa: E402
 
 from skrobot.coordinates import Coordinates  # noqa: E402
@@ -477,6 +482,96 @@ def build_robot_collision_overlay(robot, primitive_type=None,
     return collision_robot
 
 
+def colliding_link_pairs(robot, pairs, joint_positions,
+                         tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE):
+    """``solve_palm_ik.collision_pairs_min_distance`` (``solve_palm_ik.py``
+    の事後検証。IK の収束判定が見ない干渉ペナルティの残差を、厳密な形状
+    (``collision_mesh`` の頂点そのもの。勾配降下法内部が使う粗い球近似では
+    ない) で採用前にチェックする処理) と全く同じ距離計算・同じ許容誤差
+    (``tolerance``, ``solve_palm_ik.pick_verified_candidate`` が候補を
+    棄却する基準 ``dist < -tolerance`` と同じ) を使い、``pairs``
+    (``solve_palm_ik.build_collision_verification_pairs`` が作る自己干渉・
+    人体との干渉の総当たりの組み合わせ) の中から実際に貫通している組み合わせ
+    を**すべて**列挙する (``collision_pairs_min_distance`` は最小距離しか
+    返さないため、表示用にここで作り直す)。
+
+    Parameters
+    ----------
+    robot : skrobot.model.RobotModel
+        干渉ジオメトリ (プリミティブ近似済みの ``collision_mesh``) を持つ、
+        現在の姿勢のロボット (``view_handshake_poses`` では
+        ``robot_collision_overlay``)。
+    pairs : list of (Link, Link) or (Link, int)
+        ``build_collision_verification_pairs`` の戻り値。2 要素目が ``int``
+        なら ``human_obstacle_names()`` の人体セグメントとの組み合わせ、
+        ``Link`` ならロボット自身の自己干渉の組み合わせ。
+    joint_positions : dict or None
+        干渉回避の障害物にした人体の関節位置 (``human_capsules`` に渡す)。
+        ``None`` なら人体との干渉ペア (``other`` が ``int``) は判定できない
+        ので読み飛ばす。
+
+    Returns
+    -------
+    list of (str, str, str, float)
+        ``(種別, リンク A の名前, リンク B の名前 (人体セグメントなら
+        human_obstacle_names() の名前), 距離 [m])`` のリスト。種別は
+        ``'self'`` (自己干渉) / ``'human'`` (人体との干渉)。距離が負なほど
+        深く貫通している。貫通していない (``dist >= -tolerance``) 組み合わせ
+        は含めない。貫通が深い順に並べる。
+    """
+    if not pairs:
+        return []
+    caps = human_capsules(joint_positions)[0] if joint_positions else None
+    obstacle_names = human_obstacle_names()
+    world_vertices_by_link = {}
+
+    def _world_vertices(link):
+        if link not in world_vertices_by_link:
+            local = np.asarray(link.collision_mesh.vertices, dtype=np.float64)
+            world_vertices_by_link[link] = (
+                local @ link.worldrot().T + link.worldpos())
+        return world_vertices_by_link[link]
+
+    colliding = []
+    for link_a, other in pairs:
+        verts_a = _world_vertices(link_a)
+        if isinstance(other, int):
+            if caps is None:
+                continue
+            p0, p1, radius = caps[other]
+            dist = float(segment_points_distance(p0, p1, verts_a).min()) \
+                - radius
+            kind, name_b = 'human', obstacle_names[other]
+        else:
+            verts_b = _world_vertices(other)
+            dist = float(np.linalg.norm(
+                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
+                axis=-1).min())
+            kind, name_b = 'self', other.name
+        if dist < -tolerance:
+            colliding.append((kind, link_a.name, name_b, dist))
+    colliding.sort(key=lambda item: item[3])
+    return colliding
+
+
+def collision_pairs_text(colliding):
+    """``colliding_link_pairs`` の戻り値を、viser のテキストパネルに出す
+    ための文字列にする (自己干渉/人体との干渉を分けて列挙する)。"""
+    self_pairs = [c for c in colliding if c[0] == 'self']
+    human_pairs = [c for c in colliding if c[0] == 'human']
+    if not colliding:
+        return '干渉: なし (自己干渉・人体との干渉ともに検出されていません)'
+    lines = ['干渉: {} 件 (自己干渉 {} 件, 人体との干渉 {} 件)'.format(
+        len(colliding), len(self_pairs), len(human_pairs))]
+    for _, name_a, name_b, dist in self_pairs:
+        lines.append('- [自己干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
+            name_a, name_b, -dist))
+    for _, name_a, name_b, dist in human_pairs:
+        lines.append('- [対人干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
+            name_a, name_b, -dist))
+    return '\n\n'.join(lines)
+
+
 def sync_robot_collision_overlay(collision_robot, robot):
     """``build_robot_collision_overlay`` が返した overlay を ``robot`` の
     現在の姿勢 (関節角・台車位置姿勢) に追従させる.
@@ -579,6 +674,14 @@ def main():
             'を使わず毎回作り直す (solve_palm_ik.py / '
             'view_aero_collision_model.py の --force-convert-collision-model '
             '/ --force-convert と同じ)。')
+    parser.add_argument(
+        '--collision-verify-tolerance', type=float,
+        default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
+        help='表示中の人間とロボットの干渉・ロボットの自己干渉を判定する '
+            '距離の許容誤差 [m] (solve_palm_ik.py の '
+            '--collision-verify-tolerance と同じ意味。既定 {})。この値を '
+            '超えて貫通している組み合わせだけをテキストパネルに列挙する。'
+            .format(DEFAULT_COLLISION_VERIFY_TOLERANCE))
     args = parser.parse_args()
 
     names = iter_common_names(args.skeleton_dir, args.handshake_dir)
@@ -651,6 +754,16 @@ def main():
         primitive_type=args.collision_primitive_type,
         force_convert=args.force_convert_collision_model)
     viewer.add(robot_collision_overlay)
+    # solve_palm_ik.py の事後検証 (pick_verified_candidate) と全く同じ
+    # 総当たりの組み合わせ (自己干渉のロボットリンク同士、および人体との
+    # 干渉のロボットリンク×人体セグメント)。ロボットの構造だけで決まり
+    # 人物ごとの姿勢には依存しないので、人物ループの外で 1 回だけ作る
+    # (build_collision_verification_pairs の robot_arm 引数はプレース
+    # ホルダで結果に影響しない)。干渉ジオメトリは robot_collision_overlay
+    # (solve_palm_ik.apply_collision_model と同じプリミティブ近似済み) の
+    # ものを使う。
+    verification_pairs = build_collision_verification_pairs(
+        robot_collision_overlay, 'r')
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
     # 人物は常に原点で +x 方向を向いて生成されるので、+x 側から -x 方向を
@@ -745,6 +858,14 @@ def main():
         # も、動いた robot の現在の姿勢 (関節角・台車位置姿勢) に追従させる。
         sync_robot_collision_overlay(robot_collision_overlay, robot)
 
+        # solve_palm_ik.py の事後検証 (collision_pairs_min_distance) と
+        # 同じ厳密な形状・同じ許容誤差で、現在表示中の姿勢で実際に貫通して
+        # いる組み合わせ (人間とロボットの干渉・ロボットの自己干渉) を
+        # すべて求める。
+        colliding_pairs = colliding_link_pairs(
+            robot_collision_overlay, verification_pairs, joint_positions,
+            tolerance=args.collision_verify_tolerance)
+
         # IK が失敗したときは、どちらの手に合わせようとしていたのかが
         # 分かるように人間の手とロボットの腕もあわせて出す。
         # 失敗したときは、どこに届かなかったのかが目で見て分かるように
@@ -779,13 +900,14 @@ def main():
                 '(短い方, 長さ {:.2f} m): {}'.format(
                     TARGET_AXIS_LENGTH, HAND_AXIS_LENGTH,
                     pose_error_text(target_coords, hand_coords))
-        label_text.content = '**{}** ({}/{})  IK: {}{}\n\n{}'.format(
+        label_text.content = '**{}** ({}/{})  IK: {}{}\n\n{}\n\n{}'.format(
             name, i + 1, len(names), status, detail,
-            viewer_nav.format_label_text(handshake.get('human_label')))
+            viewer_nav.format_label_text(handshake.get('human_label')),
+            collision_pairs_text(colliding_pairs))
 
         viewer.redraw()
-        print('[{}/{}] displayed {} ({})'.format(
-            i + 1, len(names), name, status))
+        print('[{}/{}] displayed {} ({}, 干渉 {} 件)'.format(
+            i + 1, len(names), name, status, len(colliding_pairs)))
 
         direction, label = nav.wait(viewer)
         if direction == 0:
