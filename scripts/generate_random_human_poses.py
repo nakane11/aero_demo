@@ -14,8 +14,7 @@
     (sway) に加えて鉛直軸まわりのひねり (回旋) も与える。「両足が地面に
     ついている・重心が安定している・頭が上を向いている」という制約を
     守るため、足首から先と骨盤の傾き (前後・左右) はランダム化せず、
-    股関節の外転と膝の曲げは左右の脚に同じ角度を鏡写しに適用する
-    (旧 ``RandomSkeletonGenerator`` と同じ方針)。
+    股関節の外転と膝の曲げは左右の脚に同じ角度を鏡写しに適用する。
 
 ``RandomSkeletonGenerator``
     ``RandomSmplHumanGenerator`` が作った SMPL の人モデルを入力として
@@ -37,8 +36,7 @@
 ``height``) と SMPL の人モデル (``smpl``, ``pose``/``betas``/``root_
 pos``/``gender``, ``draw_random_human_poses.py`` が ``aero_demo.
 smpl_body.forward_world`` でメッシュを再構成するのに必要な情報) の両方
-を含める。骨格から SMPL の姿勢を推定し直す処理 (``aero_demo.smpl_body.
-retarget_and_pose``) は不要になったので、描画側ではもう使わない。
+を含める。
 
 SMPL のモデルファイル自体はライセンス上リポジトリに同梱されていないので、
 呼び出し側がローカルパスを渡す (既定値は ``aero_demo.smpl_body`` と同じ
@@ -84,11 +82,11 @@ HAND_JOINT_NAMES = ['{}Hand{}'.format(side, i)
 HAND_LOCAL = people_pose_types.HAND_LOCAL_LANDMARKS
 
 # 手の長さ (SMPL には手のランドマークが無いので、身長比の実測値を流用
-# する。旧 RandomSkeletonGenerator._RATIOS['hand_length'] と同じ値)。
+# する)。
 _HAND_LENGTH_HEIGHT_RATIO = 0.108
 
 # 頭部ランドマーク (Nose/REye/LEye/REar/LEar) を Neck からのオフセット
-# として置く距離 [m] (旧 RandomSkeletonGenerator.generate と同じ値)。
+# として置く距離 [m]。
 _HEAD_FORWARD_OFFSET = 0.06
 _NOSE_UP_OFFSET = 0.14
 _EYE_UP_OFFSET = 0.16
@@ -118,8 +116,7 @@ class RandomSmplHumanGenerator(object):
     関節の axis-angle) を毎回引き直した 1 人分の SMPL モデルを返す。
     肩・肘・股関節・膝の可動域はヒンジ関節としての肘の曲げ、仰角・方位角
     で表した肩の可動域など、解剖学的な可動域を大きく超えないよう実測
-    ベースの範囲に限る (``generate`` 参照) -- 旧 (SMPL 非依存だった頃の)
-    ``RandomSkeletonGenerator`` と同じ方針。
+    ベースの範囲に限る (``generate`` 参照)。
 
     「両足が地面についている・重心が安定している・頭が上を向いている」
     という制約を必ず満たすように、足首から先と骨盤の前後・左右の傾きは
@@ -216,8 +213,7 @@ class RandomSmplHumanGenerator(object):
         ``zb`` まわりのひねりを先に適用し、そのあとで ``zb`` をランダムな
         軸まわりに少しだけ倒す最小回転 (``smpl_body.rotation_between``)
         を掛ける。最小回転は定義上ひねり (回転軸まわりのヨー) 成分を
-        持たないので、ひねりはこうして別に与えないと必ず 0 になる
-        (以前はこの合成が無かったため、腰も首も一切ひねられなかった)。
+        持たないので、ひねりはこうして別に与える。
 
         Parameters
         ----------
@@ -331,10 +327,7 @@ class RandomSmplHumanGenerator(object):
         # 手のボーンの実際の向き (捻り込み) をそのまま表す。手のランド
         # マークをこの行列で組み立てる (``RandomSkeletonGenerator.
         # _hand_frame`` 参照) ことで、SMPL メッシュの前腕が肩・肘の回転で
-        # 蓄積する前腕軸まわりの捻りを、手のランドマークにも反映できる
-        # (指方向 + 世界の「上」だけからその場でフレームを作り直す旧方式
-        # だと、この捻りが無視されて指先方向の軸まわりに SMPL メッシュと
-        # ずれて見えていた)。
+        # 蓄積する前腕軸まわりの捻りを、手のランドマークにも反映できる。
         wrist_rots = {}
         for shoulder_idx, elbow_idx, wrist_idx, side, sign in (
                 (smpl_body.L_SHOULDER, smpl_body.L_ELBOW, smpl_body.L_WRIST,
@@ -447,10 +440,7 @@ class RandomSkeletonGenerator(object):
         robot``, ほぼ体の左右軸), n0=T-pose で掌が向く向き (実測により
         -Z (下), ``smpl_body._REST_PALM_NORMAL`` と同じ値を使う), v0=
         u0×n0 (または n0×u0) から作る親指方向 (前方 +X, 解剖学的に自然)
-        で決める。以前は現在の指方向 + 世界の「上」だけからその場でフレ
-        ームを作り直していたため、肩・肘の回転で前腕に溜まる捻りが手の
-        ランドマークに反映されず、指先方向の軸まわりに SMPL メッシュと
-        ずれて見えていた。
+        で決める。
 
         Parameters
         ----------
@@ -507,10 +497,7 @@ class RandomSkeletonGenerator(object):
         head_dir = _unit(head - neck, fallback=zb)
         # 顔の正面方向は首の累積回転 (``RandomSmplHumanGenerator.generate``
         # の ``head_rot``) が回した前方 +x を、首->頭の軸に直交する成分だけ
-        # 取り出して使う。以前は世界の左右軸 (yb) との外積から作っていた
-        # ため、首のひねり (鉛直軸まわりの回旋) が鼻・目・耳に反映されず、
-        # SMPL メッシュの顔だけが横を向いて骨格の顔は正面を向いたままに
-        # なってしまう。
+        # 取り出して使う。
         head_rot = smpl_person.get('head_rot')
         if head_rot is None:
             head_fwd_raw = np.cross(yb, head_dir)

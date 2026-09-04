@@ -14,10 +14,9 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
 2. **`scripts/estimate_palm_poses.py`**
    手順 1 の JSON (`joint_positions`) を入力とし、手のランドマークから
    左右それぞれの掌の位置姿勢を推定してJSON として保存する。
-   あわせて、人がどちらの手を差し出しているかを `OfferedHandSelector` 
+   あわせて、人がどちらの手を差し出しているかを `OfferedHandSelector`
    が判定し、`offered_hand` (`"R"` / `"L"` / `null`) として同じ JSON
-   に入れる。判定は「脱力して垂れた位置からロボットにどれだけ近づいたか」
-   「掌が人物自身の胴体からどれだけ離れているか」「指先がどれだけロボットの方を向いているか」「親指が下を向くほど捻れていないか」「顔がロボットの方を向いているか」の重み付き和で、どちらの手も基準に届かなければ `null`。
+   に入れる (判定基準の詳細は `OfferedHandSelector` の docstring 参照)。
 
 3. **`scripts/draw_random_human_poses.py`**
    手順 1・2 で生成した JSON を読み込み、SMPLの人体メッシュ・骨格・
@@ -140,24 +139,13 @@ aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
 
 一方 `view_handshake_poses.py` が既定で使う (`--no-hand` を付けない場合の)
 `aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
-`feetech_hand` パッケージから持ってくる必要がある。この URDF はメッシュを
-`package://feetech_hand/meshes` と `package://aero_description/typeJSK/
-meshes` から参照するが、`aero_demo.aero_urdf_setup.load_aero` (`view_
-handshake_poses.py`/`view_aero_collision_model.py`/`palm_plane_
-visualizer.py` が `Aero(...)` の代わりに
-使う) が初回呼び出し時に自動で
-
-* `~/ros/hand/src/feetech_hand/urdf/aero_with_feetech_hand.urdf` を
-  `~/.skrobot/aero_description/typeJSK/urdf/` にコピーし、
-* `~/.skrobot/feetech_hand` を `~/ros/hand/src/feetech_hand` への
-  シンボリックリンクとして作る
-
-ことで、`aero_description` と同じ仕組み (scikit-robot が `package://` を
-URDF の祖先ディレクトリから探すフォールバック,
-`skrobot.utils.urdf.search_up`) だけで両方のメッシュが解決できるように
-しており、**catkin ワークスペースの source や `ROS_PACKAGE_PATH` は不要**。
-`feetech_hand` パッケージが `aero_demo` と同じワークスペースの `src/` 直下
-にない場合は、`FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
+`feetech_hand` パッケージから持ってくる必要がある。`aero_demo.
+aero_urdf_setup.load_aero` (`view_handshake_poses.py`/`view_aero_
+collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し時に
+自動で URDF・メッシュを `~/.skrobot/` 以下に配置するので、**catkin
+ワークスペースの source や `ROS_PACKAGE_PATH` は不要**。`feetech_hand`
+パッケージが `aero_demo` と同じワークスペースの `src/` 直下にない場合は、
+`FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
 
 指関節そのものが不要なら (`solve_palm_ik.py` と同じく) `--no-hand` で
 `aero_nohand.urdf` を使うこともできる。
@@ -184,26 +172,11 @@ PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
 `solve_palm_ik.py` は起動時に jax の永続コンパイルキャッシュ (既定で
 `~/.cache/jax_compilation_cache`, `JAX_COMPILATION_CACHE_DIR` 環境変数で
 変更できる) を有効にする。干渉回避付きバッチ IK の JIT コンパイルは
-(`--collision-ik-stop`/`--attempts-per-pose`/`--skeleton-dir` の有無/
-使う腕 (`--robot-arm`) などで決まる計算グラフの**形状**ごとに) 1 回だけ
-必要な重い処理 (数分〜十数分かかることがある) で、コンパイル結果はこの
-ディスクキャッシュに保存される。キャッシュのキーは jax/jaxlib のバージョン
-やこの計算グラフの形状であって、プロセスや Python オブジェクトの識別子
-(`id()`) にはよらないため、以下のことが成り立つ :
-
-* **プロセスを再起動しても再コンパイルされない。** 一度ディスクに保存
-  されれば、`solve_palm_ik.py` を何度起動し直しても (venv/jax のバージョン
-  が同じ限り) 同じ形状の計算は即座にキャッシュから読み込まれる。
-* **右腕・左腕を混在させても再コンパイルされない。** 右腕用・左腕用の
-  計算グラフはそれぞれ別のキャッシュエントリとして独立に保存されるため、
-  両方を一度ずつ計算してキャッシュを作ってしまえば、以降は人物ごとに
-  どちらの腕を使っても再コンパイルは起きない。
-* **人物ごとに障害物 (その人の身体の位置) が
-  変わっても再コンパイルされない。** 障害物の値はコンパイル済みの
-  ソルバに実行時引数として渡されるだけで、コンパイル自体に焼き込まれない。
-  ただし**障害物の個数と型の並びは形状の一部**なので、人物によって
-  骨格の欠けている部位が違っても常に固定個数の
-  障害物 (欠けている部位はダミーで埋める) を渡すようにしている。
+計算グラフの形状 (`--collision-ik-stop`/`--attempts-per-pose`/
+`--skeleton-dir` の有無/使う腕 (`--robot-arm`) などで決まる) ごとに
+初回だけ必要な重い処理 (数分〜十数分かかることがある) で、以降は同じ
+venv/jax バージョンで同じ形状の計算であればディスクキャッシュから
+即座に読み込まれる。
 
 ## 使い方
 
