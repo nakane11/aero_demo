@@ -66,6 +66,22 @@ model`` 参照)。人体側・ロボット側のどちらも
 ``collision_pairs`` に指定した組み合わせが実際には貫通したままの解は
 棄却する (``--collision-verify-tolerance`` 参照)。
 
+さらに、干渉検証まで通った候補についても、``TARGET_HOVER_OFFSET`` で
+浮かせた目標に届いたというだけでは実際に人間に掌を押し付けられる保証は
+無いため、``pick_verified_candidate`` は最後に後処理判定
+(``solve_post_process``) を行う。台車を動かさず (人体との干渉回避も外した)
+通常のヤコビアン法 IK で、目標位置を掌へわずかにめり込む位置
+(``POST_PROCESS_TARGET_HOVER_OFFSET``) まで詰め直し、同時にロボットが
+自分の手を見るよう首も向ける。ただしこの後処理 IK の成否は候補の採用/
+棄却そのものには影響しない -- 干渉検証まで通った (=``TARGET_HOVER_
+OFFSET`` の目標に干渉なく届いている) 後処理前の解自体はそれとは独立に
+有効な解のため、後処理が失敗しても候補は ``solved`` のまま採用される
+(出力 JSON の ``post_process`` キーが ``null`` になるだけ)。採用された
+候補は、後処理前 (干渉回避付きバッチ IK がそのまま解いた姿勢) の位置姿勢
+に加え、後処理に成功していれば後処理後 (上記の後処理判定が解いた、掌に
+押し付け自分の手を見た姿勢) の位置姿勢も ``post_process`` キーに持つ
+(``solved_result`` 参照)。
+
 人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉。例えば解いて
 いる腕が胴体・反対側の腕・台車にぶつかる) も既定で回避する
 (``batch_inverse_kinematics`` の ``self_collision=True``、``--no-self-
@@ -258,6 +274,24 @@ DEFAULT_SELF_COLLISION_MARGIN = 0.02
 # 姿勢が要る用途では、この offline スクリプトの出力をそのまま実機に使わず、
 # 別途アプローチ動作を足すことを想定している)。
 TARGET_HOVER_OFFSET = 0.08  # [m]
+
+# 事後の後処理判定 (``solve_post_process``) で使う、掌からのオフセット
+# [m]。``pick_verified_candidate`` が干渉検証まで通した候補について、
+# 「人間にロボットが実際に掌を押し付けられるか」を追加で確認するための
+# 目標位置に使う。``TARGET_HOVER_OFFSET`` (0.08m、掌の上空) はあくまで
+# 干渉回避の目標を人体ジオメトリから逃がすためのソフトな仕掛けであり、
+# その目標に届く解が見つかったからといって、実際に掌へ手を近づけられる
+# (押し付けられる) 保証にはならない。負の値 (掌の内側にわずかにめり込む
+# 位置) にすることで、実機の初期アプローチ用オフセット
+# (``palm_plane.CONTACT_OFFSET``, 2cm) よりさらに踏み込んで、確実に
+# 触れられる姿勢が (台車を動かさずに) 取れるかを検証する。
+POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
+
+# 後処理判定の腕 IK (通常のヤコビアン法, 干渉回避なし・台車なし) の最大
+# 反復回数。干渉回避付きバッチ IK が採用した姿勢からの微小な追い込みなので
+# 収束は速いはずだが、``human_palm_contact_behavior.py`` の実機向け
+# ``_solve_palm_ik`` と同じ余裕を持った値にしておく。
+DEFAULT_POST_PROCESS_IK_STOP = 200
 
 # 肘関節 (``{r,l}_elbow_joint``) の可動域制限 [deg]。この関節は 0 度が
 # 腕をまっすぐ伸ばした状態、負方向が肘を曲げる方向で、URDF 上の可動域は
@@ -984,33 +1018,129 @@ def build_collision_verification_pairs(robot, robot_arm):
     return pairs
 
 
+def solve_post_process(robot, robot_arm, palm, target_rot,
+                       offset=POST_PROCESS_TARGET_HOVER_OFFSET,
+                       stop=DEFAULT_POST_PROCESS_IK_STOP):
+    """``pick_verified_candidate`` が干渉検証まで通した候補について、
+    人間にロボットが実際に掌を押し付けられることを確認する後処理判定を
+    行う (``POST_PROCESS_TARGET_HOVER_OFFSET`` 参照)。
+
+    台車を動かさない (``inverse_kinematics`` に ``use_base`` を渡さない
+    既定の挙動、``rarm_whole_body``/``larm_whole_body`` は台車を含まない)
+    通常のヤコビアン法 IK (干渉回避なし) で、掌の目標位置を
+    ``TARGET_HOVER_OFFSET`` (掌の上空 0.08m) の代わりに ``offset`` (既定
+    ``POST_PROCESS_TARGET_HOVER_OFFSET``、掌へわずかにめり込む位置) に
+    した腕の IK を解く。向きは採用しようとしている候補と同じ
+    ``target_rot`` を厳密に (``rotation_axis=True``) 使う。
+
+    同時に、ロボットが自分の手 (``move_target``, 上記の腕 IK の結果) を
+    見るように首を向けることも目標に入れる -- ``robot.look_at`` (skrobot
+    組み込みの視線 IK, ``inverse_transform``ではなくヤコビアン法) で
+    ``robot.head.link_list`` (首の 3 関節) だけを動かして解く。腕・視線の
+    どちらの IK も収束して初めて後処理判定は成功とする。
+
+    ``robot`` は呼び出し前の姿勢 (``pick_verified_candidate`` が反映した
+    干渉検証済みの候補の姿勢、台車位置を含む) を初期値として直接書き換え
+    て解く (``revert_if_fail=False``)。判定に失敗した場合も ``robot`` は
+    最後に試した (収束しなかった) 姿勢のままになる -- 呼び出し側は失敗した
+    候補を採用しないので問題ない。
+
+    Returns
+    -------
+    dict or None
+        腕 IK・視線 IK のどちらも収束したときは、後処理後の手先・台車・
+        関節角を持つ結果 dict (``solved_result`` と同じキー構成の一部)。
+        どちらか一方でも収束しなければ ``None``。
+    """
+    position = np.asarray(palm['position'], dtype=np.float64)
+    normal = np.asarray(palm['y_axis'], dtype=np.float64)
+    target_pos = position + normal * offset
+    target_coords = Coordinates(pos=target_pos.tolist(), rot=target_rot)
+
+    whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
+    move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+    try:
+        arm_result = whole_body.inverse_kinematics(
+            target_coords, rotation_axis=True, stop=stop,
+            revert_if_fail=True)
+    except Exception as e:
+        print('  [post-process] 押し付け確認の腕 IK で例外が発生したため '
+              '棄却します: {}'.format(e))
+        return None
+    if arm_result is False:
+        return None
+
+    try:
+        gaze_result = robot.look_at(move_target)
+    except Exception as e:
+        print('  [post-process] 自分の手を見る視線 IK で例外が発生した '
+              'ため棄却します: {}'.format(e))
+        return None
+    if gaze_result is False:
+        return None
+
+    yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
+    return dict(
+        target_position=[float(v) for v in target_pos],
+        target_rot=[[float(v) for v in row] for row in target_rot],
+        hand_position=[float(v) for v in move_target.worldpos()],
+        hand_rot=[[float(v) for v in row] for row in move_target.worldrot()],
+        base_position=[float(v) for v in robot.base_link.worldpos()],
+        base_yaw=float(yaw),
+        joint_names=[j.name for j in robot.joint_list],
+        joint_angle_vector=[float(v) for v in robot.angle_vector()],
+    )
+
+
 def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             verification_pairs, joint_positions,
-                            collision_verify_tolerance):
+                            collision_verify_tolerance,
+                            robot_arm, palm, rots,
+                            post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字 (``TURN_CANDIDATES_DEG``
-    の添字) で対応する) の中から、IK が収束していて (``success_flags``)
-    かつ ``verification_pairs`` を実際には貫通していない
-    (``collision_pairs_min_distance`` による事後検証、
-    ``collision_verify_tolerance`` [m] まで許容) 候補を、添字最小 (最優先)
-    のものから探して返す (``solve_person_ik`` の docstring 参照 -- IK の
-    収束判定は干渉ペナルティの残差を見ないため、この事後検証が別途必要)。
+    の添字) で対応する) の中から、以下を両方満たす候補を、添字最小
+    (最優先) のものから探して返す。
+
+    1. IK が収束している (``success_flags``)。
+    2. ``verification_pairs`` を実際には貫通していない
+       (``collision_pairs_min_distance`` による事後検証、
+       ``collision_verify_tolerance`` [m] まで許容, ``solve_person_ik`` の
+       docstring 参照 -- IK の収束判定は干渉ペナルティの残差を見ないため、
+       この事後検証が別途必要)。
+
     ``verification_pairs`` には最適化で使った (絞り込み済みの)
     ``collision_pairs`` ではなく、``build_collision_verification_pairs``
     が作る総当たりの組み合わせ (``solve_person_ik`` 側で ``collision_
     obstacles`` の有無に応じてフィルタ済みのもの) を渡す想定。
 
+    上記 1・2 を満たした (=採用が決まった) 候補についてのみ、後処理判定
+    (``solve_post_process``: 台車を動かさない干渉なしの腕 IK で掌に押し
+    付けられ、かつロボットが自分の手を見られるか) も試みる。ただし
+    後処理判定の成否は候補の採用/棄却そのものには影響しない -- 後処理は
+    あくまで「実際に押し付けられるか」の追加情報であり、``TARGET_HOVER_
+    OFFSET`` の目標に干渉なく届いている後処理前の解自体はそれとは独立に
+    有効な解のため、後処理が失敗しても viewer で「後処理前の姿勢」として
+    表示できるよう ``solved`` のまま返す (``post_process_result`` だけ
+    ``None`` になる)。判定の順序は 1 -> 2 -> 後処理 (干渉判定の後に後処理
+    の干渉なし IK)。
+
     候補を採用するにはロボットにその候補の姿勢を反映する必要がある
-    (``collision_pairs_min_distance`` はロボットの現在の姿勢を見る) ため、
-    検証のたびに ``robot`` を書き換える -- 呼び出し後の ``robot`` は最後に
-    調べた候補 (採用した候補、またはどれも採用できなければ最後の候補) の
-    姿勢のままになる。
+    (``collision_pairs_min_distance``/``solve_post_process`` はロボットの
+    現在の姿勢を見る/書き換える) ため、検証のたびに ``robot`` を書き換える
+    -- 呼び出し後の ``robot`` は最後に調べた候補 (採用した候補、または
+    どれも採用できなければ最後の候補) の姿勢のままになる (後処理判定の
+    成否に関わらず、後処理 IK を試みた後の姿勢になっている点に注意 --
+    呼び出し側の ``solved_result`` は ``angle_vector``/``base_pose`` を
+    改めて反映し直すので、後処理前の姿勢に戻ることを保証するのはそちら)。
 
     Returns
     -------
     tuple or None
-        ``(candidate_index, angle_vector, base_pose)``。見つからなければ
-        ``None``。
+        ``(candidate_index, angle_vector, base_pose, post_process_result)``。
+        ``post_process_result`` は ``solve_post_process`` が返した後処理後
+        の結果 dict、後処理判定に失敗していれば ``None``。1・2 を満たす
+        候補が無ければ ``None`` を返す。
     """
     for candidate_index, ok in enumerate(success_flags):
         if not ok:
@@ -1019,12 +1149,22 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         robot.newcoords(base_poses[candidate_index])
         min_dist = collision_pairs_min_distance(
             robot, verification_pairs, joint_positions)
-        if min_dist >= -collision_verify_tolerance:
-            return (candidate_index, angle_vectors[candidate_index],
-                    base_poses[candidate_index])
-        print('  [collision-verify] turn={:.0f}deg の候補は IK は収束した'
-              'が、事後検証で {:.4f} m 貫通していたため棄却します。'.format(
-                  TURN_CANDIDATES_DEG[candidate_index], min_dist))
+        if min_dist < -collision_verify_tolerance:
+            print('  [collision-verify] turn={:.0f}deg の候補は IK は収束'
+                  'したが、事後検証で {:.4f} m 貫通していたため棄却'
+                  'します。'.format(
+                      TURN_CANDIDATES_DEG[candidate_index], min_dist))
+            continue
+        post_result = solve_post_process(
+            robot, robot_arm, palm, rots[candidate_index],
+            stop=post_process_ik_stop)
+        if post_result is None:
+            print('  [post-process] turn={:.0f}deg の候補は干渉検証を通過'
+                  'したが、後処理判定 (押し付け/視線 IK) には失敗しました '
+                  '(後処理前の解として採用します)。'.format(
+                      TURN_CANDIDATES_DEG[candidate_index]))
+        return (candidate_index, angle_vectors[candidate_index],
+                base_poses[candidate_index], post_result)
     return None
 
 
@@ -1104,9 +1244,12 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     Returns
     -------
     tuple or None
-        ``(candidate_index, angle_vector, base_pose)``。
-        ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、最優先) に、収束かつ
-        事後の干渉検証の両方を満たしたものを返す。無ければ ``None``。
+        ``(candidate_index, angle_vector, base_pose, post_process_result)``。
+        ``TURN_CANDIDATES_DEG`` の中で最初 (添字最小、最優先) に、収束・
+        事後の干渉検証 (``pick_verified_candidate`` 参照) の両方を満たした
+        ものを返す。無ければ ``None``。後処理判定 (``solve_post_process``)
+        の成否はこの採用/棄却には影響しない (失敗すれば
+        ``post_process_result`` が ``None`` になるだけ)。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -1157,7 +1300,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     return pick_verified_candidate(
         robot, success_flags, angle_vectors, base_poses,
         effective_verification_pairs, joint_positions,
-        collision_verify_tolerance)
+        collision_verify_tolerance, robot_arm, palm, rots)
 
 
 def base_movable_region(base_limits):
@@ -1178,19 +1321,25 @@ def base_movable_region(base_limits):
 
 
 def solved_result(robot, robot_arm, target_pos, target_rot, candidate_index,
-                  angle_vector, base_pose, base_limits):
+                  angle_vector, base_pose, base_limits, post_process_result):
     """採用した解をロボットに反映し、結果 dict を組む.
 
     バッチ IK はロボットを動かさないので、``angle_vector`` と
     ``base_pose`` を実際に反映してから手先・台車の姿勢を読み直す。
     Aero は ``root_link`` が ``base_link`` なので台車の姿勢は
     ``robot.newcoords`` で入る (``seed_arm_pose`` の注記を参照)。
+
+    ``post_process_result`` (``solve_post_process`` が返した後処理後の
+    結果 dict, ``pick_verified_candidate`` 参照) は、この関数がここまでで
+    組んだ「後処理前」の位置姿勢と区別できるよう ``post_process`` キーに
+    そのまま格納する。``view_handshake_poses.py`` はこの 2 つを切り替えて
+    表示する。
     """
     robot.angle_vector(angle_vector)
     robot.newcoords(base_pose)
     hand_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
-    return dict(
+    result = dict(
         target=True,
         solved=True,
         turn_deg=TURN_CANDIDATES_DEG[candidate_index],
@@ -1204,6 +1353,8 @@ def solved_result(robot, robot_arm, target_pos, target_rot, candidate_index,
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
     )
+    result['post_process'] = post_process_result
+    return result
 
 
 def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits):
@@ -1578,11 +1729,12 @@ def main():
             result = unsolved_result(robot, robot_arm, target_pos, rots[-1],
                                      base_limits)
         else:
-            candidate_index, angle_vector, base_pose = picked
+            candidate_index, angle_vector, base_pose, post_process_result \
+                = picked
             result = solved_result(
                 robot, robot_arm, target_pos, rots[candidate_index],
                 candidate_index, angle_vector, base_pose,
-                base_limits)
+                base_limits, post_process_result)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1

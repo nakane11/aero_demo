@@ -423,7 +423,7 @@ def pose_error_text(target_coords, hand_coords):
         float(np.linalg.norm(diff)), float(np.rad2deg(angle)))
 
 
-def apply_robot_pose(robot, handshake):
+def apply_robot_pose(robot, handshake, use_post_process=False):
     """``solve_palm_ik`` の戻り値 (関節角・台車位置姿勢) をロボットモデル
     に反映する.
 
@@ -435,16 +435,30 @@ def apply_robot_pose(robot, handshake):
     合わせて該当する関節だけ角度を反映する (指関節は初期姿勢のまま)。
     台車の位置・向きは ``base_position``/``base_yaw`` に別で保存されている
     ので、あわせて反映する (``solve_palm_ik.solve_palm_ik`` 参照)。
+
+    Parameters
+    ----------
+    use_post_process : bool, optional
+        ``True`` のとき、``solve_palm_ik.solve_post_process`` が解いた
+        後処理後の姿勢 (``handshake['post_process']`` -- 掌に押し付ける
+        位置まで詰め、自分の手を見るよう首も向けた姿勢) を反映する。
+        既定 (``False``) は従来通り後処理前の姿勢。``post_process`` が
+        無い (後処理判定に失敗した/この機能追加前の solve_palm_ik.py が
+        書き出した/IK 自体が解けなかった) JSON では、``use_post_process``
+        が ``True`` でも後処理前の姿勢にフォールバックする。
     """
+    source = handshake
+    if use_post_process and handshake.get('post_process') is not None:
+        source = handshake['post_process']
     robot.reset_pose()
     name_to_angle = dict(zip(
-        handshake['joint_names'], handshake['joint_angle_vector']))
+        source['joint_names'], source['joint_angle_vector']))
     for joint in robot.joint_list:
         if joint.name in name_to_angle:
             joint.joint_angle(name_to_angle[joint.name])
     robot.base_link.newcoords(Coordinates(
-        pos=handshake['base_position'],
-        rot=rpy_matrix(handshake['base_yaw'], 0.0, 0.0)))
+        pos=source['base_position'],
+        rot=rpy_matrix(source['base_yaw'], 0.0, 0.0)))
 
 
 def build_robot_collision_overlay(robot, primitive_type=None,
@@ -727,8 +741,37 @@ def main():
     show_base_region_checkbox = viewer._server.gui.add_checkbox(
         '台車の可動範囲の表示', initial_value=True)
 
+    # ロボットの描画姿勢を、solve_palm_ik.py の後処理判定
+    # (solve_post_process) 前/後で切り替えるチェックボックス。既定
+    # (オフ) では従来通り後処理前の姿勢を表示し、オンにすると
+    # apply_robot_pose が handshake['post_process'] (掌に押し付ける位置
+    # まで詰め、自分の手を見るよう首も向けた姿勢) を反映する。
+    # ``current_handshake`` は表示中の人物の handshake dict を保持する
+    # (人物を切り替えるたびに while ループ側で更新する) 1 要素リスト --
+    # チェックボックスのハンドラは while ループの外で定義するクロージャ
+    # なので、素の変数への再代入では捕捉できない値をここに入れておく。
+    show_post_process_checkbox = viewer._server.gui.add_checkbox(
+        '後処理後の姿勢を表示 (掌に押し付け/自分の手を注視)',
+        initial_value=False)
+    current_handshake = [None]
+
     def set_link_visible(link, visible):
         viewer._linkid_to_handle[str(id(link))].visible = visible
+
+    def refresh_robot_pose():
+        """``current_handshake`` の内容を、``show_post_process_checkbox``
+        の状態に応じた姿勢でロボットに反映し直す (人物切り替え時、および
+        チェックボックスの切り替え時の両方から呼ぶ)。"""
+        handshake = current_handshake[0]
+        if handshake is None:
+            return
+        apply_robot_pose(robot, handshake, show_post_process_checkbox.value)
+        sync_robot_collision_overlay(robot_collision_overlay, robot)
+        viewer.redraw()
+
+    @show_post_process_checkbox.on_update
+    def _on_toggle_post_process(_):  # noqa: ANN001
+        refresh_robot_pose()
 
     @show_collision_models_checkbox.on_update
     def _on_toggle_collision_models(_):  # noqa: ANN001
@@ -853,10 +896,12 @@ def main():
             set_link_visible(current_base_region_link,
                              show_base_region_checkbox.value)
 
-        apply_robot_pose(robot, handshake)
-        # 通常のロボットモデル (不透明) に重ねた半透明の干渉モデル overlay
-        # も、動いた robot の現在の姿勢 (関節角・台車位置姿勢) に追従させる。
-        sync_robot_collision_overlay(robot_collision_overlay, robot)
+        # 人物を切り替えるたびに、まず後処理前の姿勢で表示する
+        # (show_post_process_checkbox は人物間で状態を保持しない --
+        # 新しい人物に切り替えたら毎回後処理前から見せたいため)。
+        current_handshake[0] = handshake
+        show_post_process_checkbox.value = False
+        refresh_robot_pose()
 
         # solve_palm_ik.py の事後検証 (collision_pairs_min_distance) と
         # 同じ厳密な形状・同じ許容誤差で、現在表示中の姿勢で実際に貫通して
