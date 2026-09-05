@@ -193,7 +193,7 @@ DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 # 初期値 0 は seed_arm_pose の種の姿勢 (台車はワールド原点)、残りは関節
 # 範囲・台車の可動範囲の一様乱数。初期値ごとの解は集約させずに全て受け取る
 # (``return_all_attempts``。``solve_person_ik`` 参照)。
-DEFAULT_ATTEMPTS_PER_POSE = 16
+DEFAULT_ATTEMPTS_PER_POSE = 64
 
 # 干渉回避 (collision_obstacles) 付きバッチ IK の収束判定。勾配降下法は
 # 通常のヤコビアン法より収束が遅いため、既定よりも反復回数を増やし閾値を
