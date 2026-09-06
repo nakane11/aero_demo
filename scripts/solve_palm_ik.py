@@ -257,7 +257,16 @@ DEFAULT_POST_PROCESS_IK_STOP = 40
 # RTHRE`` というずっと緩い閾値で「収束」と判定した候補を初期値に使うため、
 # skrobot 既定の厳しい基準 (位置 1mm・姿勢 1度) では後処理が失敗しやすく、
 # それに合わせて緩めてある。
-DEFAULT_POST_PROCESS_IK_THRE = 0.025  # [m]
+#
+# 位置閾値 (thre) は元々 0.025m だったが、view_handshake_poses.py で
+# 「後処理後の姿勢を表示」しても掌に数cmズレて見えるケースが実際に
+# 見つかったため 0.01m に締めた (grid_search_collision_ik.py の
+# --post-process-thre で検証: 2000人中468人が対象、成功率は99.1%→
+# 98.9%と0.2ポイントしか落ちない一方、後処理成功時の残差 (掌目標との
+# 距離) は中央値1.41cm/最大2.50cm から中央値0.81cm/最大1.00cmまで
+# 縮まる)。姿勢閾値 (rthre) は残差にも成功率にも有意な影響が無かったため
+# 元の値のまま。
+DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 後処理判定の視線 IK (人間の手を見る首 3 関節) の最大反復回数・収束閾値
@@ -1146,7 +1155,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             collision_verify_tolerance,
                             robot_arm, palm, rots,
                             attempts_per_pose=DEFAULT_ATTEMPTS_PER_POSE,
-                            post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP):
+                            post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP,
+                            post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
+                            post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、添字最小 (最優先) のものから探して返す。
@@ -1228,7 +1239,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             continue
         post_result = solve_post_process(
             robot, robot_arm, palm, rots[turn_index],
-            stop=post_process_ik_stop)
+            stop=post_process_ik_stop,
+            thre=post_process_thre, rthre=post_process_rthre)
         if post_result is not None:
             return (turn_index, angle_vectors[candidate_index],
                     base_poses[candidate_index], post_result)
@@ -1262,7 +1274,9 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                     joint_positions=None,
                     verification_pairs=None,
                     collision_verify_tolerance=(
-                        DEFAULT_COLLISION_VERIFY_TOLERANCE)):
+                        DEFAULT_COLLISION_VERIFY_TOLERANCE),
+                    post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
+                    post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE):
     """1 人分について、``TURN_CANDIDATES_DEG`` の全ての向き × 全ての初期値
     (``attempts_per_pose`` 個) を、その人の身体
     (``collision_obstacles``) を障害物とした干渉回避付きバッチ IK で
@@ -1422,7 +1436,9 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         robot, success_flags, angle_vectors, base_poses,
         effective_verification_pairs, joint_positions,
         collision_verify_tolerance, robot_arm, palm, rots,
-        attempts_per_pose=attempts_per_pose)
+        attempts_per_pose=attempts_per_pose,
+        post_process_thre=post_process_thre,
+        post_process_rthre=post_process_rthre)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -1711,6 +1727,20 @@ def main():
             '誤差を吸収する程度の小さな値。'.format(
                 DEFAULT_COLLISION_VERIFY_TOLERANCE))
     parser.add_argument(
+        '--post-process-thre', type=float,
+        default=DEFAULT_POST_PROCESS_IK_THRE,
+        help='後処理判定 (solve_post_process) の腕タスクの位置収束閾値 '
+            '[m] (既定 {})。視線タスクの閾値には影響しない。厳しくすると '
+            '「掌に近づいているが数cmズレて見える」採用を減らせるが、'
+            'その分だけ後処理判定自体が失敗 (棄却) しやすくなる '
+            'トレードオフがある。'.format(DEFAULT_POST_PROCESS_IK_THRE))
+    parser.add_argument(
+        '--post-process-rthre', type=float,
+        default=math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE),
+        help='後処理判定 (solve_post_process) の腕タスクの姿勢収束閾値 '
+            '[deg] (既定 {:.1f})。視線タスクの閾値には影響しない。'
+            .format(math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE)))
+    parser.add_argument(
         '--base-x-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
         default=list(DEFAULT_BASE_X_RANGE),
         help='台車の前後方向 (x) の移動範囲 [m]。IK 開始時の台車位置を '
@@ -1878,7 +1908,9 @@ def main():
                 args.collision_joint_limit_margin),
             joint_positions=joint_positions,
             verification_pairs=verification_pairs,
-            collision_verify_tolerance=args.collision_verify_tolerance)
+            collision_verify_tolerance=args.collision_verify_tolerance,
+            post_process_thre=args.post_process_thre,
+            post_process_rthre=math.radians(args.post_process_rthre))
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, target_pos, rots[-1], base_limits,

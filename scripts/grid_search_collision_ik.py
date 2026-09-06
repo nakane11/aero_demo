@@ -6,8 +6,11 @@
 (``--collision-pairs``)・干渉回避付きバッチIKの最大反復回数
 (``--collision-ik-stop``)・台車の前後/左右可動域の半幅
 (``--base-x-half-range``/``--base-y-half-range``、yaw は solve_palm_ik.py
-の既定のまま固定)・バッチに載せる向き候補の数 (``--turn-candidates``) の
-全組み合わせについて、人物データセット
+の既定のまま固定)・バッチに載せる向き候補の数 (``--turn-candidates``)・
+後処理IK (押し込み・視線合わせ) の反復上限・腕タスクの収束閾値
+(``--post-process-ik-stop``/``--post-process-thre``/``--post-process-
+rthre``、視線タスクの閾値は変わらない) の全組み合わせについて、人物
+データセット
 (``--human-poses-dir``/``--palm-poses-dir``で明示的に指定しなければ、
 ``run_pipeline_test.py`` と同様に ``/tmp`` 以下に一時ディレクトリを作って
 生成する) で1人あたりの平均計算時間と成功率を **2段階** に分けて計測し、
@@ -27,6 +30,12 @@
     押し込みと、差し出している手を見る視線合わせを同時に解く) まで成功
     したかどうか。段階Aの候補で失敗すれば次の候補を試すため、段階Bの所要
     時間は段階A以上になる。
+
+    腕タスクの収束閾値 (``--post-process-thre``/``--post-process-rthre``)
+    が緩いと、「成功」と判定されても実際には掌目標と手先の位置がその
+    閾値の範囲内でズレたまま採用されることがある (view_handshake_poses.py
+    で視認できるレベル)。このズレを ``residual`` (後処理成功時の掌目標
+    との距離 [m]) として計測し、段階Bの成功率・時間とあわせて表示する。
 
 ``--collision-pairs`` に渡せる値:
     ``none``
@@ -136,13 +145,19 @@ def generate_dataset(python, human_dir, palm_dir, num_samples, seed):
 def pick_verified_candidate_timed(
         robot, success_flags, angle_vectors, base_poses,
         verification_pairs, joint_positions, collision_verify_tolerance,
-        robot_arm, palm, rots, attempts_per_pose, post_process_ik_stop):
+        robot_arm, palm, rots, attempts_per_pose, post_process_ik_stop,
+        post_process_thre=spi.DEFAULT_POST_PROCESS_IK_THRE,
+        post_process_rthre=spi.DEFAULT_POST_PROCESS_IK_RTHRE):
     """``solve_palm_ik.pick_verified_candidate`` と同じ選定ロジックだが、
     段階A(事後干渉検証を通過した最初の候補が見つかった時点)と
     段階B(関数が最終的にどの候補を採用するか確定する時点、つまり
     押し込み・視線のIKまで含めた結果が決まる時点)それぞれの累積時間・
     成功可否も記録して返す。ロジック自体 (収束 -> 事後検証 -> 後処理判定
     -> フォールバック) は元の関数と同一 -- 計測のための計装を追加しただけ。
+    ``post_process_thre``/``post_process_rthre`` は腕タスクの収束閾値
+    (視線タスクの閾値には影響しない、``solve_palm_ik.solve_post_process``
+    参照) で、成功した場合の残差 (``residual``、後述) がどう変わるかを
+    調べるためのグリッド軸。
 
     Returns
     -------
@@ -157,6 +172,10 @@ def pick_verified_candidate_timed(
         ``n_converged`` (収束した候補数)・``n_examined`` (実際に干渉検証
         まで見た候補数)・``verify_time`` (干渉検証の累積秒)・
         ``n_post_calls``/``post_time`` (後処理IKの回数と累積秒) も含む。
+        ``residual`` は後処理成功時の掌目標と実際の手先の距離 [m]
+        (``post_process_result`` の ``hand_position``/``target_position``
+        から計算、フォールバック採用時や失敗時は ``None`` -- 「後処理は
+        成功したと判定されたが、実際にはどれだけズレていたか」を見る)。
     """
     t_loop_start = time.time()
     stage_a_success = False
@@ -190,7 +209,8 @@ def pick_verified_candidate_timed(
         # 両方に同じ値を渡す必要がある (片方だけ下げても max に飲まれる)。
         post_result = spi.solve_post_process(
             robot, robot_arm, palm, rots[turn_index],
-            stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop)
+            stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop,
+            thre=post_process_thre, rthre=post_process_rthre)
         post_time += time.time() - t_post
         if post_result is not None:
             picked = (turn_index, angle_vectors[candidate_index],
@@ -203,12 +223,18 @@ def pick_verified_candidate_timed(
         picked = fallback
     stage_b_time = time.time() - t_loop_start
     stage_b_success = picked is not None and picked[3] is not None
+    residual = None
+    if stage_b_success:
+        post_result = picked[3]
+        residual = float(np.linalg.norm(
+            np.array(post_result['hand_position']) -
+            np.array(post_result['target_position'])))
     return picked, dict(
         stage_a_success=stage_a_success, stage_a_time=stage_a_time,
         stage_b_success=stage_b_success, stage_b_time=stage_b_time,
         n_converged=int(sum(1 for ok in success_flags if ok)),
         n_examined=n_examined, verify_time=verify_time,
-        n_post_calls=n_post_calls, post_time=post_time)
+        n_post_calls=n_post_calls, post_time=post_time, residual=residual)
 
 
 # ``--collision-pairs`` に指定できる特殊値。
@@ -248,7 +274,9 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
                          attempts_per_pose, collision_ik_stop,
                          pairs_label, collision_pairs, verification_pairs,
                          base_limits, self_collision, collision_link_list,
-                         n_turn_candidates, post_process_ik_stop):
+                         n_turn_candidates, post_process_ik_stop,
+                         post_process_thre=spi.DEFAULT_POST_PROCESS_IK_THRE,
+                         post_process_rthre=spi.DEFAULT_POST_PROCESS_IK_RTHRE):
     """1つのグリッド点 (attempts_per_pose x collision_ik_stop x
     collision_pairs設定 x 台車可動域 x 向き候補数) について全人物を解き、
     集計結果を返す。``n_turn_candidates`` は ``TURN_CANDIDATES_DEG`` の
@@ -275,6 +303,7 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
     sum_verify_time = 0.0
     sum_n_post_calls = 0
     sum_post_time = 0.0
+    residuals = []
 
     t_wall_start = time.time()
     for path in files:
@@ -365,7 +394,9 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
             effective_verification_pairs, joint_positions,
             spi.DEFAULT_COLLISION_VERIFY_TOLERANCE, robot_arm, palm, rots,
             attempts_per_pose,
-            post_process_ik_stop=post_process_ik_stop)
+            post_process_ik_stop=post_process_ik_stop,
+            post_process_thre=post_process_thre,
+            post_process_rthre=post_process_rthre)
 
         if timing['stage_a_success']:
             n_stage_a += 1
@@ -378,10 +409,13 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
         sum_verify_time += timing['verify_time']
         sum_n_post_calls += timing['n_post_calls']
         sum_post_time += timing['post_time']
+        if timing['residual'] is not None:
+            residuals.append(timing['residual'])
 
     wall_elapsed = time.time() - t_wall_start
     per_target = (lambda total: total / n_target if n_target
                   else float('nan'))
+    residuals_arr = np.array(residuals) if residuals else None
     return dict(
         n_target=n_target,
         wall_elapsed=wall_elapsed,
@@ -398,6 +432,12 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
         verify_time_per_person=per_target(sum_verify_time),
         post_calls_per_person=per_target(sum_n_post_calls),
         post_time_per_person=per_target(sum_post_time),
+        residual_mean=(float(residuals_arr.mean())
+                      if residuals_arr is not None else float('nan')),
+        residual_median=(float(np.median(residuals_arr))
+                         if residuals_arr is not None else float('nan')),
+        residual_max=(float(residuals_arr.max())
+                     if residuals_arr is not None else float('nan')),
     )
 
 
@@ -463,6 +503,18 @@ def main():
                 spi.DEFAULT_POST_PROCESS_IK_STOP,
                 spi.DEFAULT_POST_PROCESS_GAZE_IK_STOP))
     parser.add_argument(
+        '--post-process-thre', type=float, nargs='+',
+        default=[spi.DEFAULT_POST_PROCESS_IK_THRE],
+        help='後処理IK (solve_post_process) の腕タスクの位置収束閾値 '
+            '[m] (既定 {})。視線タスクの閾値には影響しない。'
+            .format(spi.DEFAULT_POST_PROCESS_IK_THRE))
+    parser.add_argument(
+        '--post-process-rthre', type=float, nargs='+',
+        default=[np.degrees(spi.DEFAULT_POST_PROCESS_IK_RTHRE)],
+        help='後処理IK (solve_post_process) の腕タスクの姿勢収束閾値 '
+            '[deg] (既定 {:.1f})。視線タスクの閾値には影響しない。'
+            .format(np.degrees(spi.DEFAULT_POST_PROCESS_IK_RTHRE)))
+    parser.add_argument(
         '--turn-candidates', type=int, nargs='+',
         default=[len(spi.TURN_CANDIDATES_DEG)],
         help='バッチに載せる目標姿勢の向き候補数 (TURN_CANDIDATES_DEG {} '
@@ -499,13 +551,14 @@ def main():
     combos = list(itertools.product(
         args.attempts_per_pose, args.collision_ik_stop, args.collision_pairs,
         args.base_y_half_range, args.base_x_half_range,
-        args.turn_candidates, args.post_process_ik_stop))
+        args.turn_candidates, args.post_process_ik_stop,
+        args.post_process_thre, args.post_process_rthre))
     print('[grid] {} 通りの組み合わせを、各ウォームアップ+本計測の2回で '
          '計測します。'.format(len(combos)))
 
     rows = []
     for (attempts, stop, pairs_label, base_y_half_range, base_x_half_range,
-         n_turns, post_stop) in combos:
+         n_turns, post_stop, post_thre, post_rthre_deg) in combos:
         base_limits = [(spi.HUMAN_FRONT_DISTANCE - base_x_half_range,
                        spi.HUMAN_FRONT_DISTANCE + base_x_half_range),
                       (-base_y_half_range, base_y_half_range),
@@ -514,11 +567,12 @@ def main():
             np.random.seed(args.seed)
         (collision_pairs, verification_pairs, n_pairs, self_collision,
          collision_link_list) = resolve_pairs_config(pairs_label, robot)
+        post_rthre = np.radians(post_rthre_deg)
         label = ('{}pairs_attempts{}_stop{}_xhalf{}_yhalf{}_turns{}'
-                '_poststop{}').format(
+                '_poststop{}_thre{}_rthre{}').format(
             pairs_label if pairs_label in (MODE_NONE, MODE_NONE_GD)
             else n_pairs, attempts, stop, base_x_half_range,
-            base_y_half_range, n_turns, post_stop)
+            base_y_half_range, n_turns, post_stop, post_thre, post_rthre_deg)
         print('\n=== {} ==='.format(label))
 
         # 1. ウォームアップ (使い捨て、JITコンパイルを消化するだけ)
@@ -526,7 +580,7 @@ def main():
             robot, args.palm_poses_dir, args.human_poses_dir,
             args.robot_arm, attempts, stop, pairs_label, collision_pairs,
             verification_pairs, base_limits, self_collision,
-            collision_link_list, n_turns, post_stop)
+            collision_link_list, n_turns, post_stop, post_thre, post_rthre)
         # 2. 本計測 (定常状態)
         if args.seed is not None:
             np.random.seed(args.seed)
@@ -534,14 +588,15 @@ def main():
             robot, args.palm_poses_dir, args.human_poses_dir,
             args.robot_arm, attempts, stop, pairs_label, collision_pairs,
             verification_pairs, base_limits, self_collision,
-            collision_link_list, n_turns, post_stop)
+            collision_link_list, n_turns, post_stop, post_thre, post_rthre)
 
         row = dict(
             label=label, attempts_per_pose=attempts,
             collision_ik_stop=stop, collision_pairs=pairs_label,
             n_pairs=n_pairs, base_y_half_range=base_y_half_range,
             base_x_half_range=base_x_half_range, turn_candidates=n_turns,
-            post_process_ik_stop=post_stop, **result)
+            post_process_ik_stop=post_stop, post_process_thre=post_thre,
+            post_process_rthre_deg=post_rthre_deg, **result)
         rows.append(row)
         print('  n_target={n_target} '
              'stageA(事後検証まで): 成功率={stage_a_success_rate:.1%} '
@@ -553,6 +608,9 @@ def main():
              '({examined_per_person:.1f}候補/収束{converged_per_person:.1f}) '
              '| 後処理IK={post_time_per_person:.4f}s '
              '({post_calls_per_person:.1f}回)'.format(**row))
+        print('    後処理成功時の残差(掌目標との距離): '
+             '平均{residual_mean:.4f}m 中央値{residual_median:.4f}m '
+             '最大{residual_max:.4f}m'.format(**row))
 
     print_ranking(rows)
 
@@ -576,24 +634,31 @@ def print_ranking(rows):
         print(
             '{:2d}位: attempts={:<3} stop={:<4} n_pairs={:<2} '
             'x_half={:<4} y_half={:<4} turns={} post_stop={:<4} '
+            'post_thre={:<7} post_rthre={:<5}deg '
             '| stageA 成功率={:.1%} 時間={:.4f}s/人 '
-            '| stageB 成功率={:.1%} 時間={:.4f}s/人'.format(
+            '| stageB 成功率={:.1%} 時間={:.4f}s/人 '
+            '残差(中央値/最大)={:.4f}/{:.4f}m'.format(
                 rank, row['attempts_per_pose'], row['collision_ik_stop'],
                 row['n_pairs'], row['base_x_half_range'],
                 row['base_y_half_range'], row['turn_candidates'],
-                row['post_process_ik_stop'],
+                row['post_process_ik_stop'], row['post_process_thre'],
+                row['post_process_rthre_deg'],
                 row['stage_a_success_rate'], row['stage_a_time_per_person'],
-                row['stage_b_success_rate'], row['stage_b_time_per_person']))
+                row['stage_b_success_rate'], row['stage_b_time_per_person'],
+                row['residual_median'], row['residual_max']))
 
     best = ranked[0]
     print('\n[推奨] attempts={} stop={} pairs={} (n_pairs={}) x_half={} '
-         'y_half={} turns={} post_stop={}: '
-         'stageB 成功率={:.1%}・時間={:.4f}秒/人 (全構成中で最良)'.format(
+         'y_half={} turns={} post_stop={} post_thre={} post_rthre={}deg: '
+         'stageB 成功率={:.1%}・時間={:.4f}秒/人・'
+         '残差中央値={:.4f}m (全構成中で最良)'.format(
              best['attempts_per_pose'], best['collision_ik_stop'],
              best['collision_pairs'], best['n_pairs'],
              best['base_x_half_range'], best['base_y_half_range'],
              best['turn_candidates'], best['post_process_ik_stop'],
-             best['stage_b_success_rate'], best['stage_b_time_per_person']))
+             best['post_process_thre'], best['post_process_rthre_deg'],
+             best['stage_b_success_rate'], best['stage_b_time_per_person'],
+             best['residual_median']))
 
 
 if __name__ == '__main__':
