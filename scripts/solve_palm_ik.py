@@ -22,7 +22,8 @@ Aero は常にワールド原点・台車位置固定で IK を開始する (``s
 に来るようにしてから IK を解く (``human_translation_offset``/
 ``translate_joint_positions``/``translate_palm`` 参照)。台車の移動範囲は
 ``--base-x-range``/``--base-y-range``/``--base-yaw-range`` (既定はこの
-立ち位置を中心とした ``BASE_MOVABLE_HALF_RANGE`` m の正方形) で指定する。
+立ち位置を中心とした前後 ``BASE_X_MOVABLE_HALF_RANGE`` m・左右
+``BASE_Y_MOVABLE_HALF_RANGE`` m の矩形) で指定する。
 
 人体を障害物とした干渉回避も行う。``--skeleton-dir`` から人物ごとの全身の
 関節位置を読み、体幹・頭部・四肢 (差し出している側の腕・手も含めて全身)
@@ -173,32 +174,47 @@ DEFAULT_ROBOT_ARM = {'L': 'r', 'R': 'l'}
 # 現実的な距離でもある。
 HUMAN_FRONT_DISTANCE = 3.0  # [m]
 
-# 台車の既定の移動可能領域の半幅 (人物の立ち位置を中心とした前後左右の
-# 距離)。人物は常に (``HUMAN_FRONT_DISTANCE``, 0) に固定されるので、
-# ``DEFAULT_BASE_X_RANGE``/``DEFAULT_BASE_Y_RANGE`` はこの値からそのまま
-# 計算できる。
-BASE_MOVABLE_HALF_RANGE = 5.0  # [m]
+# 台車の既定の移動可能領域の半幅 (人物の立ち位置を中心とした前後・左右
+# それぞれの距離)。人物は常に (``HUMAN_FRONT_DISTANCE``, 0) に固定される
+# ので、``DEFAULT_BASE_X_RANGE``/``DEFAULT_BASE_Y_RANGE`` はこの値から
+# そのまま計算できる。前後・左右とも grid_search_collision_ik.py で
+# 2〜5m を比較した結果、半幅5mのままだと (後述の DEFAULT_COLLISION_IK_
+# STOP を減らした低反復回数では特に) 乱数初期値が有効域に対して薄まり
+# 成功率が下がるため、3mに絞っている。
+BASE_X_MOVABLE_HALF_RANGE = 3.0  # [m]
+BASE_Y_MOVABLE_HALF_RANGE = 3.0  # [m]
 
 # 台車 (use_base='planar' の仮想関節) の既定の移動範囲。IK 開始時の台車
 # 位置 (常にワールド原点, ``seed_arm_pose`` 参照) を基準にした [x, y, yaw]
 # の (下限, 上限)。乱数初期値もこの範囲から引かれる。人物の立ち位置
-# (``HUMAN_FRONT_DISTANCE``, 0) を中心に前後左右 ``BASE_MOVABLE_HALF_
-# RANGE`` m の正方形にしてある。
-DEFAULT_BASE_X_RANGE = (HUMAN_FRONT_DISTANCE - BASE_MOVABLE_HALF_RANGE,
-                        HUMAN_FRONT_DISTANCE + BASE_MOVABLE_HALF_RANGE)
-DEFAULT_BASE_Y_RANGE = (-BASE_MOVABLE_HALF_RANGE, BASE_MOVABLE_HALF_RANGE)
+# (``HUMAN_FRONT_DISTANCE``, 0) を中心に前後 ``BASE_X_MOVABLE_HALF_RANGE``
+# m・左右 ``BASE_Y_MOVABLE_HALF_RANGE`` m の矩形にしてある。
+DEFAULT_BASE_X_RANGE = (HUMAN_FRONT_DISTANCE - BASE_X_MOVABLE_HALF_RANGE,
+                        HUMAN_FRONT_DISTANCE + BASE_X_MOVABLE_HALF_RANGE)
+DEFAULT_BASE_Y_RANGE = (-BASE_Y_MOVABLE_HALF_RANGE, BASE_Y_MOVABLE_HALF_RANGE)
 DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 
 # 1 目標姿勢あたりに振る初期値の数 (バッチ IK の attempts_per_pose)。
 # 初期値 0 は seed_arm_pose の種の姿勢 (台車はワールド原点)、残りは関節
 # 範囲・台車の可動範囲の一様乱数。初期値ごとの解は集約させずに全て受け取る
 # (``return_all_attempts``。``solve_person_ik`` 参照)。
-DEFAULT_ATTEMPTS_PER_POSE = 64
+#
+# GPU (JAX の 'gradient_descent' backend) はバッチをまとめて並列に解く
+# ため、attempts_per_pose を増やしても GPU の空き並列度に吸収され
+# 実行時間はほぼ増えない (grid_search_collision_ik.py での実測: RTX 5090
+# 上で attempts=64→256 は+2.5倍の計算量で+40%程度の時間増にとどまる。
+# ただし512以降は徐々に GPU が飽和し比例に近づく)。収束する候補の絶対数が
+# 増えることで、下記の DEFAULT_COLLISION_IK_STOP を大きく減らしても
+# 成功率100%を維持できる (500人でのグリッドサーチで確認済み)。
+DEFAULT_ATTEMPTS_PER_POSE = 512
 
 # 干渉回避 (collision_obstacles) 付きバッチ IK の収束判定。勾配降下法は
 # 通常のヤコビアン法より収束が遅いため、既定よりも反復回数を増やし閾値を
-# ゆるめている。
-DEFAULT_COLLISION_IK_STOP = 500
+# ゆるめている。1人あたりの計算時間はほぼこの反復回数に比例するため、
+# 上記の DEFAULT_ATTEMPTS_PER_POSE を増やして収束機会を確保した上でこの
+# 値を下げている (500人でのグリッドサーチで成功率100%・
+# 0.25秒/人程度まで短縮を確認)。
+DEFAULT_COLLISION_IK_STOP = 80
 DEFAULT_COLLISION_IK_THRE = 0.03  # [m]
 DEFAULT_COLLISION_IK_RTHRE = math.radians(8.0)  # [rad]
 
@@ -224,8 +240,17 @@ POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
 # 後処理判定の腕 IK (通常のヤコビアン法, 干渉回避なし・台車なし) の最大
 # 反復回数。干渉回避付きバッチ IK が採用した姿勢からの微小な追い込みなので
-# 収束は速いはずだが、余裕を持った値にしておく。
-DEFAULT_POST_PROCESS_IK_STOP = 200
+# 収束は速いはずだが、余裕を持った値にしておく……はずだったが、
+# ``solve_post_process`` は腕と視線を1つのループで一緒に反復し実効上限は
+# 下記 ``DEFAULT_POST_PROCESS_GAZE_IK_STOP`` との max になるため、この値
+# 単体を下げても (300 に飲まれて) 効果が無かった。実際には失敗する候補
+# ほど反復上限を使い切ってから次の候補に移るため、事後検証を通った
+# 候補の robot.inverse_kinematics 呼び出し自体が1人あたりの計算時間の
+# 過半を占めていた (500人でのグリッドサーチで実測)。収束閾値
+# (``DEFAULT_POST_PROCESS_IK_THRE``/``..._RTHRE``) は変えず、単に
+# 「収束が遅い候補を早く見切って次の候補を試す」ようにするため、
+# ``DEFAULT_POST_PROCESS_GAZE_IK_STOP`` と揃えて両方40まで下げている。
+DEFAULT_POST_PROCESS_IK_STOP = 40
 
 # 後処理判定の腕 IK の収束閾値 (位置[m]/姿勢[rad])。干渉回避付きバッチ IK
 # (事前段階) 自体が ``DEFAULT_COLLISION_IK_THRE``/``DEFAULT_COLLISION_IK_
@@ -246,8 +271,11 @@ DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 # ``solve_post_process`` と同じく合否ではなくラフな確認なので、
 # ``look_at`` を経由せず ``robot.inverse_kinematics`` (腕の押し付け目標と
 # 同じ呼び出しに ``move_target``/``target_coords`` 等をリストで渡す) を
-# 直接使い、反復回数・閾値をここで明示的に緩める。
-DEFAULT_POST_PROCESS_GAZE_IK_STOP = 300
+# 直接使い、反復回数・閾値をここで明示的に緩める。腕・視線は1つのループ
+# で一緒に反復され実効上限は max(DEFAULT_POST_PROCESS_IK_STOP, これ) に
+# なるため、上と揃えてこちらも40まで下げている (500人でのグリッド
+# サーチで成功率100%を維持できることを確認済み)。
+DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 肘関節 (``{r,l}_elbow_joint``) の可動域制限 [deg]。この関節は 0 度が
@@ -1306,7 +1334,8 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     Returns
     -------
     tuple
-        ``(picked, collision_ik_time)``。``picked`` は
+        ``(picked, collision_ik_time, candidate_selection_time)``。
+        ``picked`` は
         ``(turn_index, angle_vector, base_pose, post_process_result)``
         または ``None`` -- 「向き (``TURN_CANDIDATES_DEG``) × 初期値
         (``attempts_per_pose``)」の全候補の中で最初 (向きが早い順、同じ
@@ -1319,6 +1348,12 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         採用する。収束・事後の干渉検証すら満たす候補が 1 つも無ければ
         ``None``。``collision_ik_time`` は干渉回避付きバッチ IK
         (``batch_inverse_kinematics`` の呼び出し) 自体の計算時間 [秒]。
+        ``candidate_selection_time`` は ``pick_verified_candidate`` の
+        呼び出し全体の計算時間 [秒] -- 事後の干渉検証と、棄却された候補も
+        含めた全ての後処理判定 (``solve_post_process``) 呼び出しの合計。
+        ``post_process_result['compute_time']`` (採用された最後の 1 回
+        分だけ) より、この値の方が「2 段階目に実際にかかった時間」を
+        表す (``run_pipeline_test.py`` の集計で使う)。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -1382,12 +1417,14 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
         effective_verification_pairs = [
             (link_a, other) for link_a, other in verification_pairs
             if not isinstance(other, int)]
+    candidate_selection_start = time.time()
     picked = pick_verified_candidate(
         robot, success_flags, angle_vectors, base_poses,
         effective_verification_pairs, joint_positions,
         collision_verify_tolerance, robot_arm, palm, rots,
         attempts_per_pose=attempts_per_pose)
-    return picked, collision_ik_time
+    candidate_selection_time = time.time() - candidate_selection_start
+    return picked, collision_ik_time, candidate_selection_time
 
 
 def base_movable_region(base_limits):
@@ -1409,7 +1446,7 @@ def base_movable_region(base_limits):
 
 def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
                   angle_vector, base_pose, base_limits, post_process_result,
-                  collision_ik_time):
+                  collision_ik_time, candidate_selection_time):
     """採用した解をロボットに反映し、結果 dict を組む.
 
     バッチ IK はロボットを動かさないので、``angle_vector`` と
@@ -1423,9 +1460,13 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
     そのまま格納する。``view_handshake_poses.py`` はこの 2 つを切り替えて
     表示する。
 
-    ``collision_ik_time`` (``solve_person_ik`` が計測した干渉回避付き
-    バッチ IK 自体の計算時間 [秒]) はそのまま ``collision_ik_time`` キーに
-    格納する (``run_pipeline_test.py`` が平均計算時間の集計に使う)。
+    ``collision_ik_time``/``candidate_selection_time`` (``solve_person_ik``
+    が計測した干渉回避付きバッチ IK・候補選定ループそれぞれの計算時間
+    [秒]) はそのまま同名のキーに格納する (``run_pipeline_test.py`` が
+    平均計算時間の集計に使う)。``post_process_result['compute_time']`` は
+    採用された最後の 1 回の後処理判定だけの時間なので、棄却された候補の
+    後処理判定・事後の干渉検証を含む実質的な「2 段階目」の時間は
+    ``candidate_selection_time`` の方を使うこと。
     """
     robot.angle_vector(angle_vector)
     robot.newcoords(base_pose)
@@ -1445,18 +1486,24 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
         collision_ik_time=collision_ik_time,
+        candidate_selection_time=candidate_selection_time,
     )
     result['post_process'] = post_process_result
     return result
 
 
-def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits):
+def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
+                    collision_ik_time, candidate_selection_time):
     """どの候補も解けなかった人物のための結果 dict.
 
     逐次版が ``revert_if_fail=True`` で種の姿勢に戻してから結果を読んで
     いたのと同じになるよう、種の姿勢 (台車は ``solve_person_ik`` と同じく
     ワールド原点) を反映してから手先・台車の姿勢を読む。``turn_deg``/
     ``target_rot`` も逐次版と同じく最後に試した候補のものにする。
+
+    ``collision_ik_time``/``candidate_selection_time`` は ``solved_result``
+    と同じ意味 (どの候補も条件を満たさなかった場合でも、バッチ IK・候補
+    選定ループ自体は最後まで走っているので計算時間の集計に含める)。
     """
     seed_arm_pose(robot, robot_arm)
     hand_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
@@ -1474,6 +1521,8 @@ def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits):
         base_movable_region=base_movable_region(base_limits),
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
+        collision_ik_time=collision_ik_time,
+        candidate_selection_time=candidate_selection_time,
     )
 
 
@@ -1812,7 +1861,7 @@ def main():
 
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, robot_arm)
-        picked, collision_ik_time = solve_person_ik(
+        picked, collision_ik_time, candidate_selection_time = solve_person_ik(
             robot, palm, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
             base_limits=base_limits,
@@ -1831,15 +1880,17 @@ def main():
             verification_pairs=verification_pairs,
             collision_verify_tolerance=args.collision_verify_tolerance)
         if picked is None:
-            result = unsolved_result(robot, robot_arm, target_pos, rots[-1],
-                                     base_limits)
+            result = unsolved_result(
+                robot, robot_arm, target_pos, rots[-1], base_limits,
+                collision_ik_time, candidate_selection_time)
         else:
             turn_index, angle_vector, base_pose, post_process_result \
                 = picked
             result = solved_result(
                 robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose,
-                base_limits, post_process_result, collision_ik_time)
+                base_limits, post_process_result, collision_ik_time,
+                candidate_selection_time)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1

@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
@@ -33,21 +34,24 @@ from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 
 
 def run_step(label, script_name, extra_args):
-    """``script_name`` を子プロセスで実行する。
+    """``script_name`` を子プロセスで実行し、壁時計時間 [秒] を返す。
 
     人物ごとの進捗行など生の標準出力はそのまま流さず捕捉するだけにし、
     失敗したとき (exit code != 0) だけ末尾を表示してから中断する。
     """
     print('[{}] 実行中...'.format(label))
     script_path = os.path.join(_THIS_DIR, script_name)
+    t0 = time.time()
     result = subprocess.run(
         [sys.executable, script_path] + extra_args, cwd=_THIS_DIR,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    elapsed = time.time() - t0
     if result.returncode != 0:
         print(result.stdout[-4000:])
         print('[{}] {} が exit code {} で失敗しました。'.format(
             label, script_name, result.returncode))
         sys.exit(1)
+    return elapsed
 
 
 def load_json_files(directory):
@@ -67,31 +71,53 @@ def summarize_palms(palm_dir):
 
 
 def summarize_handshakes(handshake_dir):
+    """``solve_palm_ik.py`` の出力 JSON を集計する。
+
+    ``collision_ik_time``/``candidate_selection_time`` は IK 対象になった
+    人物 (``target: true``) なら solved/unsolved を問わず必ず記録される
+    (``solve_palm_ik.solved_result``/``unsolved_result`` 参照)。
+    ``candidate_selection_time`` は事後の干渉検証と、棄却された候補も
+    含めた全ての後処理判定 (``solve_post_process``) 呼び出しの合計であり、
+    これが「実質的な IK 2 段階目」の時間になる -- ``post_process``
+    キー配下の ``compute_time`` は採用された最後の 1 回分だけなので、
+    棄却された候補の後処理判定・事後の干渉検証の時間を含まず過小評価に
+    なる (この関数では参考として別途集計するに留める)。
+    """
     n_total = n_target = n_solved = n_post_process = 0
     collision_ik_times = []
-    post_process_times = []
+    candidate_selection_times = []
+    post_process_last_call_times = []
     for _, data in load_json_files(handshake_dir):
         n_total += 1
         if not data.get('target'):
             continue
         n_target += 1
+        if data.get('collision_ik_time') is not None:
+            collision_ik_times.append(data['collision_ik_time'])
+        if data.get('candidate_selection_time') is not None:
+            candidate_selection_times.append(data['candidate_selection_time'])
         if data.get('solved'):
             n_solved += 1
-            if data.get('collision_ik_time') is not None:
-                collision_ik_times.append(data['collision_ik_time'])
             post_process = data.get('post_process')
             if post_process is not None:
                 n_post_process += 1
                 if post_process.get('compute_time') is not None:
-                    post_process_times.append(post_process['compute_time'])
-    return dict(n_total=n_total, n_target=n_target, n_solved=n_solved,
-               n_post_process=n_post_process,
-               avg_collision_ik_time=(
-                   sum(collision_ik_times) / len(collision_ik_times)
-                   if collision_ik_times else None),
-               avg_post_process_time=(
-                   sum(post_process_times) / len(post_process_times)
-                   if post_process_times else None))
+                    post_process_last_call_times.append(
+                        post_process['compute_time'])
+
+    def avg(values):
+        return sum(values) / len(values) if values else None
+
+    return dict(
+        n_total=n_total, n_target=n_target, n_solved=n_solved,
+        n_post_process=n_post_process,
+        avg_collision_ik_time=avg(collision_ik_times),
+        avg_candidate_selection_time=avg(candidate_selection_times),
+        avg_post_process_last_call_time=avg(post_process_last_call_times),
+        avg_total_ik_time=avg([
+            c + s for c, s in zip(collision_ik_times,
+                                  candidate_selection_times)]),
+    )
 
 
 def main():
@@ -131,8 +157,9 @@ def main():
           '({})'.format(n_generated, skeleton_dir))
 
     # 2. estimate_palm_poses.py
-    run_step('2/5', 'estimate_palm_poses.py',
-             ['--input-dir', skeleton_dir, '--output-dir', palm_dir])
+    palm_elapsed = run_step(
+        '2/5', 'estimate_palm_poses.py',
+        ['--input-dir', skeleton_dir, '--output-dir', palm_dir])
     n_palms, offered = summarize_palms(palm_dir)
     print('[2/5] estimate_palm_poses.py: 掌の位置姿勢 JSON を {} 件推定 '
           '(offered_hand: R={}, L={}, null={})'.format(
@@ -140,7 +167,7 @@ def main():
               offered.get(None, 0)))
 
     # 4. solve_palm_ik.py
-    run_step('4/5', 'solve_palm_ik.py', [
+    ik_elapsed = run_step('4/5', 'solve_palm_ik.py', [
         '--input-dir', palm_dir, '--output-dir', handshake_dir,
         '--skeleton-dir', skeleton_dir])
     summary = summarize_handshakes(handshake_dir)
@@ -155,13 +182,41 @@ def main():
     print('干渉回避まで解けた人数 (solved): {} / {}'.format(
         summary['n_solved'], n_generated))
     if summary['avg_collision_ik_time'] is not None:
-        print('  干渉回避 IK の平均計算時間: {:.2f} 秒'.format(
+        print('  干渉回避 IK (1段階目) の平均計算時間: {:.2f} 秒'.format(
             summary['avg_collision_ik_time']))
     print('後処理まで含めて成功した人数: {} / {}'.format(
         summary['n_post_process'], n_generated))
-    if summary['avg_post_process_time'] is not None:
-        print('  後処理の平均計算時間: {:.2f} 秒'.format(
-            summary['avg_post_process_time']))
+    if summary['avg_candidate_selection_time'] is not None:
+        print('  実質的な後処理 (2段階目: 事後の干渉検証+棄却された候補'
+              '分も含む全後処理判定) の平均計算時間: {:.2f} 秒'.format(
+                  summary['avg_candidate_selection_time']))
+    if summary['avg_post_process_last_call_time'] is not None:
+        print('  (参考: 採用された最後の後処理判定 1 回分だけの平均計算'
+              '時間: {:.2f} 秒 -- 棄却された候補の分は含まないため'
+              '過小評価)'.format(summary['avg_post_process_last_call_time']))
+
+    print()
+    print('=== 1人あたりの平均計算時間 (壁時計、骨格 {} 人分) ==='.format(
+        n_generated))
+    print('  掌推定 (estimate_palm_poses.py): {:.3f} 秒/人'.format(
+        palm_elapsed / n_generated))
+    if summary['avg_collision_ik_time'] is not None:
+        print('  IK 1段階目 (干渉回避バッチIK, IK対象 {} 人平均): '
+              '{:.3f} 秒/人'.format(
+                  summary['n_target'], summary['avg_collision_ik_time']))
+    if summary['avg_candidate_selection_time'] is not None:
+        print('  IK 2段階目 (事後の干渉検証+全後処理判定, IK対象 {} 人'
+              '平均): {:.3f} 秒/人'.format(
+                  summary['n_target'],
+                  summary['avg_candidate_selection_time']))
+    if summary['avg_total_ik_time'] is not None:
+        print('  実質的な IK 時間 (1+2段階目, IK対象 {} 人平均): '
+              '{:.3f} 秒/人'.format(
+                  summary['n_target'], summary['avg_total_ik_time']))
+    print('  骨格を受け取ってから最後まで (掌推定+IKを {} 人分まとめて '
+          '実行した壁時計時間の総和 / 骨格 {} 人): {:.3f} 秒/人'.format(
+              n_generated, n_generated,
+              (palm_elapsed + ik_elapsed) / n_generated))
 
     # 5. view_handshake_poses.py (--viewer のときだけ実際に起動する)
     if args.viewer:
