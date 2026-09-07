@@ -2,35 +2,44 @@
 # -*- coding:utf-8 -*-
 
 """``collision_pairs.json`` (``solve_palm_ik.py --collision-pairs`` に
-渡す、干渉回避で実際にチェックするリンクの組み合わせの JSON) を、事前に
-別途作った分析結果 JSON を介さずに、以下の手順を自動で繰り返して作る。
+渡す、干渉回避で実際にチェックするリンクの組み合わせの JSON) を、以下の
+手順で自動的に作る。
 
 1. ``generate_random_human_poses.py`` で人物 (既定 100 人) を生成する。
 2. ``estimate_palm_poses.py`` で各人物の掌の位置姿勢を推定する。
-3. 干渉回避無し (``solve_palm_ik.py --no-human-collision`` 相当。
-   ``--collision-pairs`` に存在しないパスを渡すことで自己干渉・人体との
-   干渉の両方を無効にする) で全員の IK を解く。
-4. 3. (または直前の反復) の結果 (``analyze_collision_pairs.
-   analyze_handshake_dir``) を集計し、実際に (指定した距離未満まで)
-   近づいた -- 干渉した -- リンクの組み合わせの候補のうち、まだ
-   ``collision_pairs.json`` に無く、かつ最も多くの人数で干渉した
-   組み合わせを 1 つだけ選んで追加する (一度に全候補を追加するのではなく
-   1 反復 1 組ずつ)。
-5. 4. で更新した ``collision_pairs.json`` を使って全員の IK を解き直し、
-   その所要時間を (掌が見つからず IK 対象外だった人物を除いた) 人数で
-   割った「1 人あたりの IK 計算時間」を測る。この時間が ``--max-ik-
-   seconds-per-person`` を超えた場合はここで終了する。超えていなければ
-   5. の結果を 4. に戻して繰り返す。新たな干渉ペアの候補が見つからなく
-   なった場合もそこで終了する (収束)。
+3. 干渉回避無し (``solve_palm_ik.py --collision-pairs`` に存在しない
+   パスを渡すことで自己干渉・人体との干渉の両方と、事後の干渉検証を
+   まとめて無効にする) で全員の IK を 1 回だけ解く。
+4. 3. の結果 (``analyze_collision_pairs.analyze_handshake_dir``) を
+   集計し、実際に (指定した距離未満まで) 近づいた -- 干渉した --
+   リンクの組み合わせを、干渉した人数が多い順に並べたランキングを作る。
+5. このランキングの上位 ``--num-pairs`` 組をそのまま ``collision_pairs.
+   json`` として書き出す。``--max-ik-seconds-per-person`` を指定した
+   場合は、代わりにランキングの先頭から 1・2・3... 組と増やしながら
+   干渉回避ありで実際に IK を解き直し (``solve_palm_ik.py`` の通常の
+   フルパイプライン、事後検証・後処理を含む)、1 人あたりの平均計算時間が
+   指定秒数を超えた直前の組数を採用する。
+
+この手順は「干渉回避を全く行わない解に、実際にどのリンクの組み合わせが
+どれだけの頻度で干渉するか」という一度きりの統計だけでランキングを作る
+(以前のバージョンにあった「1 組追加するたびに干渉回避ありで解き直して
+統計を取り直す」反復はしない)。かつて反復方式だったのは、干渉回避 IK を
+一度でも有効にすると事後の干渉検証 (``pick_verified_candidate``) が総
+当たりで効き、``attempts_per_pose`` を大きくした設定では 1 組追加した
+だけで採用される解が軒並みクリーンになってしまい、統計がすぐ「もう干渉
+していない」と誤認して 1 組で収束してしまう問題があったため。干渉回避
+無しの解 (事後検証もしていない、生の頻度) を一度だけ集計してランキング
+する今の方式は、この問題を避けつつ、より単純かつ (実測で) 実行時間・
+成功率の両面でより良いペア集合を作れることを確認している。
 
 ``solve_palm_ik.py`` は「``--collision-pairs`` に指定した JSON が存在
-しなければ、自己干渉・人体との干渉の両方を無効にする」という仕様
-(``solve_palm_ik.load_collision_pairs`` 呼び出し部分参照) を利用して、
-3. の「干渉回避無し」を実現している。
+しなければ、自己干渉・人体との干渉の両方と事後の干渉検証を無効にする」
+という仕様 (``solve_palm_ik.load_collision_pairs`` 呼び出し部分参照) を
+利用して、3. の「干渉回避無し」を実現している。
 
 Usage
 -----
-    python3 build_collision_pairs.py
+    python3 build_collision_pairs.py --num-pairs 8
 
 既存の (README 記載の) パイプラインと同じ既定ディレクトリ
 (``random_human_poses/``/``random_palm_poses/``) を使い、``solve_palm_
@@ -102,6 +111,19 @@ def find_collision_candidates(handshake_dir, skeleton_dir,
     return counts
 
 
+def rank_collision_candidates(handshake_dir, skeleton_dir,
+                              human_front_distance, dist_threshold,
+                              exclude=()):
+    """``find_collision_candidates`` の結果を、干渉した人数が多い順に
+    並べた ``[(名前A, 名前B), ...]`` のリストにして返す (``exclude`` に
+    含まれる組み合わせは除く)。同数の場合はタプルの辞書順で安定させる。"""
+    candidates = find_collision_candidates(
+        handshake_dir, skeleton_dir, human_front_distance, dist_threshold)
+    candidates = {pair: count for pair, count in candidates.items()
+                 if pair not in exclude}
+    return sorted(candidates, key=lambda pair: (-candidates[pair], pair))
+
+
 def run(cmd):
     """``cmd`` を実行する。呼び出し先 (generate_random_human_poses.py/
     estimate_palm_poses.py/solve_palm_ik.py) が標準出力に print した文字列
@@ -140,10 +162,10 @@ def timed_solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='人物生成 -> 掌推定 -> 干渉回避無しの IK -> 最も多くの '
-                    '人数で干渉したリンクの組み合わせを 1 組ずつ追加 -> '
-                    '干渉回避ありの IK による再抽出 (収束するか、1 人あたり '
-                    'の IK 計算時間が上限を超えるまで反復) を自動で行い、'
+        description='人物生成 -> 掌推定 -> 干渉回避無しの IK を 1 回解いて '
+                    '干渉したリンクの組み合わせを頻度順にランキング -> '
+                    '上位 --num-pairs 組 (または --max-ik-seconds-per-'
+                    'person を満たす組数) を採用、を自動で行い、'
                     'collision_pairs.json (solve_palm_ik.py --collision-'
                     'pairs 用) を作る。')
     parser.add_argument(
@@ -165,15 +187,15 @@ def main():
     parser.add_argument(
         '--handshake-dir', type=str, default=None,
         help='solve_palm_ik.py の出力ディレクトリ (既定は一時ディレクトリ '
-            'を自動作成し、プログラム終了時に削除する。反復のたびに上書き '
-            'される。明示的にパスを指定した場合は終了時に削除されない)。')
+            'を自動作成し、プログラム終了時に削除する。既定動作 (手順3) '
+            'の出力に使い、``--max-ik-seconds-per-person`` 指定時は組数を '
+            '変えて解き直すたびに上書きされる。明示的にパスを指定した '
+            '場合は終了時に削除されない)。')
     parser.add_argument(
         '--output', type=str,
         default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
         help='書き出す干渉ペア JSON のパス (既定 collision_pairs.json。'
-            'solve_palm_ik.py --collision-pairs の既定パスと同じ)。既に '
-            'このファイルがあれば、そこに含まれる組み合わせから続きを '
-            '積み上げる。')
+            'solve_palm_ik.py --collision-pairs の既定パスと同じ)。')
     parser.add_argument(
         '--skip-generate', action='store_true',
         help='手順 1・2 (人物生成・掌推定) を省略し、既存の --human-poses-'
@@ -181,16 +203,19 @@ def main():
     parser.add_argument(
         '--collision-dist-threshold', type=float, default=0.0,
         help='この距離 [m] 未満まで近づいた組み合わせを「干渉した」と '
-            'みなして collision_pairs.json に追加する (既定 0.0 = 実際に '
-            '干渉用メッシュ同士がめり込んだ組み合わせのみ)。')
-    parser.add_argument(
-        '--max-ik-seconds-per-person', type=float, required=True,
-        help='干渉ペアを 1 組追加するたびに干渉回避ありで IK を解き直し、'
-            'その所要時間を (掌が見つからず IK 対象外だった人物を除いた) '
-            '人数で割った「1 人あたりの IK 計算時間」を測る。干渉ペアが '
-            '増えてこの時間 [秒] を超えたら、そこで反復を終了する (新たな '
-            '干渉ペアの候補が見つからなくなった場合はそれより前に収束して '
-            '終了する)。')
+            'みなしてランキングに使う (既定 0.0 = 実際に干渉用メッシュ '
+            '同士がめり込んだ組み合わせのみ)。')
+    count_group = parser.add_mutually_exclusive_group(required=True)
+    count_group.add_argument(
+        '--num-pairs', type=int,
+        help='干渉頻度ランキングの上位何組を採用するか。')
+    count_group.add_argument(
+        '--max-ik-seconds-per-person', type=float,
+        help='ランキングの上位から 1・2・3... 組と増やしながら干渉回避 '
+            'ありで実際に IK を解き直し (フルパイプライン、事後検証・'
+            '後処理を含む)、1 人あたりの平均計算時間がこの秒数を超えた '
+            '直前の組数を採用する (ランキングを使い切っても超えなければ '
+            '全組を採用する)。')
     parser.add_argument(
         '--human-front-distance', type=float, default=HUMAN_FRONT_DISTANCE,
         help='solve_palm_ik.py に渡すのと同じ --human-front-distance '
@@ -231,6 +256,7 @@ def main():
                 temp_dir, 'random_handshake_poses')
         nonexistent_collision_pairs = os.path.join(
             temp_dir, 'no_collision_pairs.json')
+        candidate_output = os.path.join(temp_dir, 'candidate_pairs.json')
 
         if not args.skip_generate:
             run([args.python,
@@ -241,11 +267,6 @@ def main():
                 os.path.join(_THIS_DIR, 'estimate_palm_poses.py'),
                 '--input-dir', args.human_poses_dir,
                 '--output-dir', args.palm_poses_dir])
-
-        pairs = load_pairs(args.output)
-        if pairs:
-            print('{} から既存の干渉ペア {} 組を読み込みました。'.format(
-                args.output, len(pairs)))
 
         n_people = len(
             glob.glob(os.path.join(args.palm_poses_dir, '*.json')))
@@ -270,31 +291,33 @@ def main():
                   'あたりの IK 計算時間の母数は {} 人とします。'.format(
                       n_people, n_people - n_ik_people, n_ik_people))
 
-        iteration = 0
-        while True:
-            iteration_start = time.time()
-            candidates = find_collision_candidates(
-                args.handshake_dir, args.human_poses_dir,
-                args.human_front_distance, args.collision_dist_threshold)
-            candidates = {key: count for key, count in candidates.items()
-                         if key not in pairs}
-            if not candidates:
-                print('\n新たな干渉ペアの候補が見つかりませんでした。収束'
-                      'したので終了します。')
-                break
+        print('\n=== 手順 4: 干渉頻度をランキング ===')
+        ranking = rank_collision_candidates(
+            args.handshake_dir, args.human_poses_dir,
+            args.human_front_distance, args.collision_dist_threshold)
+        if not ranking:
+            print('干渉した組み合わせが見つかりませんでした。')
+            sys.exit(1)
+        print('干渉頻度の高い順に {} 組の候補が見つかりました (上位10件):'
+             .format(len(ranking)))
+        candidates_dict = find_collision_candidates(
+            args.handshake_dir, args.human_poses_dir,
+            args.human_front_distance, args.collision_dist_threshold)
+        for pair in ranking[:10]:
+            print('  {} ({} / {} 人で干渉)'.format(
+                pair, candidates_dict[pair], n_ik_people))
 
-            iteration += 1
-            best_pair = max(candidates, key=lambda key: candidates[key])
-            best_count = candidates[best_pair]
-            pairs.add(best_pair)
+        print('\n=== 手順 5: 採用する組数を決定 ===')
+        if args.num_pairs is not None:
+            if args.num_pairs > len(ranking):
+                print('警告: --num-pairs ({}) がランキングの候補数 ({}) を '
+                      '超えているため、候補数だけ採用します。'.format(
+                          args.num_pairs, len(ranking)))
+            pairs = set(ranking[:args.num_pairs])
             save_pairs(pairs, args.output)
-            print('\n=== 反復 {}: 干渉ペアを 1 組追加 ==='.format(iteration))
-            print('新規 1 組を追加: {} ({} / {} 人で干渉) (合計 {} 組) -> {}'
-                 .format(best_pair, best_count, n_ik_people, len(pairs),
-                         args.output))
-
-            print('干渉回避ありで IK を解き直します (現在 {} 組)。'.format(
-                len(pairs)))
+            print('上位 {} 組を採用しました -> {}'.format(
+                len(pairs), args.output))
+            print('検証のため、この組数で干渉回避ありの IK を解き直します。')
             elapsed = timed_solve_ik(
                 args.python, args.human_poses_dir, args.palm_poses_dir,
                 args.handshake_dir, args.output, args.robot_arm, args.seed,
@@ -302,18 +325,31 @@ def main():
             per_person = elapsed / n_ik_people
             print('IK 計算時間: {:.2f} 秒 ({:.3f} 秒/人 x {} 人)。'.format(
                 elapsed, per_person, n_ik_people))
-
-            iteration_elapsed = time.time() - iteration_start
-            print('反復 {} の所要時間: {:.2f} 秒。'.format(
-                iteration, iteration_elapsed))
-            print('反復 {} 終了: 干渉ペア {} 個, 1 人あたり {:.3f} 秒。'
-                 .format(iteration, len(pairs), per_person))
-
-            if per_person > args.max_ik_seconds_per_person:
-                print('1 人あたりの IK 計算時間が上限 ({:.2f} 秒) を超えた '
-                      'ため終了します。'.format(
-                          args.max_ik_seconds_per_person))
-                break
+        else:
+            n_pairs = 0
+            per_person = None
+            for n_pairs in range(1, len(ranking) + 1):
+                pairs = set(ranking[:n_pairs])
+                save_pairs(pairs, candidate_output)
+                elapsed = timed_solve_ik(
+                    args.python, args.human_poses_dir, args.palm_poses_dir,
+                    args.handshake_dir, candidate_output, args.robot_arm,
+                    args.seed, args.solve_args)
+                per_person = elapsed / n_ik_people
+                print('{} 組: {:.2f} 秒 ({:.3f} 秒/人 x {} 人)。'.format(
+                    n_pairs, elapsed, per_person, n_ik_people))
+                if per_person > args.max_ik_seconds_per_person:
+                    print('1 人あたりの IK 計算時間が上限 ({:.2f} 秒) を '
+                         '超えたため、直前の {} 組を採用します。'.format(
+                             args.max_ik_seconds_per_person, n_pairs - 1))
+                    n_pairs -= 1
+                    break
+            else:
+                print('ランキングを全て試しても上限を超えませんでした。'
+                     '全 {} 組を採用します。'.format(n_pairs))
+            pairs = set(ranking[:n_pairs])
+            save_pairs(pairs, args.output)
+            print('{} 組を採用しました -> {}'.format(len(pairs), args.output))
 
         print('\n最終的な干渉ペア数: {} -> {}'.format(len(pairs), args.output))
     finally:

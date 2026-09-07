@@ -755,7 +755,14 @@ def main():
     current_handshake = [None]
 
     def set_link_visible(link, visible):
-        viewer._linkid_to_handle[str(id(link))].visible = visible
+        # 人物切り替え中のメインループがリンクを削除/再作成するのと
+        # チェックボックスの on_update (viser の GUI コールバックは別
+        # スレッドで実行される) が競合すると、既に削除されて
+        # viewer._linkid_to_handle に存在しないリンクを渡されることが
+        # ある。その場合は何もしない (どうせ表示すべき対象ではない)。
+        handle = viewer._linkid_to_handle.get(str(id(link)))
+        if handle is not None:
+            handle.visible = visible
 
     def refresh_robot_pose():
         """``current_handshake`` の内容を、``show_post_process_checkbox``

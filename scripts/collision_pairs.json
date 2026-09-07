@@ -1,66 +1,34 @@
 [
   [
-    "body_link",
-    "LShoulder-LElbow"
-  ],
-  [
-    "body_link",
-    "L_palm"
-  ],
-  [
-    "body_link",
-    "R_palm"
-  ],
-  [
-    "head_link",
-    "LElbow-LWrist"
-  ],
-  [
-    "head_link",
-    "L_middle"
-  ],
-  [
-    "head_link",
-    "RElbow-RWrist"
-  ],
-  [
-    "head_link",
-    "R_index"
-  ],
-  [
-    "l_forearm_link",
-    "RElbow-RWrist"
-  ],
-  [
-    "l_hand_link",
-    "R_palm"
-  ],
-  [
-    "l_hand_yaw_link",
-    "R_palm"
-  ],
-  [
     "l_shoulder_center",
     "Neck-RShoulder"
   ],
   [
     "l_shoulder_center",
-    "RElbow-RWrist"
+    "RShoulder-RElbow"
   ],
   [
     "l_upperarm_link",
-    "Neck-RHip"
+    "Neck-RShoulder"
   ],
   [
-    "leg_thigh_link",
-    "RHip-RKnee"
+    "l_upperarm_link",
+    "RShoulder-RElbow"
   ],
   [
-    "r_forearm_link",
-    "LElbow-LWrist"
+    "r_shoulder_center",
+    "LShoulder-LElbow"
   ],
   [
-    "waist_link",
-    "Neck-RHip"
+    "r_shoulder_center",
+    "Neck-LShoulder"
+  ],
+  [
+    "r_upperarm_link",
+    "LShoulder-LElbow"
+  ],
+  [
+    "r_upperarm_link",
+    "Neck-LShoulder"
   ]
 ]

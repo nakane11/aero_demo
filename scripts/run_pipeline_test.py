@@ -184,6 +184,8 @@ def main():
     print('  (1人を入力したときの所要時間の目安。掌推定は骨格 {} 人分 '
           'まとめて実行した壁時計時間を人数で割った値、IK 1/2段階目は '
           'IK対象 {} 人だけの平均。)'.format(n_generated, summary['n_target']))
+    if palm_time_per_person is not None:
+        print('  掌推定: {:.3f} 秒/人'.format(palm_time_per_person))
     if summary['avg_collision_ik_time'] is not None:
         print('  IK 1段階目 (干渉回避バッチIK): {:.3f} 秒/人'.format(
             summary['avg_collision_ik_time']))
