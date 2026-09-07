@@ -7,50 +7,37 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
 
 1. **`scripts/generate_random_human_poses.py`**
    SMPL（https://smpl.is.tue.mpg.de/）の体型・姿勢をランダムに生成し、
-   MediaPipe と同じ関節名の骨格 (手のランドマークを含む) を組み立てる。SMPLの
-   人モデル (`pose`/`betas`/`root_pos`/`gender`) と骨格 (`joint_positions`/
-   `height`) を 1 人分 1 ファイルの JSON として保存する。
+   MediaPipe と同じ関節名の骨格を組み立てる。SMPLの人モデルと骨格 
+   を 1 人分 1 ファイルの JSON として保存する。
 
 2. **`scripts/estimate_palm_poses.py`**
-   手順 1 の JSON (`joint_positions`) を入力とし、手のランドマークから
-   左右それぞれの掌の位置姿勢を推定してJSON として保存する。
+   手順 1 の JSON（骨格）を入力とし、手のランドマークから左右それぞれの掌の位置
+   姿勢を推定してJSON として保存する。
    あわせて、人がどちらの手を差し出しているかを `OfferedHandSelector`
    が判定し、`offered_hand` (`"R"` / `"L"` / `null`) として同じ JSON
-   に入れる (判定基準の詳細は `OfferedHandSelector` の docstring 参照)。
+   に入れる。
 
 3. **`scripts/draw_random_human_poses.py`**
-   手順 1・2 で生成した JSON を読み込み、SMPLの人体メッシュ・骨格・
-   左右の掌の座標系をビューアで表示する。`offered_hand` を読み、手繋ぎに
-   使うと判定された手を赤で描く。
+   手順 1・2 で生成した JSON を読み込み、SMPLの人体メッシュ・骨格・左右
+   の掌の座標系をビューアで表示する。手繋ぎに使うと判定された手を赤で描く。
 
 4. **`scripts/solve_palm_ik.py`**
    手順 2 の JSON (掌の位置姿勢) を入力とし、人間の手にロボットが触れる
-   全身 IK (台車の平面移動 `use_base='planar'` を含む) を
-   解いて、結果 (台車位置・全関節角・実際の手先姿勢) を JSON として保存
-   する。人体を近似した円柱を障害物とした干渉回避付き。ソフトな制約なので、
-   干渉のない解が必ず得られるとは限らない。
-   IK を解く対象は、手順 2 の `offered_hand` が `"L"`/`"R"` になった人物だけで、使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
-   干渉回避の障害物 (その人物の全身の関節位置) は `--skeleton-dir`
-   (既定は手順 1 の出力先と同じ `random_human_poses/`。`--input-dir` と
-   同じファイル名で対応づける) から読む。差し出している側の腕自体は
-   ロボットの手先目標のすぐそばにあるため、障害物からは除く。
-   IK は 1 人ずつ、`batch_inverse_kinematics` (複数初期値からの並列 IK) 
-   で解く。
-   `collision_obstacles` はバッチ呼び出し全体で 1 つの集合しか渡せない
-   ため、人数分だけ低速になる。干渉回避は
-   `backend='jax'` の勾配降下法でしか使えないため、バックエンドは
-   常に jax を使う。1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512、GPU
-   なら並列に解けるためこの数を増やしても計算時間はあまり増えない)。
-   初期値ごとの解は 1 つに集約せず、全て (向き 3 通り × 初期値の数) が
-   干渉検証・後処理判定に回され、最初に通ったものが採用される。干渉回避ペナルティの重み・
+   干渉回避付き全身 IK (台車移動 `use_base='planar'` を含む) を解いて、
+   結果 (台車位置・全関節角・実際の手先姿勢) を JSON として保存する。
+   ソフトな制約なので、干渉のない解が必ず得られるとは限らない。
+   IK に使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
+   IK は 1 人ずつ、複数初期値からの並列 IK で解く。
+   1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512、この数を
+   増やしても計算時間はあまり増えない)。
+   初期値ごとの解は全て (向き 3 通り × 初期値の数) が干渉検証・後処理判定に
+   回され、最初に通ったものが採用される。干渉回避ペナルティの重み・
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
 
 5. **`scripts/view_handshake_poses.py`**
-   手順 1 の骨格 JSON (SMPL の `pose`/`betas`/`root_pos`/`gender`) と、
-   手順 4 の IK 結果 JSON (`joint_angle_vector`/`base_position`/
-   `base_yaw`) を読み込み、SMPL の人体メッシュと
+   手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
    ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
 
 ```
@@ -135,14 +122,13 @@ pip install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入�
 
 ### 2. Aero の URDF
 
-`solve_palm_ik.py` は指の関節が要らないので `Aero(use_hand=False)` =
-`aero_nohand.urdf` を使う。これは初回実行時に `skrobot.data.
-aero_urdfpath` が `aero_description.tar.gz` を自動ダウンロードして
+`solve_palm_ik.py` は`Aero(use_hand=False)` =
+`aero_nohand.urdf` を使う。これは初回実行時に自動ダウンロードして
 `~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要。
 
-一方 `view_handshake_poses.py` が既定で使う (`--no-hand` を付けない場合の)
-`aero_with_feetech_hand.urdf` はこの tarball に含まれていないので、
-`feetech_hand` パッケージから持ってくる必要がある。`aero_demo.
+一方 `view_handshake_poses.py` が既定で使う`aero_with_feetech_hand.urdf` 
+はこの tarball に含まれていないので、`feetech_hand` パッケージから持ってくる
+必要がある。`aero_demo.
 aero_urdf_setup.load_aero` (`view_handshake_poses.py`/`view_aero_
 collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し時に
 自動で URDF・メッシュを `~/.skrobot/` 以下に配置するので、**catkin
@@ -150,8 +136,6 @@ collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し
 パッケージが `aero_demo` と同じワークスペースの `src/` 直下にない場合は、
 `FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
 
-指関節そのものが不要なら (`solve_palm_ik.py` と同じく) `--no-hand` で
-`aero_nohand.urdf` を使うこともできる。
 
 ### 3. バッチ IK のバックエンド (jax)
 
@@ -165,9 +149,7 @@ pip install -U jax jaxlib
 GPU が使える環境では CUDA 対応の jaxlib (`pip install -U "jax[cuda12]"`)
 を入れるとバッチ IK がさらに速くなる。GPU 版 jax は起動時にデバイスメモリの確保を試み、大きいサイズから
 確保に失敗するたびに `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の
-警告を出しながら要求サイズを段階的に縮小していくことがある。警告が出ていても最終的に確保・続行できて
-いれば動作・速度に問題はない (気になる場合は `XLA_PYTHON_CLIENT_
-PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
+警告を出しながら要求サイズを段階的に縮小していくことがある。気になる場合は `XLA_PYTHON_CLIENT_PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
 抑えられる)。
 
 #### jax の永続コンパイルキャッシュ
@@ -215,15 +197,9 @@ python3 view_handshake_poses.py
 使うロボットの腕は `--robot-arm` で変更できる (既定のは人間の手の
 反対側)。
 
-`draw_random_human_poses.py`/`view_handshake_poses.py` は viser の
-ブラウザビューアを起動する。どちらも viser 画面の Back/Next
-ボタンで人物を切り替える (`draw_random_human_poses.py` は加えて
+`draw_random_human_poses.py` は加えて
 `--advance-mode auto` にすると `--pause` 秒ごとに自動で次の人物へ進み、
-`--output-dir` を指定すると表示した各姿勢の画像をその都度保存する)。
-`view_handshake_poses.py` はビューアに SMPL メッシュとロボットモデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマークなどは描かない)。
-ロボットは既定で指関節ありの URDF (`aero_with_feetech_hand.urdf`) を使う
-(上記「2. Aero の URDF」の通り ROS 非依存で読み込める)。`solve_palm_ik.py`
-と同じ指関節なしの URDF で表示したい場合は `--no-hand` を付ける。
+`--output-dir` を指定すると表示した各姿勢の画像をその都度保存する
 
 ## 座標系
 
