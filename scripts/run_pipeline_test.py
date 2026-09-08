@@ -113,6 +113,32 @@ def summarize_handshakes(handshake_dir):
     )
 
 
+def summarize_motions(motion_dir):
+    """``plan_handshake_motion.py`` の出力 JSON を集計する。
+
+    ``planned`` が ``false`` (IK 対象外/IK 失敗) の人物は集計から除く。
+    ``kind`` は採用した軌道の作り方 (``pretouch``/``linear``/
+    ``optimized``、``plan_handshake_motion.KIND_LABELS`` 参照)。
+    """
+    n_planned = n_verified = 0
+    kinds = {}
+    compute_times = []
+    for _, data in load_json_files(motion_dir):
+        if not data.get('planned'):
+            continue
+        n_planned += 1
+        n_verified += int(bool(data.get('verified')))
+        kind = data.get('kind')
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if data.get('compute_time') is not None:
+            compute_times.append(data['compute_time'])
+
+    avg_compute_time = (sum(compute_times) / len(compute_times)
+                        if compute_times else None)
+    return dict(n_planned=n_planned, n_verified=n_verified, kinds=kinds,
+               avg_compute_time=avg_compute_time)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='README.md のパイプライン 1/2/4/5 を順に実行する '
@@ -131,12 +157,20 @@ def main():
         '--seed', type=int, default=None,
         help='generate_random_human_poses.py (ステップ 1) に渡す乱数 '
             'シード (既定は指定なし)。')
+    parser.add_argument(
+        '--plan-motion', action='store_true',
+        help='ステップ 4.5 (plan_handshake_motion.py) を実行し、握手の '
+            '最終姿勢だけでなくロボットの初期姿勢からそこへ至る干渉回避 '
+            '付きの軌道も生成する。jaxls (pip install "git+https://'
+            'github.com/brentyi/jaxls.git") が別途必要で、1 人あたり '
+            '数十秒かかるため既定では実行しない。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
     skeleton_dir = os.path.join(base_dir, 'skeletons')
     palm_dir = os.path.join(base_dir, 'palms')
     handshake_dir = os.path.join(base_dir, 'handshakes')
+    motion_dir = os.path.join(base_dir, 'motions')
     print('作業ディレクトリ: {}'.format(base_dir))
 
     # 1. generate_random_human_poses.py
@@ -169,6 +203,21 @@ def main():
               summary['n_target'], summary['n_solved'],
               summary['n_total'] - summary['n_target']))
 
+    # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
+    motion_summary = None
+    if args.plan_motion:
+        run_step('4.5/5', 'plan_handshake_motion.py', [
+            '--input-dir', handshake_dir, '--output-dir', motion_dir,
+            '--skeleton-dir', skeleton_dir])
+        motion_summary = summarize_motions(motion_dir)
+        print('[4.5/5] plan_handshake_motion.py: 軌道計画対象 {} 人中 '
+              '{} 人 verified (厳密形状で経路上の干渉なしを確認)。'
+              '採用した軌道の作り方: {}'.format(
+                  motion_summary['n_planned'], motion_summary['n_verified'],
+                  ', '.join('{}={}'.format(k, v) for k, v
+                            in sorted(motion_summary['kinds'].items(),
+                                      key=lambda kv: str(kv[0])))))
+
     print()
     print('=== 結果 ===')
     print('生成した骨格人数: {}'.format(n_generated))
@@ -176,6 +225,13 @@ def main():
         summary['n_solved'], n_generated))
     print('後処理まで含めて成功した人数: {} / {}'.format(
         summary['n_post_process'], n_generated))
+    if motion_summary is not None:
+        print('初期姿勢から握手姿勢までの軌道が経路上の干渉も含めて '
+              '検証できた人数 (verified): {} / {}'.format(
+                  motion_summary['n_verified'], n_generated))
+        if motion_summary['avg_compute_time'] is not None:
+            print('  軌道計画の 1人あたり平均計算時間: {:.1f} 秒/人'.format(
+                motion_summary['avg_compute_time']))
 
     palm_time_per_person = palm_elapsed / n_generated if n_generated else None
     print()

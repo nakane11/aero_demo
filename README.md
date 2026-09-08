@@ -36,6 +36,25 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
 
+4.5. **`scripts/plan_handshake_motion.py`**
+   手順 4 の握手姿勢 (最終姿勢 1 点) を目標として、そこへ至る「最後の接近」
+   の軌道 (waypoint 列) を干渉回避付きで生成し JSON として保存する。
+   遠方からの長距離走行はナビゲーションの担当として計画対象にせず、軌道の
+   始点は「腕を下ろした姿勢 (`Aero.reset_pose`) + 最終台車位置から人間の
+   反対方向へ `--approach-distance` (既定 1.0 m) 下がった位置」にする。
+   終点の手前には掌の法線方向へ `--pretouch-standoff` (既定 0.25 m)
+   引き戻した **pre-touch 姿勢** を挟み、最後の接近を法線方向の直線に
+   することで手先が掌を通り抜けないようにする。この幾何的な構成だけで
+   干渉が無ければ最適化は行わず (実測では多くの人物がこれで通る)、
+   干渉が残った場合だけ scikit-robot の
+   `skrobot.planner.trajectory_optimization.TrajectoryProblem`
+   (台車 3 自由度 + 腕、`jaxls` バックエンド) で軌道最適化を行う。
+   採用前には必ず、`solve_palm_ik.py` が最終姿勢の判定に使うのと同じ
+   厳密な形状 (実メッシュ) で全 waypoint を検証し、結果を `verified`
+   フラグに入れる (経路上の許容貫通量は既定 1 cm)。
+   `jaxls` (PyPI に無い) が別途必要:
+   `pip install "git+https://github.com/brentyi/jaxls.git"`。
+
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
    ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
@@ -51,17 +70,21 @@ estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: ran
         ▼
 solve_palm_ik.py  (既定の入力先: random_palm_poses/, skeleton: random_human_poses/, 出力先: random_handshake_poses/)
         │  (IK 後の台車位置/全関節角/手先姿勢)
+        ├──▶ plan_handshake_motion.py  (既定の入力先: random_handshake_poses/, skeleton: random_human_poses/, 出力先: random_motion_poses/)
+        │        (接近開始姿勢 -> pre-touch -> 握手姿勢 の waypoint 列 + verified)
         ▼
 view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handshake_poses/)
          (SMPL メッシュ + ロボットモデルを viserで表示)
 ```
 
 `generate_random_human_poses.py`/`estimate_palm_poses.py`/`draw_random_
-human_poses.py`/`solve_palm_ik.py`/`view_handshake_poses.py` の
+human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
+`view_handshake_poses.py` の
 `--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
 `--handshake-dir` は、いずれも `scripts/` 直下の
-`random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/` が
-既定値になっているため、指定を省略すれば 1〜5 はそのままつながる。
+`random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/`/
+`random_motion_poses/` が既定値になっているため、指定を省略すれば 1〜5
+はそのままつながる。
 
 ## 環境構築 (IK を解くために必要なもの)
 
@@ -152,6 +175,14 @@ GPU が使える環境では CUDA 対応の jaxlib (`pip install -U "jax[cuda12]
 警告を出しながら要求サイズを段階的に縮小していくことがある。気になる場合は `XLA_PYTHON_CLIENT_PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
 抑えられる)。
 
+`plan_handshake_motion.py` の軌道最適化バックエンド (`jaxls`) は PyPI に
+無いため、使う場合は別途 GitHub から editable install ではなく直接
+インストールする:
+
+```bash
+pip install "git+https://github.com/brentyi/jaxls.git"
+```
+
 #### jax の永続コンパイルキャッシュ
 
 `solve_palm_ik.py` は起動時に jax の永続コンパイルキャッシュ (既定で
@@ -186,9 +217,16 @@ python3 draw_random_human_poses.py
 #    ロボットの腕で触れる全身 IK を解く (offered_hand が null の人物は対象外)
 python3 solve_palm_ik.py
 
+# 4.5. 握手姿勢へ至る「最後の接近」の軌道を干渉回避付きで生成 (4. の結果を目標にする)
+python3 plan_handshake_motion.py
+
 # 5. SMPL メッシュ + ロボットモデルを viser で表示 (4. の結果と、1. の骨格を対応づける)
 python3 view_handshake_poses.py
 ```
+
+`scripts/run_pipeline_test.py` は 1/2/4 (と `--viewer` 指定時は 5) を
+順に実行する回帰テストで、`--plan-motion` を付けると 4.5 も実行して
+「経路上の干渉も含めて検証できた人数 (verified)」を集計に加える。
 
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
 `--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
