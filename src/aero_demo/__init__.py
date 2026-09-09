@@ -4,8 +4,9 @@
 """aero_demo のライブラリ (ROS ノードではないモジュール).
 
 ここに置くモジュールは rospy を import せず、ノードとしても起動しない。
-ROS ノードはパッケージ直下の scripts/ に置き、このパッケージを import
-して使う。
+ROS ノードはパッケージ直下の scripts/ros/ に置き、このパッケージを import
+して使う (rospy に依存しないパイプラインのテスト・ツール用スクリプトは
+scripts/ 直下に置く)。
 
   people_pose_types          … 姿勢推定結果のデータ型 (EstimationResult 含む)
   people_pose_estimator      … MediaPipe による人物姿勢推定
@@ -19,5 +20,5 @@ ROS ノードはパッケージ直下の scripts/ に置き、このパッケー
                                準備する (load_aero)
 
 カメラ無しで偽の姿勢を生成する版は rospy を使うので
-scripts/fake_people_pose_estimator_ros.py にある。
+scripts/ros/fake_people_pose_estimator_ros.py にある。
 """

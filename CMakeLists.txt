@@ -161,7 +161,7 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
-  scripts/fake_people_pose_estimator_ros.py
+  scripts/ros/fake_people_pose_estimator_ros.py
   scripts/head_pose_estimation.py
   scripts/human_following_control.py
   scripts/human_gaze_control.py

@@ -1079,10 +1079,18 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     # batch_inverse_kinematics 側でインデックス範囲外のエラーになる。
     # その場合は自己干渉ペア (Link 同士) だけを残す。
     effective_collision_pairs = collision_pairs
+    effective_self_collision = self_collision
     if collision_pairs is not None and not collision_obstacles:
         effective_collision_pairs = [
             (link_a, other) for link_a, other in collision_pairs
             if not isinstance(other, int)]
+        if not effective_collision_pairs:
+            # collision_pairs が人体セグメントとのペアしか含んでおらず、
+            # 自己干渉ペア (Link 同士) が 1 つも残らなかった場合。
+            # self_collision=True のまま空リストを batch_inverse_
+            # kinematics に渡すと、collision_link_list を導出できず
+            # ValueError になるため、この呼び出しでは無効化する。
+            effective_self_collision = False
     restore_joint_range = restrict_joint_range_margin(
         whole_body.link_list, collision_joint_limit_margin_ratio)
     collision_ik_start = time.time()
@@ -1108,7 +1116,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                 collision_obstacles=collision_obstacles,
                 collision_weight=collision_weight,
                 collision_margin=collision_margin,
-                self_collision=self_collision,
+                self_collision=effective_self_collision,
                 collision_pairs=effective_collision_pairs,
                 self_collision_weight=self_collision_weight,
                 self_collision_margin=self_collision_margin)

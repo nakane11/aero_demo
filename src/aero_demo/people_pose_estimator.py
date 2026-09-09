@@ -19,12 +19,12 @@ import matplotlib
 matplotlib.use('Agg')  # Prevent GUI issues
 import matplotlib.cm
 
-# 結果の型は偽推定 (scripts/fake_people_pose_estimator_ros.py) と共有する
-from aero_demo.people_pose_types import Bone, CameraIntrinsics, Person3D
+# 2D 関節の型は偽推定 (scripts/ros/fake_people_pose_estimator_ros.py) と共有する
+from aero_demo.people_pose_types import CameraIntrinsics
 from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2HANDNAME
 from aero_demo.people_pose_types import INDEX2LIMBNAME, LIMB_SEQUENCE
 
-__all__ = ['Bone', 'CameraIntrinsics', 'Person3D', 'PeoplePoseEstimator']
+__all__ = ['CameraIntrinsics', 'PeoplePoseEstimator']
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,8 @@ class PeoplePoseEstimator(object):
     --------
     >>> estimator = PeoplePoseEstimator(use_hand=False)
     >>> joints = estimator.estimate(bgr_img)                  # 2D
-    >>> people = estimator.estimate_3d(bgr_img, depth_m, intr)  # 3D
+    >>> people, joints = estimator.estimate_3d(bgr_img, depth_m, intr)  # 3D
+    >>> people[0]  # {'Neck': [x, y, z], 'RShoulder': [x, y, z], ...}
     >>> vis = estimator.draw_joints(bgr_img.copy(), joints)
     >>> estimator.close()
     """
@@ -282,15 +283,19 @@ class PeoplePoseEstimator(object):
             ``estimate`` の結果を再利用したい場合に渡す。None なら内部で推定する。
         output_transform : numpy.ndarray or callable or None
             None ならカメラ座標系のまま返す。4x4 の同次変換行列か
-            (x, y, z) -> (x, y, z) の callable を渡すと、返す関節点と骨を
+            (x, y, z) -> (x, y, z) の callable を渡すと、返す関節点を
             その座標系 (base_link など) へ変換してから返す。
             フィルタ自体はカメラ座標系のまま行う (``max_z_diff`` は奥行きの
             ばらつきを見る指標なので、高さ方向を含む座標系では意味が変わる)。
 
         Returns
         -------
-        (list of Person3D, list of list of dict)
-            フィルタを通過した 3 次元姿勢と、描画などに使う 2 次元関節位置。
+        (list of dict, list of list of dict)
+            フィルタを通過した人物ごとの 3 次元関節位置 (関節名 ->
+            [x, y, z] の dict, 検出できた関節だけを持つ -- ``estimate_
+            palm_poses.py``/``solve_palm_ik.py`` が読む骨格 JSON の
+            ``skeleton.joint_positions`` と同じ形) のリストと、描画などに
+            使う 2 次元関節位置。
         """
         if people_joint_positions is None:
             people_joint_positions = self.estimate(bgr_img)
@@ -302,25 +307,22 @@ class PeoplePoseEstimator(object):
             if current_time - t < self.history_duration]
 
         for person_joint_positions in people_joint_positions:
-            person = self._to_person_3d(
+            positions = self._to_joint_positions(
                 person_joint_positions, depth_img, intrinsics)
 
-            neck_pos = person.position_of("Neck")
-            if neck_pos is None:
-                neck_pos = person.position_of("Nose")
+            neck_pos = positions.get("Neck", positions.get("Nose"))
             if neck_pos is None:
                 continue
 
-            if not self._is_valid_person(person, neck_pos, current_time):
+            if not self._is_valid_person(positions, neck_pos, current_time):
                 continue
 
             # 履歴はカメラ座標系のまま保持する (フィルタと同じ座標系)
             self.recent_human_positions.append((current_time, neck_pos))
             if output_transform is not None:
-                self._apply_transform(person, output_transform)
-            # 骨は変換後の点から作るので出力座標系になる
-            person.bones = self._create_bones(person)
-            people.append(person)
+                positions = self._apply_transform(positions, output_transform)
+            people.append({name: [float(v) for v in p]
+                           for name, p in positions.items()})
 
         return people, people_joint_positions
 
@@ -341,8 +343,9 @@ class PeoplePoseEstimator(object):
             return None
         return float(np.median(valid))
 
-    def _to_person_3d(self, person_joint_positions, depth_img, intrinsics):
-        person = Person3D()
+    def _to_joint_positions(self, person_joint_positions, depth_img, intrinsics):
+        """検出できた関節だけを持つ ``{limb_name: (3,) ndarray}`` を作る."""
+        positions = {}
         for joint_pos in person_joint_positions:
             if joint_pos['score'] < 0:
                 continue
@@ -355,12 +358,10 @@ class PeoplePoseEstimator(object):
                 continue
             x = (joint_pos['x'] - intrinsics.cx) * z / intrinsics.fx
             y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
-            person.limb_names.append(joint_pos['limb'])
-            person.scores.append(joint_pos['score'])
-            person.positions.append(np.array([x, y, z], dtype=np.float64))
-        return person
+            positions[joint_pos['limb']] = np.array([x, y, z], dtype=np.float64)
+        return positions
 
-    def _is_valid_person(self, person, neck_pos, current_time):
+    def _is_valid_person(self, positions, neck_pos, current_time):
         """椅子などの誤検出を弾く."""
         is_valid_by_history = False
         for _, p in self.recent_human_positions:
@@ -372,9 +373,9 @@ class PeoplePoseEstimator(object):
                 break
 
         if not is_valid_by_history:
-            if len(person.positions) < self.min_joints:
+            if len(positions) < self.min_joints:
                 return False
-            z_values = [p[2] for p in person.positions]
+            z_values = [p[2] for p in positions.values()]
             if z_values and (max(z_values) - min(z_values)) > self.max_z_diff:
                 return False
 
@@ -393,19 +394,21 @@ class PeoplePoseEstimator(object):
         return True
 
     @staticmethod
-    def _apply_transform(person, transform):
-        """person の全関節点を transform の座標系へ移す (破壊的)."""
-        if not person.positions:
-            return
+    def _apply_transform(positions, transform):
+        """全関節点を transform の座標系へ移した新しい dict を返す."""
+        if not positions:
+            return positions
+        names = list(positions.keys())
         if callable(transform):
-            person.positions = [
-                np.asarray(transform(p), dtype=np.float64)[:3]
-                for p in person.positions]
-            return
+            return {name: np.asarray(transform(positions[name]),
+                                     dtype=np.float64)[:3]
+                   for name in names}
         matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-        points = np.asarray(person.positions, dtype=np.float64)   # (N, 3)
+        points = np.array([positions[name] for name in names],
+                          dtype=np.float64)   # (N, 3)
         homogeneous = np.hstack([points, np.ones((len(points), 1))])
-        person.positions = list(homogeneous.dot(matrix.T)[:, :3])
+        transformed = homogeneous.dot(matrix.T)[:, :3]
+        return {name: transformed[i] for i, name in enumerate(names)}
 
     def _transform_to_base(self, point):
         transform = self.camera_to_base_transform
@@ -418,22 +421,6 @@ class PeoplePoseEstimator(object):
         except Exception as e:
             logger.warning("Transform to base frame failed: %s", e)
             return None
-
-    def _create_bones(self, person):
-        bones = []
-        for conn in self.limb_sequence:
-            j1_name = self.index2limbname[conn[0] - 1]
-            j2_name = self.index2limbname[conn[1] - 1]
-            if j1_name not in person.limb_names \
-                    or j2_name not in person.limb_names:
-                continue
-            j1_index = person.limb_names.index(j1_name)
-            j2_index = person.limb_names.index(j2_name)
-            bones.append(Bone(
-                name='{}->{}'.format(j1_name, j2_name),
-                start_point=person.positions[j1_index],
-                end_point=person.positions[j2_index]))
-        return bones
 
     # ------------------------------------------------------------------
     # visualization
@@ -534,7 +521,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', type=int, default=0, help='camera device id')
-    parser.add_argument('--hand', action='store_true', help='estimate hands too')
+    parser.add_argument('--no-hand', dest='hand', action='store_false',
+                        help='do not estimate hands (estimated by default)')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)

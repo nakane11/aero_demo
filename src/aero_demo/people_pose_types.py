@@ -3,9 +3,11 @@
 
 """people pose 推定結果を保持する ROS 非依存のデータ型.
 
-people_pose_estimator.PeoplePoseEstimator (MediaPipe による実推定) と
-scripts/fake_people_pose_estimator_ros.py (カメラ無しの偽推定) が同じ形式で
-結果を返せるように、両者から共有される。
+scripts/ros/fake_people_pose_estimator_ros.py (カメラ無しの偽推定) が
+EstimationResult/Person3D/Bone として結果を返すのに使う型。
+people_pose_estimator.PeoplePoseEstimator (MediaPipe による実推定) は
+3 次元の推定結果を ``{関節名: [x, y, z]}`` の dict で返すだけなので、
+これらの型は使わない (2D 関節の型・関節名の定数だけ共有する)。
 MediaPipe に依存しないので、偽推定側だけを使うときは MediaPipe が無くてもよい。
 
   Person3D / Bone / CameraIntrinsics … 1 人分の姿勢とカメラ内部パラメータ
