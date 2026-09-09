@@ -130,7 +130,7 @@ def rodrigues(r):
     return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * K.dot(K)
 
 
-def smpl_forward(model, pose, betas, trans):
+def smpl_forward(model, pose, betas, trans, bone_scale=None):
     """SMPL の順運動学 (Linear Blend Skinning).
 
     Parameters
@@ -140,6 +140,12 @@ def smpl_forward(model, pose, betas, trans):
         各関節の axis-angle (親関節相対)。
     betas : (10,) array_like
     trans : (3,) array_like
+    bone_scale : dict, optional
+        関節 index -> その関節と親関節を結ぶボーンの伸縮率。``retarget_
+        and_pose`` が実測の関節間距離に SMPL テンプレートのボーン長を
+        合わせるために使う (既定では全ボーン 1.0 = テンプレートのまま)。
+        skinning weight は変えないため見た目の皮膚変形は近似だが、
+        四肢の先端 (肘・手首など) の位置を実測に合わせられる。
 
     Returns
     -------
@@ -167,7 +173,10 @@ def smpl_forward(model, pose, betas, trans):
         p = model.parent[i]
         local = np.eye(4)
         local[:3, :3] = R[i]
-        local[:3, 3] = J[i] - J[p]
+        offset = J[i] - J[p]
+        if bone_scale is not None and i in bone_scale:
+            offset = offset * bone_scale[i]
+        local[:3, 3] = offset
         G[i] = G[p].dot(local)
 
     # rest-pose の関節位置の寄与を抜く (標準の SMPL のトリック)
@@ -460,7 +469,19 @@ def retarget_and_pose(model, joints, betas=None):
             - world_up * (scale * permuted_dist(NECK, PELVIS))
 
     # --- 四肢の swing (捻りは無視) ---
+    # ボーン長は SMPL テンプレートの既定比率 (scale で全身一律に拡縮した
+    # もの) のままだと、実際の四肢の長さ (体格比がテンプレートと違う人物)
+    # とはズレる -- 特にこのカメラ用パイプラインは握手のため上半身しか
+    # 映らないことが多く、脚/腰が見えないと scale が 1.0 (無補正) の
+    # ままになるため、腕の実測長との差がそのまま SMPL の手先位置の大きな
+    # ズレになる (元は方向 (rotation_between) だけ実測に合わせ、長さは
+    # 合わせていなかった)。ここで見えているチェーンごとに実測の関節間
+    # 距離と SMPL テンプレートの距離 (scale 込み) の比を取り、``bone_
+    # scale`` として ``forward_world``/``smpl_forward`` に渡してボーン
+    # 自体を伸縮させる (skinning weight はそのままなので皮膚変形は近似だ
+    # が、関節位置は実測に合う)。
     pose = np.zeros((24, 3))
+    bone_scale = {}
     cumulative = {0: root_rot}
 
     def get_cumulative(idx):
@@ -470,12 +491,18 @@ def retarget_and_pose(model, joints, betas=None):
 
     for pose_idx, child_idx, robot_parent, robot_child in _LIMB_CHAINS:
         parent_rot = get_cumulative(model.parent[pose_idx])
-        rest_dir_robot = _unit(PERM.dot(model.J[child_idx] - model.J[pose_idx]))
+        rest_vec_robot = PERM.dot(model.J[child_idx] - model.J[pose_idx])
+        rest_length = float(np.linalg.norm(rest_vec_robot))
+        rest_dir_robot = _unit(rest_vec_robot)
         matched = False
         if (rest_dir_robot is not None and robot_parent in joints
                 and robot_child in joints):
-            obs_dir_world = _unit(joints[robot_child] - joints[robot_parent])
+            obs_vec_world = joints[robot_child] - joints[robot_parent]
+            obs_dir_world = _unit(obs_vec_world)
             if obs_dir_world is not None:
+                if rest_length > 1e-6 and scale > 1e-6:
+                    obs_length = float(np.linalg.norm(obs_vec_world))
+                    bone_scale[child_idx] = obs_length / (scale * rest_length)
                 obs_dir_local = parent_rot.T.dot(obs_dir_world)
                 R_local = rotation_between(rest_dir_robot, obs_dir_local)
                 if pose_idx in (L_WRIST, R_WRIST):
@@ -507,11 +534,13 @@ def retarget_and_pose(model, joints, betas=None):
 
     # --- 頂点の生成・配置 ---
     betas = np.zeros(10) if betas is None else np.asarray(betas, dtype=np.float64)
-    v_world, _ = forward_world(model, pose, betas, root_pos, root_rot, scale=scale)
+    v_world, _ = forward_world(model, pose, betas, root_pos, root_rot,
+                               scale=scale, bone_scale=bone_scale)
     return v_world, model.f
 
 
-def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0):
+def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0,
+                  bone_scale=None):
     """SMPL の ``pose``/``betas`` から、ワールド (ロボット座標系) に配置
     した頂点・関節位置を返す.
 
@@ -537,6 +566,9 @@ def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0):
         SMPL の頂点・関節をこの倍率で拡大縮小する (``retarget_and_pose``
         が観測した身長に合わせるのに使う)。既定 1.0 (SMPL 自身の betas
         が表す実寸のまま使う, ``RandomSmplHumanGenerator`` はこちら)。
+    bone_scale : dict, optional
+        ``smpl_forward`` にそのまま渡す、関節ごとのボーン伸縮率
+        (``retarget_and_pose`` が実測の関節間距離に合わせるのに使う)。
 
     Returns
     -------
@@ -544,7 +576,8 @@ def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0):
     """
     if root_rot is None:
         root_rot = np.eye(3)
-    v_local, joints_local = smpl_forward(model, pose, betas, np.zeros(3))
+    v_local, joints_local = smpl_forward(
+        model, pose, betas, np.zeros(3), bone_scale=bone_scale)
     v_robot_local = (v_local - model.J[PELVIS]).dot(PERM.T)
     joints_robot_local = (joints_local - model.J[PELVIS]).dot(PERM.T)
     vertices_world = root_pos + scale * v_robot_local.dot(root_rot.T)
