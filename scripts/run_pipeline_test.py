@@ -3,7 +3,8 @@
 
 """README.md のパイプラインのうち 1 (generate_random_human_poses.py) ->
 2 (estimate_palm_poses.py) -> 4 (solve_palm_ik.py) -> 5 (view_handshake_
-poses.py, --viewer 指定時のみ) を順に実行する。
+poses.py または --plan-motion 指定時は view_handshake_motion.py、いずれも
+--viewer 指定時のみ) を順に実行する。
 
 各ステップの入出力 JSON は /tmp 以下に作る一時ディレクトリに保存・
 読み出しし、各スクリプトの (人物ごとの) 生の画面出力はそのまま流さず、
@@ -150,9 +151,10 @@ def main():
         help='generate_random_human_poses.py (ステップ 1) で生成する人数。')
     parser.add_argument(
         '--viewer', action='store_true',
-        help='ステップ 5 (view_handshake_poses.py) の viser ビューアを '
-            '実際に起動する。既定ではブラウザ接続を待ち続けて自動実行が '
-            '止まってしまうため起動しない。')
+        help='ステップ 5 (view_handshake_poses.py、--plan-motion 指定時は '
+            'view_handshake_motion.py) の viser ビューアを実際に起動する。'
+            '既定ではブラウザ接続を待ち続けて自動実行が止まってしまうため '
+            '起動しない。')
     parser.add_argument(
         '--seed', type=int, default=None,
         help='generate_random_human_poses.py (ステップ 1) に渡す乱数 '
@@ -253,19 +255,33 @@ def main():
         print('  掌推定込みの全体 (掌推定 + IK 1+2段階目): {:.3f} 秒/人'
               .format(palm_time_per_person + summary['avg_total_ik_time']))
 
-    # 5. view_handshake_poses.py (--viewer のときだけ実際に起動する)
+    # 5. view_handshake_poses.py / view_handshake_motion.py
+    #    (--viewer のときだけ実際に起動する。--plan-motion も指定されて
+    #    いれば軌道再生付きの view_handshake_motion.py を、そうでなければ
+    #    最終姿勢のみの view_handshake_poses.py を開く)
     if args.viewer:
-        print('[5/5] view_handshake_poses.py の viser ビューアを起動 '
-              'します。確認が終わったらビューアを閉じるか Ctrl-C して '
-              'ください。')
-        subprocess.run([
-            sys.executable,
-            os.path.join(_THIS_DIR, 'view_handshake_poses.py'),
-            '--skeleton-dir', skeleton_dir,
-            '--handshake-dir', handshake_dir], cwd=_THIS_DIR)
+        if args.plan_motion:
+            print('[5/5] view_handshake_motion.py の viser ビューアを起動 '
+                  'します。確認が終わったらビューアを閉じるか Ctrl-C して '
+                  'ください。')
+            subprocess.run([
+                sys.executable,
+                os.path.join(_THIS_DIR, 'view_handshake_motion.py'),
+                '--skeleton-dir', skeleton_dir,
+                '--handshake-dir', handshake_dir,
+                '--motion-dir', motion_dir], cwd=_THIS_DIR)
+        else:
+            print('[5/5] view_handshake_poses.py の viser ビューアを起動 '
+                  'します。確認が終わったらビューアを閉じるか Ctrl-C して '
+                  'ください。')
+            subprocess.run([
+                sys.executable,
+                os.path.join(_THIS_DIR, 'view_handshake_poses.py'),
+                '--skeleton-dir', skeleton_dir,
+                '--handshake-dir', handshake_dir], cwd=_THIS_DIR)
     else:
-        print('[5/5] view_handshake_poses.py: --viewer 未指定のため '
-              'スキップしました。')
+        print('[5/5] view_handshake_poses.py/view_handshake_motion.py: '
+              '--viewer 未指定のためスキップしました。')
 
 
 if __name__ == '__main__':

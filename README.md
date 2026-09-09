@@ -222,7 +222,9 @@ python3 view_handshake_poses.py
 
 `scripts/run_pipeline_test.py` は 1/2/4 (と `--viewer` 指定時は 5) を
 順に実行する回帰テストで、`--plan-motion` を付けると 4.5 も実行して
-「経路上の干渉も含めて検証できた人数 (verified)」を集計に加える。
+「経路上の干渉も含めて検証できた人数 (verified)」を集計に加える。この
+とき `--viewer` も指定すると、5 は `view_handshake_poses.py` の代わりに
+軌道を再生できる `view_handshake_motion.py` を開く。
 
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
 `--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
