@@ -88,39 +88,19 @@ human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
 
 ## 環境構築 (IK を解くために必要なもの)
 
-動作確認環境は Ubuntu 20.04 + Python 3.10 以上。バッチIKの
-バックエンドには jax を使う。
+動作確認環境は Ubuntu 20.04 + Python 3.11。SMPL 経由の合成データパイプライン
+(1〜5) とカメラ入力パイプライン (`scripts/ros/run_camera_pipeline_test.py`) の
+依存関係はすべて [`pyproject.toml`](pyproject.toml) にまとまっており、
+`uv sync` 一回で揃う (venv 内で個別に `pip install` する必要はない)。
+バッチIKのバックエンドには jax を使う。
 
-```bash
-# 例: deadsnakes PPA で Python 3.10 を追加する場合
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install python3.10 python3.10-venv
-```
+パッケージ管理には [uv](https://docs.astral.sh/uv/) を使う (`uv` は Python
+本体のダウンロード・インストールも自動でやってくれるため、事前に
+deadsnakes PPA 等で Python 3.11 を用意しなくてもよい)。
+`pyproject.toml` の `[tool.uv.sources]` (scikit-robot fork の path 参照、
+jaxls の git 参照) は uv 固有の機能なので、素の `pip install` では揃わない。
 
-### 0. venv を作る
-
-システムの Python にはインストールせず、venv を切って隔離する。
-
-```bash
-python3.10 -m venv ~/venv/aero-py310
-source ~/venv/aero-py310/bin/activate
-pip install -U pip setuptools wheel
-```
-
-uv を使う場合 (`uv` は Python 本体のダウンロード・インストールも
-自動でやってくれるため、事前に deadsnakes PPA 等で Python 3.10 以上を
-用意しなくてもよい):
-
-```bash
-uv venv --python 3.11 ~/venv/aero-uv
-source ~/venv/aero-uv/bin/activate
-```
-
-以降の `pip install`/`python` (uv の venv では `uv pip install` でもよい)
-はこの venv を activate した状態で実行する。
-
-### 1. scikit-robot (fork の `aero` ブランチ) を editable install
+### 0. scikit-robot (fork の `aero` ブランチ) を隣に clone する
 
 IK は skrobot の以下の機能に依存しており、これらは上流
 (`iory/scikit-robot`) には入っていないため fork を使う:
@@ -135,13 +115,52 @@ IK は skrobot の以下の機能に依存しており、これらは上流
   `collision_obstacles` (干渉回避付きバッチ IK。
   `backend='jax'` の勾配降下法でしか使えない)
 
+`pyproject.toml` が `../scikit-robot` を editable install するので、
+`aero_demo` と同じワークスペースの `src/` 直下に clone しておく:
+
 ```bash
 cd ~/ros/hand/src
 git clone -b aero git@github.com:nakane11/scikit-robot.git
 # すでに clone 済みなら: cd scikit-robot && git checkout aero
-cd scikit-robot
-pip install -e .   # 依存 (numpy/scipy/trimesh/viser など) もここで入る
 ```
+
+### 1. venv を作って依存関係を sync する
+
+```bash
+uv venv --python 3.11 ~/venv/aero-uv
+cd ~/ros/hand/src/aero_demo
+UV_PROJECT_ENVIRONMENT=~/venv/aero-uv uv sync
+source ~/venv/aero-uv/bin/activate
+```
+
+これで scikit-robot (editable)・jax (`jax[cuda12]`)・numpy・opencv-python・
+mediapipe・rospkg 等、SMPL パイプラインとカメラパイプライン両方の依存が
+まとめて入る。GPU が無い環境では `pyproject.toml` の `dependencies` にある
+`"jax[cuda12]>=0.10"` を `"jax>=0.10"` に変更してから sync し直す。
+
+`plan_handshake_motion.py` の軌道最適化バックエンド (`jaxls`) は PyPI に
+無いため既定では入らない。使う場合は `--extra motion` を付けて sync する:
+
+```bash
+UV_PROJECT_ENVIRONMENT=~/venv/aero-uv uv sync --extra motion
+```
+
+依存関係を追加・変更したくなったら `pyproject.toml` の `dependencies`
+(または `optional-dependencies`) を編集して同じ `uv sync` を再実行すればよい。
+venv ごと作り直したい場合も、上の2ステップ (`uv venv` → `uv sync`) を
+やり直すだけで復元できる。
+
+なお `rospy` 経由の ROS 本体 (`tf2_ros`/`message_filters`/
+`sensor_msgs` 等) は ROS Noetic のシステムインストール由来なので、
+`scripts/ros/*.py` を実行する前には venv の activate に加えて
+`source /opt/ros/noetic/setup.bash` (ROS ワークスペースの setup.bash) も
+必要。
+
+GPU 版 jax は起動時にデバイスメモリの確保を試み、大きいサイズから
+確保に失敗するたびに `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の
+警告を出しながら要求サイズを段階的に縮小していくことがある。気になる場合は
+`XLA_PYTHON_CLIENT_PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で
+確保量を抑えられる。
 
 ### 2. Aero の URDF
 
@@ -160,30 +179,7 @@ collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し
 `FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
 
 
-### 3. バッチ IK のバックエンド (jax)
-
-干渉回避付きバッチ IKは`backend='jax'` の勾配降下法を指定する。
-venv (Python 3.10 以上) に jax を追加でインストールする:
-
-```bash
-pip install -U jax jaxlib
-```
-
-GPU が使える環境では CUDA 対応の jaxlib (`pip install -U "jax[cuda12]"`)
-を入れるとバッチ IK がさらに速くなる。GPU 版 jax は起動時にデバイスメモリの確保を試み、大きいサイズから
-確保に失敗するたびに `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の
-警告を出しながら要求サイズを段階的に縮小していくことがある。気になる場合は `XLA_PYTHON_CLIENT_PREALLOCATE=false` や `XLA_PYTHON_CLIENT_MEM_FRACTION` で確保量を
-抑えられる)。
-
-`plan_handshake_motion.py` の軌道最適化バックエンド (`jaxls`) は PyPI に
-無いため、使う場合は別途 GitHub から editable install ではなく直接
-インストールする:
-
-```bash
-pip install "git+https://github.com/brentyi/jaxls.git"
-```
-
-#### jax の永続コンパイルキャッシュ
+### 3. jax の永続コンパイルキャッシュ
 
 `solve_palm_ik.py` は起動時に jax の永続コンパイルキャッシュ (既定で
 `~/.cache/jax_compilation_cache`, `JAX_COMPILATION_CACHE_DIR` 環境変数で
