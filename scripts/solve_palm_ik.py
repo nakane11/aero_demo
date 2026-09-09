@@ -365,10 +365,21 @@ def seed_arm_pose(robot, robot_arm):
     ``robot.reset_pose()`` は関節角度だけを戻し、台車の位置姿勢は変えない
     ため、``robot``/``base_link`` の両方を明示的に単位姿勢へ戻す
     (Aero では ``base_link.worldpos()`` が両者の変換の積で決まるため)。
+
+    使わない方の腕 (``robot_arm`` の反対側) は IK の最適化対象に含めない
+    (``solve_person_ik``/``solve_post_process`` とも ``link_list`` に
+    含まれない) ため、ここで作った姿勢がそのまま最終結果の
+    ``joint_angle_vector`` にも残る。``reset_pose()`` は肘を目一杯曲げた
+    (``elbow_joint`` を -135 度にする) 姿勢で、これは前腕を肩の高さまで
+    持ち上げた「構え」のような姿勢になってしまう (``plan_handshake_
+    motion.arms_down_angles`` 参照) ため、使わない方の腕だけ肘を伸ばして
+    (0 度) 体の横に自然に下ろした姿勢に戻しておく。
     """
     robot.reset_pose()
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
+    other_arm = 'l' if robot_arm == 'r' else 'r'
+    getattr(robot, '{}_elbow_joint'.format(other_arm)).joint_angle(0.0)
     mirror = 1.0 if robot_arm == 'l' else -1.0
     getattr(robot, '{}_shoulder_p_joint'.format(robot_arm)).joint_angle(0.0)
     getattr(robot, '{}_shoulder_r_joint'.format(robot_arm)) \
