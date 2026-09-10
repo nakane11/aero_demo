@@ -85,6 +85,40 @@ def set_link_visible(viewer, link, visible):
         handle.visible = visible
 
 
+def remove_joint_angle_gui(viewer):
+    """``ViserViewer.add(RobotModel)`` が自動で追加する "Joint Angles"
+    フォルダ (関節ごとのスライダー) と "Export Joint Angles" フォルダを
+    GUI から取り除く.
+
+    これらのスライダーは触ると表示用ロボットと ``build_robot_collision_
+    overlay`` の overlay の**一方だけ**を動かしてしまい、両者の姿勢が
+    食い違ったまま残る (次に waypoint/IK 結果を反映するまで戻らない)。
+    しかも ``skrobot`` の ``ViserViewer`` はスライダーを関節名だけで
+    管理している (``_joint_sliders[joint.name]``) ため、同じ関節名を持つ
+    ロボットを 2 体 ``add`` すると後から add した方のスライダーで上書き
+    され、表示用ロボット側のスライダーを動かすと overlay 側のスライダー
+    値が適用されるという取り違えも起きる。
+
+    このモジュールを使う 3 つのビューアはいずれもロボットの姿勢を
+    waypoint や IK 結果からしか動かさない表示専用の派生なので、関節
+    スライダーは不要。``viewer.add`` で全てのロボットを追加し終えた後に
+    呼ぶこと (``add`` のたびにスライダーが作り直されるため)。
+    """
+    # フォルダを remove するとその中身 (スライダー・グループごとの
+    # サブフォルダ) も再帰的に消える。_joint_sliders は上書きの結果
+    # 2 体目のスライダーしか持たないので、個別に remove するのではなく
+    # 親フォルダごと消す必要がある。
+    for attr in ('_joint_angles_folder', '_export_folder'):
+        folder = getattr(viewer, attr, None)
+        if folder is not None:
+            folder.remove()
+            setattr(viewer, attr, None)
+    # 消したハンドルを skrobot 側が後から参照しないようにしておく
+    # (Export の "Generate Code" は _joint_sliders に無い関節を読み飛ばす)。
+    viewer._joint_sliders.clear()
+    viewer._joint_folders.clear()
+
+
 def build_robot_collision_overlay(robot, primitive_type=None,
                                   force_convert=False):
     """``solve_palm_ik.py``/``plan_handshake_motion.py`` が干渉回避に

@@ -119,6 +119,7 @@ from handshake_viewer_common import build_display_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
 from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
+from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
@@ -796,6 +797,10 @@ class HandshakePipelineNode(object):
         # で見た目は不透明) に重ねて半透明で表示する (view_handshake_poses.py
         # と同じ)。
         self.viewer.add(self.robot_collision_overlay)
+        # ロボットを add し終えたので、自動で付いてくる関節スライダーを
+        # 消す (触ると display_robot と overlay の一方だけが動いて姿勢が
+        # 食い違ったまま残るため、remove_joint_angle_gui 参照)。
+        remove_joint_angle_gui(self.viewer)
         self.viewer.show(open_browser=not args.no_open_browser)
         viewer_nav.wait_for_client(self.viewer, args.client_wait_timeout)
 

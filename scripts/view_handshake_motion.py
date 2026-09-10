@@ -63,6 +63,7 @@ from handshake_viewer_common import build_display_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
 from handshake_viewer_common import collision_pairs_text  # noqa: E402
+from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from solve_palm_ik import DEFAULT_COLLISION_VERIFY_TOLERANCE  # noqa: E402
@@ -360,6 +361,10 @@ def main():
     viewer.add(robot_collision_overlay)
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
+    # ロボットを add し終えたので、自動で付いてくる関節スライダーを消す
+    # (触ると robot と robot_collision_overlay の一方だけが動いて姿勢が
+    # 食い違ったまま残るため、remove_joint_angle_gui 参照)。
+    remove_joint_angle_gui(viewer)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
     viewer_nav.set_front_view(viewer)
