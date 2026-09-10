@@ -2,6 +2,8 @@
   <!-- 出力トピック名の引数（デフォルト値を設定していますが、必要に応じて変更可能です） -->
   <arg name="color_out" default="/camera/color/image_raw/decompressed" />
   <arg name="depth_out" default="/camera/depth/image_raw/decompressed" />
+  <arg name="color_camera_info" default="/camera/color/camera_info" />
+  <arg name="points_out" default="/camera/depth_registered/points" />
 
   <!-- Color画像の解凍 (compressed -> raw) -->
   <node pkg="image_transport" type="republish" name="decompress_color" output="screen"
@@ -11,6 +13,16 @@
   <!-- Depth画像の解凍 (compressedDepth -> raw) -->
   <node pkg="image_transport" type="republish" name="decompress_depth" output="screen"
         args="compressedDepth in:=/camera/depth/image_raw raw out:=$(arg depth_out)">
+  </node>
+
+  <!-- 解凍したColor/Depth画像からPointCloud2を生成 -->
+  <node pkg="nodelet" type="nodelet" name="decompress_nodelet_manager" args="manager" output="screen" />
+  <node pkg="nodelet" type="nodelet" name="point_cloud_xyzrgb"
+        args="load depth_image_proc/point_cloud_xyzrgb decompress_nodelet_manager" output="screen">
+    <remap from="rgb/image_rect_color" to="$(arg color_out)" />
+    <remap from="rgb/camera_info" to="$(arg color_camera_info)" />
+    <remap from="depth_registered/image_rect" to="$(arg depth_out)" />
+    <remap from="depth_registered/points" to="$(arg points_out)" />
   </node>
   <node name="head_to_camera_link"
         pkg="tf" type="static_transform_publisher"
