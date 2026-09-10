@@ -202,14 +202,122 @@ HUMAN_COLLISION_SEGMENTS = (
     ('LShoulder', 'LElbow', 0.06),
     ('RElbow', 'RWrist', 0.04),
     ('LElbow', 'LWrist', 0.04),
-    ('Neck', 'RHip', 0.13),
-    ('Neck', 'LHip', 0.13),
+    ('RShoulder', 'RHip', 0.13),
+    ('LShoulder', 'LHip', 0.13),
     ('RHip', 'LHip', 0.13),
     ('RHip', 'RKnee', 0.09),
     ('RKnee', 'RAnkle', 0.06),
     ('LHip', 'LKnee', 0.09),
     ('LKnee', 'LAnkle', 0.06),
 )
+# 胴体は、実際の直方体 (box) ではなく ``RShoulder-RHip``/``LShoulder-LHip``
+# の 2 本の円柱 (左右それぞれの「胴の柱」) + ``RHip-LHip`` (腰を結ぶ辺) の
+# 計 3 本の Cylinder で近似する。``batch_inverse_kinematics`` (skrobot の
+# JAX 実装) は Box も渡せるが、事後検証 (``collision_pairs_min_distance``/
+# ``colliding_link_pairs``) 側の距離計算は円柱の ``radius``/``height`` から
+# 解析的に「中に入り込んだ深さ」を求める前提 (``human_body_obstacles`` が
+# 常に Cylinder を返すことに依存) にしたいため、あえて Box を使わず
+# Cylinder のみで組む。
+#
+# 円柱の両端を ``Neck`` (体の中心) ではなく実測の肩・腰の関節
+# (``RShoulder``/``LShoulder``/``RHip``/``LHip``) にすることで、左右方向の
+# 幅は円柱の**端点の位置**がそのまま実測値を反映してくれる (半径に頼る必要
+# がない)。半径は前後方向の厚み (奥行き) だけを表せばよいので、体格に
+# よらない固定値ではなく、実測した肩幅・腰幅から動的に決める
+# (``_torso_segment_radius`` 参照)。左右の肩/腰の関節がどちらも欠けている
+# 場合だけ、下の ``HUMAN_COLLISION_SEGMENTS`` タプルの固定半径にフォール
+# バックする。
+_TORSO_SEGMENT_WIDTH_JOINTS = {
+    ('RShoulder', 'RHip'): ('RShoulder', 'LShoulder'),
+    ('LShoulder', 'LHip'): ('RShoulder', 'LShoulder'),
+    ('RHip', 'LHip'): ('RHip', 'LHip'),
+}
+# 体幹の前後方向の厚み (胸厚/背中の厚み) は、成人の見た目の比率として
+# おおむね左右方向の幅の 0.5〜0.6 倍程度になることが多い、という経験則に
+# 基づく係数 (実測できない前後方向を、実測できる左右方向の幅から概算する)。
+TORSO_DEPTH_TO_WIDTH_RATIO = 0.55
+# 衣服の厚み等を見込んだ安全マージン [m]。
+TORSO_RADIUS_MARGIN = 0.03
+# 極端な誤検出 (肩/腰の関節が変な位置に飛んだ等) で半径が非現実的な値に
+# ならないようにするクリップ範囲 [m]。
+MIN_TORSO_RADIUS = 0.08
+MAX_TORSO_RADIUS = 0.20
+
+
+def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
+    """胴体の 3 辺 (``_TORSO_SEGMENT_WIDTH_JOINTS`` のキー) については、
+    対応する実測の幅 (肩幅 or 腰幅) から前後方向の厚みを概算した半径を
+    返す。それ以外の辺 (四肢・首) は ``default_radius`` をそのまま返す。
+
+    幅を測るための関節が (体の向き・オクルージョン等で) 検出できていない
+    ときは ``default_radius`` にフォールバックする。
+    """
+    width_joints = _TORSO_SEGMENT_WIDTH_JOINTS.get((name_a, name_b))
+    if width_joints is None:
+        return default_radius
+    joint_a, joint_b = width_joints
+    if joint_a not in joint_positions or joint_b not in joint_positions:
+        return default_radius
+    width = float(np.linalg.norm(
+        np.asarray(joint_positions[joint_a], dtype=np.float64)
+        - np.asarray(joint_positions[joint_b], dtype=np.float64)))
+    radius = 0.5 * width * TORSO_DEPTH_TO_WIDTH_RATIO + TORSO_RADIUS_MARGIN
+    return float(np.clip(radius, MIN_TORSO_RADIUS, MAX_TORSO_RADIUS))
+
+
+# 実カメラでは、体幹に近い関節 (肩・腰等) は検出できていても、その先
+# (肘から下・膝から下等) がカメラ視野外/オクルージョンで検出できない
+# ことがある。単に検出できた部分だけを障害物にすると、検出できなかった
+# 側には障害物が何も無いことになり、実際にはそこに人がいるのに素通り
+# してしまう恐れがある。そのため、直近の親関節 (体幹に近い側) さえ検出
+# できていれば、そこから先は「腕は自然に下げている/脚はまっすぐ立って
+# いる」と仮定し、世界 (base_link) 座標系の鉛直方向に経験的な長さだけ
+# 離れた位置にあるとみなして埋める (_fill_missing_joints_straight_down
+# 参照)。
+#
+# 各タプルは (親関節名, 子関節名, 鉛直方向オフセット [m]、符号は負が
+# 下方向/正が上方向)。長さは正確な値である必要はなく、「そこに障害物が
+# 無い」と見なすよりは安全側に倒すための、成人の平均的な体格を想定した
+# 概算値。首から肩 (Neck-RShoulder/LShoulder) はここに含めない --
+# ``PeoplePoseEstimator`` の ``Neck`` は左右の肩の中点として計算される
+# ため (``aero_demo/people_pose_estimator.py`` 参照)、``Neck`` が検出
+# できているなら通常は両肩とも既に検出できており、フォールバックが
+# 必要になる場面がほぼ無い。
+_CHAIN_FALLBACK_OFFSETS = (
+    ('Neck', 'Nose', 0.12),         # 頭は首の上
+    ('RShoulder', 'RElbow', -0.30),  # 上腕
+    ('LShoulder', 'LElbow', -0.30),
+    ('RElbow', 'RWrist', -0.25),     # 前腕
+    ('LElbow', 'LWrist', -0.25),
+    ('RShoulder', 'RHip', -0.50),   # 体幹の側面 (肩から腰)
+    ('LShoulder', 'LHip', -0.50),
+    ('RHip', 'RKnee', -0.40),        # 大腿
+    ('LHip', 'LKnee', -0.40),
+    ('RKnee', 'RAnkle', -0.40),      # 下腿
+    ('LKnee', 'LAnkle', -0.40),
+)
+
+
+def _fill_missing_joints_straight_down(joint_positions):
+    """検出できなかった関節を、親関節が検出できていれば
+    ``_CHAIN_FALLBACK_OFFSETS`` の鉛直オフセットで補って埋めた
+    ``joint_positions`` のコピーを返す (``human_body_obstacles``/
+    ``human_capsules`` の入口で呼ぶ)。
+
+    ``_CHAIN_FALLBACK_OFFSETS`` はおおむね体幹に近い側 (親) -> 遠い側
+    (子) の順に並んでいるため、先頭から順に 1 回埋めれば、ある子が
+    別のエントリの親にもなっている場合 (例: ``RHip`` を ``RShoulder``
+    から補い、続けて ``RKnee`` をその ``RHip`` から補う) も連鎖して
+    正しく埋まる。親自身も検出できていない (その先の全身が視野外等)
+    場合は埋めようがないので、そのまま欠損のままにする (呼び出し側で
+    従来通りダミー障害物になる)。
+    """
+    filled = dict(joint_positions)
+    for parent_name, child_name, z_offset in _CHAIN_FALLBACK_OFFSETS:
+        if parent_name in filled and child_name not in filled:
+            parent_pos = np.asarray(filled[parent_name], dtype=np.float64)
+            filled[child_name] = parent_pos + np.array([0.0, 0.0, z_offset])
+    return filled
 
 # 手 (指先まで) の干渉回避用ジオメトリ。骨格の関節位置は手首までしか無く、
 # 手首より先の指はカバーされないため、MediaPipe 形式の手のランドマーク
@@ -516,20 +624,28 @@ def human_body_obstacles(joint_positions):
     ``skeleton.joint_positions``) から、干渉回避の障害物として使う
     ``Cylinder`` のリストを作る (``HUMAN_COLLISION_SEGMENTS``/
     ``HAND_PALM_LANDMARKS``/``HAND_FINGER_LANDMARKS`` 参照)。差し出して
-    いる側の腕・手も含め、全身を障害物にする。
+    いる側の腕・手も含め、全身を障害物にする。胴体の 3 辺 (RShoulder-RHip/
+    LShoulder-LHip/RHip-LHip) だけは、半径を固定値ではなく実測した肩幅・
+    腰幅から動的に計算する (``_torso_segment_radius`` 参照)。
 
     常に ``len(HUMAN_COLLISION_SEGMENTS) + 2 * (1 + len(HAND_FINGER_
     LANDMARKS))`` 個 (骨格検出が全身分揃っているときの最大数) を返す --
     関節位置が片方でも欠けている骨・掌・指は、``DUMMY_OBSTACLE_DISTANCE``
-    だけ離れたダミーの ``Cylinder`` で埋める。
+    だけ離れたダミーの ``Cylinder`` で埋める。ただし親関節 (体幹に近い側)
+    さえ検出できていれば、``_fill_missing_joints_straight_down`` により
+    子関節はダミーにせず鉛直方向に伸ばした推定位置で埋める (肘から先/膝
+    から先がカメラ視野外のときに、そこに障害物が無いと誤解しないため)。
     """
+    joint_positions = _fill_missing_joints_straight_down(joint_positions)
     obstacles = []
-    for name_a, name_b, radius in HUMAN_COLLISION_SEGMENTS:
+    for name_a, name_b, default_radius in HUMAN_COLLISION_SEGMENTS:
         if name_a in joint_positions and name_b in joint_positions:
+            radius = _torso_segment_radius(
+                name_a, name_b, default_radius, joint_positions)
             obstacles.append(_cylinder_between(
                 joint_positions[name_a], joint_positions[name_b], radius))
         else:
-            obstacles.append(_dummy_cylinder(radius))
+            obstacles.append(_dummy_cylinder(default_radius))
     for side in ('R', 'L'):
         palm_names = ['{}Hand{}'.format(side, idx)
                      for idx in HAND_PALM_LANDMARKS]
@@ -589,18 +705,24 @@ def human_capsules(joint_positions):
     """``human_body_obstacles`` と同じ順序・同じ部位のカプセル (線分 2 端点
     + 半径) のリストと、対応する名前 (``human_obstacle_names`` と同じ) の
     リストを返す。骨格の関節が欠けている部位は ``DUMMY_OBSTACLE_DISTANCE``
-    だけ離れた点に潰す。``analyze_collision_pairs.py`` と
-    ``collision_pairs_min_distance`` が、``Cylinder`` の代わりに素の
-    (線分, 半径) を使いたいときに使う。"""
+    だけ離れた点に潰す。ただし親関節が検出できていれば
+    ``_fill_missing_joints_straight_down`` により、子関節は鉛直方向に
+    伸ばした推定位置で埋める (``human_body_obstacles`` と同じ)。
+    ``analyze_collision_pairs.py`` と ``collision_pairs_min_distance`` が、
+    ``Cylinder`` の代わりに素の (線分, 半径) を使いたいときに使う。"""
+    joint_positions = _fill_missing_joints_straight_down(joint_positions)
     caps = []
     names = []
     dummy = np.array([DUMMY_OBSTACLE_DISTANCE] * 3)
-    for name_a, name_b, radius in HUMAN_COLLISION_SEGMENTS:
+    for name_a, name_b, default_radius in HUMAN_COLLISION_SEGMENTS:
         if name_a in joint_positions and name_b in joint_positions:
             p0 = np.asarray(joint_positions[name_a], dtype=np.float64)
             p1 = np.asarray(joint_positions[name_b], dtype=np.float64)
+            radius = _torso_segment_radius(
+                name_a, name_b, default_radius, joint_positions)
         else:
             p0 = p1 = dummy
+            radius = default_radius
         caps.append((p0, p1, radius))
         names.append('{}-{}'.format(name_a, name_b))
     for side in ('R', 'L'):
@@ -643,10 +765,25 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     ``analyze_collision_pairs.py`` が干渉ペア候補を洗い出すのに使ったのと
     同じ厳密な形状 (``apply_collision_model`` が差し替えた
     ``collision_mesh`` の頂点そのもの) を使って距離を計算する。
+
+    人体側は ``human_capsules`` の解析的な (線分, 半径) ではなく
+    ``human_body_obstacles`` が返す ``Cylinder`` (``view_handshake_
+    poses.py``/``scripts/ros/run_camera_pipeline_test.py`` が画面に表示
+    しているのと全く同じジオメトリ) を使う。掌 (``R_palm``/``L_palm``) の
+    ように、解析的な捉え方 (``human_capsules`` では端点が退化した球扱い)
+    と実際の形状 (掌面に沿った平たい円柱) が一致しない部位があり、画面表示
+    は貫通しているのに IK はこれを貫通と見なさない (逆に、画面上は平気でも
+    IK が過剰に避けてしまう) 食い違いが起きうるため、判定にも表示と同じ
+    形状をそのまま使う。円柱は常にローカル Z 軸が高さ方向・原点中心なので、
+    頂点同士の最短距離ではなく円柱の ``radius``/``height`` から直接
+    「中に入り込んだ深さ」を解析的に求める (単純な頂点同士の最短距離だと、
+    指のように細いリンクが円柱の内部深くまで潜り込んでも頂点同士は互いの
+    表面近くまで来ず見逃してしまうため)。
     """
     if not collision_pairs:
         return float('inf')
-    caps = human_capsules(joint_positions)[0] if joint_positions else None
+    obstacle_links = human_body_obstacles(joint_positions) \
+        if joint_positions else None
     min_dist = float('inf')
     world_vertices_by_link = {}
 
@@ -660,11 +797,17 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     for link_a, other in collision_pairs:
         verts_a = _world_vertices(link_a)
         if isinstance(other, int):
-            if caps is None:
+            if obstacle_links is None:
                 continue
-            p0, p1, radius = caps[other]
-            dist = float(segment_points_distance(p0, p1, verts_a).min()) \
-                - radius
+            obstacle = obstacle_links[other]
+            local_pts = ((verts_a - obstacle.worldpos())
+                        @ obstacle.worldrot())
+            radial = np.linalg.norm(local_pts[:, :2], axis=1)
+            axial = np.abs(local_pts[:, 2])
+            depth = float(np.minimum(
+                obstacle.radius - radial,
+                obstacle.height / 2.0 - axial).max())
+            dist = -depth
         else:
             verts_b = _world_vertices(other)
             dist = float(np.linalg.norm(

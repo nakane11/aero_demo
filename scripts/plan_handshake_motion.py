@@ -59,11 +59,12 @@ pre-grasp approach と同じ考え方で、最後の接近が法線方向の直�
 ``solved`` が ``true`` の人物だけ (対象外/IK 失敗の人物は経路の目標が
 無いため、``planned: false`` の JSON をそのまま書き出す)。
 
-障害物 (人体) には ``solve_palm_ik.human_capsules`` が返すカプセル
-(体幹・頭部・四肢・掌・指、``solve_palm_ik.py`` が干渉回避の障害物その
-ものとして使う ``skrobot.model.primitives.Cylinder`` と全く同じ端点・
-半径) を、``TrajectoryProblem.add_collision_cost`` の ``world_obstacles``
-に ``'cylinder'`` 型 (中心・回転・半径・軸方向半長) としてそのまま渡す
+障害物 (人体) には ``solve_palm_ik.human_body_obstacles`` が返す
+``Cylinder`` (体幹・頭部・四肢・掌・指、``solve_palm_ik.py``/``view_
+handshake_poses.py`` 等が実際の干渉回避・画面表示に使うものと全く同じ
+ジオメトリ) を、``TrajectoryProblem.add_collision_cost`` の
+``world_obstacles`` に ``'cylinder'`` 型 (中心・回転・半径・軸方向半長)
+としてそのまま渡す
 (``human_body_cylinder_obstacles`` 参照)。``'cylinder'`` 型は scikit-robot
 (fork, ``base_limit`` ブランチ) 側にこの実装のために追加したもので
 (``skrobot.planner.trajectory_optimization.fk_utils.compute_cylinder_
@@ -213,55 +214,27 @@ DEFAULT_ROBOT_SPHERES_PER_LINK = 6
 
 # シリンダーの軸長が実質 0 (退化した「線分」、``solve_palm_ik.human_
 # capsules`` が掌・ダミー障害物に使う) のときに与える最小の半長 [m]。
-# 0 だと回転行列はそのまま有効だが、円柱としての厚みがなくなる
-# (``solve_palm_ik._cylinder_between`` の ``height`` 下限と同じ理由)。
-MIN_CYLINDER_HALF_HEIGHT = 1e-6
-
-
-def _cylinder_frame(p0, p1):
-    """線分 ``p0``-``p1`` を軸とする円柱の中心・回転行列・全長を返す
-    (``solve_palm_ik._cylinder_between`` と同じ組み方: ローカル +Z が軸
-    方向)。円柱は軸まわり対称なので x/y 軸の向きは何でもよい。"""
-    p0 = np.asarray(p0, dtype=np.float64)
-    p1 = np.asarray(p1, dtype=np.float64)
-    diff = p1 - p0
-    height = float(np.linalg.norm(diff))
-    if height < 1e-6:
-        z_axis = np.array([0.0, 0.0, 1.0])
-    else:
-        z_axis = diff / height
-    seed = np.array([0.0, 0.0, 1.0]) if abs(z_axis[2]) < 0.9 \
-        else np.array([1.0, 0.0, 0.0])
-    x_axis = np.cross(seed, z_axis)
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z_axis, x_axis)
-    rot = np.column_stack([x_axis, y_axis, z_axis])
-    center = (p0 + p1) / 2.0
-    return center, rot, height
-
-
 def human_body_cylinder_obstacles(joint_positions):
-    """``solve_palm_ik.human_capsules`` の全カプセル (体幹・頭部・四肢・
-    掌・指、関節欠損はダミーで埋め済み) を、``TrajectoryProblem.add_
-    collision_cost`` の ``world_obstacles`` が受け付ける ``'cylinder'``
+    """``solve_palm_ik.human_body_obstacles`` が返す全 ``Cylinder`` (体幹・
+    頭部・四肢・掌・指、関節欠損はダミーで埋め済み) を、``TrajectoryProblem.
+    add_collision_cost`` の ``world_obstacles`` が受け付ける ``'cylinder'``
     形式 (``{'type': 'cylinder', 'center', 'rotation', 'radius',
-    'half_height'}``) に変換する。``solve_palm_ik.py`` が実際に干渉回避の
-    障害物として使う ``Cylinder`` プリミティブと全く同じ端点・半径から
-    作るので、球近似のような隙間は生じない。
+    'half_height'}``) に変換する。``solve_palm_ik.py``/``view_handshake_
+    poses.py`` 等が実際の干渉回避・画面表示に使うのと全く同じ ``Cylinder``
+    プリミティブ (掌のように骨の線分では表せない部位も、実物と同じ向き・
+    大きさの円柱) から作るので、形状の食い違いは生じない。
 
-    常に ``len(human_capsules(...)[0])`` 個のシリンダーを返す (人物に
+    常に ``len(human_obstacle_names())`` 個のシリンダーを返す (人物に
     よらず一定 -- モジュール docstring 参照)。
     """
-    caps, _names = spik.human_capsules(joint_positions)
     obstacles = []
-    for p0, p1, radius in caps:
-        center, rot, height = _cylinder_frame(p0, p1)
+    for cyl in spik.human_body_obstacles(joint_positions):
         obstacles.append(dict(
             type='cylinder',
-            center=[float(v) for v in center],
-            rotation=[[float(v) for v in row] for row in rot],
-            radius=float(radius),
-            half_height=max(height / 2.0, MIN_CYLINDER_HALF_HEIGHT),
+            center=[float(v) for v in cyl.worldpos()],
+            rotation=[[float(v) for v in row] for row in cyl.worldrot()],
+            radius=float(cyl.radius),
+            half_height=float(cyl.height) / 2.0,
         ))
     return obstacles
 

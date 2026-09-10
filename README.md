@@ -35,6 +35,12 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
+   人体側の干渉回避ジオメトリ (体幹・頭部・四肢・掌・指、いずれも
+   `Cylinder`) は `human_body_obstacles` が一手に作り、IK 最適化中の
+   干渉コスト・候補採用前の事後検証 (`collision_pairs_min_distance`)・
+   ビューアでの半透明表示 (`view_handshake_poses.py` 等) のすべてで
+   同じ関数・同じ形状を使う (掌のような骨の線分では表せない部位も含めて
+   一致させてあるので、表示と判定の間に見た目の食い違いは生じない)。
 
 4.5. **`scripts/plan_handshake_motion.py`**
    手順 4 の握手姿勢 (最終姿勢 1 点) を目標として、そこへ至る「最後の接近」
@@ -50,14 +56,22 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    `skrobot.planner.trajectory_optimization.TrajectoryProblem`
    (台車 3 自由度 + 腕、`jaxls` バックエンド) で軌道最適化を行う。
    採用前には必ず、`solve_palm_ik.py` が最終姿勢の判定に使うのと同じ
-   厳密な形状 (実メッシュ) で全 waypoint を検証し、結果を `verified`
-   フラグに入れる (経路上の許容貫通量は既定 1 cm)。
+   厳密な形状 (実メッシュ)・同じ人体ジオメトリ (`human_body_obstacles`)
+   で全 waypoint を検証し、結果を `verified` フラグに入れる (経路上の
+   許容貫通量は既定 1 cm)。軌道最適化のコスト関数に渡す人体障害物も
+   同じ `human_body_obstacles` から作るので、最適化・事後検証・表示の
+   3 者で人体側の形状が食い違うことはない。
    `jaxls` (PyPI に無い) が別途必要:
    `pip install "git+https://github.com/brentyi/jaxls.git"`。
 
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
    ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
+   干渉回避に使ったのと同じ近似ジオメトリ (ロボット・人体とも) を半透明で
+   重ねて表示でき、テキストパネルの事後検証 (指先まで含めた貫通の再チェック)
+   もこの表示中のメッシュをそのまま使って判定するので、見た目と判定結果が
+   食い違うことはない (`scripts/ros/run_camera_pipeline_test.py` の骨格
+   プレビュー画面も同じ仕組み)。
 
 ```
 generate_random_human_poses.py  (既定の出力先: random_human_poses/)
