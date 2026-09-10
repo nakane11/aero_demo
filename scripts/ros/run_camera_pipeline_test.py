@@ -93,6 +93,14 @@ if _PKG_SRC_DIR not in sys.path:
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+# plan_handshake_motion (jaxls 経由で JAX/XLA を使う) を import する際、
+# JAX がデフォルトで GPU メモリを一括プリアロケートしようとして失敗し、
+# "Failed to allocate device memory ... RESOURCE_EXHAUSTED" というエラー
+# ログが標準エラーに出る (実際には失敗後にサイズを縮小して再試行するため
+# 動作上は問題ないが、紛らわしいので抑制する)。import 前に一括確保をやめ
+# 必要な分だけ確保する設定にしておくことで、このログ自体を出さなくする。
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
@@ -126,7 +134,7 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 
 # waypoint 自動再生 (Play チェックボックス) の既定の速さ [waypoint/秒]
 # (view_handshake_motion.DEFAULT_PLAYBACK_FPS と同じ)。
-DEFAULT_PLAYBACK_FPS = 20.0
+DEFAULT_PLAYBACK_FPS = 40.0
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -535,6 +543,7 @@ class HandshakePipelineNode(object):
         self._frozen_joint_positions = None  # offered_hand が決まった瞬間の骨格 (以後この骨格を固定表示する) or None
         self._current_result = None       # 直近の solve_palm_ik の結果 dict (ボタン用) or None
         self._current_motion = None       # 直近の plan_handshake_motion の結果 dict or None
+        self._handshake_total_time = None  # 掌推定開始 ~ 軌道計画完了までの合計時間 [秒] or None (_try_handshake 参照)
         self._display_waypoints = None    # build_display_waypoints の表示用 waypoint リスト or None
         self._display_n_prepend = 0        # 上記の先頭のうち、初期位置->経路開始点の表示専用フレームの個数
         self._display_n_approach = 0      # 上記のうち経路計画済み (表示専用の先頭/末尾フレームでない) 個数
@@ -683,6 +692,8 @@ class HandshakePipelineNode(object):
             self.state = 'armed'
             self.armed_deadline = time.time() + self.args.armed_timeout
             self._latest_offer_selection = None
+            with self._lock:
+                self._handshake_total_time = None
             print('[ARM] ARMED になりました。{:.0f} 秒以内に手を差し出して'
                   'ください。'.format(self.args.armed_timeout))
 
@@ -695,6 +706,7 @@ class HandshakePipelineNode(object):
                 self._display_waypoints = None
                 self._display_n_prepend = 0
                 self._display_n_approach = 0
+                self._handshake_total_time = None
             self.play_checkbox.value = False
             self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
             self.reset_button.visible = False
@@ -720,9 +732,12 @@ class HandshakePipelineNode(object):
 
         @self.waypoint_slider.on_update
         def _on_waypoint(_):  # noqa: ANN001
+            # redraw() は _apply_current_waypoint 内で self._viewer_lock を
+            # 保持したまま (ロボットの姿勢更新と合わせて) 行うので、ここで
+            # 別途呼ぶ必要はない (呼ぶと spin() 側の redraw() が姿勢更新の
+            # 途中に割り込める隙が生まれてしまう、_apply_current_waypoint
+            # のコメント参照)。
             self._apply_current_waypoint()
-            with self._viewer_lock:
-                self.viewer.redraw()
 
         @self.play_checkbox.on_update
         def _on_play_toggle(_):  # noqa: ANN001
@@ -898,6 +913,7 @@ class HandshakePipelineNode(object):
                   'でした。')
 
     def _try_handshake(self, joint_positions):
+        handshake_t0 = time.time()
         palms = self.palm_estimator.estimate(joint_positions)
         # ARMED なのに offered_hand が決まらないとき、viser 画面 (と
         # スロットルした標準出力) にスコア/veto 理由の内訳を出す。「手の
@@ -908,10 +924,6 @@ class HandshakePipelineNode(object):
         selection = self.offered_hand_selector.select(joint_positions, palms)
         with self._lock:
             self._latest_offer_selection = selection
-        rospy.loginfo_throttle(
-            1.0, '[ARMED] %s',
-            _format_offer_scores(selection, self.offered_hand_selector.score_min)
-            .replace('**', '').replace('\n', ' / '))
 
         offered_hand = palms['offered_hand']
         if offered_hand is None:
@@ -931,6 +943,8 @@ class HandshakePipelineNode(object):
         finally:
             self._busy = False
             self.state = 'result'
+            with self._lock:
+                self._handshake_total_time = time.time() - handshake_t0
 
     def _log_debug(self, record):
         """デバッグ用ログを JSON 1 行として標準出力・ファイルに書く.
@@ -1083,8 +1097,11 @@ class HandshakePipelineNode(object):
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
-            apply_result_pose(self.display_robot, result,
-                              use_post_process=False)
+            # _set_waypoint_slider_range(0) -> _apply_current_waypoint が
+            # self._current_result (上で設定済み) から同じ姿勢を
+            # self._viewer_lock 付きで反映してくれるので、ここで別途
+            # apply_result_pose を呼ぶ必要はない (呼ぶと _viewer_lock なしの
+            # 重複更新になり、spin() 側の redraw() と競合しうる)。
             self._set_waypoint_slider_range(0)
 
         if args.save_dir:
@@ -1187,22 +1204,37 @@ class HandshakePipelineNode(object):
             result = self._current_result
             motion = self._current_motion
             display_waypoints = self._display_waypoints
-        if display_waypoints is not None:
-            index = min(int(self.waypoint_slider.value),
-                       len(display_waypoints) - 1)
-            apply_waypoint_pose(
-                self.display_robot, motion['joint_names'],
-                display_waypoints, index)
-        elif result is not None:
-            apply_result_pose(self.display_robot, result,
-                              use_post_process=False)
-        else:
-            phm.arms_down_angles(self.display_robot,
-                                 self.display_robot.joint_list)
-            self.display_robot.base_link.newcoords(
-                self._initial_base_coords.copy_worldcoords())
-        sync_robot_collision_overlay(
-            self.robot_collision_overlay, self.display_robot)
+        # self.display_robot の関節角・台車位置姿勢の更新 (apply_waypoint_
+        # pose 等) は reset_pose() -> 関節ごとの joint_angle() -> base_link.
+        # newcoords() と複数ステップにまたがり、その間ロボットは一時的に
+        # 「新しい関節角のままだが台車位置は古い」ような不整合な状態になる。
+        # spin() が別スレッドで self._viewer_lock を取って独立に viewer.
+        # redraw() を呼び続けている (10Hz) ため、この lock を取らずに更新
+        # すると、更新の途中の不整合な姿勢がそのまま spin() 側の redraw()
+        # に読まれて画面に出てしまう (実メッシュだけがおかしな位置で表示
+        # される不具合の原因。sync_robot_collision_overlay は更新が完了した
+        # 後に 1 回だけ呼ばれるため影響を受けにくく、干渉モデル側だけ
+        # 正しく追従しているように見えていた)。そのため更新から redraw()
+        # までを 1 つの self._viewer_lock 区間にして、spin() 側の redraw()
+        # が更新の合間に割り込めないようにする。
+        with self._viewer_lock:
+            if display_waypoints is not None:
+                index = min(int(self.waypoint_slider.value),
+                           len(display_waypoints) - 1)
+                apply_waypoint_pose(
+                    self.display_robot, motion['joint_names'],
+                    display_waypoints, index)
+            elif result is not None:
+                apply_result_pose(self.display_robot, result,
+                                  use_post_process=False)
+            else:
+                phm.arms_down_angles(self.display_robot,
+                                     self.display_robot.joint_list)
+                self.display_robot.base_link.newcoords(
+                    self._initial_base_coords.copy_worldcoords())
+            sync_robot_collision_overlay(
+                self.robot_collision_overlay, self.display_robot)
+            self.viewer.redraw()
         self._refresh_collision_pairs_text()
 
     def _refresh_collision_pairs_text(self):
@@ -1301,13 +1333,11 @@ class HandshakePipelineNode(object):
         elif self.state == 'solving':
             state_text = 'IK を計算中です...'
         elif self.state == 'result':
-            state_text = ('結果を表示中です (waypoint スライダー/Play で '
-                          '初期姿勢から握手姿勢までの軌道を確認できます。'
-                          'RESET ボタンで最初からやり直せます)')
+            state_text = ('結果を表示中です')
         else:
             state_text = 'IDLE (ARM ボタンを押すと手を差し出す人を待ちます)'
         if is_frozen:
-            detected_text = '固定表示中 (差し出し手が決まった時点の骨格)'
+            detected_text = '固定表示中'
         elif joint_positions is None:
             detected_text = '未検出'
         elif is_base_frame:
@@ -1326,6 +1356,10 @@ class HandshakePipelineNode(object):
             motion = self._current_motion
             n_prepend = self._display_n_prepend
             n_approach = self._display_n_approach
+            handshake_total_time = self._handshake_total_time
+        if handshake_total_time is not None:
+            content += ('\n\n**計算時間 (掌推定 ~ 軌道計画):** {:.2f} 秒'
+                       .format(handshake_total_time))
         if result is not None:
             if motion is not None:
                 kind = phm.KIND_LABELS.get(motion['kind'], motion['kind'])
@@ -1338,15 +1372,14 @@ class HandshakePipelineNode(object):
                                self.waypoint_slider.max))
                 if waypoint_index < n_prepend:
                     content += (' (初期位置から経路開始点への移動、干渉は'
-                               '考慮していない表示のみ)')
+                               '考慮していない)')
                 elif waypoint_index < n_prepend + n_approach:
                     dist = motion['waypoint_min_distances'][
                         waypoint_index - n_prepend]
                     content += (' (この waypoint の干渉余裕: {:+.4f} m, {})'
                                .format(dist, '貫通' if dist < 0 else '干渉なし'))
                 else:
-                    content += (' (掌への押し込み: solve_palm_ik.py の後処理'
-                               '判定、表示のみ)')
+                    content += (' (掌への押し込み)')
             else:
                 content += ('\n\n**軌道:** 計画なし ({})'.format(
                     'IK 失敗' if not result['solved'] else '計算中'))
@@ -1514,7 +1547,7 @@ def main():
         '--joint-smoothing-dcutoff', type=float, default=1.0,
         help='One Euro Filter の速度推定のカットオフ周波数 [Hz] (既定 1.0)。')
     parser.add_argument(
-        '--offer-score-min', type=float, default=0.7,
+        '--offer-score-min', type=float, default=0.65,
         help='差し出し手と判定するスコアの閾値 (既定 0.7)。'
             'estimate_palm_poses.OFFER_SCORE_MIN ({:.2f}) は合成骨格向けに '
             '調整された値で実カメラでは届きにくいため、実カメラ用にここで '

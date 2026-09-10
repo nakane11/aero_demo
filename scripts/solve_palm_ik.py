@@ -317,6 +317,40 @@ def _fill_missing_joints_straight_down(joint_positions):
         if parent_name in filled and child_name not in filled:
             parent_pos = np.asarray(filled[parent_name], dtype=np.float64)
             filled[child_name] = parent_pos + np.array([0.0, 0.0, z_offset])
+    # 前腕 (body skeleton の手首 {R,L}Wrist) と掌 (hand landmark の手首
+    # {R,L}Hand0 含む landmark の重心) は別々の推定器由来で、そのままだと
+    # human_body_obstacles/human_capsules が作る前腕と掌の Cylinder が
+    # 視覚的に繋がらない。掌の landmark が (5点全部でなくとも
+    # PALM_OBSTACLE_MIN_POINTS 点以上) 揃っているときは、
+    # human_body_obstacles/human_capsules がその点数で大まかな掌
+    # Cylinder を作る (``_palm_obstacle_partial`` 参照) のと同じ重心を
+    # 使い、前腕の Wrist 端点を「肘->掌中心」方向にその Cylinder の
+    # 半径 (HAND_PALM_RADIUS) 分だけ伸ばして、掌 Cylinder の表面に
+    # 接する位置まで前腕を延長する (それより点数が少なくとも Hand0 だけ
+    # あればそちらで代用する)。
+    for side in ('R', 'L'):
+        wrist_name = '{}Wrist'.format(side)
+        elbow_name = '{}Elbow'.format(side)
+        palm_names = ['{}Hand{}'.format(side, idx)
+                     for idx in HAND_PALM_LANDMARKS]
+        available = [np.asarray(filled[name], dtype=np.float64)
+                    for name in palm_names if name in filled]
+        if len(available) >= PALM_OBSTACLE_MIN_POINTS:
+            palm_center = np.mean(available, axis=0)
+            if elbow_name in filled:
+                elbow_pos = np.asarray(filled[elbow_name], dtype=np.float64)
+                direction = palm_center - elbow_pos
+                dist = np.linalg.norm(direction)
+                if dist > 1e-6:
+                    filled[wrist_name] = (
+                        palm_center
+                        - (direction / dist) * HAND_PALM_RADIUS)
+                else:
+                    filled[wrist_name] = palm_center
+            else:
+                filled[wrist_name] = palm_center
+        elif '{}Hand0'.format(side) in filled:
+            filled[wrist_name] = filled['{}Hand0'.format(side)]
     return filled
 
 # 手 (指先まで) の干渉回避用ジオメトリ。骨格の関節位置は手首までしか無く、
@@ -340,6 +374,13 @@ HAND_FINGER_LABELS = ('thumb', 'index', 'middle', 'ring', 'pinky')
 HAND_PALM_RADIUS = 0.05  # [m] 掌の円柱の半径
 HAND_PALM_HEIGHT = 0.02  # [m] 掌の円柱の厚み (平たくする)
 HAND_FINGER_RADIUS = 0.008  # [m] 指の円柱の半径 (細くする)
+
+# 掌の平面 (法線) を SVD フィットするのに最低限必要な landmark 数。
+# aero_demo.palm_plane.fit_palm_plane の MIN_PALM_POINTS と同じ値にして
+# あり、掌の目標姿勢 (IK) が成立する (= fit_palm_plane が成功する) ときは
+# 必ず掌の干渉回避 Cylinder も大まかにでも置かれるようにしている
+# (``_palm_obstacle_partial`` 参照)。
+PALM_OBSTACLE_MIN_POINTS = 3
 
 # human_body_obstacles が返す障害物の個数を人物によらず常に固定にする
 # ため (JAX の再コンパイルを避けるため)、骨格の関節が欠けている骨・手を
@@ -612,6 +653,39 @@ def _palm_obstacle(points):
                     pos=center.tolist(), rot=rot)
 
 
+def _palm_obstacle_partial(points):
+    """``HAND_PALM_LANDMARKS`` のうち検出できた landmark (``PALM_OBSTACLE_
+    MIN_POINTS`` 点以上) だけから、大まかな掌の Cylinder を作る。
+
+    ``_palm_obstacle`` は 5 点全部揃っていないと使えない (法線を手首->
+    人差し指付け根/手首->小指付け根の外積で決めているため)。干渉回避と
+    しては多少大まかでも掌の位置に何も無い (ダミーで 100m 先に飛ばす)
+    よりずっとよいので、``aero_demo.palm_plane.fit_palm_plane`` と同じ
+    SVD 平面フィットの簡易版で法線を求める。干渉回避用の Cylinder は軸を
+    反転しても同じ形状なので、``fit_palm_plane`` が行う解剖学的な向きの
+    解決 (法線がどちら向きか) は不要で省く。点が足りない、またはほぼ
+    一直線で法線が数値的に不安定なときは ``None`` を返す (呼び出し側で
+    ダミーにフォールバックする)。"""
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < PALM_OBSTACLE_MIN_POINTS:
+        return None
+    center = points.mean(axis=0)
+    centered = points - center
+    _u, s, vt = np.linalg.svd(centered, full_matrices=False)
+    if len(s) < 3 or s[0] < 1e-9 or (s[1] / s[0]) < 0.15:
+        # ほぼ一直線 (法線が数値的に不安定)。
+        return None
+    z_axis = vt[2]
+    seed = np.array([0.0, 0.0, 1.0]) if abs(z_axis[2]) < 0.9 \
+        else np.array([1.0, 0.0, 0.0])
+    x_axis = np.cross(seed, z_axis)
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    rot = np.column_stack([x_axis, y_axis, z_axis])
+    return Cylinder(radius=HAND_PALM_RADIUS, height=HAND_PALM_HEIGHT,
+                    pos=center.tolist(), rot=rot)
+
+
 def _dummy_cylinder(radius):
     """``DUMMY_OBSTACLE_DISTANCE`` だけ離れた位置に置くダミー ``Cylinder``
     (骨・掌・指が欠けている場合に個数を揃えるため)。"""
@@ -649,11 +723,15 @@ def human_body_obstacles(joint_positions):
     for side in ('R', 'L'):
         palm_names = ['{}Hand{}'.format(side, idx)
                      for idx in HAND_PALM_LANDMARKS]
-        if all(name in joint_positions for name in palm_names):
-            obstacles.append(_palm_obstacle(
-                [joint_positions[name] for name in palm_names]))
+        available = [joint_positions[name] for name in palm_names
+                    if name in joint_positions]
+        if len(available) == len(palm_names):
+            obstacles.append(_palm_obstacle(available))
         else:
-            obstacles.append(_dummy_cylinder(HAND_PALM_RADIUS))
+            partial = _palm_obstacle_partial(available)
+            obstacles.append(
+                partial if partial is not None
+                else _dummy_cylinder(HAND_PALM_RADIUS))
         for base_idx, tip_idx in HAND_FINGER_LANDMARKS:
             base_name = '{}Hand{}'.format(side, base_idx)
             tip_name = '{}Hand{}'.format(side, tip_idx)
@@ -728,10 +806,13 @@ def human_capsules(joint_positions):
     for side in ('R', 'L'):
         palm_names = ['{}Hand{}'.format(side, idx)
                      for idx in HAND_PALM_LANDMARKS]
-        if all(name in joint_positions for name in palm_names):
-            pts = np.array([joint_positions[name] for name in palm_names],
-                           dtype=np.float64)
-            center = pts.mean(axis=0)
+        available = [joint_positions[name] for name in palm_names
+                    if name in joint_positions]
+        # human_body_obstacles (_palm_obstacle_partial) と同じ基準: 5点
+        # 全部でなくとも PALM_OBSTACLE_MIN_POINTS 点あれば、ダミー (100m
+        # 先) にせず検出できた点の重心を大まかな掌の位置として使う。
+        if len(available) >= PALM_OBSTACLE_MIN_POINTS:
+            center = np.mean(available, axis=0)
         else:
             center = dummy
         caps.append((center, center, HAND_PALM_RADIUS))
