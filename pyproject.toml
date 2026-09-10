@@ -4,18 +4,20 @@ version = "0.1.0"
 description = "aero_demo scripts: camera + MediaPipe + scikit-robot IK pipeline for the Aero handshake demo."
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "rospkg",
-    "catkin_pkg",
-    "empy",
-    "numpy>=2",
-    "opencv-python>=4.9",
+    "rospkg==1.6.2",
+    "catkin_pkg==1.1.0",
+    "empy==4.2.1",
+    "numpy==2.4.6; python_full_version < '3.12'",
+    "numpy==2.5.3; python_full_version >= '3.12'",
+    "opencv-python==5.0.0.93",
     # people_pose_estimator.py が使う mp.solutions.holistic/pose (legacy
     # Solutions API) は 0.10.9 より後のバージョンで python/solutions パッケージ
     # ごと削除されている (1.0 系では mediapipe.solutions 自体が無くなる)。
     # Tasks API に移行するまではこのバージョンに固定する。
     "mediapipe==0.10.9",
-    "scikit-robot[all]>=0.3.15",
-    "jax[cuda12]>=0.10",
+    "scikit-robot[all]==0.3.15",
+    "jax[cuda12]==0.10.2; python_full_version < '3.12'",
+    "jax[cuda12]==0.11.1; python_full_version >= '3.12'",
 ]
 
 [project.optional-dependencies]

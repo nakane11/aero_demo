@@ -2,5 +2,4 @@ __pycache__/
 *.pyc
 .claude/
 scripts/random*
-uv.lock
 src/aero_demo.egg-info/
