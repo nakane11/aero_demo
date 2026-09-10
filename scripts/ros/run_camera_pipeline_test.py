@@ -45,9 +45,13 @@ dict で、合成骨格の ``skeleton.joint_positions`` と同じ形なので、
 
 実カメラ特有の 2 つの問題への対策も入れてある。
 
-* 深度が単発で背景側に飛ぶ (``_JointSmoother``): 関節位置を直近数フレーム
-  (``--joint-smoothing-window``, 既定 3) の成分ごとの中央値で時間方向に
-  平滑化してから使う。
+* 深度が単発で背景側に飛ぶ (``aero_demo.skeleton_filters.OneEuroFilter``):
+  関節位置に One Euro Filter (Casiez et al. 2012) をかけて時間方向に
+  平滑化してから使う。``scripts/record_skeleton_data.py`` で録った実データ
+  を ``scripts/filter_skeleton_data.py`` で分析した結果、単純な移動中央値
+  (旧 ``_JointSmoother``) よりも跳びを抑えつつ追従の遅れが小さかったため
+  採用した (``--joint-smoothing-mincutoff``/``--joint-smoothing-beta``、
+  既定はそのときに良かった設定)。
 * ARM を押しても差し出し手が見つからない: ``OfferedHandSelector`` は
   合成骨格向けにスコア閾値 (``--offer-score-min``, 既定は ``estimate_
   palm_poses.OFFER_SCORE_MIN``) が調整されているため、実カメラの姿勢では
@@ -95,16 +99,22 @@ from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
 from aero_demo.people_pose_types import Bone  # noqa: E402
+from aero_demo import skeleton_filters  # noqa: E402
 
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
 import plan_handshake_motion as phm  # noqa: E402
-from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
+from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
+from handshake_viewer_common import apply_robot_pose as apply_result_pose  # noqa: E402,E501
+from handshake_viewer_common import apply_waypoint_pose  # noqa: E402
+from handshake_viewer_common import build_display_waypoints  # noqa: E402
+from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
+from handshake_viewer_common import colliding_link_pairs  # noqa: E402
+from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
+from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
+from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
-from skrobot.coordinates import Coordinates  # noqa: E402
-from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
-from skrobot.model import RobotModel  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
@@ -118,24 +128,11 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 # (view_handshake_motion.DEFAULT_PLAYBACK_FPS と同じ)。
 DEFAULT_PLAYBACK_FPS = 20.0
 
-# solve_palm_ik.py が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
-# (box/cylinder/sphere のプリミティブ形状) を、表示用ロボット
-# (self.display_robot、不透明) に重ねて半透明で表示する色 (RGBA, 0-255)。
-# view_handshake_poses.ROBOT_COLLISION_LINK_COLOR と同じ値
-# (build_robot_collision_overlay 参照)。
-ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
-
-# solve_palm_ik.human_body_obstacles が作る、人体側の干渉回避ジオメトリ
-# (Cylinder) を表示する色 (RGBA, 0-255)。view_handshake_poses.
-# COLLISION_OBSTACLE_COLOR と同じ値 (ロボット側の橙系と見分けられるよう
-# 青系にしてある)。
-HUMAN_COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
-
-# 経路の最後に表示専用で追加する、後処理判定 (post_process = 掌への
-# 押し込み) までの補間フレーム数。plan_handshake_motion.py の経路には
-# 含めない (view_handshake_motion.PRESS_IN_DISPLAY_WAYPOINTS と同じ、
-# scripts/ros/ 層をこのファイル単独で完結させるため複製してある)。
-PRESS_IN_DISPLAY_WAYPOINTS = 5
+# ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
+# 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
+# なので handshake_viewer_common.py に一本化してある
+# (ROBOT_COLLISION_LINK_COLOR/HUMAN_COLLISION_OBSTACLE_COLOR/
+# PRESS_IN_DISPLAY_WAYPOINTS)。
 
 # 経路の先頭に表示専用で追加する、ロボットの初期位置 (台車=ワールド原点,
 # 関節=reset_pose) から経路計算の始点 (motion['waypoints'][0]、腕を下ろし
@@ -192,6 +189,28 @@ BONE_NAME_PAIRS = BODY_BONE_PAIRS + HAND_WRIST_PAIRS + [
     for side in ('R', 'L') for a, b in HAND_SEQUENCE]
 
 
+def _fill_missing_wrist_from_hand(positions):
+    """手首 (``RWrist``/``LWrist``) が未検出でも、Hand モデルの手首
+    ランドマーク (``RHand0``/``LHand0``) が検出できていればその位置を
+    手首として補って返す (辞書のコピー、``positions`` 自体は書き換えない)。
+
+    Pose モデルの手首 (``RWrist``/``LWrist``) と Hand モデルの手首
+    (``RHand0``/``LHand0``) は別々に検出されるランドマークなので
+    (``PeoplePoseEstimator._prune_implausible_hand_wrist_offset`` 参照)、
+    人にカメラから見て手が体の陰に隠れる等で Pose 側の手首だけ未検出に
+    なっても Hand 側は検出できていることがある。これを補わずに描画すると
+    ``RElbow``-``RWrist`` と ``RWrist``-``RHand0`` のどちらのボーンも
+    (``RWrist`` が無いので) 引けず、手のランドマークだけが肘から浮いて見え
+    (肘から先が骨格線として繋がって見えない) てしまう。
+    """
+    filled = dict(positions)
+    for wrist_name, hand_wrist_name in (('RWrist', 'RHand0'),
+                                        ('LWrist', 'LHand0')):
+        if wrist_name not in filled and hand_wrist_name in filled:
+            filled[wrist_name] = filled[hand_wrist_name]
+    return filled
+
+
 def build_skeleton_links(joint_positions):
     """骨格を部位ごとに色分けした線 (``skrobot.model.primitives.
     LineString``) のリストにする。
@@ -199,7 +218,8 @@ def build_skeleton_links(joint_positions):
     ``draw_random_human_poses.build_skeleton_links`` と同じ
     ``palm_plane_view.bone_line``/``bone_color`` を使うので、見た目
     (部位ごとの色) も同じになる。欠損した関節の補間や SMPL メッシュの
-    表示は行わず、実際に検出できた関節だけを線でつなぐ。
+    表示は行わない (``_fill_missing_wrist_from_hand`` による手首の補完を
+    除く) 。実際に検出できた関節だけを線でつなぐ。
 
     Parameters
     ----------
@@ -207,6 +227,7 @@ def build_skeleton_links(joint_positions):
         関節名 -> ``np.ndarray([x, y, z])`` (base_link 座標系)。
         ``PeoplePoseEstimator.estimate_3d`` が返す形式。
     """
+    joint_positions = _fill_missing_wrist_from_hand(joint_positions)
     links = []
     for start_name, end_name in BONE_NAME_PAIRS:
         if start_name not in joint_positions or end_name not in joint_positions:
@@ -219,241 +240,21 @@ def build_skeleton_links(joint_positions):
     return links
 
 
-def apply_result_pose(robot, result, use_post_process=False):
-    """``solve_palm_ik`` の結果 dict (関節角・台車位置姿勢) を、表示用の
-    (指ありの) ロボットモデルに反映する.
-
-    ``scripts/view_handshake_poses.py`` の ``apply_robot_pose`` と同じ
-    パターン -- ``result['joint_names']``/``joint_angle_vector`` は IK を
-    解いた指なしロボットの ``joint_list`` の角度なので、指ありの
-    ``robot`` とは関節の要素数・並びが異なる。そのため名前で突き合わせて
-    該当する関節だけ角度を反映する (指関節は既定姿勢のまま)。
-
-    Parameters
-    ----------
-    use_post_process : bool, optional
-        ``True`` のとき、``result['post_process']`` (掌に押し付ける位置
-        まで詰めた後処理後の姿勢) があればそれを反映する。無ければ
-        (後処理判定に失敗した/IK 自体が解けなかった) 後処理前の姿勢に
-        フォールバックする。
-    """
-    source = result
-    if use_post_process and result.get('post_process') is not None:
-        source = result['post_process']
-    robot.reset_pose()
-    name_to_angle = dict(zip(
-        source['joint_names'], source['joint_angle_vector']))
-    for joint in robot.joint_list:
-        if joint.name in name_to_angle:
-            joint.joint_angle(name_to_angle[joint.name])
-    robot.base_link.newcoords(Coordinates(
-        pos=source['base_position'],
-        rot=rpy_matrix(source['base_yaw'], 0.0, 0.0)))
-
-
-def apply_waypoint_pose(display_robot, joint_names, waypoints, index):
-    """``waypoints[index]`` (台車位置姿勢・全身の関節角) を、表示用の
-    (指ありの) ``display_robot`` に反映する。
-
-    ``apply_result_pose`` と同じパターン -- ``joint_names``/
-    ``waypoints[...]['joint_angle_vector']`` は指なしロボット
-    (``plan_handshake_motion.plan_person_motion`` が使う ``self.robot``)
-    の関節角なので、名前で突き合わせて該当する関節だけ反映する (指関節は
-    既定姿勢のまま)。
-    """
-    wp = waypoints[index]
-    display_robot.reset_pose()
-    name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
-    for joint in display_robot.joint_list:
-        if joint.name in name_to_angle:
-            joint.joint_angle(name_to_angle[joint.name])
-    display_robot.base_link.newcoords(Coordinates(
-        pos=wp['base_position'], rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
-
-
-def build_robot_collision_overlay(robot, primitive_type=None,
-                                  force_convert=False):
-    """``robot`` (表示用の不透明なロボットモデル) に重ねて表示するための、
-    ``robot`` と同じ URDF から作ったプリミティブ近似 (box/cylinder/sphere)
-    の、もう一体の ``skrobot.model.RobotModel`` を作る。
-
-    ``view_handshake_poses.build_robot_collision_overlay`` と同じ
-    (scripts/ros/ 層をこのファイル単独で完結させるため複製してある) --
-    ``build_collision_model_urdf`` (``view_aero_collision_model.py``、
-    ``solve_palm_ik.apply_collision_model`` と共通) が生成・キャッシュした
-    プリミティブ近似 URDF (visual/collision とも同じ形状に変換済み) を
-    もう一体のロボットとして読み込む。
-
-    このノードでは ``robot`` に指ありの ``self.display_robot`` を渡す
-    (呼び出し元の ``_setup_viewer`` 参照)。IK 自体は指なしの ``self.robot``
-    で解いているため、この overlay 自体は IK が実際に使った形状ではない --
-    指を含めた事後検証 (``colliding_link_pairs``) とその表示のためだけの
-    もので、``self.robot_collision_overlay`` から作る ``verification_pairs``
-    (``build_collision_verification_pairs``) にも指のリンクが入る。``robot``
-    自体は変更しない。呼び出し側は毎フレーム ``sync_robot_collision_
-    overlay`` で ``robot`` 相当の現在の姿勢に追従させる。
-    """
-    collision_urdf_path = build_collision_model_urdf(
-        robot.urdf_path, primitive_type=primitive_type, force=force_convert)
-    collision_robot = RobotModel()
-    collision_robot.load_urdf_file(
-        str(collision_urdf_path), include_mimic_joints=False)
-    for link in collision_robot.link_list:
-        palm_plane_view.set_color(link, ROBOT_COLLISION_LINK_COLOR)
-    return collision_robot
-
-
-def sync_robot_collision_overlay(collision_overlay, display_robot):
-    """``build_robot_collision_overlay`` が返した overlay を、表示用の
-    (指ありの) ``display_robot`` の現在の姿勢 (関節角・台車位置姿勢) に
-    追従させる。
-
-    ``collision_overlay`` は指なしロボットの URDF (``self.robot.urdf_path``)
-    から作られており ``display_robot`` (指あり) とは関節の要素数・並びが
-    異なるため、``apply_result_pose``/``apply_waypoint_pose`` と同じく
-    名前で突き合わせて反映する (overlay 側に指関節は無いので、指の姿勢は
-    自然に無視される)。
-    """
-    name_to_angle = {joint.name: joint.joint_angle()
-                     for joint in display_robot.joint_list}
-    for joint in collision_overlay.joint_list:
-        if joint.name in name_to_angle:
-            joint.joint_angle(name_to_angle[joint.name])
-    collision_overlay.newcoords(display_robot.base_link.copy_worldcoords())
-
-
-def colliding_link_pairs(robot, pairs, joint_positions,
-                         tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
-    """``view_handshake_poses.colliding_link_pairs`` と同じ (scripts/ros/
-    層をこのファイル単独で完結させるため複製してある) -- ``solve_palm_ik.
-    collision_pairs_min_distance`` と全く同じ距離計算・同じ許容誤差
-    (``tolerance``) を使い、``pairs`` (``solve_palm_ik.build_collision_
-    verification_pairs`` が作る自己干渉・人体との干渉の総当たりの組み合わせ)
-    の中から実際に貫通している組み合わせを**すべて**列挙する。
-
-    Parameters
-    ----------
-    robot : skrobot.model.RobotModel
-        干渉ジオメトリ (プリミティブ近似済みの ``collision_mesh``) を持つ、
-        現在の姿勢のロボット (このノードでは指ありの
-        ``self.robot_collision_overlay``)。
-    pairs : list of (Link, Link) or (Link, int)
-        ``build_collision_verification_pairs`` の戻り値。2 要素目が ``int``
-        なら ``spik.human_obstacle_names()`` の人体セグメントとの組み合わせ、
-        ``Link`` ならロボット自身の自己干渉の組み合わせ。
-    joint_positions : dict or None
-        干渉回避の障害物にした人体の関節位置 (``spik.human_capsules`` に
-        渡す)。``None`` なら人体との干渉ペア (``other`` が ``int``) は判定
-        できないので読み飛ばす (自己干渉ペアは判定する)。
-
-    Returns
-    -------
-    list of (str, str, str, float)
-        ``(種別, リンク A の名前, リンク B の名前 (人体セグメントなら
-        human_obstacle_names() の名前), 距離 [m])`` のリスト。種別は
-        ``'self'`` (自己干渉) / ``'human'`` (人体との干渉)。距離が負なほど
-        深く貫通している。貫通していない (``dist >= -tolerance``) 組み合わせ
-        は含めない。貫通が深い順に並べる。
-    """
-    if not pairs:
-        return []
-    caps = spik.human_capsules(joint_positions)[0] if joint_positions else None
-    obstacle_names = spik.human_obstacle_names()
-    world_vertices_by_link = {}
-
-    def _world_vertices(link):
-        if link not in world_vertices_by_link:
-            local = np.asarray(link.collision_mesh.vertices, dtype=np.float64)
-            world_vertices_by_link[link] = (
-                local @ link.worldrot().T + link.worldpos())
-        return world_vertices_by_link[link]
-
-    colliding = []
-    for link_a, other in pairs:
-        verts_a = _world_vertices(link_a)
-        if isinstance(other, int):
-            if caps is None:
-                continue
-            p0, p1, radius = caps[other]
-            dist = float(
-                spik.segment_points_distance(p0, p1, verts_a).min()) - radius
-            kind, name_b = 'human', obstacle_names[other]
-        else:
-            verts_b = _world_vertices(other)
-            dist = float(np.linalg.norm(
-                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
-                axis=-1).min())
-            kind, name_b = 'self', other.name
-        if dist < -tolerance:
-            colliding.append((kind, link_a.name, name_b, dist))
-    colliding.sort(key=lambda item: item[3])
-    return colliding
+# apply_result_pose (handshake_viewer_common.apply_robot_pose)/
+# apply_waypoint_pose/build_robot_collision_overlay/
+# sync_robot_collision_overlay/colliding_link_pairs/build_display_waypoints
+# は view_handshake_poses.py/view_handshake_motion.py と共通なので
+# handshake_viewer_common.py に一本化してある (モジュール先頭で import
+# 済み)。collision_pairs_text だけは、IK 自体は指なしで解いているのに
+# 画面表示は指先まで含めた事後検証であることが分かるよう、見出しを
+# 変えたラッパー (下の collision_pairs_text) をこのファイルに残す。
 
 
 def collision_pairs_text(colliding):
-    """``colliding_link_pairs`` の戻り値を、viser のテキストパネルに出す
-    ための文字列にする (``view_handshake_poses.collision_pairs_text`` と
-    同じ、自己干渉/人体との干渉を分けて列挙する)。"""
-    self_pairs = [c for c in colliding if c[0] == 'self']
-    human_pairs = [c for c in colliding if c[0] == 'human']
-    if not colliding:
-        return ('指先まで含めた事後検証: 干渉なし (自己干渉・人体との干渉'
-                'ともに検出されていません)')
-    lines = ['指先まで含めた事後検証: 干渉 {} 件 (自己干渉 {} 件, '
-            '人体との干渉 {} 件)'.format(
-                len(colliding), len(self_pairs), len(human_pairs))]
-    for _, name_a, name_b, dist in self_pairs:
-        lines.append('- [自己干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
-            name_a, name_b, -dist))
-    for _, name_a, name_b, dist in human_pairs:
-        lines.append('- [対人干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
-            name_a, name_b, -dist))
-    return '\n\n'.join(lines)
-
-
-def build_display_waypoints(motion, result):
-    """``motion['waypoints']`` (``plan_handshake_motion.py`` が計画・検証
-    した経路) に、``result['post_process']`` (``solve_palm_ik.py`` の後処理
-    判定) までの補間フレームを表示用に追加する
-    (``view_handshake_motion.build_display_waypoints`` と同じ、
-    scripts/ros/ 層をこのファイル単独で完結させるため複製してある)。
-
-    ``post_process`` が無い場合は ``motion['waypoints']`` をそのまま返す。
-
-    Returns
-    -------
-    (waypoints, n_approach)
-        ``waypoints`` は表示用の waypoint リスト。``n_approach`` は
-        ``motion['waypoints']`` の個数 (この添字以降が表示専用の後処理
-        フレームで、``waypoint_min_distances`` による検証の対象外)。
-    """
-    waypoints = list(motion['waypoints'])
-    n_approach = len(waypoints)
-    post = result.get('post_process')
-    if post is None:
-        return waypoints, n_approach
-
-    joint_names = motion['joint_names']
-    last_wp = waypoints[-1]
-    start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
-    post_name_to_angle = dict(zip(post['joint_names'],
-                                  post['joint_angle_vector']))
-    end_vec = np.array([post_name_to_angle.get(name, start_vec[i])
-                        for i, name in enumerate(joint_names)])
-    base_start = np.array([last_wp['base_position'][0],
-                           last_wp['base_position'][1], last_wp['base_yaw']])
-    base_end = np.array([post['base_position'][0], post['base_position'][1],
-                         post['base_yaw']])
-
-    for t in np.linspace(0.0, 1.0, PRESS_IN_DISPLAY_WAYPOINTS + 1)[1:]:
-        angle_vec = start_vec + (end_vec - start_vec) * t
-        base_vec = base_start + (base_end - base_start) * t
-        waypoints.append(dict(
-            base_position=[float(base_vec[0]), float(base_vec[1]), 0.0],
-            base_yaw=float(base_vec[2]),
-            joint_angle_vector=[float(v) for v in angle_vec],
-        ))
-    return waypoints, n_approach
+    """``handshake_viewer_common.collision_pairs_text`` に、IK 自体は
+    指なしロボットで解いているが画面表示は指先まで含めた事後検証で
+    あることを示す見出しを付けて呼ぶ (モジュール docstring 参照)。"""
+    return common_collision_pairs_text(colliding, label='指先まで含めた事後検証')
 
 
 def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
@@ -501,61 +302,6 @@ def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
             joint_angle_vector=[float(v) for v in angle_vec],
         ))
     return waypoints
-
-
-class _JointSmoother(object):
-    """関節位置を、直近数フレームの成分ごとの中央値で平滑化する.
-
-    実カメラの深度は関節の輪郭付近で単発の外れ値を返すことがある
-    (2D landmark が輪郭からわずかに外れた拍子に ``PeoplePoseEstimator.
-    _sample_depth`` のパッチが背景側の画素を拾ってしまう、等) -- これが
-    「デプスが後ろの方に一瞬飛ぶ」現象の主な原因で、関節が一瞬だけ背景の
-    depth を拾って画面奥に跳ぶように見える。この外れ値が 2〜3 フレーム
-    連続することは稀なので、直近 ``window`` フレームの位置を関節名ごとに
-    ためておき、成分ごとの中央値を返すだけで単発の外れ値はほぼ消える
-    (実際に人物が素早く動いた場合は数フレームで新しい位置に中央値も追従
-    する)。空間方向 (``PeoplePoseEstimator.depth_patch_size``) の平滑化と
-    直交する、時間方向の平滑化にあたる。
-
-    カメラ座標系と base_link 座標系 (TF 解決状況によって毎フレーム変わり
-    うる, ``run_camera_pipeline_test.HandshakePipelineNode._on_frame``
-    参照) を混ぜて中央値を取ると数フレームだけ無意味な値になるため、
-    座標系が変わったら ``update`` の ``frame_key`` が変わったとみなして
-    履歴を作り直す。
-    """
-
-    def __init__(self, window=3):
-        self.window = max(1, int(window))
-        self._history = {}  # name -> list of np.ndarray (古い順)
-        self._frame_key = None
-
-    def update(self, joint_positions, frame_key=None):
-        """今フレームの生の関節位置を履歴に積み、平滑化した結果を返す.
-
-        Parameters
-        ----------
-        joint_positions : dict
-            関節名 -> [x, y, z] (今フレームで検出できた関節だけ)。
-        frame_key : hashable, optional
-            座標系を識別するキー (例: base_link 座標系かどうか)。前回と
-            異なれば履歴をリセットする。
-        """
-        if frame_key != self._frame_key:
-            self._history = {}
-            self._frame_key = frame_key
-        smoothed = {}
-        for name, pos in joint_positions.items():
-            history = self._history.setdefault(name, [])
-            history.append(np.asarray(pos, dtype=np.float64))
-            if len(history) > self.window:
-                del history[0]
-            smoothed[name] = np.median(np.stack(history, axis=0), axis=0)
-        # 今フレームで検出できなかった関節の履歴は消す (再検出したときに
-        # 古い位置との中央値を取ってしまわないようにするため)。
-        for name in list(self._history):
-            if name not in joint_positions:
-                del self._history[name]
-        return smoothed
 
 
 def _format_offer_scores(selection, score_min):
@@ -657,6 +403,7 @@ def draw_skeleton_overlay(color_bgr, joints_2d):
     overlay = color_bgr.copy()
     positions = {j['limb']: (int(round(j['x'])), int(round(j['y'])))
                 for j in joints_2d if j['score'] >= 0}
+    positions = _fill_missing_wrist_from_hand(positions)
     for start_name, end_name in BONE_NAME_PAIRS:
         if start_name not in positions or end_name not in positions:
             continue
@@ -694,6 +441,8 @@ class HandshakePipelineNode(object):
             min_body_size=args.min_body_size,
             max_body_size=args.max_body_size,
             max_limb_length=args.max_limb_length,
+            max_hand_segment_length=args.max_hand_segment_length,
+            max_hand_reach=args.max_hand_reach,
             depth_patch_size=args.depth_patch_size)
 
         # IK 自体は指なしロボットで解く (solve_palm_ik.py と同じ、指関節が
@@ -754,8 +503,14 @@ class HandshakePipelineNode(object):
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
         # 深度ノイズによる関節位置の単発の飛び (「デプスが後ろの方に一瞬
-        # 飛ぶ」) を抑える時間方向の平滑化 (_JointSmoother 参照)。
-        self._joint_smoother = _JointSmoother(window=args.joint_smoothing_window)
+        # 飛ぶ」) を抑える時間方向の平滑化 (aero_demo.skeleton_filters.
+        # OneEuroFilter 参照。record_skeleton_data.py で録った実データを
+        # filter_skeleton_data.py で比較し、単純な移動中央値より跳びを
+        # 抑えつつ追従の遅れが小さかったため採用)。
+        self._joint_smoother = skeleton_filters.OneEuroFilter(
+            mincutoff=args.joint_smoothing_mincutoff,
+            beta=args.joint_smoothing_beta,
+            dcutoff=args.joint_smoothing_dcutoff)
 
         # --- 表示・状態管理用 (コールバックスレッドと表示ループの両方から
         # 触るので lock で保護する) ---
@@ -783,8 +538,7 @@ class HandshakePipelineNode(object):
         self._display_waypoints = None    # build_display_waypoints の表示用 waypoint リスト or None
         self._display_n_prepend = 0        # 上記の先頭のうち、初期位置->経路開始点の表示専用フレームの個数
         self._display_n_approach = 0      # 上記のうち経路計画済み (表示専用の先頭/末尾フレームでない) 個数
-        self._collision_joint_positions = None  # 指ありでの事後検証 (colliding_link_pairs) に使う人体の関節位置 (real 座標系) or None
-        self._collision_pairs_text = ''   # 上記の事後検証結果 (collision_pairs_text の戻り値)。_refresh_collision_pairs_text で更新する
+        self._collision_pairs_text = ''   # 指ありでの事後検証結果 (colliding_link_pairs/collision_pairs_text の戻り値)。_refresh_collision_pairs_text で更新する
         # 骨格表示のちらつき対策 (spin 参照)。いずれも spin() のスレッドから
         # のみ読み書きするため lock は不要。
         self._last_detected_joint_positions = None  # 直近に検出できた骨格 (未検出フレームの間もこれを表示し続ける)
@@ -916,8 +670,8 @@ class HandshakePipelineNode(object):
         # self.verification_pairs (指なし) とは別物。
         self.hand_verification_pairs = spik.build_collision_verification_pairs(
             self.robot_collision_overlay, 'r')
-        self._refresh_collision_pairs_text()
         self._current_obstacle_links = []  # 人体側の干渉回避ジオメトリ (Cylinder) の overlay。RESET/再 ARM のたびに作り直す
+        self._refresh_collision_pairs_text()
         self.arm_button = self.viewer._server.gui.add_button(
             'ARM (差し出し手を待つ)')
         self.reset_button = self.viewer._server.gui.add_button(
@@ -941,7 +695,6 @@ class HandshakePipelineNode(object):
                 self._display_waypoints = None
                 self._display_n_prepend = 0
                 self._display_n_approach = 0
-                self._collision_joint_positions = None
             self.play_checkbox.value = False
             self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
             self.reset_button.visible = False
@@ -1032,17 +785,7 @@ class HandshakePipelineNode(object):
         viewer_nav.wait_for_client(self.viewer, args.client_wait_timeout)
 
     def _set_link_visible(self, link, visible):
-        """``link`` (``viewer.add`` 済み) の表示/非表示を切り替える.
-
-        ``view_handshake_poses.set_link_visible`` と同じ -- チェックボックス
-        の on_update (viser の GUI コールバックは別スレッドで実行される) が
-        人物切り替え/RESET によるリンクの削除/再作成と競合すると、既に
-        削除されて ``viewer._linkid_to_handle`` に存在しないリンクを渡され
-        ることがある。その場合は何もしない (どうせ表示すべき対象ではない)。
-        """
-        handle = self.viewer._linkid_to_handle.get(str(id(link)))
-        if handle is not None:
-            handle.visible = visible
+        common_set_link_visible(self.viewer, link, visible)
 
     def _resolve_robot_position(self):
         """既定のロボット手先位置 (掌推定の ``robot_position``)。
@@ -1127,13 +870,16 @@ class HandshakePipelineNode(object):
         # base_link 座標系が要るので、変換できたフレームでのみ行う。
         is_base_frame = camera_to_base is not None
         raw_joint_positions = people[0] if people else None
-        # 深度の単発の外れ値 (奥の壁に一瞬飛ぶ等) を時間方向の中央値で抑える
-        # (_JointSmoother 参照)。座標系が変わったら (TF 解決状況の変化)
-        # 履歴を自動でリセットする。
+        # 深度の単発の外れ値 (奥の壁に一瞬飛ぶ等) を One Euro Filter で時間
+        # 方向に抑える (self._joint_smoother 参照)。座標系が変わったら (TF
+        # 解決状況の変化) 履歴を自動でリセットする。One Euro Filter はフレーム
+        # 数ではなく実時間に基づいて減衰するため、カメラ画像のタイムスタンプ
+        # (color_msg.header.stamp) を渡す。
         preview_joint_positions = (
             None if raw_joint_positions is None
-            else self._joint_smoother.update(raw_joint_positions,
-                                             frame_key=is_base_frame))
+            else self._joint_smoother.update(
+                raw_joint_positions, t=color_msg.header.stamp.to_sec(),
+                frame_key=is_base_frame))
         armed_joint_positions = (
             preview_joint_positions if is_base_frame else None)
 
@@ -1301,16 +1047,12 @@ class HandshakePipelineNode(object):
         # solve_palm_ik.py が実際に干渉判定へ使ったのと同じ人体の近似
         # ジオメトリ (Cylinder) は、この joint_positions (frozen 表示中の
         # 骨格) に対して spin() -> _update_skeleton_view が継続的に描画・
-        # 更新している (view_handshake_poses.py と同じ半透明表示、「干渉
-        # 余裕は正のはずなのに見た目は貫通しているように見える」場合に
-        # 実際に使われている近似形状を重ねて見比べられるようにするため)。
-        # ここで改めて作り直す必要はない。
-        # 指ありでの事後検証 (colliding_link_pairs) にも同じ関節位置を使う。
-        # ここではまだ self.display_robot の姿勢を更新していないので実際の
-        # 再計算は行わず、後段の _set_waypoint_slider_range が呼ぶ
-        # _apply_current_waypoint (-> _refresh_collision_pairs_text) に
-        # 任せる。
-        self._collision_joint_positions = joint_positions
+        # 更新し、self._current_obstacle_links に保持している
+        # (view_handshake_poses.py と同じ半透明表示)。指ありでの事後検証
+        # (colliding_link_pairs) は、この self._current_obstacle_links を
+        # そのまま使う (_refresh_collision_pairs_text 参照) ので、見た目の
+        # メッシュと判定に使うメッシュが常に一致する。ここで改めて作り直す
+        # 必要はない。
 
         # 画面の指ありロボットに軌道の waypoint 0 (初期姿勢) から表示する
         # (view_handshake_motion.py と同じ、waypoint スライダー/Play で
@@ -1472,14 +1214,16 @@ class HandshakePipelineNode(object):
         用の別チェックであり ``motion['waypoint_min_distances']`` (指なしで
         の判定) を上書きするものではない。
 
-        ``self._collision_joint_positions`` (``_solve_handshake`` が offered_
-        hand 決定時の骨格で更新する、RESET でクリアされる) が ``None`` の
-        間 (IDLE/RESET 直後) は人体との干渉は判定できないが、ロボットの
-        自己干渉 (指同士/指と他リンク含む) はそれでも判定できる。
+        人体側は ``self._current_obstacle_links`` (``_update_skeleton_view``
+        が画面に表示している、まさにその半透明 Cylinder) をそのまま渡すので、
+        見た目のメッシュと判定に使うメッシュが常に一致する。これが空
+        (``[]``, 骨格未検出/IDLE/RESET 直後) の間は人体との干渉は判定でき
+        ないが、ロボットの自己干渉 (指同士/指と他リンク含む) はそれでも
+        判定できる。
         """
         colliding = colliding_link_pairs(
             self.robot_collision_overlay, self.hand_verification_pairs,
-            self._collision_joint_positions,
+            self._current_obstacle_links,
             tolerance=self.args.collision_verify_tolerance)
         self._collision_pairs_text = collision_pairs_text(colliding)
 
@@ -1737,21 +1481,46 @@ def main():
             '捨てる (既定 0.7m)。深度が単発で背景側に飛んで腕や脚が不自然 '
             'に伸びて見える現象への対策 (PeoplePoseEstimator._prune_'
             'implausible_limbs 参照)。')
+    parser.add_argument(
+        '--max-hand-segment-length', type=float, default=0.12,
+        help='手首-各指の関節間の区間の長さ [m] がこれを超えたら遠位側の '
+            'ランドマークを検出できなかった扱いにして捨てる (既定 0.12m)。'
+            '指は輪郭が細く深度パッチが背景を拾いやすいため、指のランド '
+            'マークが一瞬だけ全く違う場所に飛ぶ現象への対策 '
+            '(PeoplePoseEstimator._prune_implausible_hand_landmarks 参照)。')
+    parser.add_argument(
+        '--max-hand-reach', type=float, default=0.22,
+        help='手首 ({side}Hand0) から各指ランドマークまでの直線距離 [m] '
+            'がこれを超えたら遠位側のランドマークを検出できなかった扱い '
+            'にして捨てる (既定 0.22m)。--max-hand-segment-length は隣接 '
+            '関節同士の距離しか見ないため、各区間が閾値ギリギリで同じ '
+            '方向に連鎖すると手首-指先の累積では大きく伸びうる (指全体が '
+            '花束状に開いて見える現象) のを防ぐための追加チェック '
+            '(PeoplePoseEstimator._prune_implausible_hand_landmarks 参照)。')
     parser.add_argument('--depth-patch-size', type=int, default=3)
     parser.add_argument(
-        '--joint-smoothing-window', type=int, default=3,
-        help='関節位置の時間方向の平滑化に使う直近フレーム数 (既定 3, '
-            '_JointSmoother 参照)。深度が単発で背景に飛ぶ外れ値を、直近 '
-            'この枚数の成分ごとの中央値を取ることで抑える。1 にすると '
-            '平滑化を無効化する (従来の挙動)。大きくするほど滑らかになる '
-            '代わりに追従が遅れる。')
+        '--joint-smoothing-mincutoff', type=float, default=0.5,
+        help='関節位置の時間方向の平滑化 (One Euro Filter, aero_demo.'
+            'skeleton_filters.OneEuroFilter 参照) の最小カットオフ周波数 '
+            '[Hz] (既定 0.5)。下げるほど静止時のジッタが減るが追従が '
+            '遅れる。record_skeleton_data.py で録った実データを '
+            'filter_skeleton_data.py で比較して決めた値。')
     parser.add_argument(
-        '--offer-score-min', type=float, default=epp.OFFER_SCORE_MIN,
-        help='差し出し手と判定するスコアの閾値 (既定 {:.2f}, '
-            'estimate_palm_poses.OFFER_SCORE_MIN と同じ)。合成骨格向けに '
-            '調整された値なので、実カメラで ARM を押しても差し出し手が '
-            '見つからない場合は、viser 画面に表示されるスコアを見ながら '
-            'この値を下げて試すとよい。'.format(epp.OFFER_SCORE_MIN))
+        '--joint-smoothing-beta', type=float, default=0.3,
+        help='One Euro Filter の速度依存カットオフの係数 (既定 0.3)。'
+            '上げるほど速い動きへの追従の遅れが減るが静止時のジッタが '
+            '増える。')
+    parser.add_argument(
+        '--joint-smoothing-dcutoff', type=float, default=1.0,
+        help='One Euro Filter の速度推定のカットオフ周波数 [Hz] (既定 1.0)。')
+    parser.add_argument(
+        '--offer-score-min', type=float, default=0.7,
+        help='差し出し手と判定するスコアの閾値 (既定 0.7)。'
+            'estimate_palm_poses.OFFER_SCORE_MIN ({:.2f}) は合成骨格向けに '
+            '調整された値で実カメラでは届きにくいため、実カメラ用にここで '
+            '下げてある。それでも ARM を押して差し出し手が見つからない '
+            '場合は、viser 画面に表示されるスコアを見ながらさらに調整する '
+            'とよい。'.format(epp.OFFER_SCORE_MIN))
     parser.add_argument(
         '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
         help='使うロボットの腕。既定 (auto) は人間の手の反対側 '
