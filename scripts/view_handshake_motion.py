@@ -57,6 +57,14 @@ if _THIS_DIR not in sys.path:
 from aero_demo import viewer_nav  # noqa: E402
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
+from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR as COLLISION_OBSTACLE_COLOR  # noqa: E402,E501
+from handshake_viewer_common import apply_waypoint_pose  # noqa: E402
+from handshake_viewer_common import build_display_waypoints  # noqa: E402
+from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
+from handshake_viewer_common import colliding_link_pairs  # noqa: E402
+from handshake_viewer_common import collision_pairs_text  # noqa: E402
+from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
+from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from solve_palm_ik import DEFAULT_COLLISION_VERIFY_TOLERANCE  # noqa: E402
 from solve_palm_ik import HUMAN_FRONT_DISTANCE  # noqa: E402
 from solve_palm_ik import build_collision_verification_pairs  # noqa: E402
@@ -65,34 +73,25 @@ from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402,E501
 from solve_palm_ik import translate_joint_positions  # noqa: E402
 
-from skrobot.coordinates import Coordinates  # noqa: E402
-from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
-from view_handshake_poses import build_robot_collision_overlay  # noqa: E402
 from view_handshake_poses import build_smpl_mesh  # noqa: E402
-from view_handshake_poses import colliding_link_pairs  # noqa: E402
-from view_handshake_poses import collision_pairs_text  # noqa: E402
 from view_handshake_poses import look_at_pose  # noqa: E402
 from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa: E402,E501
-from view_handshake_poses import COLLISION_OBSTACLE_COLOR  # noqa: E402
 
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from skrobot.model import Link  # noqa: E402
 
-# 干渉回避用モデル (人体障害物・ロボット自身のプリミティブ近似) の色は
-# view_handshake_poses.py と揃える (COLLISION_OBSTACLE_COLOR/
-# ROBOT_COLLISION_LINK_COLOR)。
+# 干渉回避用モデル (人体障害物・ロボット自身のプリミティブ近似) の色、
+# apply_waypoint_pose/build_display_waypoints/build_robot_collision_
+# overlay/colliding_link_pairs/collision_pairs_text/sync_robot_collision_
+# overlay は view_handshake_poses.py/scripts/ros/run_camera_pipeline_
+# test.py と共通なので handshake_viewer_common.py に一本化してある。
 
 # waypoint 自動再生の既定の速さ [waypoint/秒]。
 DEFAULT_PLAYBACK_FPS = 20.0
-
-# 経路の最後に表示専用で追加する、後処理判定 (post_process = 掌への
-# 押し込み) までの補間フレーム数。plan_handshake_motion.py の経路には
-# 含めない (モジュール docstring 参照)。
-PRESS_IN_DISPLAY_WAYPOINTS = 5
 
 # 採用した軌道の作り方 (plan_handshake_motion.KIND_LABELS と同じ内容を
 # ここでも持つ -- plan_handshake_motion は jaxls 依存で import が重い
@@ -129,71 +128,10 @@ def iter_common_names(skeleton_dir, handshake_dir, motion_dir):
         if load_motion_json(os.path.join(motion_dir, name)).get('planned'))
 
 
-def apply_waypoint_pose(robot, joint_names, waypoints, waypoint_index):
-    """``waypoints[waypoint_index]`` (台車位置姿勢・全身の関節角) を
-    ``robot`` に反映する。``joint_names`` は ``waypoints`` の
-    ``joint_angle_vector`` に対応する関節名の並び
-    (``motion['joint_names']``)。"""
-    wp = waypoints[waypoint_index]
-    name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
-    for joint in robot.joint_list:
-        if joint.name in name_to_angle:
-            joint.joint_angle(name_to_angle[joint.name])
-    robot.base_link.newcoords(Coordinates(
-        pos=wp['base_position'],
-        rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
-
-
-def build_display_waypoints(motion, handshake):
-    """``motion['waypoints']`` (``plan_handshake_motion.py`` が計画・検証
-    した経路) に、``handshake['post_process']`` (``solve_palm_ik.py`` の
-    後処理判定) までの補間フレームを表示用に追加する
-    (``PRESS_IN_DISPLAY_WAYPOINTS`` 個、台車は動かさず腕+首だけ)。
-
-    ``post_process`` が無い (後処理判定が全ての候補で失敗し、後処理前の
-    まま採用された) 場合は ``motion['waypoints']`` をそのまま返す。
-
-    Returns
-    -------
-    (waypoints, n_approach)
-        ``waypoints`` は表示用の waypoint リスト。``n_approach`` は
-        ``motion['waypoints']`` の個数 (この添字以降が表示専用の後処理
-        フレーム、``waypoint_min_distances`` による検証の対象外)。
-    """
-    waypoints = list(motion['waypoints'])
-    n_approach = len(waypoints)
-    post = handshake.get('post_process')
-    if post is None:
-        return waypoints, n_approach
-
-    joint_names = motion['joint_names']
-    last_wp = waypoints[-1]
-    start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
-    post_name_to_angle = dict(zip(post['joint_names'],
-                                  post['joint_angle_vector']))
-    end_vec = np.array([post_name_to_angle.get(name, start_vec[i])
-                        for i, name in enumerate(joint_names)])
-    base_start = np.array([last_wp['base_position'][0],
-                           last_wp['base_position'][1], last_wp['base_yaw']])
-    base_end = np.array([post['base_position'][0], post['base_position'][1],
-                         post['base_yaw']])
-
-    for t in np.linspace(0.0, 1.0, PRESS_IN_DISPLAY_WAYPOINTS + 1)[1:]:
-        angle_vec = start_vec + (end_vec - start_vec) * t
-        base_vec = base_start + (base_end - base_start) * t
-        waypoints.append(dict(
-            base_position=[float(base_vec[0]), float(base_vec[1]), 0.0],
-            base_yaw=float(base_vec[2]),
-            joint_angle_vector=[float(v) for v in angle_vec],
-        ))
-    return waypoints, n_approach
-
-
-def sync_robot_collision_overlay(collision_robot, robot):
-    """``view_handshake_poses.sync_robot_collision_overlay`` と同じ
-    (``robot`` の現在の姿勢に ``collision_robot`` を追従させる)。"""
-    collision_robot.angle_vector(robot.angle_vector())
-    collision_robot.newcoords(robot.base_link.copy_worldcoords())
+# apply_waypoint_pose/build_display_waypoints/sync_robot_collision_overlay
+# は view_handshake_poses.py/scripts/ros/run_camera_pipeline_test.py と
+# 共通なので handshake_viewer_common.py に一本化してある (モジュール先頭で
+# import 済み)。
 
 
 class PlaybackControls(object):
@@ -427,9 +365,7 @@ def main():
     viewer_nav.set_front_view(viewer)
 
     def set_link_visible(link, visible):
-        handle = viewer._linkid_to_handle.get(str(id(link)))
-        if handle is not None:
-            handle.visible = visible
+        common_set_link_visible(viewer, link, visible)
 
     @show_collision_models_checkbox.on_update
     def _on_toggle_collision_models(_):  # noqa: ANN001
@@ -441,7 +377,7 @@ def main():
 
     current_mesh_link = [None]
     current_obstacle_links = []
-    current = {'name': None, 'motion': None, 'joint_positions': None,
+    current = {'name': None, 'motion': None,
               'person': None, 'model': None}
 
     def refresh_person():
@@ -471,7 +407,7 @@ def main():
         display_waypoints, n_approach = build_display_waypoints(
             motion, handshake)
         current.update(name=name, motion=motion,
-                      joint_positions=joint_positions, person=person,
+                      person=person,
                       model=model, handshake=handshake,
                       display_waypoints=display_waypoints,
                       n_approach=n_approach)
@@ -518,7 +454,7 @@ def main():
 
         colliding = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
-            current['joint_positions'],
+            current_obstacle_links,
             tolerance=args.collision_verify_tolerance)
         label_text.content = status_text(
             current['name'], controls.person_index, controls.n_people,

@@ -97,26 +97,26 @@ from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
+from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR as COLLISION_OBSTACLE_COLOR  # noqa: E402,E501
+from handshake_viewer_common import apply_robot_pose  # noqa: E402
+from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
+from handshake_viewer_common import colliding_link_pairs  # noqa: E402
+from handshake_viewer_common import collision_pairs_text  # noqa: E402
+from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
+from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from solve_palm_ik import DEFAULT_COLLISION_VERIFY_TOLERANCE  # noqa: E402
 from solve_palm_ik import HUMAN_FRONT_DISTANCE  # noqa: E402
 from solve_palm_ik import build_collision_verification_pairs  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
-from solve_palm_ik import human_capsules  # noqa: E402
-from solve_palm_ik import human_obstacle_names  # noqa: E402
 from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402
-from solve_palm_ik import segment_points_distance  # noqa: E402
 from solve_palm_ik import translate_joint_positions  # noqa: E402
 
 from skrobot.coordinates import Coordinates  # noqa: E402
-from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.model import Link  # noqa: E402
-from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Box  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
-
-from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
 # SMPL メッシュの肌色 (RGBA, 0-255)。draw_random_human_poses.py と違い
 # 人物ごとにランダムにはしない (このビューアは IK 結果の確認が目的で、
@@ -124,15 +124,10 @@ from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 SKIN_COLOR = [180, 130, 110, 255]
 
 # solve_palm_ik.human_body_obstacles が作る干渉回避ジオメトリ (Cylinder)
-# を表示する色 (RGBA, 0-255)。半透明にして SMPL メッシュ越しでも
-# 円柱の位置関係が見えるようにする (alpha が 255 未満)。
-COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
-
-# solve_palm_ik.py が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
-# (box/cylinder/sphere のプリミティブ形状。build_robot_collision_overlay
-# 参照) を表示する色 (RGBA, 0-255)。人体側の COLLISION_OBSTACLE_COLOR
-# (青系) と見分けられるよう、こちらは橙系にしてある。
-ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
+# を表示する色、ロボット自身の近似ジオメトリを表示する色は
+# handshake_viewer_common.HUMAN_COLLISION_OBSTACLE_COLOR/
+# ROBOT_COLLISION_LINK_COLOR に一本化してある (view_handshake_motion.py/
+# scripts/ros/run_camera_pipeline_test.py と共通)。
 
 # solve_palm_ik.base_movable_region が JSON に書き出す台車の可動範囲
 # (x_range/y_range, ワールド座標の平面矩形) を表示する色 (RGBA, 0-255)。
@@ -422,183 +417,11 @@ def pose_error_text(target_coords, hand_coords):
         float(np.linalg.norm(diff)), float(np.rad2deg(angle)))
 
 
-def apply_robot_pose(robot, handshake, use_post_process=False):
-    """``solve_palm_ik`` の戻り値 (関節角・台車位置姿勢) をロボットモデル
-    に反映する.
-
-    ``joint_angle_vector``/``joint_names`` は ``solve_palm_ik.py`` が
-    ``use_hand=False`` (指関節なし) のロボットで解いた際の ``robot.joint_list``
-    の角度なので、指関節ありのロボット (``--no-hand`` を付けない既定の表示
-    モデル) とは ``joint_list`` の要素数・並びが異なる。そのため
-    ``robot.angle_vector`` にそのまま渡さず、``joint_names`` で名前を突き
-    合わせて該当する関節だけ角度を反映する (指関節は初期姿勢のまま)。
-    台車の位置・向きは ``base_position``/``base_yaw`` に別で保存されている
-    ので、あわせて反映する (``solve_palm_ik.solve_palm_ik`` 参照)。
-
-    Parameters
-    ----------
-    use_post_process : bool, optional
-        ``True`` のとき、``solve_palm_ik.solve_post_process`` が解いた
-        後処理後の姿勢 (``handshake['post_process']`` -- 掌に押し付ける
-        位置まで詰め、自分の手を見るよう首も向けた姿勢) を反映する。
-        既定 (``False``) は従来通り後処理前の姿勢。``post_process`` が
-        無い (後処理判定に失敗した/この機能追加前の solve_palm_ik.py が
-        書き出した/IK 自体が解けなかった) JSON では、``use_post_process``
-        が ``True`` でも後処理前の姿勢にフォールバックする。
-    """
-    source = handshake
-    if use_post_process and handshake.get('post_process') is not None:
-        source = handshake['post_process']
-    robot.reset_pose()
-    name_to_angle = dict(zip(
-        source['joint_names'], source['joint_angle_vector']))
-    for joint in robot.joint_list:
-        if joint.name in name_to_angle:
-            joint.joint_angle(name_to_angle[joint.name])
-    robot.base_link.newcoords(Coordinates(
-        pos=source['base_position'],
-        rot=rpy_matrix(source['base_yaw'], 0.0, 0.0)))
-
-
-def build_robot_collision_overlay(robot, primitive_type=None,
-                                  force_convert=False):
-    """``solve_palm_ik.py`` が干渉回避に使ったのと同じロボット自身の近似
-    ジオメトリを、``view_aero_collision_model.py`` と全く同じ方法でもう
-    一体の ``RobotModel`` として読み込む。
-
-    ``build_collision_model_urdf`` (``view_aero_collision_model.py`` /
-    ``solve_palm_ik.apply_collision_model`` と共通) が ``robot.urdf_path``
-    から生成した box/cylinder/sphere のプリミティブ近似 URDF をキャッシュ
-    する (既に生成済みならそれを再利用し、``force_convert`` を指定した
-    ときだけ作り直す) ので、``skr convert-urdf-to-primitives`` で見える
-    のと同じ形状がそのまま overlay になる (``solve_palm_ik.py`` の IK が
-    球近似で使っているジオメトリの元でもある)。``robot`` 自体は変更しない。
-
-    読み込んだ ``collision_robot`` は ``robot`` と全く同じ URDF (ジオメトリ
-    以外) から作られるため、リンク・関節の構成は ``robot`` と同一
-    (``use_hand`` の値によらず ``robot.urdf_path`` を使うので、指ありなし
-    どちらのモデルでも動く)。呼び出し側は毎フレーム
-    ``sync_robot_collision_overlay`` で ``robot`` の現在の姿勢に追従させる。
-
-    Returns
-    -------
-    skrobot.model.RobotModel
-        半透明 (``ROBOT_COLLISION_LINK_COLOR``) に色付け済みの overlay。
-    """
-    collision_urdf_path = build_collision_model_urdf(
-        robot.urdf_path, primitive_type=primitive_type, force=force_convert)
-    collision_robot = RobotModel()
-    collision_robot.load_urdf_file(
-        str(collision_urdf_path), include_mimic_joints=False)
-    for link in collision_robot.link_list:
-        set_translucent_color(link, ROBOT_COLLISION_LINK_COLOR)
-    return collision_robot
-
-
-def colliding_link_pairs(robot, pairs, joint_positions,
-                         tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE):
-    """``solve_palm_ik.collision_pairs_min_distance`` (``solve_palm_ik.py``
-    の事後検証。IK の収束判定が見ない干渉ペナルティの残差を、厳密な形状
-    (``collision_mesh`` の頂点そのもの。勾配降下法内部が使う粗い球近似では
-    ない) で採用前にチェックする処理) と全く同じ距離計算・同じ許容誤差
-    (``tolerance``, ``solve_palm_ik.pick_verified_candidate`` が候補を
-    棄却する基準 ``dist < -tolerance`` と同じ) を使い、``pairs``
-    (``solve_palm_ik.build_collision_verification_pairs`` が作る自己干渉・
-    人体との干渉の総当たりの組み合わせ) の中から実際に貫通している組み合わせ
-    を**すべて**列挙する (``collision_pairs_min_distance`` は最小距離しか
-    返さないため、表示用にここで作り直す)。
-
-    Parameters
-    ----------
-    robot : skrobot.model.RobotModel
-        干渉ジオメトリ (プリミティブ近似済みの ``collision_mesh``) を持つ、
-        現在の姿勢のロボット (``view_handshake_poses`` では
-        ``robot_collision_overlay``)。
-    pairs : list of (Link, Link) or (Link, int)
-        ``build_collision_verification_pairs`` の戻り値。2 要素目が ``int``
-        なら ``human_obstacle_names()`` の人体セグメントとの組み合わせ、
-        ``Link`` ならロボット自身の自己干渉の組み合わせ。
-    joint_positions : dict or None
-        干渉回避の障害物にした人体の関節位置 (``human_capsules`` に渡す)。
-        ``None`` なら人体との干渉ペア (``other`` が ``int``) は判定できない
-        ので読み飛ばす。
-
-    Returns
-    -------
-    list of (str, str, str, float)
-        ``(種別, リンク A の名前, リンク B の名前 (人体セグメントなら
-        human_obstacle_names() の名前), 距離 [m])`` のリスト。種別は
-        ``'self'`` (自己干渉) / ``'human'`` (人体との干渉)。距離が負なほど
-        深く貫通している。貫通していない (``dist >= -tolerance``) 組み合わせ
-        は含めない。貫通が深い順に並べる。
-    """
-    if not pairs:
-        return []
-    caps = human_capsules(joint_positions)[0] if joint_positions else None
-    obstacle_names = human_obstacle_names()
-    world_vertices_by_link = {}
-
-    def _world_vertices(link):
-        if link not in world_vertices_by_link:
-            local = np.asarray(link.collision_mesh.vertices, dtype=np.float64)
-            world_vertices_by_link[link] = (
-                local @ link.worldrot().T + link.worldpos())
-        return world_vertices_by_link[link]
-
-    colliding = []
-    for link_a, other in pairs:
-        verts_a = _world_vertices(link_a)
-        if isinstance(other, int):
-            if caps is None:
-                continue
-            p0, p1, radius = caps[other]
-            dist = float(segment_points_distance(p0, p1, verts_a).min()) \
-                - radius
-            kind, name_b = 'human', obstacle_names[other]
-        else:
-            verts_b = _world_vertices(other)
-            dist = float(np.linalg.norm(
-                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
-                axis=-1).min())
-            kind, name_b = 'self', other.name
-        if dist < -tolerance:
-            colliding.append((kind, link_a.name, name_b, dist))
-    colliding.sort(key=lambda item: item[3])
-    return colliding
-
-
-def collision_pairs_text(colliding):
-    """``colliding_link_pairs`` の戻り値を、viser のテキストパネルに出す
-    ための文字列にする (自己干渉/人体との干渉を分けて列挙する)。"""
-    self_pairs = [c for c in colliding if c[0] == 'self']
-    human_pairs = [c for c in colliding if c[0] == 'human']
-    if not colliding:
-        return '干渉: なし (自己干渉・人体との干渉ともに検出されていません)'
-    lines = ['干渉: {} 件 (自己干渉 {} 件, 人体との干渉 {} 件)'.format(
-        len(colliding), len(self_pairs), len(human_pairs))]
-    for _, name_a, name_b, dist in self_pairs:
-        lines.append('- [自己干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
-            name_a, name_b, -dist))
-    for _, name_a, name_b, dist in human_pairs:
-        lines.append('- [対人干渉] `{}` - `{}` ({:.4f} m 貫通)'.format(
-            name_a, name_b, -dist))
-    return '\n\n'.join(lines)
-
-
-def sync_robot_collision_overlay(collision_robot, robot):
-    """``build_robot_collision_overlay`` が返した overlay を ``robot`` の
-    現在の姿勢 (関節角・台車位置姿勢) に追従させる.
-
-    ``collision_robot`` は ``robot`` と同じ URDF から作られているので
-    (``build_robot_collision_overlay`` 参照)、関節の構成は完全に一致し、
-    ``angle_vector`` をそのままコピーできる。台車の位置姿勢は
-    ``robot.base_link.copy_worldcoords()`` を ``collision_robot`` に
-    反映する (Aero は ``root_link`` が ``base_link`` そのものなので、
-    ``newcoords`` で台車の移動も含めて反映される。``seed_arm_pose`` の
-    注記を参照)。
-    """
-    collision_robot.angle_vector(robot.angle_vector())
-    collision_robot.newcoords(robot.base_link.copy_worldcoords())
+# apply_robot_pose/build_robot_collision_overlay/colliding_link_pairs/
+# collision_pairs_text/sync_robot_collision_overlay は
+# view_handshake_motion.py/scripts/ros/run_camera_pipeline_test.py と
+# 共通なので handshake_viewer_common.py に一本化してある (モジュール先頭で
+# import 済み)。
 
 
 def iter_common_names(skeleton_dir, handshake_dir):
@@ -755,14 +578,7 @@ def main():
     current_handshake = [None]
 
     def set_link_visible(link, visible):
-        # 人物切り替え中のメインループがリンクを削除/再作成するのと
-        # チェックボックスの on_update (viser の GUI コールバックは別
-        # スレッドで実行される) が競合すると、既に削除されて
-        # viewer._linkid_to_handle に存在しないリンクを渡されることが
-        # ある。その場合は何もしない (どうせ表示すべき対象ではない)。
-        handle = viewer._linkid_to_handle.get(str(id(link)))
-        if handle is not None:
-            handle.visible = visible
+        common_set_link_visible(viewer, link, visible)
 
     def refresh_robot_pose():
         """``current_handshake`` の内容を、``show_post_process_checkbox``
@@ -912,9 +728,12 @@ def main():
         # solve_palm_ik.py の事後検証 (collision_pairs_min_distance) と
         # 同じ厳密な形状・同じ許容誤差で、現在表示中の姿勢で実際に貫通して
         # いる組み合わせ (人間とロボットの干渉・ロボットの自己干渉) を
-        # すべて求める。
+        # すべて求める。人体側は画面に表示中の current_obstacle_links
+        # (半透明 Cylinder) をそのまま使うので、見た目のメッシュと判定に
+        # 使うメッシュが常に一致する。
         colliding_pairs = colliding_link_pairs(
-            robot_collision_overlay, verification_pairs, joint_positions,
+            robot_collision_overlay, verification_pairs,
+            current_obstacle_links,
             tolerance=args.collision_verify_tolerance)
 
         # IK が失敗したときは、どちらの手に合わせようとしていたのかが
