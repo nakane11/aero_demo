@@ -47,6 +47,22 @@ class PeoplePoseEstimator(object):
     index2handname = INDEX2HANDNAME
     hand_sequence = HAND_SEQUENCE
 
+    # 腕・脚の「近位 -> 遠位」の関節ペア。深度が単発でおかしくなったとき
+    # 症状が出やすいのは、体幹から離れた末端側の関節 (肘/手首、膝/足首) が
+    # 輪郭付近の細い部位で背景の深度を拾ってしまう場合 (腕が不自然に伸びて
+    # 見える現象、_prune_implausible_limbs 参照)。近位側 (肩/腰) は胴体に
+    # 近く輪郭も太いため相対的に信頼できるという前提で、超過時は常に遠位
+    # 側を落とす。同じ考え方を手のランドマークにも適用したものが
+    # ``hand_sequence`` (``HAND_SEQUENCE``、既に手首 -> 各指先の近位 ->
+    # 遠位順で並んでいるのでそのまま使える、``_prune_implausible_hand_
+    # landmarks`` 参照)。
+    _LIMB_CHAINS = [
+        ('RShoulder', 'RElbow'), ('RElbow', 'RWrist'),
+        ('LShoulder', 'LElbow'), ('LElbow', 'LWrist'),
+        ('RHip', 'RKnee'), ('RKnee', 'RAnkle'),
+        ('LHip', 'LKnee'), ('LKnee', 'LAnkle'),
+    ]
+
     mp_indices = {
         "Nose": 0,
         "RShoulder": 12,
@@ -75,6 +91,12 @@ class PeoplePoseEstimator(object):
                  min_visibility=0.5,
                  min_joints=6,
                  max_z_diff=1.0,
+                 min_body_size=0.3,
+                 max_body_size=2.5,
+                 max_limb_length=0.7,
+                 max_hand_segment_length=0.12,
+                 max_hand_reach=0.22,
+                 max_hand_wrist_offset=0.08,
                  depth_patch_size=3,
                  min_neck_height=0.8,
                  max_neck_height=2.0,
@@ -95,6 +117,48 @@ class PeoplePoseEstimator(object):
             3 次元姿勢としてこれ未満の関節数しか取れなければ棄却する。
         max_z_diff : float
             関節の奥行きのばらつきがこれを超えたら人でないとみなす [m]。
+        min_body_size : float
+            検出できた関節のバウンディングボックス対角線長がこれ未満なら
+            (物の一部を人物と誤検出した等) 人でないとみなす [m]。
+        max_body_size : float
+            検出できた関節のバウンディングボックス対角線長がこれを超えたら
+            (深度ノイズで関節が実際より大きく散らばった等) 人でないとみなす
+            [m]。
+        max_limb_length : float
+            肩-肘/肘-手首/腰-膝/膝-足首の各区間がこれを超えて長ければ、
+            遠位側の関節 (肘/手首/膝/足首) を検出できなかった扱いにして
+            捨てる [m] (``_prune_implausible_limbs`` 参照)。深度が単発で
+            背景側に飛んで腕や脚が不自然に伸びて見える現象への対策。
+        max_hand_segment_length : float
+            手のランドマーク (手首 - 各指の関節間、``HAND_SEQUENCE`` の
+            各区間) がこれを超えて長ければ、遠位側のランドマークを検出
+            できなかった扱いにして捨てる [m] (``_prune_implausible_hand_
+            landmarks`` 参照)。指は輪郭が細く深度パッチが背景を拾い
+            やすいため、``max_limb_length`` と同じ考え方で手専用に別の
+            閾値を用意してある (実際の指の区間はどれも数 cm 程度なので、
+            既定の 0.12m は明らかにおかしい跳びだけを弾く緩めの値)。
+            ただしこれは隣接する関節同士の距離しか見ないため、各区間が
+            閾値ギリギリで同じ方向に連鎖すると手首から指先までの累積では
+            大きく伸びうる (実際の指の骨は 1 区間あたり数 cm 程度)。
+            ``max_hand_reach`` はこれを補うためのもの。
+        max_hand_reach : float
+            手首 (``{side}Hand0``) から各指のランドマークまでの直線距離が
+            これを超えたら、``max_hand_segment_length`` と同様に遠位側の
+            ランドマークを検出できなかった扱いにして捨てる [m]。成人の
+            手首-指先の最大到達距離はおよそ 0.18-0.20m 程度なので、既定の
+            0.22m は多少の余裕を見た値 (``_prune_implausible_hand_
+            landmarks`` 参照)。指が実際より大きく開いたブーケ状/花火状に
+            見える現象 (区間ごとの伸びが連鎖して蓄積したもの) への対策。
+        max_hand_wrist_offset : float
+            Pose モデルの手首 (RWrist/LWrist) と Hand モデルの手首
+            (RHand0/LHand0) は別々に検出された 2D 点であり、素の 3D 化
+            処理では両者を一致させる制約が無い。速い動きやオクルージョン
+            などでこの 2 点の距離がこれを超えたら、掌側の推定 (RHand0
+            など) が信頼できないとみなしてその手のランドマーク全体を
+            検出できなかった扱いにして捨てる [m] (``_prune_implausible_
+            hand_wrist_offset`` 参照)。これを入れないと、掌の当たり判定
+            (掌ランドマークから平面フィット) と前腕の当たり判定 (RElbow-
+            RWrist の円柱) が大きく離れて見える。
         depth_patch_size : int
             関節の深度を取るときに参照する近傍の一辺 [px]。奇数。3 なら
             3x3 の有効画素の中央値を使う。1 にすると 1 画素だけを見る
@@ -117,6 +181,12 @@ class PeoplePoseEstimator(object):
         self.min_visibility = min_visibility
         self.min_joints = min_joints
         self.max_z_diff = max_z_diff
+        self.min_body_size = min_body_size
+        self.max_body_size = max_body_size
+        self.max_limb_length = max_limb_length
+        self.max_hand_segment_length = max_hand_segment_length
+        self.max_hand_reach = max_hand_reach
+        self.max_hand_wrist_offset = max_hand_wrist_offset
         self.depth_patch_size = max(1, int(depth_patch_size))
         self.min_neck_height = min_neck_height
         self.max_neck_height = max_neck_height
@@ -359,6 +429,133 @@ class PeoplePoseEstimator(object):
             x = (joint_pos['x'] - intrinsics.cx) * z / intrinsics.fx
             y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
             positions[joint_pos['limb']] = np.array([x, y, z], dtype=np.float64)
+        positions = self._prune_implausible_limbs(positions)
+        positions = self._prune_implausible_hand_landmarks(positions)
+        positions = self._prune_implausible_hand_wrist_offset(positions)
+        return positions
+
+    def _prune_implausible_limbs(self, positions):
+        """深度エラーで腕/脚が不自然に伸びて見える関節を取り除く.
+
+        ``_LIMB_CHAINS`` の各区間 (近位 -> 遠位) の長さが ``max_limb_length``
+        を超えたら、遠位側の関節を検出できなかった扱いにして落とす (肘が
+        既に落ちていれば、それに連なる手首の区間はそもそも判定できず自然に
+        素通りする)。
+        """
+        positions = dict(positions)
+        for parent_name, child_name in self._LIMB_CHAINS:
+            if parent_name not in positions or child_name not in positions:
+                continue
+            length = np.linalg.norm(
+                positions[child_name] - positions[parent_name])
+            if length > self.max_limb_length:
+                logger.warning(
+                    "Joint %s dropped: distance from %s is %.2fm "
+                    "(limit: %sm)", child_name, parent_name, length,
+                    self.max_limb_length)
+                del positions[child_name]
+        return positions
+
+    def _prune_implausible_hand_landmarks(self, positions):
+        """深度エラーで指のランドマークが一瞬だけ全く違う場所に飛ぶ現象を
+        取り除く (``_prune_implausible_limbs`` の手版).
+
+        指は輪郭が細く、``_sample_depth`` のパッチが背景側の画素を拾い
+        やすい。``hand_sequence`` (``HAND_SEQUENCE``、手首から各指先まで
+        近位 -> 遠位の順に並んだ関節ペア) の各区間の長さが ``max_hand_
+        segment_length`` を超えたら、遠位側のランドマークを検出できなかった
+        扱いにして落とす。あわせて、手首 (``{prefix}0``) から各ランド
+        マークまでの直線距離が ``max_hand_reach`` を超えた場合も同様に
+        落とす。区間ごとの判定だけでは、各区間が ``max_hand_segment_
+        length`` ギリギリで同じ方向に連鎖したときに、手首-指先の累積では
+        大きく伸びてしまう (実際の指の骨は 1 区間あたり数 cm 程度しかない
+        ため、指全体が花束状/花火状に開いて見える現象になる) のを防げない
+        ための追加チェック。
+
+        腕/脚 (``_prune_implausible_limbs``) はチェーンが 2 区間 (肩-肘-
+        手首) しかないため「親が落ちれば子は自然に判定されず残る」で
+        十分だったが、指は 4 関節 (MCP-PIP-DIP-tip) と深く、実際のデータ
+        では指全体が背景の深度をまとめて拾って一塊で浮く現象がよく起きる
+        (根元の MCP だけ手首から離れて浮き、それより先の PIP/PIP 間の
+        距離自体は正常に見えてしまうため、素通り版では先が残ってしまう)。
+        そのため、この関数の中でこの呼び出し中に自分で落とした関節は
+        ``removed`` に記録しておき、その関節を親とする区間は距離を見ずに
+        連鎖的に落とす。use_hand=False のときは RHand*/LHand* が存在しない
+        ため何もしない。
+        """
+        if not self.use_hand:
+            return positions
+        positions = dict(positions)
+        removed = set()
+        for prefix in ("RHand", "LHand"):
+            wrist_name = "{}0".format(prefix)
+            for parent_idx, child_idx in self.hand_sequence:
+                parent_name = "{}{}".format(prefix, parent_idx)
+                child_name = "{}{}".format(prefix, child_idx)
+                if child_name not in positions:
+                    continue
+                if parent_name in removed:
+                    logger.warning(
+                        "Joint %s dropped: parent %s was already dropped "
+                        "(cascaded)", child_name, parent_name)
+                    del positions[child_name]
+                    removed.add(child_name)
+                    continue
+                if parent_name not in positions:
+                    continue
+                length = np.linalg.norm(
+                    positions[child_name] - positions[parent_name])
+                reach = (
+                    np.linalg.norm(positions[child_name] - positions[wrist_name])
+                    if wrist_name in positions else 0.0)
+                if length > self.max_hand_segment_length:
+                    logger.warning(
+                        "Joint %s dropped: distance from %s is %.2fm "
+                        "(limit: %sm)", child_name, parent_name, length,
+                        self.max_hand_segment_length)
+                    del positions[child_name]
+                    removed.add(child_name)
+                elif reach > self.max_hand_reach:
+                    logger.warning(
+                        "Joint %s dropped: reach from %s is %.2fm "
+                        "(limit: %sm)", child_name, wrist_name, reach,
+                        self.max_hand_reach)
+                    del positions[child_name]
+                    removed.add(child_name)
+        return positions
+
+    def _prune_implausible_hand_wrist_offset(self, positions):
+        """Pose モデルの手首と Hand モデルの手首が食い違う手を丸ごと捨てる.
+
+        ``RWrist``/``LWrist`` (body-pose モデル) と ``RHand0``/``LHand0``
+        (hand モデル、クロップした手の領域に対して独立に推定される) は
+        同じ物理的な手首を指すはずだが、別々のモデル出力の 2D 点をそれぞれ
+        独立に深度サンプリングして 3D 化しているため (``_to_joint_
+        positions``)、両者を一致させる制約が存在しない。速い動きや
+        オクルージョンで乖離すると、掌のランドマーク (``RHand0`` 等から
+        平面フィットする掌の当たり判定) が前腕 (``RElbow``-``RWrist`` の
+        円柱) から大きく離れて見える。ここで両手首間の距離が
+        ``max_hand_wrist_offset`` を超えたら、掌側のランドマーク
+        (``RHand*``/``LHand*``) を検出できなかった扱いにして全て捨てる
+        (手首だけずらして残りの指を維持しても、平面フィットの基準点が
+        誤っているままなので意味がない)。
+        """
+        if not self.use_hand:
+            return positions
+        positions = dict(positions)
+        for pose_wrist, hand_prefix in (("RWrist", "RHand"), ("LWrist", "LHand")):
+            wrist0 = "{}0".format(hand_prefix)
+            if pose_wrist not in positions or wrist0 not in positions:
+                continue
+            offset = np.linalg.norm(positions[wrist0] - positions[pose_wrist])
+            if offset > self.max_hand_wrist_offset:
+                logger.warning(
+                    "Hand %s dropped: wrist offset from %s is %.2fm "
+                    "(limit: %sm)", hand_prefix, pose_wrist, offset,
+                    self.max_hand_wrist_offset)
+                for name in list(positions.keys()):
+                    if name.startswith(hand_prefix):
+                        del positions[name]
         return positions
 
     def _is_valid_person(self, positions, neck_pos, current_time):
@@ -378,6 +575,14 @@ class PeoplePoseEstimator(object):
             z_values = [p[2] for p in positions.values()]
             if z_values and (max(z_values) - min(z_values)) > self.max_z_diff:
                 return False
+            body_size = self._compute_body_size(positions)
+            if body_size is not None and not (
+                    self.min_body_size <= body_size <= self.max_body_size):
+                logger.warning(
+                    "Pose rejected by body size filter: size=%.2fm "
+                    "(limits: %sm - %sm)",
+                    body_size, self.min_body_size, self.max_body_size)
+                return False
 
         if self.enable_neck_height_filter:
             neck_height = self._transform_to_base(neck_pos)
@@ -392,6 +597,20 @@ class PeoplePoseEstimator(object):
                     neck_height, self.min_neck_height, self.max_neck_height)
                 return False
         return True
+
+    @staticmethod
+    def _compute_body_size(positions):
+        """検出できた関節のバウンディングボックスの対角線長を返す [m].
+
+        特定の骨 (肩幅など) だけを見ると体の向きによって短く見えることが
+        あるため、検出できた全関節の広がりを見る方が「人物ひとり分の
+        大きさ」として頑健。関節が 2 点未満なら判定できないので None。
+        """
+        if len(positions) < 2:
+            return None
+        pts = np.array(list(positions.values()), dtype=np.float64)
+        extent = pts.max(axis=0) - pts.min(axis=0)
+        return float(np.linalg.norm(extent))
 
     @staticmethod
     def _apply_transform(positions, transform):
