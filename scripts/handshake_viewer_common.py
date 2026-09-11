@@ -116,6 +116,25 @@ def remove_joint_angle_gui(viewer):
     # 消したハンドルを skrobot 側が後から参照しないようにしておく
     # (Export の "Generate Code" は _joint_sliders に無い関節を読み飛ばす)。
     viewer._joint_sliders.clear()
+
+
+def remove_obstacles_gui(viewer):
+    """``ViserViewer`` が自動で追加する "Obstacles" フォルダ (Add/Delete
+    Obstacle・Show Collisions 等、任意の障害物を画面上で追加・編集する
+    機能) を GUI から取り除く.
+
+    この障害物管理 GUI は skrobot 側の汎用機能で、人体を障害物にした干渉
+    回避を検証する 3 つのビューア (``view_handshake_poses.py``/``view_
+    handshake_motion.py``/``scripts/ros/run_camera_pipeline_test.py``) では
+    使わない (人体の障害物は ``solve_palm_ik.human_body_obstacles`` が骨格
+    から自動生成するもので、画面から手動で追加するものではない)。
+    ``remove_joint_angle_gui`` と同様、``viewer.add`` で全てのロボットを
+    追加し終えた後に呼ぶこと。
+    """
+    folder = getattr(viewer, '_obstacles_folder', None)
+    if folder is not None:
+        folder.remove()
+        viewer._obstacles_folder = None
     viewer._joint_folders.clear()
 
 
@@ -204,6 +223,9 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
     ``trimesh.proximity.signed_distance`` でも同じことは求まるが、この
     ペア数 (ロボットの全リンク × 人体セグメント数) でリアルタイムに使うには
     汎用メッシュのレイキャストは遅すぎるため、円柱に特化した解析式にする)。
+    これだけだと逆向き (円柱がリンクの頂点から離れた面の途中を貫通して
+    いる場合) を見逃すので、円柱側の表面からの判定
+    (``solve_palm_ik.obstacle_into_link_depth``) も併せて行う。
     ロボットの自己干渉 (``other`` が ``Link``) は従来通り頂点同士の最短
     距離のまま (自己干渉ペアはどちらも薄いリンク同士がほとんどで、この
     見逃しが実質問題にならないため)。
@@ -239,6 +261,8 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
         return []
     obstacle_names = spik.human_obstacle_names()
     world_vertices_by_link = {}
+    shape_by_link = {}
+    samples_by_obstacle = {}
 
     def _world_vertices(link):
         if link not in world_vertices_by_link:
@@ -246,6 +270,17 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             world_vertices_by_link[link] = (
                 local @ link.worldrot().T + link.worldpos())
         return world_vertices_by_link[link]
+
+    def _shape(link):
+        if link not in shape_by_link:
+            shape_by_link[link] = spik.link_collision_shape(link)
+        return shape_by_link[link]
+
+    def _samples(index):
+        if index not in samples_by_obstacle:
+            samples_by_obstacle[index] = spik.cylinder_surface_samples(
+                obstacle_links[index])
+        return samples_by_obstacle[index]
 
     colliding = []
     for link_a, other in pairs:
@@ -265,6 +300,11 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             depth = float(np.minimum(
                 obstacle.radius - radial,
                 obstacle.height / 2.0 - axial).max())
+            # 上だけだと逆向き (円柱がリンクの頂点から離れた面の途中を
+            # 貫通している場合) を見逃すため、円柱側の表面からの判定も
+            # 併せて行う (spik.obstacle_into_link_depth 参照)。
+            depth = max(depth, spik.obstacle_into_link_depth(
+                _samples(other), link_a, _shape(link_a)))
             dist = -depth
             kind, name_b = 'human', obstacle_names[other]
         else:
