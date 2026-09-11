@@ -55,7 +55,7 @@ dict で、合成骨格の ``skeleton.joint_positions`` と同じ形なので、
 * ARM を押しても差し出し手が見つからない: ``OfferedHandSelector`` は
   合成骨格向けにスコア閾値 (``--offer-score-min``, 既定は ``estimate_
   palm_poses.OFFER_SCORE_MIN``) が調整されているため、実カメラの姿勢では
-  届きにくいことがある。ARMED 中は viser 画面 (と標準出力) に左右の
+  届きにくいことがある。ARMED 中は viser 画面に左右の
   スコア/判定不可の理由 (``no_palm``: 手のランドマークが取れていない、
   等) を表示するので、それを見ながら閾値を調整する。
 
@@ -65,7 +65,8 @@ Usage
     python3 scripts/ros/run_camera_pipeline_test.py --save-dir /tmp/camera_handshake_poses
 
 IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現れ、押すと
-計画済みの waypoint を実機に順番に送る (``_execute_on_robot`` 参照)。
+計画済みの waypoint 列を 1 つの軌道としてまとめて実機に送る
+(``_execute_on_robot`` 参照)。
 ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に動かすか
 どうかを独立に指定できる (既定はどちらもオフで、EXECUTE ボタン自体が
 表示されない)。``--execute-arm`` 指定時は ``ARM`` ボタンを押した瞬間にも
@@ -122,8 +123,8 @@ from aero_demo.people_pose_estimator import (  # noqa: E402
 from aero_demo.people_pose_types import Bone  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo.ros_camera_utils import (  # noqa: E402
-    imgmsg_to_ndarray, lookup_camera_to_base, ndarray_to_imgmsg,
-    transform_to_matrix)
+    imgmsg_to_ndarray, lookup_camera_to_base, lookup_frame_position,
+    ndarray_to_imgmsg, transform_to_matrix)
 
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
@@ -343,26 +344,6 @@ def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
         ))
     return waypoints
 
-
-def _format_offer_scores(selection, score_min):
-    """``OfferedHandSelector.select`` の戻り値を viser 画面に出す文字列にする.
-
-    ``ARM`` ボタンを押しても差し出し手が決まらないとき、原因が「そもそも
-    手のランドマークが取れていない (``veto``: ``no_palm``)」のか「取れて
-    いるがスコアが閾値 ``score_min`` に届いていない」のかを見分けられる
-    ようにする。
-    """
-    lines = ['**差し出し手判定 (閾値 {:.2f}):**'.format(score_min)]
-    for side in ('R', 'L'):
-        veto = selection['veto'][side]
-        score = selection['scores'][side]
-        if veto is not None:
-            lines.append('- {}: 判定不可 ({})'.format(side, veto))
-        else:
-            lines.append('- {}: {:.2f}'.format(side, score))
-    return '\n'.join(lines)
-
-
 def draw_skeleton_overlay(color_bgr, joints_2d):
     """カメラ画像 (BGR) に、検出できた 2D 関節位置を重ねて描いた画像を
     返す (デバッグ用の publish 専用、元の ``color_bgr`` は書き換えない)。
@@ -463,16 +444,27 @@ class HandshakePipelineNode(object):
                             tuple(args.base_y_range),
                             tuple(args.base_yaw_range)]
 
+        # TF 未解決時のフォールバック値は起動時に 1 回だけ計算しキャッシュ
+        # する (_resolve_robot_position 参照、毎フレーム呼ぶのは実機 TF の
+        # 解決のみ)。
+        self._robot_hand_position_fallback = \
+            self._compute_robot_hand_position_fallback()
         self.robot_position = self._resolve_robot_position()
         print('[robot-hand-position] {} (base_link)'.format(
             self.robot_position.tolist()))
 
         # 掌推定・差し出し手判定器は毎フレーム作り直さず使い回す (以前は
         # ARMED の全フレームで新規に作っていたが、無駄な上に判定の内訳
-        # (スコア/veto 理由) を毎フレーム覗けなかった)。
+        # (スコア/veto 理由) を毎フレーム覗けなかった)。robot_position は
+        # ARMED 中フレームごとに _resolve_robot_position で TF から引き
+        # 直して差し込み直す (_on_frame 参照、record_palm_offer_clips.py
+        # と同じ)。
+        max_distance = (None if args.max_person_distance <= 0
+                        else args.max_person_distance)
         self.offered_hand_selector = epp.OfferedHandSelector(
             robot_position=self.robot_position,
-            score_min=args.offer_score_min)
+            score_min=args.offer_score_min,
+            max_distance=max_distance)
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
         # 深度ノイズによる関節位置の単発の飛び (「デプスが後ろの方に一瞬
@@ -828,14 +820,34 @@ class HandshakePipelineNode(object):
         common_set_link_visible(self.viewer, link, visible)
 
     def _resolve_robot_position(self):
-        """既定のロボット手先位置 (掌推定の ``robot_position``)。
+        """差し出し手判定の基準にするロボット手先の base_link 座標を返す.
 
-        ``--robot-hand-position`` が明示されていればそれを、なければ右腕の
-        「種の姿勢」(``solve_person_ik`` が IK の初期値に使うのと同じ姿勢,
-        台車はワールド原点) の手先位置を base_link 座標として使う。
+        ``--robot-hand-position`` が明示されていればそれを固定で使う。
+        そうでなければ実機の TF (``--robot-hand-frame`` -> ``--base-
+        frame``、既定 ``r_eef_grasp_link`` -> ``base_link``) を毎回引き
+        (``record_palm_offer_clips.py`` と共通の ``ros_camera_utils.
+        lookup_frame_position``)、まだ引けなければ (ロボット未接続・
+        /aero_state_publisher 未起動など) 右腕の「種の姿勢」
+        (``solve_person_ik`` が IK の初期値に使うのと同じ姿勢、台車は
+        ワールド原点) の手先位置 (``self._robot_hand_position_fallback``、
+        起動時に 1 回だけ計算・キャッシュ済み) にフォールバックする。
         """
         if self.args.robot_hand_position is not None:
             return np.asarray(self.args.robot_hand_position, dtype=np.float64)
+        return lookup_frame_position(
+            self.tf_buffer, self.args.base_frame, self.args.robot_hand_frame,
+            self._robot_hand_position_fallback,
+            warn_label='[run-camera-pipeline-test] ')
+
+    def _compute_robot_hand_position_fallback(self):
+        """``_resolve_robot_position`` が TF 未解決時に使うフォールバック値
+        (右腕の「種の姿勢」の手先位置、台車はワールド原点) を計算する.
+
+        ``spik.seed_arm_pose`` は ``self.robot`` の関節角・台車位置姿勢を
+        書き換えるが、``solve_person_ik`` (``_solve_handshake`` 経由) は
+        呼ばれるたびに内部で ``seed_arm_pose`` を呼び直して姿勢を作り直す
+        ため、ここで 1 回呼んでおいても実際の IK 計算には影響しない。
+        """
         spik.seed_arm_pose(self.robot, 'r')
         return np.asarray(self.robot.rarm_end_coords.worldpos(),
                           dtype=np.float64)
@@ -899,6 +911,12 @@ class HandshakePipelineNode(object):
             self._latest_is_base_frame = is_base_frame
 
         if self.state == 'armed' and armed_joint_positions is not None:
+            # robot_position (差し出し手判定の基準にするロボット手先位置)
+            # は ARMED 中フレームごとに実機 TF から引き直す
+            # (record_palm_offer_clips.py の _on_frame と同じ、
+            # _resolve_robot_position 参照)。
+            self.offered_hand_selector.robot_position = \
+                self._resolve_robot_position()
             self._try_handshake(armed_joint_positions)
 
         if (self.state == 'armed' and self.armed_deadline is not None
@@ -911,12 +929,12 @@ class HandshakePipelineNode(object):
     def _try_handshake(self, joint_positions):
         handshake_t0 = time.time()
         palms = self.palm_estimator.estimate(joint_positions)
-        # ARMED なのに offered_hand が決まらないとき、viser 画面 (と
-        # スロットルした標準出力) にスコア/veto 理由の内訳を出す。「手の
-        # ランドマークがそもそも取れていない (veto=no_palm)」のか
-        # 「取れているがスコアが --offer-score-min に届いていない」のかを
-        # 見分けられるようにするため (PalmPoseEstimator.estimate は
-        # offered_hand しか返さないので、同じ入力で select() を呼び直す)。
+        # ARMED なのに offered_hand が決まらないとき、viser 画面にスコア/
+        # veto 理由の内訳を出す。「手のランドマークがそもそも取れていない
+        # (veto=no_palm)」のか「取れているがスコアが --offer-score-min に
+        # 届いていない」のかを見分けられるようにするため (PalmPoseEstimator.
+        # estimate は offered_hand しか返さないので、同じ入力で select() を
+        # 呼び直す)。
         selection = self.offered_hand_selector.select(joint_positions, palms)
         with self._lock:
             self._latest_offer_selection = selection
@@ -1302,24 +1320,36 @@ class HandshakePipelineNode(object):
     def _execute_on_robot(self):
         """``EXECUTE`` ボタン押下時、計画済みの waypoint 列
         (``self._display_waypoints``、waypoint スライダー/Play で画面
-        確認しているのと同じもの) を実機に順番に送る。
+        確認しているのと同じもの) を実機にまとめて送る。
 
         台車移動には ``AeroROSRobotInterface.move_to`` (``move_base``
-        経由、costmap を使う) ではなく ``go_pos_unsafe`` を使う --
-        ``go_pos_unsafe`` は costmap を見ず、``base_controller`` の
-        ``FollowJointTrajectoryAction`` へ直接軌道を送るだけの相対移動
-        (現在の台車姿勢を基準にした前後左右+回転の移動量) なので、
-        カメラで検出した人物に対する計画済みの軌道をそのまま素直に
-        なぞらせたいこのユースケースに向いている (costmap 上の障害物
-        回避や大域的な経路計画はそもそも不要で、干渉回避は
-        ``plan_handshake_motion.py`` 側で waypoint 単位に検証済み)。
+        経由、costmap を使う) ではなく ``move_trajectory_sequence``
+        (``go_pos_unsafe`` が内部の 1 点版として使っているのと同じ、
+        costmap を見ず ``base_controller`` の ``FollowJointTrajectoryAction``
+        へ直接軌道を送るだけの相対移動) を使う。カメラで検出した人物に
+        対する計画済みの軌道をそのまま素直になぞらせたいこのユースケース
+        に向いている (costmap 上の障害物回避や大域的な経路計画はそもそも
+        不要で、干渉回避は ``plan_handshake_motion.py`` 側で waypoint
+        単位に検証済み)。
+
+        以前は waypoint ごとに ``angle_vector``/``go_pos_unsafe`` を個別の
+        ゴールとして送り、毎回 ``wait_interpolation()``/
+        ``go_pos_unsafe_wait()`` で完全に停止するまで待ってから次を送って
+        いた。そのため waypoint の境界ごとに関節・台車の速度がゼロへ
+        リセットされ、動きが小刻みに (「かくかく」) 見えていた。
+        ``angle_vector_sequence``/``move_trajectory_sequence`` は全
+        waypoint 分の関節角・移動量をまとめて 1 つの
+        ``FollowJointTrajectoryAction`` ゴールとして送るため (内部で
+        隣接区間の移動方向が同じであれば waypoint 通過時の速度をゼロに
+        せず補間する、``RobotInterface.angle_vector_sequence`` 参照)、
+        waypoint の境界で止まらない滑らかな軌道になる。そのため送信は
+        最初にまとめて 1 回だけ行い (どちらも ``wait``/``send_action`` を
+        揃えて非ブロッキングにする)、完了待ちも最後にまとめて 1 回だけ
+        行う (台車・腕は並行して動く)。
 
         ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
         動かすかどうかを独立に切り替えられる (どちらも指定しなければ
         ``self.ri`` が ``None`` のままで EXECUTE ボタン自体が表示されない)。
-        台車と腕は waypoint ごとに両方とも ``wait=False`` で送信してから
-        ``wait_interpolation()``/``go_pos_unsafe_wait()`` でまとめて完了を
-        待つ (並行して動く)。次の waypoint へ進むのは両方が完了してから。
         """
         with self._lock:
             result = self._current_result
@@ -1341,14 +1371,17 @@ class HandshakePipelineNode(object):
               '(--execute-base={}, --execute-arm={})。'.format(
                   len(display_waypoints), self.args.execute_base,
                   self.args.execute_arm))
+
+        arm_angle_vectors = []  # [av0, av1, ...] (angle_vector_sequence にそのまま渡す)
+        base_trajectory_points = []  # [[dx, dy, dyaw], ...] (直前 waypoint の台車向き基準の相対移動量)
         prev_base = None  # (x, y, yaw) 直前 waypoint の台車位置姿勢 (world 系)
-        for i, wp in enumerate(display_waypoints):
+        for wp in display_waypoints:
             if self.args.execute_arm:
                 name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
                 for joint in self.real_robot.joint_list:
                     if joint.name in name_to_angle:
                         joint.joint_angle(name_to_angle[joint.name])
-                self.ri.angle_vector(self.real_robot.angle_vector(), move_time)
+                arm_angle_vectors.append(self.real_robot.angle_vector())
 
             if self.args.execute_base:
                 bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
@@ -1367,24 +1400,30 @@ class HandshakePipelineNode(object):
                     dyaw = byaw - prev_base[2]
                     prev_yaw = prev_base[2]
                 # world 系の移動量を、直前 waypoint での台車の向き基準
-                # (go_pos_unsafe が要求する「現在の台車姿勢を基準にした
-                # 前後左右」) に回転させる。
+                # (move_trajectory_sequence が要求する「現在の台車姿勢を
+                # 基準にした前後左右」) に回転させる。
                 cos_yaw, sin_yaw = math.cos(prev_yaw), math.sin(prev_yaw)
                 dx = cos_yaw * dx_world + sin_yaw * dy_world
                 dy = -sin_yaw * dx_world + cos_yaw * dy_world
-                self.ri.go_pos_unsafe(dx, dy, dyaw, wait=False)
+                base_trajectory_points.append([dx, dy, dyaw])
                 prev_base = (bx, by, byaw)
 
-            # 台車・腕とも送信は非ブロッキング (angle_vector は元々非同期、
-            # go_pos_unsafe も上で wait=False) なので、両方投げ終えてから
-            # まとめて完了を待つ (並行して動く)。
-            if self.args.execute_arm:
-                self.ri.wait_interpolation()
-            if self.args.execute_base:
-                self.ri.go_pos_unsafe_wait()
+        # ここまでで waypoint 全部分の関節角・移動量を集め終えたので、
+        # それぞれ 1 回のゴールとしてまとめて送る (どちらも非ブロッキング)。
+        if self.args.execute_arm and arm_angle_vectors:
+            self.ri.angle_vector_sequence(arm_angle_vectors, move_time)
+        if self.args.execute_base and base_trajectory_points:
+            self.ri.move_trajectory_sequence(
+                base_trajectory_points,
+                [move_time] * len(base_trajectory_points),
+                stop=True, send_action=True, wait=False)
 
-            print('[execute] waypoint {}/{} を実行しました。'.format(
-                i + 1, len(display_waypoints)))
+        # 送信は上でまとめて 1 回だけ行っているので、完了待ちも最後に
+        # まとめて 1 回だけ行う (台車・腕は並行して動く)。
+        if self.args.execute_arm and arm_angle_vectors:
+            self.ri.wait_interpolation()
+        if self.args.execute_base and base_trajectory_points:
+            self.ri.move_base_trajectory_action.wait_for_result()
         print('[execute] 実行を終了しました。')
 
     def _play_loop(self):
@@ -1477,7 +1516,7 @@ class HandshakePipelineNode(object):
         # ARMED 中に判定できた差し出し手のスコア内訳を出す (ARM を押しても
         # 見つからないときの原因切り分け用、_try_handshake 参照)。
         if self.state == 'armed' and self._latest_offer_selection is not None:
-            content += '\n\n' + _format_offer_scores(
+            content += '\n\n' + epp.format_offer_scores(
                 self._latest_offer_selection, self.offered_hand_selector.score_min)
         with self._lock:
             result = self._current_result
@@ -1687,12 +1726,22 @@ def main():
         help='One Euro Filter の速度推定のカットオフ周波数 [Hz] (既定 1.0)。')
     parser.add_argument(
         '--offer-score-min', type=float, default=0.65,
-        help='差し出し手と判定するスコアの閾値 (既定 0.7)。'
+        help='差し出し手と判定するスコアの閾値 (既定 0.65)。'
             'estimate_palm_poses.OFFER_SCORE_MIN ({:.2f}) は合成骨格向けに '
             '調整された値で実カメラでは届きにくいため、実カメラ用にここで '
             '下げてある。それでも ARM を押して差し出し手が見つからない '
             '場合は、viser 画面に表示されるスコアを見ながらさらに調整する '
             'とよい。'.format(epp.OFFER_SCORE_MIN))
+    parser.add_argument(
+        '--max-person-distance', type=float, default=4.2,
+        help='人物 (腰の中点) からロボット手先までの距離 [m] がこれを '
+            '超えたら、スコアを見るまでもなく両手とも差し出し候補から '
+            '外す (既定 4.2、record_palm_offer_clips.py の既定値と揃えて '
+            'ある)。奥や画面の端に映り込んだだけの、手を差し出す気の無い '
+            '通行人を拾わないための足切り (estimate_palm_poses.'
+            'OfferedHandSelector の max_distance 引数、veto 理由は '
+            '"too_far"、viser 画面のスコア表示にも出る)。0 以下を指定する '
+            'と足切りを無効にする。')
     parser.add_argument(
         '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
         help='使うロボットの腕。既定 (auto) は人間の手の反対側 '
@@ -1701,7 +1750,17 @@ def main():
         '--robot-hand-position', type=float, nargs=3, default=None,
         metavar=('X', 'Y', 'Z'),
         help='掌推定 (差し出し手判定) が基準にするロボット手先の base_link '
-            '座標 [m]。既定は右腕の種の姿勢の手先位置から自動計算する。')
+            '座標 [m] を固定値で指定する (既定 None)。指定すると '
+            '--robot-hand-frame での TF 解決より優先される。')
+    parser.add_argument(
+        '--robot-hand-frame', type=str, default='r_eef_grasp_link',
+        help='--robot-hand-position が未指定のとき、差し出し手判定の基準に '
+            '毎フレーム TF (--base-frame からのこのフレーム) を引いて使う '
+            '(既定 r_eef_grasp_link -- skrobot Aero モデルの rarm_end_'
+            'coords に対応する実リンクで、実機では /aero_state_publisher '
+            'が配信する、record_palm_offer_clips.py と同じ既定値)。ロボット '
+            '未接続などでまだ TF が引けない間だけ、右腕の種の姿勢の手先 '
+            '位置にフォールバックする。')
     parser.add_argument(
         '--human-front-distance', type=float,
         default=spik.HUMAN_FRONT_DISTANCE,
