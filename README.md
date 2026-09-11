@@ -251,6 +251,97 @@ python3 view_handshake_poses.py
 `--advance-mode auto` にすると `--pause` 秒ごとに自動で次の人物へ進み、
 `--output-dir` を指定すると表示した各姿勢の画像をその都度保存する
 
+## 実カメラ入力: 掌差し出しクリップの収集とカメラ無しでのテスト
+
+実カメラで動かすパイプライン (`scripts/ros/run_camera_pipeline_test.py`)
+に加えて、`scripts/ros/record_palm_offer_clips.py` を常時起動しておくと、
+掌の差し出しを検出するたびにその前後を rosbag クリップとして自動で
+切り出して保存できる。保存したクリップは `run_camera_pipeline_test.py`
+に `--bag` で渡せば、実カメラ・実ロボットの TF 配信なしにパイプライン
+全体をそのままテストできる (デフォルトのトピック名が一致しているため、
+再生したトピックをそのまま subscribe できる)。
+
+いずれも ROS Noetic + `uv sync` (`环境構築` 節参照) の両方が必要:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/venv/aero-uv/bin/activate
+```
+
+### 1. `record_palm_offer_clips.py`: クリップの録画
+
+実カメラ・実ロボットが動いている (`roscore` が立っていて、
+`/camera/color/image_raw/decompressed`・`/camera/depth/image_raw/
+decompressed`・`/camera/color/camera_info`・`/tf`・`/tf_static` が配信
+されている) 状態で実行する:
+
+```bash
+python3 scripts/ros/record_palm_offer_clips.py
+# 保存先を変えたい場合
+python3 scripts/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
+```
+
+`run_camera_pipeline_test.py` と異なり ARM ボタン操作は不要で、起動直後
+から常時掌の差し出しを検出し続ける (判定基準は `run_camera_pipeline_
+test.py` の ARMED 中の判定と同じ既定値に揃えてある)。1 人分保存したら
+終了するのではなく `Ctrl-C` などで止めるまで無期限に動き続け、その間に
+検出した掌の差し出しを (`--cooldown-seconds` の間隔を空けつつ) 何人分でも
+連番のファイル名で次々に保存し続ける。掌の差し出し
+(`offered_hand` が `None` から `'R'`/`'L'` になった瞬間) を検出すると、
+その時刻の `--pre-seconds` 秒前 (既定 2.0) から `--post-seconds` 秒後
+(既定 2.0) までの color/depth/camera_info/tf/tf_static を 1 本の
+`.bag` にまとめて `--save-dir` (既定 `palm_offer_clips/`) に保存する。
+同じ差し出し動作を 2 回に分けて録らないよう、1 クリップ保存後
+`--cooldown-seconds` 秒 (既定 3.0) は次のトリガーを無視する。
+
+保存されるファイルはクリップごとに 3 つ:
+
+```
+palm_offer_clips/
+    20260911_214500_R_000.bag   # color/depth/camera_info/tf/tf_static (4秒分)
+    20260911_214500_R_000.json  # trigger_stamp/offered_hand/pre_seconds/post_seconds/topics/bag_path/snapshot_path
+    20260911_214500_R_000.png   # 差し出しを検出した瞬間のカラー画像 + 骨格描画 (差し出し手は赤)
+```
+
+録画中 (トリガーしてから `--post-seconds` 経過するまでの間、クールダウン
+中は publish されない) は `~skeleton_image` にも同じ骨格描画画像を
+publish するので、`rqt_image_view` 等で購読すればどのフレームが実際に
+クリップへ書き込まれているかをリアルタイムに確認できる。
+
+`--robot-hand-position X Y Z` (既定 `(0.32, -0.55, 0.93)`, base_link 座標
+[m]) は差し出し手判定の基準にするロボット手先の位置で、実際に運用する
+ロボットの手先位置に近ければ近いほど判定が安定する (既定値は Aero の
+右腕初期姿勢の手先位置に近い概算値。`estimate_palm_poses.
+OfferedHandSelector` 自身の既定動作 (未指定/`None`) は合成骨格向けの
+「人物より world +x 側にロボットがいる」という前提で、実カメラ・
+base_link 座標系ではロボット自身がおよそ原点付近 (=人物より -x 側)
+にいることが多く食い違うため、この既定値へ上書きしてある)。ARM を押しても
+差し出し手が見つからないときと同じ理由で判定が届かない場合は
+`--offer-score-min` (既定 0.65) を調整する。
+
+### 2. `run_camera_pipeline_test.py --bag`: 保存したクリップで実カメラ無しテスト
+
+```bash
+python3 scripts/ros/run_camera_pipeline_test.py \
+    --bag palm_offer_clips/20260911_214500_R_000.bag \
+    --auto-arm --no-wait-for-client
+```
+
+- `--bag <path>`: 実カメラの代わりに指定した rosbag を再生する
+  (内部で `rosbag play --clock` をサブプロセスとして起動し、
+  `/use_sim_time` をあわせて有効にする)。`--bag-rate` で再生速度、
+  `--bag-loop` で繰り返し再生を指定できる。
+- `--auto-arm`: viser 画面の ARM ボタンを押す代わりに起動直後から
+  ARMED 状態にする (無人でのバッグ再生テスト用)。
+- `--no-wait-for-client`: viser のブラウザクライアント接続を待たずに
+  起動を続ける (既定では接続まで無期限に待つため、無人テストでは必須)。
+  表示自体は見たい場合はこのオプションを外して普段どおり viser の URL
+  をブラウザで開けばよい。
+
+`--execute-base`/`--execute-arm` を指定しなければ実機は一切動かさない
+ので、このテストに実ロボットは不要 (`--bag` のクリップに `tf`/`tf_static`
+も含めているため、実ロボットの TF 配信も不要)。
+
 ## 座標系
 
 各 JSON の座標はロボット座標系 (x=前, y=左, z=上) で、両足が地面

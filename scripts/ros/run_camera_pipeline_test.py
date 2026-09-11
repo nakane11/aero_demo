@@ -63,6 +63,17 @@ Usage
 -----
     python3 scripts/ros/run_camera_pipeline_test.py
     python3 scripts/ros/run_camera_pipeline_test.py --save-dir /tmp/camera_handshake_poses
+
+IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現れ、押すと
+計画済みの waypoint を実機に順番に送る (``_execute_on_robot`` 参照)。
+``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に動かすか
+どうかを独立に指定できる (既定はどちらもオフで、EXECUTE ボタン自体が
+表示されない)。``--execute-arm`` 指定時は ``ARM`` ボタンを押した瞬間にも
+実機の首を少し下げ、人間が手を差し出しやすい姿勢にする
+(``_nod_head_for_arm`` 参照):
+
+    python3 scripts/ros/run_camera_pipeline_test.py --execute-arm
+    python3 scripts/ros/run_camera_pipeline_test.py --execute-base --execute-arm
 """
 
 import argparse
@@ -70,6 +81,8 @@ import copy
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -108,6 +121,9 @@ from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
 from aero_demo.people_pose_types import Bone  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
+from aero_demo.ros_camera_utils import (  # noqa: E402
+    imgmsg_to_ndarray, lookup_camera_to_base, ndarray_to_imgmsg,
+    transform_to_matrix)
 
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
@@ -120,9 +136,11 @@ from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
 from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
 from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
+from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
+from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
@@ -136,6 +154,18 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 # waypoint 自動再生 (Play チェックボックス) の既定の速さ [waypoint/秒]
 # (view_handshake_motion.DEFAULT_PLAYBACK_FPS と同じ)。
 DEFAULT_PLAYBACK_FPS = 40.0
+
+# ARM ボタンを押した瞬間 (--execute-arm 指定時のみ、_nod_head_for_arm
+# 参照) に実機の首を下げる目標角度 [deg]。``Aero.reset_pose`` の既定
+# (neck_p_joint = 25 度、以後このパイプライン全体の「見ている」基準姿勢)
+# からさらに下げ、まっすぐ人の顔の高さを見続けるより控えめにうつむかせる
+# ことで、人間が手 (ロボットの手先の高さ) を差し出しやすい・近づきやすい
+# 印象にする。実機の首の可動方向 (どちらが「下」か) は個体差の可能性が
+# あるため、実機で確認して向きが逆なら符号を反転させること。
+ARM_HEAD_NOD_PITCH_DEG = 25.0
+# 上記の首下げ動作にかける時間 [秒]。あまり速いと会釈というより首を
+# 振っただけに見えるため、ゆっくりめにしてある。
+ARM_HEAD_NOD_MOVE_TIME = 1.5
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -263,7 +293,8 @@ def collision_pairs_text(colliding):
     """``handshake_viewer_common.collision_pairs_text`` に、IK 自体は
     指なしロボットで解いているが画面表示は指先まで含めた事後検証で
     あることを示す見出しを付けて呼ぶ (モジュール docstring 参照)。"""
-    return common_collision_pairs_text(colliding, label='指先まで含めた事後検証')
+    return common_collision_pairs_text(
+        colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
 def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
@@ -330,73 +361,6 @@ def _format_offer_scores(selection, score_min):
         else:
             lines.append('- {}: {:.2f}'.format(side, score))
     return '\n'.join(lines)
-
-
-def _transform_to_matrix(transform):
-    """``geometry_msgs/Transform`` を 4x4 の同次変換行列にする."""
-    t = transform.translation
-    q = transform.rotation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    rot = np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-    matrix = np.eye(4)
-    matrix[:3, :3] = rot
-    matrix[:3, 3] = [t.x, t.y, t.z]
-    return matrix
-
-
-# sensor_msgs/Image -> numpy 変換用の dtype/チャンネル数テーブル。
-# cv_bridge はシステム (apt) 由来のバイナリで、ビルド時の NumPy 1.x の
-# C-API を静的に埋め込んでいるため NumPy 2.x 実行時に ImportError/
-# AttributeError (_ARRAY_API not found) を起こす。ここで使うのは
-# bgr8/rgb8/mono8/16UC1/32FC1 だけなので、cv_bridge に頼らず
-# Image.data を直接 numpy 配列に変換する。
-_IMGMSG_DTYPE_CHANNELS = {
-    'bgr8': (np.uint8, 3),
-    'rgb8': (np.uint8, 3),
-    'mono8': (np.uint8, 1),
-    '8UC1': (np.uint8, 1),
-    '16UC1': (np.uint16, 1),
-    '32FC1': (np.float32, 1),
-}
-
-
-def _imgmsg_to_ndarray(msg, desired_encoding=None):
-    """``sensor_msgs/Image`` を numpy 配列へ変換する (cv_bridge の代替)."""
-    if msg.encoding not in _IMGMSG_DTYPE_CHANNELS:
-        raise ValueError('Unsupported image encoding: {}'.format(msg.encoding))
-    dtype, channels = _IMGMSG_DTYPE_CHANNELS[msg.encoding]
-    dtype = np.dtype(dtype).newbyteorder('>' if msg.is_bigendian else '<')
-    arr = np.frombuffer(msg.data, dtype=dtype)
-    shape = (msg.height, msg.width, channels) if channels > 1 else (msg.height, msg.width)
-    arr = arr.reshape(shape)
-
-    if desired_encoding is not None and desired_encoding != msg.encoding:
-        if {desired_encoding, msg.encoding} == {'bgr8', 'rgb8'}:
-            arr = arr[..., ::-1]
-        else:
-            raise ValueError(
-                'Cannot convert image encoding {} -> {}'.format(
-                    msg.encoding, desired_encoding))
-    return np.ascontiguousarray(arr)
-
-
-def _ndarray_to_imgmsg(arr, encoding, header):
-    """numpy 配列を ``sensor_msgs/Image`` に変換する
-    (``_imgmsg_to_ndarray`` の逆、cv_bridge の代替)."""
-    dtype, channels = _IMGMSG_DTYPE_CHANNELS[encoding]
-    arr = np.ascontiguousarray(arr, dtype=dtype)
-    msg = Image()
-    msg.header = header
-    msg.height, msg.width = arr.shape[0], arr.shape[1]
-    msg.encoding = encoding
-    msg.is_bigendian = 0
-    msg.step = msg.width * channels * np.dtype(dtype).itemsize
-    msg.data = arr.tobytes()
-    return msg
 
 
 def draw_skeleton_overlay(color_bgr, joints_2d):
@@ -569,6 +533,26 @@ class HandshakePipelineNode(object):
 
         self._warmup_ik()
 
+        # 実機接続 (--execute-base/--execute-arm のどちらかが指定された
+        # ときだけ AeroROSRobotInterface を作る。実機/実機用 ROS ノードが
+        # 立っていない環境でこのスクリプトを viewer 確認だけに使うことも
+        # 多いため、指定が無ければ一切 ROS アクションサーバへの接続を
+        # 試みない -- コンストラクタでサーバ待ちしてブロックすることを
+        # 避ける)。台車・関節を別々の robot_model インスタンス
+        # (self.robot/self.display_robot) と混ぜて操作すると angle_vector
+        # 送信中に表示スレッドが同じインスタンスを書き換えてしまう恐れが
+        # あるため、実機操作専用の robot_model を別に持つ (_execute_on_robot
+        # 参照)。
+        self.real_robot = None
+        self.ri = None
+        if args.execute_base or args.execute_arm:
+            self.real_robot = load_aero(use_hand=True)
+            print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
+            self.ri = AeroROSRobotInterface(self.real_robot)
+            print('[execute] 実機への接続が完了しました (--execute-base={}, '
+                  '--execute-arm={})。'.format(
+                      args.execute_base, args.execute_arm))
+
         # デバッグ用: カメラ画像に検出できた 2D 骨格を重ねた画像を publish
         # する (draw_skeleton_overlay 参照)。rqt_image_view 等で購読すれば、
         # viser の 3D プレビューとは別に「実際にどの関節がどの画素で検出
@@ -586,6 +570,18 @@ class HandshakePipelineNode(object):
         self.sync.registerCallback(self._on_frame)
 
         self._setup_viewer(args)
+
+        if args.auto_arm:
+            # ARM ボタンクリックの代わりに起動直後から ARMED にする
+            # (_on_arm ボタンハンドラと全く同じ処理、--bag での無人テスト用)。
+            self.state = 'armed'
+            self.armed_deadline = time.time() + args.armed_timeout
+            self._latest_offer_selection = None
+            with self._lock:
+                self._handshake_total_time = None
+            print('[auto-arm] 起動直後に ARMED 状態にしました '
+                  '(--auto-arm)。{:.0f} 秒以内に手を差し出してください。'
+                  .format(args.armed_timeout))
 
     _WARMUP_PALM = dict(
         position=[0.5, 0.0, 1.0],
@@ -687,6 +683,18 @@ class HandshakePipelineNode(object):
         self.reset_button = self.viewer._server.gui.add_button(
             'RESET (最初からやり直す)')
         self.reset_button.visible = False
+        # IK・軌道計画が終わって waypoint が確認できる状態 ('result') に
+        # なったら押せる、実機を動かすボタン (--execute-base/--execute-arm
+        # のどちらかが指定されているときだけ表示する。両方とも未指定なら
+        # self.ri が None のままで実行しようがないため、ボタン自体を出さない)。
+        self.execute_button = self.viewer._server.gui.add_button(
+            'EXECUTE (実機を動かす)')
+        self.execute_button.visible = False
+
+        @self.execute_button.on_click
+        def _on_execute(_):  # noqa: ANN001
+            threading.Thread(
+                target=self._execute_on_robot, daemon=True).start()
 
         @self.arm_button.on_click
         def _on_arm(_):  # noqa: ANN001  (viser の GuiEvent は型を問わない)
@@ -695,6 +703,12 @@ class HandshakePipelineNode(object):
             self._latest_offer_selection = None
             with self._lock:
                 self._handshake_total_time = None
+            if self.args.execute_arm and self.ri is not None:
+                # 実機通信 (joint_states 待ち/action 送信) をこの GUI
+                # コールバックのスレッドで直接行うとブロックするため、
+                # _on_execute と同様に別スレッドに逃がす。
+                threading.Thread(
+                    target=self._nod_head_for_arm, daemon=True).start()
             print('[ARM] ARMED になりました。{:.0f} 秒以内に手を差し出して'
                   'ください。'.format(self.args.armed_timeout))
 
@@ -711,6 +725,7 @@ class HandshakePipelineNode(object):
             self.play_checkbox.value = False
             self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
             self.reset_button.visible = False
+            self.execute_button.visible = False
             self.arm_button.visible = True
             self.state = 'idle'
             with self._viewer_lock:
@@ -801,8 +816,13 @@ class HandshakePipelineNode(object):
         # 消す (触ると display_robot と overlay の一方だけが動いて姿勢が
         # 食い違ったまま残るため、remove_joint_angle_gui 参照)。
         remove_joint_angle_gui(self.viewer)
+        # 同様に、任意の障害物を画面から手動で追加・編集する GUI (Obstacles
+        # フォルダ) も、人体の障害物は骨格から自動生成するこのビューアでは
+        # 使わないので消す (remove_obstacles_gui 参照)。
+        remove_obstacles_gui(self.viewer)
         self.viewer.show(open_browser=not args.no_open_browser)
-        viewer_nav.wait_for_client(self.viewer, args.client_wait_timeout)
+        if not args.no_wait_for_client:
+            viewer_nav.wait_for_client(self.viewer, args.client_wait_timeout)
 
     def _set_link_visible(self, link, visible):
         common_set_link_visible(self.viewer, link, visible)
@@ -821,39 +841,10 @@ class HandshakePipelineNode(object):
                           dtype=np.float64)
 
     def _lookup_camera_to_base(self, header):
-        """``header`` (画像の frame_id/stamp) から base_link への TF を引く.
-
-        まず画像の stamp ちょうどの TF を試み、それが (バッファに無い/
-        extrapolation エラー等で) 引けなければ最新の TF (``rospy.Time(0)``)
-        にフォールバックする。後者は画像とTFの時刻が厳密には一致しない
-        (カメラ画像を出しているマシンと TF を配信しているマシンの間で
-        システムクロックがズレていると、``ExtrapolationException`` が
-        毎回発生してこの経路に入り続ける -- その場合は根本的には NTP 等で
-        クロックを同期するべきだが、応急的にこのフォールバックでテストを
-        続けられるようにしてある)。
-        """
-        try:
-            return self.tf_buffer.lookup_transform(
-                self.args.base_frame, header.frame_id, header.stamp,
-                rospy.Duration(0.2))
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-               tf2_ros.ExtrapolationException):
-            # マシン間の時刻ズレで毎フレーム発生しうる想定内のフォール
-            # バックなので、警告は出さず黙って最新の TF にフォールバック
-            # する (それでも引けない場合だけ下の except で警告する)。
-            pass
-        try:
-            # tf2 では Time(0) は「時刻 0」であり tf とは違って「最新」を
-            # 意味しない。最新を取得するには現在時刻を渡す必要がある。
-            return self.tf_buffer.lookup_transform(
-                self.args.base_frame, header.frame_id, rospy.Time.now(),
-                rospy.Duration(0.2))
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-               tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn_throttle(
-                5.0, 'TF lookup failed (%s -> %s): %s',
-                header.frame_id, self.args.base_frame, e)
-            return None
+        """``header`` (画像の frame_id/stamp) から base_link への TF を引く
+        (``aero_demo.ros_camera_utils.lookup_camera_to_base`` 参照)."""
+        return lookup_camera_to_base(
+            self.tf_buffer, self.args.base_frame, header)
 
     # ------------------------------------------------------------------
     # camera callback
@@ -867,10 +858,10 @@ class HandshakePipelineNode(object):
         # base_link 座標系が要るので、変換できたフレームでのみ行う。
         transform = self._lookup_camera_to_base(color_msg.header)
         camera_to_base = (None if transform is None
-                          else _transform_to_matrix(transform.transform))
+                          else transform_to_matrix(transform.transform))
 
-        color = _imgmsg_to_ndarray(color_msg, desired_encoding='bgr8')
-        depth_raw = _imgmsg_to_ndarray(depth_msg)
+        color = imgmsg_to_ndarray(color_msg, desired_encoding='bgr8')
+        depth_raw = imgmsg_to_ndarray(depth_msg)
         depth_m = PeoplePoseEstimator.depth_to_meters(
             depth_raw, encoding=depth_msg.encoding)
         intrinsics = CameraIntrinsics.from_matrix(info_msg.K)
@@ -882,7 +873,7 @@ class HandshakePipelineNode(object):
             overlay = (draw_skeleton_overlay(color, joints_2d[0])
                       if joints_2d else color)
             self.skeleton_image_pub.publish(
-                _ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
+                ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
         # TF が引けなくても viser のプレビューは止めない (camera_to_base が
         # None のフレームは people がカメラ座標系のままになるが、それでも
         # 骨格の形自体は見えるので、TF 未解決時に画面が真っ暗になるのを
@@ -1099,6 +1090,12 @@ class HandshakePipelineNode(object):
             self._display_waypoints = display_waypoints
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
+        # 実機で動かせる状態 (IK・軌道計画が成功していて、かつ --execute-base
+        # /--execute-arm のどちらかが指定されて self.ri が使える) になった
+        # ときだけ EXECUTE ボタンを表示する。
+        self.execute_button.visible = (
+            self.ri is not None and result['solved'] and motion is not None
+            and display_waypoints is not None)
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -1264,6 +1261,132 @@ class HandshakePipelineNode(object):
             tolerance=self.args.collision_verify_tolerance)
         self._collision_pairs_text = collision_pairs_text(colliding)
 
+    # ------------------------------------------------------------------
+    # 実機動作 (ARM ボタン押下時の首下げ、EXECUTE ボタン)
+    # ------------------------------------------------------------------
+    def _nod_head_for_arm(self):
+        """ARM ボタン押下時 (``--execute-arm`` 指定時のみ ``_on_arm`` から
+        別スレッドで呼ばれる) に、実機の首だけを ``ARM_HEAD_NOD_PITCH_DEG``
+        まで下げ、人間が手を差し出しやすい (ロボットがまっすぐ顔を見続ける
+        より威圧感の少ない) 姿勢にする。
+
+        ``controller_type='head_controller'`` を明示して送ることで、
+        ``AeroROSRobotInterface.head_controller`` (``neck_y_joint``/
+        ``neck_p_joint``/``neck_r_joint`` だけの独立した action server) が
+        使われ、腕・台車・腰など他の関節へは一切コマンドを送らない
+        (``_execute_on_robot`` の腕・台車の送信とは完全に独立)。
+
+        送るベクトルの首以外の要素は実機の現在値をそのまま使う
+        (``self.ri.angle_vector()`` を引数なしで呼ぶと joint_states から
+        読んだ実機の現在角を返す) -- ``self.real_robot`` は ``neck_p_joint``
+        以外まだ一度も実機の姿勢を反映していない (角度 0 のまま) ため、
+        そのまま送ると首以外の関節の目標到達時間の見積もり
+        (``angle_vector`` 内の ``angle_vector_duration``) が実際には送らない
+        関節の見かけ上の大きな角度差につられておかしくなる。
+        """
+        try:
+            current_av = self.ri.angle_vector()
+        except RuntimeError as exc:
+            print('[ARM] 実機の関節角を取得できなかったため、首を下げる '
+                  '動作をスキップしました ({})。'.format(exc))
+            return
+        self.real_robot.angle_vector(current_av)
+        self.real_robot.neck_p_joint.joint_angle(
+            np.deg2rad(ARM_HEAD_NOD_PITCH_DEG))
+        self.ri.angle_vector(self.real_robot.angle_vector(),
+                             ARM_HEAD_NOD_MOVE_TIME,
+                             controller_type='head_controller')
+        print('[ARM] 首を {:.0f} 度まで下げました。'.format(
+            ARM_HEAD_NOD_PITCH_DEG))
+
+    def _execute_on_robot(self):
+        """``EXECUTE`` ボタン押下時、計画済みの waypoint 列
+        (``self._display_waypoints``、waypoint スライダー/Play で画面
+        確認しているのと同じもの) を実機に順番に送る。
+
+        台車移動には ``AeroROSRobotInterface.move_to`` (``move_base``
+        経由、costmap を使う) ではなく ``go_pos_unsafe`` を使う --
+        ``go_pos_unsafe`` は costmap を見ず、``base_controller`` の
+        ``FollowJointTrajectoryAction`` へ直接軌道を送るだけの相対移動
+        (現在の台車姿勢を基準にした前後左右+回転の移動量) なので、
+        カメラで検出した人物に対する計画済みの軌道をそのまま素直に
+        なぞらせたいこのユースケースに向いている (costmap 上の障害物
+        回避や大域的な経路計画はそもそも不要で、干渉回避は
+        ``plan_handshake_motion.py`` 側で waypoint 単位に検証済み)。
+
+        ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
+        動かすかどうかを独立に切り替えられる (どちらも指定しなければ
+        ``self.ri`` が ``None`` のままで EXECUTE ボタン自体が表示されない)。
+        台車と腕は waypoint ごとに両方とも ``wait=False`` で送信してから
+        ``wait_interpolation()``/``go_pos_unsafe_wait()`` でまとめて完了を
+        待つ (並行して動く)。次の waypoint へ進むのは両方が完了してから。
+        """
+        with self._lock:
+            result = self._current_result
+            motion = self._current_motion
+            display_waypoints = self._display_waypoints
+        if self.ri is None:
+            print('[execute] --execute-base/--execute-arm のいずれも指定 '
+                  'されていないため実機を動かせません。')
+            return
+        if result is None or not result.get('solved') or motion is None \
+               or display_waypoints is None:
+            print('[execute] IK・軌道計画が完了していないため実機を動かせ '
+                  'ません。')
+            return
+
+        joint_names = motion['joint_names']
+        move_time = max(motion['dt'], 0.01)
+        print('[execute] 実機で waypoint を {} 個実行します '
+              '(--execute-base={}, --execute-arm={})。'.format(
+                  len(display_waypoints), self.args.execute_base,
+                  self.args.execute_arm))
+        prev_base = None  # (x, y, yaw) 直前 waypoint の台車位置姿勢 (world 系)
+        for i, wp in enumerate(display_waypoints):
+            if self.args.execute_arm:
+                name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
+                for joint in self.real_robot.joint_list:
+                    if joint.name in name_to_angle:
+                        joint.joint_angle(name_to_angle[joint.name])
+                self.ri.angle_vector(self.real_robot.angle_vector(), move_time)
+
+            if self.args.execute_base:
+                bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
+                               wp['base_yaw'])
+                if prev_base is None:
+                    # 最初の waypoint: このノードの座標系はロボットの台車が
+                    # ワールド原点にいる前提 (_initial_base_coords 参照) な
+                    # ので、ロボットは今まさにこの world 原点にいるはず --
+                    # 絶対座標 (bx, by, byaw) をそのまま原点からの移動量
+                    # として使える。
+                    dx_world, dy_world, dyaw = bx, by, byaw
+                    prev_yaw = 0.0
+                else:
+                    dx_world = bx - prev_base[0]
+                    dy_world = by - prev_base[1]
+                    dyaw = byaw - prev_base[2]
+                    prev_yaw = prev_base[2]
+                # world 系の移動量を、直前 waypoint での台車の向き基準
+                # (go_pos_unsafe が要求する「現在の台車姿勢を基準にした
+                # 前後左右」) に回転させる。
+                cos_yaw, sin_yaw = math.cos(prev_yaw), math.sin(prev_yaw)
+                dx = cos_yaw * dx_world + sin_yaw * dy_world
+                dy = -sin_yaw * dx_world + cos_yaw * dy_world
+                self.ri.go_pos_unsafe(dx, dy, dyaw, wait=False)
+                prev_base = (bx, by, byaw)
+
+            # 台車・腕とも送信は非ブロッキング (angle_vector は元々非同期、
+            # go_pos_unsafe も上で wait=False) なので、両方投げ終えてから
+            # まとめて完了を待つ (並行して動く)。
+            if self.args.execute_arm:
+                self.ri.wait_interpolation()
+            if self.args.execute_base:
+                self.ri.go_pos_unsafe_wait()
+
+            print('[execute] waypoint {}/{} を実行しました。'.format(
+                i + 1, len(display_waypoints)))
+        print('[execute] 実行を終了しました。')
+
     def _play_loop(self):
         """``Play`` チェックボックスがオンの間、``--fps`` の周期で waypoint
         スライダーを進める (view_handshake_motion.PlaybackControls._play_
@@ -1371,27 +1494,32 @@ class HandshakePipelineNode(object):
                 verified_text = ('OK (経路全体で干渉なし)' if motion['verified']
                                  else 'NG (経路上に干渉が残る waypoint あり)')
                 waypoint_index = int(self.waypoint_slider.value)
-                content += ('\n\n**軌道:** {} / 検証: {}\n\n'
+                content += ('\n\n**軌道:** {} / 計画時 (指なし) の検証: {}\n\n'
                            'waypoint {}/{}'.format(
                                kind, verified_text, waypoint_index,
                                self.waypoint_slider.max))
                 if waypoint_index < n_prepend:
-                    content += (' (初期位置から経路開始点への移動、干渉は'
-                               '考慮していない)')
+                    content += (' (初期位置から経路開始点への移動、経路計画の'
+                               '干渉検証の対象外)')
                 elif waypoint_index < n_prepend + n_approach:
                     dist = motion['waypoint_min_distances'][
                         waypoint_index - n_prepend]
-                    content += (' (この waypoint の干渉余裕: {:+.4f} m, {})'
-                               .format(dist, '貫通' if dist < 0 else '干渉なし'))
+                    content += (' (この waypoint の計画時 (指なし) の干渉'
+                               '余裕: {:+.4f} m)'.format(dist))
                 else:
-                    content += (' (掌への押し込み)')
+                    content += (' (掌への押し込み、経路計画の干渉検証の対象外)')
             else:
                 content += ('\n\n**軌道:** 計画なし ({})'.format(
                     'IK 失敗' if not result['solved'] else '計算中'))
-        # IK 自体は指なしで解いているが (self.verification_pairs/motion の
-        # waypoint_min_distances)、指先まで含めた実際の貫通有無は別に事後
-        # 検証している (view_handshake_poses.py と同じ、_refresh_collision_
-        # pairs_text 参照)。表示中の waypoint が切り替わるたびに更新済み。
+        # 干渉しているかどうかの結論は、上の計画時 (指なし) の干渉余裕では
+        # なく下の事後検証で出す -- 経路計画・IK は指なしロボットで解いて
+        # いる (self.verification_pairs/motion の waypoint_min_distances)
+        # ため、指先や表示専用フレーム (初期位置からの移動/掌への押し込み)
+        # を含む「いま画面に出ている姿勢が実際に貫通しているか」は、表示
+        # 中の waypoint の姿勢に対して指ありで解き直した _refresh_collision
+        # _pairs_text の結果だけが答えられる。両方に貫通の有無を書くと、
+        # 同じ waypoint について食い違う判定が並んで紛らわしいため、
+        # 上には計画時の数値だけを出す。
         content += '\n\n' + self._collision_pairs_text
         self._status_text.content = content
 
@@ -1496,6 +1624,12 @@ def main():
         '--no-open-browser', action='store_true',
         help='viser のブラウザの自動起動を無効にする (URL を自分で開く '
             '場合)。')
+    parser.add_argument(
+        '--no-wait-for-client', action='store_true',
+        help='viser のブラウザクライアント接続を待たずに起動を続ける。'
+            '既定では ``viewer_nav.wait_for_client`` がクライアント接続 '
+            'まで無期限に待ち続けるため、``--bag``/``--auto-arm`` を使った '
+            '無人でのバッグ再生テストでは併せてこれを指定する。')
     parser.add_argument('--min-detection-confidence', type=float, default=0.5)
     parser.add_argument('--min-tracking-confidence', type=float, default=0.5)
     parser.add_argument('--min-visibility', type=float, default=0.5)
@@ -1673,12 +1807,75 @@ def main():
         '--playback-fps', type=float, default=DEFAULT_PLAYBACK_FPS,
         help='Play チェックボックスをオンにしたときの waypoint 自動再生の '
             '速さ [waypoint/秒] (既定 {})。'.format(DEFAULT_PLAYBACK_FPS))
+    # --- 実機動作 (EXECUTE ボタン、_execute_on_robot 参照) ---
+    parser.add_argument(
+        '--execute-base', action='store_true',
+        help='EXECUTE ボタンを押したとき、計画済みの軌道に沿って台車を '
+            '実機で実際に動かす (AeroROSRobotInterface.go_pos_unsafe。'
+            'move_to/move_base の costmap は使わず、現在姿勢を基準にした '
+            '相対移動を waypoint ごとに送る)。指定しなければ台車は動かさ '
+            'ない (既定オフ、--execute-arm と併せてどちらも未指定なら '
+            'EXECUTE ボタン自体を表示しない)。')
+    parser.add_argument(
+        '--execute-arm', action='store_true',
+        help='EXECUTE ボタンを押したとき、計画済みの軌道に沿って腕を含む '
+            '全身の関節を実機で実際に動かす (AeroROSRobotInterface.'
+            'angle_vector)。指定しなければ関節は動かさない (既定オフ)。')
+    # --- 実カメラ無しでのテスト (rosbag 再生、record_palm_offer_clips.py
+    # が保存したクリップを入力にする) ---
+    parser.add_argument(
+        '--bag', type=str, default=None,
+        help='実カメラの代わりに再生する rosbag ファイル '
+            '(record_palm_offer_clips.py が保存したクリップなど)。'
+            'color/depth/camera_info/tf/tf_static を同じデフォルトの '
+            'トピック名で記録済みなら、このノードのライブトピック '
+            'subscribe をそのまま流用できる。指定すると内部で '
+            '"rosbag play" をサブプロセスとして起動し、ノード終了時に '
+            '終了させる。')
+    parser.add_argument(
+        '--bag-rate', type=float, default=1.0,
+        help='--bag 再生時の速度倍率 ("rosbag play -r"、既定 1.0)。')
+    parser.add_argument(
+        '--bag-loop', action='store_true',
+        help='--bag をループ再生する ("rosbag play --loop")。')
+    parser.add_argument(
+        '--auto-arm', action='store_true',
+        help='起動直後に viser の ARM ボタンを押した状態 (ARMED) から '
+            '始める。--bag での無人テスト時に、ブラウザで ARM ボタンを '
+            'クリックする代わりに使う。')
     # argparse は roslaunch が付ける残りの引数 (__name/__log 等) を無視する
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
+    bag_process = None
+    if args.bag:
+        if shutil.which('rosbag') is None:
+            sys.exit(
+                'rosbag が見つかりません。source /opt/ros/noetic/setup.bash '
+                '等で ROS の setup.bash を読み込んでから実行してください。')
+        if not os.path.exists(args.bag):
+            sys.exit('--bag で指定したファイルが見つかりません: {}'.format(
+                args.bag))
+        # --bag 再生時は "rosbag play --clock" が配信する /clock に同期させ、
+        # クリップ記録時のタイムスタンプのまま TF/画像の時刻整合性を保つ。
+        rospy.set_param('/use_sim_time', True)
+
     rospy.init_node('run_camera_pipeline_test')
     node = HandshakePipelineNode(args)
-    node.spin()
+
+    if args.bag:
+        cmd = ['rosbag', 'play', args.bag, '--clock',
+              '-r', str(args.bag_rate)]
+        if args.bag_loop:
+            cmd.append('--loop')
+        print('[bag] 再生します: {}'.format(' '.join(cmd)))
+        bag_process = subprocess.Popen(cmd)
+
+    try:
+        node.spin()
+    finally:
+        if bag_process is not None:
+            bag_process.terminate()
+            bag_process.wait()
 
 
 if __name__ == '__main__':

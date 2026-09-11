@@ -15,6 +15,11 @@ dependencies = [
     # ごと削除されている (1.0 系では mediapipe.solutions 自体が無くなる)。
     # Tasks API に移行するまではこのバージョンに固定する。
     "mediapipe==0.10.9",
+    # record_palm_offer_clips.py が使う ROS Noetic の rosbag モジュールが
+    # (bag ファイルの暗号化オプション用に) Cryptodome/gnupg を import
+    # するため (使わなくても import 時に必要)。
+    "pycryptodomex==3.23.0",
+    "python-gnupg==0.5.4",
     "scikit-robot[all]==0.3.15",
     "jax[cuda12]==0.10.2; python_full_version < '3.12'",
     "jax[cuda12]==0.11.1; python_full_version >= '3.12'",

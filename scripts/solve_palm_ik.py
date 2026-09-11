@@ -836,6 +836,104 @@ def human_capsules(joint_positions):
 DEFAULT_COLLISION_VERIFY_TOLERANCE = 0.001  # [m]
 
 
+def cylinder_surface_samples(obstacle, n_theta=16, n_height=5):
+    """円柱障害物 ``obstacle`` の表面 (側面の格子点 + 上下端面の中心) を
+    ワールド座標でサンプルし、``obstacle_into_link_depth`` が使う形で返す。
+
+    同じ姿勢のまま多数のリンクと突き合わせるので、リンクごとに作り直さず
+    呼び出し側でキャッシュして使い回す想定。
+
+    Returns
+    -------
+    (points, center, radius)
+        ``points`` はワールド座標のサンプル点 ``(n_theta * n_height + 2, 3)``。
+        ``center``/``radius`` は足切り用の包含球 (円柱の中心と、円柱全体を
+        包む球の半径)。
+    """
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    heights = np.linspace(-obstacle.height / 2.0, obstacle.height / 2.0,
+                          n_height)
+    ring = np.column_stack([obstacle.radius * np.cos(thetas),
+                            obstacle.radius * np.sin(thetas),
+                            np.zeros(n_theta)])
+    side = (np.tile(ring, (n_height, 1))
+            + np.repeat(np.column_stack(
+                [np.zeros(n_height), np.zeros(n_height), heights]),
+                n_theta, axis=0))
+    caps = np.array([[0.0, 0.0, obstacle.height / 2.0],
+                     [0.0, 0.0, -obstacle.height / 2.0]])
+    local_pts = np.vstack([side, caps])
+    center = obstacle.worldpos()
+    radius = math.hypot(obstacle.radius, obstacle.height / 2.0)
+    return local_pts @ obstacle.worldrot().T + center, center, radius
+
+
+def link_collision_shape(link):
+    """``link.collision_mesh`` (``apply_collision_model`` が差し替えた
+    box/cylinder/sphere のプリミティブ = 凸形状) を、``obstacle_into_link_
+    depth`` が使う形でローカル座標のまま返す。リンクの姿勢には依存しない
+    ので、呼び出し側でリンクごとにキャッシュして使い回す想定。
+
+    Returns
+    -------
+    (bounds, normals, offsets, radius)
+        ``bounds`` は軸並行バウンディングボックスの ``(min, max)``
+        (安い足切り用)。``normals``/``offsets`` は各面の外向き単位法線と
+        平面のオフセットで、``normals @ p - offsets`` が全て 0 以下の点 ``p``
+        がこの凸形状の内部にある (厳密判定用)。``radius`` はリンク原点を
+        中心とする包含球の半径 (同じく足切り用)。
+    """
+    mesh = link.collision_mesh
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces)
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    face_points = verts[faces[:, 0]]
+    # URDF 由来のメッシュは面の向き (winding) が保証されないため、凸形状
+    # であることを利用して重心から外を向くように符号を揃える (法線が内向き
+    # のままだと内外判定が反転してしまう)。
+    outward = np.einsum(
+        'ij,ij->i', normals, verts[faces].mean(axis=1) - verts.mean(axis=0))
+    normals = normals * np.where(outward < 0.0, -1.0, 1.0)[:, np.newaxis]
+    offsets = np.einsum('ij,ij->i', normals, face_points)
+    radius = float(np.linalg.norm(verts, axis=1).max())
+    return ((verts.min(axis=0), verts.max(axis=0)), normals, offsets, radius)
+
+
+def obstacle_into_link_depth(samples, link, shape):
+    """円柱障害物の表面 (``samples`` = ``cylinder_surface_samples`` の
+    戻り値) が、ロボットのリンク ``link`` (``shape`` = ``link_collision_
+    shape(link)`` の戻り値) の形状にどれだけ入り込んでいるか [m]
+    (正なら貫通、負なら離れている) を返す。
+
+    ロボット側の頂点が円柱に食い込んでいるかを見る判定 (``collision_pairs_
+    min_distance``/``handshake_viewer_common.colliding_link_pairs``) だけ
+    では、逆向き -- 円柱がリンクの頂点から離れた場所 (箱形プリミティブの面
+    の途中など) を貫通しているケース -- を見逃す。前腕のような箱形プリミ
+    ティブは頂点が 8 個の角しかなく、細い人体の円柱が面の中央付近を貫通して
+    も角のどれもが円柱の内部に入らないことがあるためで、これを補うために
+    円柱側の表面をサンプルして逆向きの判定を行う。
+
+    ペア数が多い (ロボットの全リンク × 人体セグメント数) ので、包含球
+    同士・軸並行バウンディングボックスの順に安い判定で足切りし、最後まで
+    残った点だけ各面の平面に対して厳密に判定する。バウンディングボックス
+    だけで内外を決めないのは、胴体や頭部のような cylinder/sphere の
+    プリミティブでは実形状より最大 8 cm ほど大きく、逆に干渉を過剰検出して
+    しまうため。
+    """
+    points, obstacle_center, obstacle_radius = samples
+    (lo, hi), normals, offsets, link_radius = shape
+    if (np.linalg.norm(obstacle_center - link.worldpos())
+            > link_radius + obstacle_radius):
+        return -float('inf')
+    local_pts = (points - link.worldpos()) @ link.worldrot()
+    bbox_depth = np.minimum(local_pts - lo, hi - local_pts).min(axis=1)
+    inside_bbox = bbox_depth > 0.0
+    if not inside_bbox.any():
+        return float(bbox_depth.max())
+    plane_dist = local_pts[inside_bbox] @ normals.T - offsets
+    return float(-plane_dist.max(axis=1).min())
+
+
 def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     """``robot`` の現在の姿勢 (``angle_vector``/``base_pose`` 適用済み) で、
     ``collision_pairs`` (``load_collision_pairs`` が返す ``(Link, Link)``/
@@ -860,6 +958,18 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     「中に入り込んだ深さ」を解析的に求める (単純な頂点同士の最短距離だと、
     指のように細いリンクが円柱の内部深くまで潜り込んでも頂点同士は互いの
     表面近くまで来ず見逃してしまうため)。
+
+    ただし、この「ロボット側の頂点が円柱に食い込んでいるか」だけの判定は
+    非対称で、逆向き -- 円柱がロボット側リンクの頂点から離れた場所 (箱形
+    プリミティブの面の途中など) を貫通しているケース -- を見逃す。前腕の
+    ような箱形プリミティブは頂点が 8 個の角しかなく、細い人体の円柱がその
+    面の中央付近を貫通しても角のどれもが円柱の内部に入らないことがあり、
+    見た目には貫通していても本関数は「干渉なし」を返してしまう
+    (画面上は明らかに貫通しているのに干渉余裕がわずかに正の値になる、
+    という食い違いはこれで起こりうる)。これを検出するため、円柱側の表面
+    からの逆向きの判定
+    (``obstacle_into_link_depth``) も併せて行い、両方の深さの大きい方
+    (より貫通している方) を採用する。
     """
     if not collision_pairs:
         return float('inf')
@@ -867,6 +977,8 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
         if joint_positions else None
     min_dist = float('inf')
     world_vertices_by_link = {}
+    shape_by_link = {}
+    samples_by_obstacle = {}
 
     def _world_vertices(link):
         if link not in world_vertices_by_link:
@@ -874,6 +986,17 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
             world_vertices_by_link[link] = (
                 local @ link.worldrot().T + link.worldpos())
         return world_vertices_by_link[link]
+
+    def _shape(link):
+        if link not in shape_by_link:
+            shape_by_link[link] = link_collision_shape(link)
+        return shape_by_link[link]
+
+    def _samples(index):
+        if index not in samples_by_obstacle:
+            samples_by_obstacle[index] = cylinder_surface_samples(
+                obstacle_links[index])
+        return samples_by_obstacle[index]
 
     for link_a, other in collision_pairs:
         verts_a = _world_vertices(link_a)
@@ -888,6 +1011,8 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
             depth = float(np.minimum(
                 obstacle.radius - radial,
                 obstacle.height / 2.0 - axial).max())
+            depth = max(depth, obstacle_into_link_depth(
+                _samples(other), link_a, _shape(link_a)))
             dist = -depth
         else:
             verts_b = _world_vertices(other)
