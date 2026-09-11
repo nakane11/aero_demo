@@ -360,7 +360,8 @@ class OfferedHandSelector(object):
     def __init__(self, robot_position=None, side_prior=None, weights=None,
                  score_min=OFFER_SCORE_MIN,
                  ambiguous_margin=AMBIGUOUS_MARGIN,
-                 face_away_penalty=FACE_AWAY_PENALTY):
+                 face_away_penalty=FACE_AWAY_PENALTY,
+                 max_distance=None):
         """
         Parameters
         ----------
@@ -386,6 +387,14 @@ class OfferedHandSelector(object):
             顔をロボットに向けていない分 (``1 - face_to_robot``) に掛けて
             スコアから引く減点の大きさ。既定は
             :data:`FACE_AWAY_PENALTY`。0.0 にすれば顔向きを一切見なくなる。
+        max_distance : float or None
+            人物 (``body.hip_center``) から ``robot_position`` (``None``
+            のときは ``_robot_position`` が人物ごとに計算する仮のロボット
+            位置) までの距離がこれを超えたら、スコアを計算するまでもなく
+            両手とも ``veto='too_far'`` にして候補から外す (奥や画面の端に
+            映り込んだ、差し出す気の無い通行人を拾わないための足切り)。
+            既定 ``None`` は距離では足切りしない (``score_min`` だけで
+            判定する、元の挙動のまま)。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -395,6 +404,8 @@ class OfferedHandSelector(object):
         self.score_min = float(score_min)
         self.ambiguous_margin = float(ambiguous_margin)
         self.face_away_penalty = float(face_away_penalty)
+        self.max_distance = (None if max_distance is None
+                             else float(max_distance))
 
     def select(self, joint_positions, palms):
         """どちらの手を繋ぐべきかを判定する.
@@ -424,15 +435,33 @@ class OfferedHandSelector(object):
                 左右のスコアが拮抗しているか。
             ``veto``
                 候補から外した理由 (外していなければ ``None``)。
+            ``distance``
+                人物 (``body.hip_center``) からロボットまでの距離 [m]
+                (``body`` が作れなければ ``None``)。``max_distance`` の
+                調整・デバッグ用。
         """
         joints = {name: np.asarray(p, dtype=np.float64)
                   for name, p in joint_positions.items()}
         body = _body_frame(joints)
 
+        distance = None
+        too_far = False
+        if body is not None:
+            distance = float(np.linalg.norm(
+                body.hip_center - self._robot_position(body)))
+            too_far = (self.max_distance is not None
+                      and distance > self.max_distance)
+
         scores = {'R': None, 'L': None}
         features = {'R': None, 'L': None}
         veto = {'R': None, 'L': None}
         for side in ('R', 'L'):
+            if too_far:
+                # 距離の足切りは「そもそも手が見えているか」より優先して
+                # 報告する (遠くの通行人の腕がたまたま検出できていても、
+                # 差し出す気が無い以上スコアを見る意味が無いため)。
+                veto[side] = 'too_far'
+                continue
             palm = palms.get(side)
             if palm is None:
                 veto[side] = 'no_palm'
@@ -461,7 +490,8 @@ class OfferedHandSelector(object):
         ambiguous = bool(side is not None and margin is not None
                          and margin < self.ambiguous_margin)
         return dict(side=side, scores=scores, features=features,
-                    margin=margin, ambiguous=ambiguous, veto=veto)
+                    margin=margin, ambiguous=ambiguous, veto=veto,
+                    distance=distance)
 
     def _robot_position(self, body):
         """ロボットの手先のワールド座標.
@@ -556,6 +586,32 @@ class OfferedHandSelector(object):
         if up_perp is None:
             return 1.0
         return float(np.dot(thumb, up_perp))
+
+
+def format_offer_scores(selection, score_min):
+    """``OfferedHandSelector.select`` の戻り値を、人手で読む 1 行のログ用
+    文字列にする.
+
+    ``ARM`` を押しても (あるいは常時検出のノードで差し出しを待っても)
+    offered_hand が決まらないとき、原因が「そもそも手のランドマークが
+    取れていない (``veto``: ``no_palm``)」のか「人物が遠すぎる
+    (``veto``: ``too_far``、``OfferedHandSelector(max_distance=...)``
+    参照)」のか「取れているがスコアが閾値 ``score_min`` に届いていない」
+    のかを見分けられるようにする。``run_camera_pipeline_test.py`` (viser
+    画面・標準出力) と ``record_palm_offer_clips.py`` (標準出力) の両方が
+    使う共通の整形処理。
+    """
+    parts = ['差し出し手判定 (閾値 {:.2f})'.format(score_min)]
+    if selection['distance'] is not None:
+        parts.append('距離={:.2f}m'.format(selection['distance']))
+    for side in ('R', 'L'):
+        veto = selection['veto'][side]
+        score = selection['scores'][side]
+        if veto is not None:
+            parts.append('{}=判定不可({})'.format(side, veto))
+        else:
+            parts.append('{}={:.2f}'.format(side, score))
+    return ', '.join(parts)
 
 
 class PalmPoseEstimator(object):

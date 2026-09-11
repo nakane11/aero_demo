@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``sensor_msgs/Image`` <-> numpy 変換、TF <-> 4x4 行列変換、camera->base の
-TF 解決といった、``scripts/ros/`` 配下の複数のノード
+"""``sensor_msgs/Image`` <-> numpy 変換、TF <-> 4x4 行列変換、camera->base/
+任意フレームの TF 解決といった、``scripts/ros/`` 配下の複数のノード
 (``run_camera_pipeline_test.py``/``record_palm_offer_clips.py``) が共通で
 使うヘルパー。
 
@@ -12,6 +12,12 @@ TF 解決といった、``scripts/ros/`` 配下の複数のノード
 (``_ARRAY_API not found``) を起こす。ここで使うのは bgr8/rgb8/mono8/16UC1/
 32FC1 だけなので、cv_bridge に頼らず ``Image.data`` を直接 numpy 配列に
 変換する)。
+
+``lookup_frame_position`` は、差し出し手判定 (``estimate_palm_poses.
+OfferedHandSelector.robot_position``) の基準にするロボット手先位置を実機の
+TF から引く処理を両ノードで共通化したもの (``run_camera_pipeline_test.py``/
+``record_palm_offer_clips.py`` のどちらも、ロボット未接続などでまだ TF が
+引けない間だけそれぞれのフォールバック値を使う)。
 """
 
 import numpy as np
@@ -115,3 +121,38 @@ def lookup_camera_to_base(tf_buffer, base_frame, header):
             5.0, 'TF lookup failed (%s -> %s): %s',
             header.frame_id, base_frame, e)
         return None
+
+
+def lookup_frame_position(tf_buffer, base_frame, frame_id, fallback_position,
+                          warn_label=''):
+    """``base_frame`` から見た ``frame_id`` 原点の並進成分 ``[x, y, z]`` を
+    最新の TF (``rospy.Time(0)``) から引いて返す。
+
+    ``run_camera_pipeline_test.py``/``record_palm_offer_clips.py`` が
+    差し出し手判定 (``estimate_palm_poses.OfferedHandSelector.
+    robot_position``) の基準にするロボット手先位置を、実機の TF
+    (既定 ``r_eef_grasp_link`` -> ``base_link``) から毎フレーム引く処理を
+    共通化したもの。TF がまだ引けなければ (``LookupException`` 等、ロボット
+    未接続・対象ノード未起動など) throttled warning を出し、呼び出し側が
+    用意した ``fallback_position`` (array-like ``[m]``) を返す (2 ノードとも
+    フォールバック値の中身自体は別々に決めてよい -- 呼び出し側の docstring
+    参照)。
+
+    Parameters
+    ----------
+    warn_label : str
+        フォールバック時の警告ログの先頭に付ける、呼び出し元を示す文字列
+        (例 ``'[record-palm-offer-clips] '``)。
+    """
+    try:
+        transform = tf_buffer.lookup_transform(
+            base_frame, frame_id, rospy.Time(0))
+    except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+           tf2_ros.ExtrapolationException) as e:
+        rospy.logwarn_throttle(
+            5.0, '%sロボット手先の TF (%s -> %s) がまだ引けません (%s)。'
+            'フォールバック値 %s に切り替えます。',
+            warn_label, frame_id, base_frame, e, tuple(fallback_position))
+        return np.asarray(fallback_position, dtype=np.float64)
+    t = transform.transform.translation
+    return np.array([t.x, t.y, t.z], dtype=np.float64)
