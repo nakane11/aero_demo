@@ -154,6 +154,8 @@ AMBIGUOUS_MARGIN = 0.08
 # 上腕+前腕 ~0.58 m 程度。
 _TORSO_PER_SHOULDER_WIDTH = 1.25
 _ARM_PER_TORSO = 1.15
+# 片肩しか見えず肩幅そのものを測れないフレーム向けの既定値。
+_DEFAULT_SHOULDER_WIDTH = 0.40
 
 
 # 人体基準の座標系。「脱力して真下に垂れた腕」の位置 (体軸 ``up`` と肩) と
@@ -191,20 +193,29 @@ def _distance_to_segment(point, end_a, end_b):
 def _body_frame(joints):
     """関節位置から人体基準の座標系 (:class:`_BodyFrame`) を作る.
 
-    両肩が要る。両腰が無い場合はロボット座標系の +z を体軸とみなし、胴長
-    を肩幅から補う (実カメラで下半身が映っていないフレーム向けの保険で、
-    合成骨格では常に両腰が揃っているのでこの経路は通らない)。
+    両肩が要る。片方の肩だけ欠けている場合は、``Neck`` (無ければ見えて
+    いる方の肩をそのまま) で ``shoulder_center`` を補う (実カメラで片肩が
+    オクルージョンで一時的に消えるフレーム向けの保険。肩幅の半分ぶんの
+    誤差が乗るが、連続フレームの一部が欠けるだけなので許容する)。
+    両腰が無い場合はロボット座標系の +z を体軸とみなし、胴長を肩幅から
+    補う (実カメラで下半身が映っていないフレーム向けの保険で、合成骨格
+    では常に両腰が揃っているのでこの経路は通らない)。
 
     Returns
     -------
     _BodyFrame or None
-        両肩が無い、または体格が縮退している場合は ``None``。
+        両肩とも無い、または体格が縮退している場合は ``None``。
     """
     r_sho = joints.get('RShoulder')
     l_sho = joints.get('LShoulder')
-    if r_sho is None or l_sho is None:
+    if r_sho is not None and l_sho is not None:
+        shoulder_center = 0.5 * (r_sho + l_sho)
+    elif r_sho is not None or l_sho is not None:
+        neck = joints.get('Neck')
+        shoulder_center = neck if neck is not None else (
+            r_sho if r_sho is not None else l_sho)
+    else:
         return None
-    shoulder_center = 0.5 * (r_sho + l_sho)
 
     r_hip = joints.get('RHip')
     l_hip = joints.get('LHip')
@@ -215,7 +226,11 @@ def _body_frame(joints):
         up = _unit(shoulder_center - hip_center)
     if up is None:
         up = np.array([0.0, 0.0, 1.0])
-        torso = _TORSO_PER_SHOULDER_WIDTH * float(np.linalg.norm(l_sho - r_sho))
+        if r_sho is not None and l_sho is not None:
+            shoulder_width = float(np.linalg.norm(l_sho - r_sho))
+        else:
+            shoulder_width = _DEFAULT_SHOULDER_WIDTH
+        torso = _TORSO_PER_SHOULDER_WIDTH * shoulder_width
         hip_center = shoulder_center - torso * up
     else:
         torso = float(np.linalg.norm(shoulder_center - hip_center))
@@ -276,6 +291,27 @@ def _face_frame(joints, body):
     if forward is None or position is None:
         return None
     return forward, position
+
+
+def _shoulder_position(joints, side, body):
+    """``side`` の肩の位置 (無ければ推定値)。
+
+    その肩が直接見えていればそれを使う。見えていなければ、反対側の肩が
+    あれば ``Neck`` を支点に鏡映しして推定する (体幹フレーム全体の
+    ``body.shoulder_center`` をそのまま使うと、欠けている側の肩自身が
+    ``Neck`` 寄りに引き寄せられてしまい、その腕の脱力位置 (``rest``、
+    :meth:`OfferedHandSelector._features` 参照) がずれる)。それも無理なら
+    最後の手段として ``body.shoulder_center`` を返す。
+    """
+    own = joints.get('{}Shoulder'.format(side))
+    if own is not None:
+        return own
+    other_side = 'L' if side == 'R' else 'R'
+    other = joints.get('{}Shoulder'.format(other_side))
+    neck = joints.get('Neck')
+    if other is not None and neck is not None:
+        return 2.0 * neck - other
+    return body.shoulder_center
 
 
 def _arm_length(joints, side, torso):
@@ -361,7 +397,11 @@ class OfferedHandSelector(object):
                  score_min=OFFER_SCORE_MIN,
                  ambiguous_margin=AMBIGUOUS_MARGIN,
                  face_away_penalty=FACE_AWAY_PENALTY,
-                 max_distance=None):
+                 max_distance=None,
+                 finger_to_robot_axis_blend=0.0,
+                 finger_to_robot_ramp=FINGER_TO_ROBOT_RAMP,
+                 approach_ramp=APPROACH_RAMP,
+                 approach_height_scale=1.0):
         """
         Parameters
         ----------
@@ -395,6 +435,26 @@ class OfferedHandSelector(object):
             映り込んだ、差し出す気の無い通行人を拾わないための足切り)。
             既定 ``None`` は距離では足切りしない (``score_min`` だけで
             判定する、元の挙動のまま)。
+        finger_to_robot_axis_blend : float
+            ``finger_to_robot`` で「ロボットの方を向いているか」を測る軸を
+            指先方向 (``x_axis``, blend=0.0, 既定・従来の挙動) から掌の
+            法線方向 (``y_axis``, 手の甲->掌方向, blend=1.0) へどれだけ
+            寄せるか (0..1 の線形ブレンド、``_offer_direction`` 参照)。
+            「指で相手を指す」のではなく「掌を見せる」動作を評価したい
+            場合に 1.0 に近づける。
+        finger_to_robot_ramp : (float, float)
+            ``finger_to_robot`` のランプ (下限, 上限)。既定は
+            :data:`FINGER_TO_ROBOT_RAMP`。上限を下げるほど、正対して
+            いない (斜めに構えた) 姿勢でも満点になりやすくなる。
+        approach_ramp : (float, float)
+            ``approach`` のランプ (下限, 上限)。既定は
+            :data:`APPROACH_RAMP`。
+        approach_height_scale : float
+            ``approach`` (脱力位置 -> ロボット/実際の掌 -> ロボットの
+            距離差) を計算する際、高さ (z) 方向の差分に掛けるスケール。
+            既定 1.0 (従来通り 3 次元距離)。0.0 にすると水平面 (xy) の
+            接近だけを見るようになり、「ロボットの手の高さまで上げないと
+            近づいたと評価されない」問題を弱められる。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -406,6 +466,10 @@ class OfferedHandSelector(object):
         self.face_away_penalty = float(face_away_penalty)
         self.max_distance = (None if max_distance is None
                              else float(max_distance))
+        self.finger_to_robot_axis_blend = float(finger_to_robot_axis_blend)
+        self.finger_to_robot_ramp = tuple(finger_to_robot_ramp)
+        self.approach_ramp = tuple(approach_ramp)
+        self.approach_height_scale = float(approach_height_scale)
 
     def select(self, joint_positions, palms):
         """どちらの手を繋ぐべきかを判定する.
@@ -508,32 +572,63 @@ class OfferedHandSelector(object):
                          body.hip_center[1],
                          ROBOT_HAND_HEIGHT])
 
+    def _offer_direction(self, finger, palm_normal):
+        """``finger_to_robot`` で「ロボットの方を向いているか」を測る軸.
+
+        ``finger_to_robot_axis_blend`` (既定 0.0) で指先方向 (``finger``)
+        と掌の法線方向 (``palm_normal``) を線形ブレンドする。既定の 0.0 は
+        従来通り指先方向のみ。どちらかが ``None`` (縮退) なら、もう一方を
+        そのまま返す。両方 ``None`` なら ``None``。
+        """
+        if finger is None and palm_normal is None:
+            return None
+        blend = self.finger_to_robot_axis_blend
+        if finger is None or blend >= 1.0:
+            return palm_normal if palm_normal is not None else finger
+        if palm_normal is None or blend <= 0.0:
+            return finger
+        return _unit((1.0 - blend) * finger + blend * palm_normal)
+
+    def _robot_distance(self, robot, point):
+        """``robot`` と ``point`` の距離 [m] (``approach`` 用).
+
+        ``approach_height_scale`` (既定 1.0) で高さ (z) 方向の差分に
+        スケールを掛ける。1.0 で従来通りの 3 次元距離、0.0 にすると水平面
+        (xy) の接近だけを見る。
+        """
+        diff = robot - point
+        diff = np.array([diff[0], diff[1],
+                         diff[2] * self.approach_height_scale])
+        return float(np.linalg.norm(diff))
+
     def _features(self, joints, body, side, palm):
         """片手ぶんの特徴量 (クラス docstring 参照) を計算する."""
         center = np.asarray(palm['position'], dtype=np.float64)
         finger = _unit(palm['x_axis'])    # 手首 -> 指先
-        shoulder = joints.get('{}Shoulder'.format(side), body.shoulder_center)
+        offer_dir = self._offer_direction(finger, _unit(palm['y_axis']))
+        shoulder = _shoulder_position(joints, side, body)
         arm = _arm_length(joints, side, body.torso)
         robot = self._robot_position(body)
 
         # 脱力して真下に垂れた掌の位置 (肩から体軸方向へ腕長ぶん下げた点)。
         # そこからロボットまでの距離が、実際の掌でどれだけ縮んだか。
         rest = shoulder - arm * body.up
-        approach = _ramp(float(np.linalg.norm(robot - rest))
-                         - float(np.linalg.norm(robot - center)),
-                         *APPROACH_RAMP)
+        approach = _ramp(self._robot_distance(robot, rest)
+                         - self._robot_distance(robot, center),
+                         *self.approach_ramp)
         # 掌が人物自身の胴体 (腰 -> 肩の線分) からどれだけ離れているか。
         separation = _ramp(
             _distance_to_segment(center, body.hip_center,
                                  body.shoulder_center),
             *SEPARATION_RAMP)
-        # 指先がどれだけロボットの方を向いているか。
+        # 指先 (既定) または掌の法線方向 (finger_to_robot_axis_blend 参照)
+        # がどれだけロボットの方を向いているか。
         to_robot = _unit(robot - center)
-        if finger is None or to_robot is None:
+        if offer_dir is None or to_robot is None:
             finger_to_robot = 0.0
         else:
-            finger_to_robot = _ramp(float(np.dot(finger, to_robot)),
-                                    *FINGER_TO_ROBOT_RAMP)
+            finger_to_robot = _ramp(float(np.dot(offer_dir, to_robot)),
+                                    *self.finger_to_robot_ramp)
         thumb_roll = _ramp(self._thumb_roll(palm, side, finger),
                            *THUMB_ROLL_RAMP)
         # 顔がどれだけロボットの方を向いているか (左右で同じ値になる)。
