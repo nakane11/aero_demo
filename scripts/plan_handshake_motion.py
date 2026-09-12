@@ -542,7 +542,7 @@ def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
 
 
 def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
-                       args, verification_pairs):
+                       args, verification_pairs, solver):
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
     まず最適化を掛けずに、幾何的に構成した軌道を厳密検証に通す:
@@ -561,6 +561,12 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     候補を ``verified: false`` のまま採用する
     (``solve_palm_ik.pick_verified_candidate`` のフォールバックと同じ
     考え方)。
+
+    ``solver`` は ``verification_pairs`` と同様、呼び出し側 (``main``)
+    が人物ループの外で1回だけ作って使い回す ``JaxlsSolver`` インスタンス
+    (人物・試行ごとに作り直すと jaxls の JIT キャッシュ
+    (``JaxlsSolver._cached_problem``) が効かず、初回コンパイルが人物ごとに
+    走ってしまうため)。
     """
     start_time = time.time()
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
@@ -637,8 +643,6 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
         collision_weight=args.collision_weight,
         self_collision_weight=args.self_collision_weight,
         robot_spheres_per_link=args.robot_spheres_per_link)
-    solver = create_solver('jaxls', max_iterations=args.max_iterations,
-                           verbose=False)
     rng = np.random.RandomState(args.seed)
 
     for attempt in range(args.motion_attempts):
@@ -820,6 +824,12 @@ def main():
     # (solve_palm_ik.py の main と同じ理由。robot_arm 引数は結果に
     # 影響しないプレースホルダ)。
     verification_pairs = spik.build_collision_verification_pairs(robot, 'r')
+    # jaxls ソルバーも人物ループの外で 1 個だけ作って使い回す。人物・試行
+    # ごとに作り直すと JaxlsSolver の JIT キャッシュ (_cached_problem) が
+    # 3 回の --motion-attempts リトライの間しか効かず、次の人物では毎回
+    # 初回コンパイルが走ってしまう (実測で人物あたり最大 23 秒)。
+    solver = create_solver('jaxls', max_iterations=args.max_iterations,
+                           verbose=False)
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     for i, path in enumerate(files):
@@ -850,7 +860,7 @@ def main():
 
         result = plan_person_motion(
             robot, handshake['robot_arm'], handshake, joint_positions,
-            human_xy, args, verification_pairs)
+            human_xy, args, verification_pairs, solver)
         n_total += 1
         n_optimized += int(result['optimized'])
         n_verified += int(result['verified'])
