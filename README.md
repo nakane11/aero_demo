@@ -1,6 +1,6 @@
 # aero_demo
 
-SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形式の骨格・掌の
+MediaPipe 形式の骨格・掌の
 位置姿勢を推定して、viser ビューアで可視化するためのツール群。
 
 ## パイプライン
@@ -11,7 +11,7 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    を 1 人分 1 ファイルの JSON として保存する。
 
 2. **`scripts/estimate_palm_poses.py`**
-   手順 1 の JSON（骨格）を入力とし、手のランドマークから左右それぞれの掌の位置
+   手順 1 の JSONを入力とし、手のランドマークから左右それぞれの掌の位置
    姿勢を推定してJSON として保存する。
    あわせて、人がどちらの手を差し出しているかを `OfferedHandSelector`
    が判定し、`offered_hand` (`"R"` / `"L"` / `null`) として同じ JSON
@@ -22,56 +22,40 @@ SMPL の人体モデルからランダムな姿勢を生成し、MediaPipe 形�
    の掌の座標系をビューアで表示する。手繋ぎに使うと判定された手を赤で描く。
 
 4. **`scripts/solve_palm_ik.py`**
-   手順 2 の JSON (掌の位置姿勢) を入力とし、人間の手にロボットが触れる
-   干渉回避付き全身 IK (台車移動 `use_base='planar'` を含む) を解いて、
-   結果 (台車位置・全関節角・実際の手先姿勢) を JSON として保存する。
+   手順 2 の JSONを入力とし、人間の手にロボットが触れる干渉回避付き全身 
+   IK (台車移動を含む) を解いて、結果を JSON として保存する。
    ソフトな制約なので、干渉のない解が必ず得られるとは限らない。
    IK に使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
-   IK は 1 人ずつ、複数初期値からの並列 IK で解く。
-   1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512、この数を
-   増やしても計算時間はあまり増えない)。
+   1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512)。
    初期値ごとの解は全て (向き 3 通り × 初期値の数) が干渉検証・後処理判定に
    回され、最初に通ったものが採用される。干渉回避ペナルティの重み・
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
-   人体側の干渉回避ジオメトリ (体幹・頭部・四肢・掌・指、いずれも
-   `Cylinder`) は `human_body_obstacles` が一手に作り、IK 最適化中の
-   干渉コスト・候補採用前の事後検証 (`collision_pairs_min_distance`)・
-   ビューアでの半透明表示 (`view_handshake_poses.py` 等) のすべてで
-   同じ関数・同じ形状を使う (掌のような骨の線分では表せない部位も含めて
-   一致させてあるので、表示と判定の間に見た目の食い違いは生じない)。
+   人体側の干渉回避ジオメトリはIK 最適化中の干渉コスト・候補採用前の事後検証
+   ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。
 
 4.5. **`scripts/plan_handshake_motion.py`**
-   手順 4 の握手姿勢 (最終姿勢 1 点) を目標として、そこへ至る「最後の接近」
-   の軌道 (waypoint 列) を干渉回避付きで生成し JSON として保存する。
-   遠方からの長距離走行はナビゲーションの担当として計画対象にせず、軌道の
-   始点は「腕を下ろした姿勢 (`Aero.reset_pose`) + 最終台車位置から人間の
-   反対方向へ `--approach-distance` (既定 1.0 m) 下がった位置」にする。
+   手順 4 の握手姿勢を目標として、そこへ至る接近の軌道 (waypoints) を干渉回避
+   付きで生成し JSON として保存する。軌道の始点は「腕を下ろした姿勢 + 最終台車
+   位置から人間の反対方向へ `--approach-distance` (既定 1.0 m) 下がった位置」にする。
    終点の手前には掌の法線方向へ `--pretouch-standoff` (既定 0.25 m)
    引き戻した **pre-touch 姿勢** を挟み、最後の接近を法線方向の直線に
    することで手先が掌を通り抜けないようにする。この幾何的な構成だけで
-   干渉が無ければ最適化は行わず (実測では多くの人物がこれで通る)、
-   干渉が残った場合だけ scikit-robot の
+   干渉が無ければ最適化は行わず、干渉が残った場合だけ scikit-robot の
    `skrobot.planner.trajectory_optimization.TrajectoryProblem`
-   (台車 3 自由度 + 腕、`jaxls` バックエンド) で軌道最適化を行う。
+   で軌道最適化を行う。
    採用前には必ず、`solve_palm_ik.py` が最終姿勢の判定に使うのと同じ
    厳密な形状 (実メッシュ)・同じ人体ジオメトリ (`human_body_obstacles`)
    で全 waypoint を検証し、結果を `verified` フラグに入れる (経路上の
-   許容貫通量は既定 1 cm)。軌道最適化のコスト関数に渡す人体障害物も
-   同じ `human_body_obstacles` から作るので、最適化・事後検証・表示の
-   3 者で人体側の形状が食い違うことはない。
-   `jaxls` (PyPI に無い) が別途必要:
-   `pip install "git+https://github.com/brentyi/jaxls.git"`。
+   許容貫通量は既定 1 cm)。
 
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
    ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
-   干渉回避に使ったのと同じ近似ジオメトリ (ロボット・人体とも) を半透明で
+   干渉回避に使ったのと同じ近似ジオメトリを半透明で
    重ねて表示でき、テキストパネルの事後検証 (指先まで含めた貫通の再チェック)
-   もこの表示中のメッシュをそのまま使って判定するので、見た目と判定結果が
-   食い違うことはない (`scripts/ros/run_camera_pipeline_test.py` の骨格
-   プレビュー画面も同じ仕組み)。
+   もこの表示中のメッシュをそのまま使って判定する。
 
 ```
 generate_random_human_poses.py  (既定の出力先: random_human_poses/)
@@ -100,7 +84,7 @@ human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
 `random_motion_poses/` が既定値になっているため、指定を省略すれば 1〜5
 はそのままつながる。
 
-## 環境構築 (IK を解くために必要なもの)
+## 環境構築
 
 動作確認環境は Ubuntu 20.04 + Python 3.11。SMPL 経由の合成データパイプライン
 (1〜5) とカメラ入力パイプライン (`scripts/ros/run_camera_pipeline_test.py`) の
@@ -108,16 +92,10 @@ human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
 `uv sync` 一回で揃う (venv 内で個別に `pip install` する必要はない)。
 バッチIKのバックエンドには jax を使う。
 
-パッケージ管理には [uv](https://docs.astral.sh/uv/) を使う (`uv` は Python
-本体のダウンロード・インストールも自動でやってくれるため、事前に
-deadsnakes PPA 等で Python 3.11 を用意しなくてもよい)。
-`pyproject.toml` の `[tool.uv.sources]` (scikit-robot fork の path 参照、
-jaxls の git 参照) は uv 固有の機能なので、素の `pip install` では揃わない。
+### 0. scikit-robot (fork の `base_limit` ブランチ) を隣に clone する
 
-### 0. scikit-robot (fork の `aero` ブランチ) を隣に clone する
-
-IK は skrobot の以下の機能に依存しており、これらは上流
-(`iory/scikit-robot`) には入っていないため fork を使う:
+IK は skrobot の以下の機能に依存しており、これらは上流には入っていないため 
+fork を使う:
 
 * `skrobot.models.Aero` (`use_hand` 引数付き) と
   `skrobot.data.aero_urdfpath`
@@ -134,8 +112,7 @@ IK は skrobot の以下の機能に依存しており、これらは上流
 
 ```bash
 cd ~/ros/hand/src
-git clone -b aero git@github.com:nakane11/scikit-robot.git
-# すでに clone 済みなら: cd scikit-robot && git checkout aero
+git clone -b base_limit git@github.com:nakane11/scikit-robot.git
 ```
 
 ### 1. venv を作って依存関係を sync する
@@ -147,9 +124,7 @@ UV_PROJECT_ENVIRONMENT=~/venv/aero-uv uv sync
 source ~/venv/aero-uv/bin/activate
 ```
 
-これで scikit-robot (editable)・jax (`jax[cuda12]`)・numpy・opencv-python・
-mediapipe・rospkg 等、SMPL パイプラインとカメラパイプライン両方の依存が
-まとめて入る。GPU が無い環境では `pyproject.toml` の `dependencies` にある
+GPU が無い環境では `pyproject.toml` の `dependencies` にある
 `"jax[cuda12]>=0.10"` を `"jax>=0.10"` に変更してから sync し直す。
 
 `plan_handshake_motion.py` の軌道最適化バックエンド (`jaxls`) は PyPI に
@@ -164,12 +139,6 @@ UV_PROJECT_ENVIRONMENT=~/venv/aero-uv uv sync --extra motion
 venv ごと作り直したい場合も、上の2ステップ (`uv venv` → `uv sync`) を
 やり直すだけで復元できる。
 
-なお `rospy` 経由の ROS 本体 (`tf2_ros`/`message_filters`/
-`sensor_msgs` 等) は ROS Noetic のシステムインストール由来なので、
-`scripts/ros/*.py` を実行する前には venv の activate に加えて
-`source /opt/ros/noetic/setup.bash` (ROS ワークスペースの setup.bash) も
-必要。
-
 GPU 版 jax は起動時にデバイスメモリの確保を試み、大きいサイズから
 確保に失敗するたびに `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の
 警告を出しながら要求サイズを段階的に縮小していくことがある。気になる場合は
@@ -178,13 +147,8 @@ GPU 版 jax は起動時にデバイスメモリの確保を試み、大きい�
 
 ### 2. Aero の URDF
 
-`solve_palm_ik.py` は`Aero(use_hand=False)` =
-`aero_nohand.urdf` を使う。これは初回実行時に自動ダウンロードして
-`~/.skrobot/aero_description/typeJSK/urdf/` に展開するため、手作業は不要。
-
-一方 `view_handshake_poses.py` が既定で使う`aero_with_feetech_hand.urdf` 
-はこの tarball に含まれていないので、`feetech_hand` パッケージから持ってくる
-必要がある。`aero_demo.
+`view_handshake_poses.py` が既定で使う`aero_with_feetech_hand.urdf` 
+は`feetech_hand` パッケージから持ってくる必要がある。`aero_demo.
 aero_urdf_setup.load_aero` (`view_handshake_poses.py`/`view_aero_
 collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し時に
 自動で URDF・メッシュを `~/.skrobot/` 以下に配置するので、**catkin
@@ -258,22 +222,11 @@ python3 view_handshake_poses.py
 掌の差し出しを検出するたびにその前後を rosbag クリップとして自動で
 切り出して保存できる。保存したクリップは `run_camera_pipeline_test.py`
 に `--bag` で渡せば、実カメラ・実ロボットの TF 配信なしにパイプライン
-全体をそのままテストできる (デフォルトのトピック名が一致しているため、
-再生したトピックをそのまま subscribe できる)。
-
-いずれも ROS Noetic + `uv sync` (`环境構築` 節参照) の両方が必要:
-
-```bash
-source /opt/ros/noetic/setup.bash
-source ~/venv/aero-uv/bin/activate
-```
+全体をそのままテストできる。
 
 ### 1. `record_palm_offer_clips.py`: クリップの録画
 
-実カメラ・実ロボットが動いている (`roscore` が立っていて、
-`/camera/color/image_raw/decompressed`・`/camera/depth/image_raw/
-decompressed`・`/camera/color/camera_info`・`/tf`・`/tf_static` が配信
-されている) 状態で実行する:
+実カメラ・実ロボットが動いている状態で実行する:
 
 ```bash
 python3 scripts/ros/record_palm_offer_clips.py
@@ -281,15 +234,10 @@ python3 scripts/ros/record_palm_offer_clips.py
 python3 scripts/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 ```
 
-`run_camera_pipeline_test.py` と異なり ARM ボタン操作は不要で、起動直後
-から常時掌の差し出しを検出し続ける (判定基準は `run_camera_pipeline_
-test.py` の ARMED 中の判定と同じ既定値に揃えてある)。1 人分保存したら
-終了するのではなく `Ctrl-C` などで止めるまで無期限に動き続け、その間に
-検出した掌の差し出しを (`--cooldown-seconds` の間隔を空けつつ) 何人分でも
-連番のファイル名で次々に保存し続ける。掌の差し出し
-(`offered_hand` が `None` から `'R'`/`'L'` になった瞬間) を検出すると、
-その時刻の `--pre-seconds` 秒前 (既定 2.0) から `--post-seconds` 秒後
-(既定 2.0) までの color/depth/camera_info/tf/tf_static を 1 本の
+`Ctrl-C` などで止めるまで無期限に動き続け、その間に検出した掌の差し出しを連番のファイル名
+で次々に保存し続ける(判定基準は `run_camera_pipeline_test.py` の ARMED 中の判定と同じ
+既定値に揃えてある)。掌の差し出しを検出すると、その時刻の `--pre-seconds` 秒前 (既定 2.0) 
+から `--post-seconds` 秒後(既定 2.0) までの color/depth/camera_info/tf/tf_static を 1 本の
 `.bag` にまとめて `--save-dir` (既定 `palm_offer_clips/`) に保存する。
 同じ差し出し動作を 2 回に分けて録らないよう、1 クリップ保存後
 `--cooldown-seconds` 秒 (既定 3.0) は次のトリガーを無視する。
