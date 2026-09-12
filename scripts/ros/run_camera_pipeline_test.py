@@ -69,11 +69,14 @@ IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現�
 (``_execute_on_robot`` 参照)。
 ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に動かすか
 どうかを独立に指定できる (既定はどちらもオフで、EXECUTE ボタン自体が
-表示されない)。``--execute-arm`` 指定時は ``ARM`` ボタンを押した瞬間にも
-実機の首を少し下げ、人間が手を差し出しやすい姿勢にする
+表示されない)。実機 (``AeroROSRobotInterface``) への接続自体はこれらの
+指定に関わらず起動時に常に試みるため、接続に成功していれば
+(``--execute-base``/``--execute-arm`` を何も指定していなくても) ``ARM``
+ボタンを押した瞬間に実機の首を少し下げると同時に腕を初期姿勢 (体の横に
+下ろした姿勢) まで戻し、人間が手を差し出しやすい姿勢にする
 (``_nod_head_for_arm`` 参照):
 
-    python3 scripts/ros/run_camera_pipeline_test.py --execute-arm
+    python3 scripts/ros/run_camera_pipeline_test.py
     python3 scripts/ros/run_camera_pipeline_test.py --execute-base --execute-arm
 """
 
@@ -156,7 +159,8 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 # (view_handshake_motion.DEFAULT_PLAYBACK_FPS と同じ)。
 DEFAULT_PLAYBACK_FPS = 40.0
 
-# ARM ボタンを押した瞬間 (--execute-arm 指定時のみ、_nod_head_for_arm
+# ARM ボタンを押した瞬間 (実機 self.ri への接続に成功している状態のとき
+# に、--execute-base/--execute-arm の指定有無に関わらず、_nod_head_for_arm
 # 参照) に実機の首を下げる目標角度 [deg]。``Aero.reset_pose`` の既定
 # (neck_p_joint = 25 度、以後このパイプライン全体の「見ている」基準姿勢)
 # からさらに下げ、まっすぐ人の顔の高さを見続けるより控えめにうつむかせる
@@ -164,9 +168,10 @@ DEFAULT_PLAYBACK_FPS = 40.0
 # 印象にする。実機の首の可動方向 (どちらが「下」か) は個体差の可能性が
 # あるため、実機で確認して向きが逆なら符号を反転させること。
 ARM_HEAD_NOD_PITCH_DEG = 25.0
-# 上記の首下げ動作にかける時間 [秒]。あまり速いと会釈というより首を
-# 振っただけに見えるため、ゆっくりめにしてある。
-ARM_HEAD_NOD_MOVE_TIME = 1.5
+# 上記の首下げ・腕を初期姿勢まで下ろす動作 (_nod_head_for_arm) にかける
+# 時間 [秒]。あまり速いと会釈というより首を振っただけに見えるため、
+# ゆっくりめにしてある。
+ARM_HEAD_NOD_MOVE_TIME = 5
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -525,25 +530,37 @@ class HandshakePipelineNode(object):
 
         self._warmup_ik()
 
-        # 実機接続 (--execute-base/--execute-arm のどちらかが指定された
-        # ときだけ AeroROSRobotInterface を作る。実機/実機用 ROS ノードが
-        # 立っていない環境でこのスクリプトを viewer 確認だけに使うことも
-        # 多いため、指定が無ければ一切 ROS アクションサーバへの接続を
-        # 試みない -- コンストラクタでサーバ待ちしてブロックすることを
-        # 避ける)。台車・関節を別々の robot_model インスタンス
+        # 実機接続 (--execute-base/--execute-arm の指定に関わらず常に
+        # AeroROSRobotInterface への接続を試みる)。ARM ボタン押下時の首下げ
+        # (_nod_head_for_arm) は台車・腕を実際に動かすフラグとは独立に、
+        # self.ri さえ使えれば行いたいため。台車・腕を実際に動かす EXECUTE
+        # ボタンの表示/実行は引き続き --execute-base/--execute-arm で
+        # 独立に制御する (_execute_on_robot 参照)。skrobot の
+        # ROSRobotInterfaceBase はアクションサーバ待ちに controller_timeout
+        # (既定 3 秒) の上限があり無限ブロックはしないため、実機/実機用
+        # ROS ノードが立っていない環境でこのスクリプトを viewer 確認だけに
+        # 使う用途を大きくは妨げない。接続失敗時にこの viewer 自体が
+        # 使えなくなることは避けたいので、例外は握りつぶして self.ri を
+        # None のままにする。台車・関節を別々の robot_model インスタンス
         # (self.robot/self.display_robot) と混ぜて操作すると angle_vector
         # 送信中に表示スレッドが同じインスタンスを書き換えてしまう恐れが
         # あるため、実機操作専用の robot_model を別に持つ (_execute_on_robot
         # 参照)。
         self.real_robot = None
         self.ri = None
-        if args.execute_base or args.execute_arm:
+        try:
             self.real_robot = load_aero(use_hand=True)
             print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
             self.ri = AeroROSRobotInterface(self.real_robot)
             print('[execute] 実機への接続が完了しました (--execute-base={}, '
                   '--execute-arm={})。'.format(
                       args.execute_base, args.execute_arm))
+        except Exception as exc:  # noqa: BLE001  (実機/ROS 環境が無くても viewer 単体としては動作を継続したい)
+            self.real_robot = None
+            self.ri = None
+            print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗した '
+                  'ため、ARM 時の首下げ/EXECUTE による実機操作は無効の '
+                  'ままになります ({})。'.format(exc))
 
         # デバッグ用: カメラ画像に検出できた 2D 骨格を重ねた画像を publish
         # する (draw_skeleton_overlay 参照)。rqt_image_view 等で購読すれば、
@@ -677,8 +694,9 @@ class HandshakePipelineNode(object):
         self.reset_button.visible = False
         # IK・軌道計画が終わって waypoint が確認できる状態 ('result') に
         # なったら押せる、実機を動かすボタン (--execute-base/--execute-arm
-        # のどちらかが指定されているときだけ表示する。両方とも未指定なら
-        # self.ri が None のままで実行しようがないため、ボタン自体を出さない)。
+        # のどちらかが指定されているときだけ表示する。self.ri はこれらの
+        # フラグとは独立に常に接続を試みるため、表示条件は別途フラグの
+        # 指定有無で見る、_solve_handshake 参照)。
         self.execute_button = self.viewer._server.gui.add_button(
             'EXECUTE (実機を動かす)')
         self.execute_button.visible = False
@@ -695,7 +713,12 @@ class HandshakePipelineNode(object):
             self._latest_offer_selection = None
             with self._lock:
                 self._handshake_total_time = None
-            if self.args.execute_arm and self.ri is not None:
+            if self.ri is not None:
+                # 首下げ・腕を初期姿勢まで下ろす動作 (_nod_head_for_arm)。
+                # self.ri は --execute-base/--execute-arm の指定に関わらず
+                # 接続を試みているため (__init__ 参照)、接続さえ成功して
+                # いれば --execute-base/--execute-arm を何も指定していない
+                # 場合でも実行する。
                 # 実機通信 (joint_states 待ち/action 送信) をこの GUI
                 # コールバックのスレッドで直接行うとブロックするため、
                 # _on_execute と同様に別スレッドに逃がす。
@@ -1109,11 +1132,15 @@ class HandshakePipelineNode(object):
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
         # 実機で動かせる状態 (IK・軌道計画が成功していて、かつ --execute-base
-        # /--execute-arm のどちらかが指定されて self.ri が使える) になった
-        # ときだけ EXECUTE ボタンを表示する。
+        # /--execute-arm のどちらかが指定されていて、実際に self.ri への
+        # 接続も成功している) になったときだけ EXECUTE ボタンを表示する。
+        # self.ri 自体は --execute-base/--execute-arm を何も指定していな
+        # くても (ARM 時の首下げのために) 接続を試みるので、EXECUTE ボタン
+        # の表示条件には別途フラグの指定有無を含める必要がある。
         self.execute_button.visible = (
-            self.ri is not None and result['solved'] and motion is not None
-            and display_waypoints is not None)
+            (self.args.execute_base or self.args.execute_arm)
+            and self.ri is not None and result['solved']
+            and motion is not None and display_waypoints is not None)
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -1280,42 +1307,51 @@ class HandshakePipelineNode(object):
         self._collision_pairs_text = collision_pairs_text(colliding)
 
     # ------------------------------------------------------------------
-    # 実機動作 (ARM ボタン押下時の首下げ、EXECUTE ボタン)
+    # 実機動作 (ARM ボタン押下時の首下げ・初期姿勢への復帰、EXECUTE ボタン)
     # ------------------------------------------------------------------
     def _nod_head_for_arm(self):
-        """ARM ボタン押下時 (``--execute-arm`` 指定時のみ ``_on_arm`` から
-        別スレッドで呼ばれる) に、実機の首だけを ``ARM_HEAD_NOD_PITCH_DEG``
-        まで下げ、人間が手を差し出しやすい (ロボットがまっすぐ顔を見続ける
-        より威圧感の少ない) 姿勢にする。
+        """ARM ボタン押下時 (``--execute-base``/``--execute-arm`` の指定有無に
+        関わらず、実機 ``self.ri`` への接続に成功している状態のときのみ
+        ``_on_arm`` から別スレッドで呼ばれる) に、実機の首を
+        ``ARM_HEAD_NOD_PITCH_DEG`` まで下げると同時に、腕を含む全身を
+        ``self._initial_joint_names``/``self._initial_joint_angle_vector``
+        (``__init__`` 参照、``phm.arms_down_angles`` による「両腕を体の横に
+        下ろした」初期姿勢 -- ARM 前/RESET 後に画面へ表示しているのと同じ
+        姿勢) まで動かす。まっすぐ顔を見続け腕を構えたままより威圧感の
+        少ない、人間が手を差し出しやすい姿勢にする。
 
-        ``controller_type='head_controller'`` を明示して送ることで、
-        ``AeroROSRobotInterface.head_controller`` (``neck_y_joint``/
-        ``neck_p_joint``/``neck_r_joint`` だけの独立した action server) が
-        使われ、腕・台車・腰など他の関節へは一切コマンドを送らない
-        (``_execute_on_robot`` の腕・台車の送信とは完全に独立)。
+        ``controller_type`` を指定せずに送ることで既定の
+        ``'default_controller'`` (``larm_controller``/``rarm_controller``/
+        ``head_controller``/``waist_controller``/``lifter_controller`` を
+        まとめて 1 回のゴールとして送る、``AeroROSRobotInterface.
+        default_controller`` 参照) が使われ、首と腕を同時に動かせる。腰・
+        腰上げ機構は初期姿勢の値をそのまま使うため、既にその姿勢にいれば
+        実質何も動かない。
 
-        送るベクトルの首以外の要素は実機の現在値をそのまま使う
-        (``self.ri.angle_vector()`` を引数なしで呼ぶと joint_states から
-        読んだ実機の現在角を返す) -- ``self.real_robot`` は ``neck_p_joint``
-        以外まだ一度も実機の姿勢を反映していない (角度 0 のまま) ため、
-        そのまま送ると首以外の関節の目標到達時間の見積もり
-        (``angle_vector`` 内の ``angle_vector_duration``) が実際には送らない
-        関節の見かけ上の大きな角度差につられておかしくなる。
+        送るベクトルのうち初期姿勢に含まれない関節 (指など) は実機の現在値
+        をそのまま使う (``self.ri.angle_vector()`` を引数なしで呼ぶと
+        joint_states から読んだ実機の現在角を返す) -- ``self.real_robot`` は
+        まだ一度も実機の姿勢を反映していない (角度 0 のまま) ため、先に
+        現在値を反映してから首・腕だけを上書きする。
         """
         try:
             current_av = self.ri.angle_vector()
         except RuntimeError as exc:
-            print('[ARM] 実機の関節角を取得できなかったため、首を下げる '
-                  '動作をスキップしました ({})。'.format(exc))
+            print('[ARM] 実機の関節角を取得できなかったため、姿勢を初期化 '
+                  'する動作をスキップしました ({})。'.format(exc))
             return
         self.real_robot.angle_vector(current_av)
+        name_to_initial_angle = dict(
+            zip(self._initial_joint_names, self._initial_joint_angle_vector))
+        for joint in self.real_robot.joint_list:
+            if joint.name in name_to_initial_angle:
+                joint.joint_angle(name_to_initial_angle[joint.name])
         self.real_robot.neck_p_joint.joint_angle(
             np.deg2rad(ARM_HEAD_NOD_PITCH_DEG))
         self.ri.angle_vector(self.real_robot.angle_vector(),
-                             ARM_HEAD_NOD_MOVE_TIME,
-                             controller_type='head_controller')
-        print('[ARM] 首を {:.0f} 度まで下げました。'.format(
-            ARM_HEAD_NOD_PITCH_DEG))
+                             ARM_HEAD_NOD_MOVE_TIME)
+        print('[ARM] 腕を初期姿勢まで下ろし、首を {:.0f} 度まで下げました。'
+              .format(ARM_HEAD_NOD_PITCH_DEG))
 
     def _execute_on_robot(self):
         """``EXECUTE`` ボタン押下時、計画済みの waypoint 列
@@ -1349,15 +1385,21 @@ class HandshakePipelineNode(object):
 
         ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
         動かすかどうかを独立に切り替えられる (どちらも指定しなければ
-        ``self.ri`` が ``None`` のままで EXECUTE ボタン自体が表示されない)。
+        EXECUTE ボタン自体が表示されない、``_setup_viewer`` 参照。
+        ``self.ri`` はこれらのフラグとは別に ARM 時の首下げのため常に
+        接続を試みているので、ここでは改めてフラグの指定有無を見る)。
         """
         with self._lock:
             result = self._current_result
             motion = self._current_motion
             display_waypoints = self._display_waypoints
-        if self.ri is None:
+        if not (self.args.execute_base or self.args.execute_arm):
             print('[execute] --execute-base/--execute-arm のいずれも指定 '
                   'されていないため実機を動かせません。')
+            return
+        if self.ri is None:
+            print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗 '
+                  'しているため実機を動かせません。')
             return
         if result is None or not result.get('solved') or motion is None \
                or display_waypoints is None:
@@ -1652,9 +1694,9 @@ def main():
             'TF が引けないことがある。根本的にはマシン間の時刻同期が '
             '必要 (NTP/chrony)。')
     parser.add_argument(
-        '--armed-timeout', type=float, default=15.0,
+        '--armed-timeout', type=float, default=30.0,
         help='ARMED になってから offered_hand が決まらなければ諦めて '
-            'IDLE に戻るまでの秒数 (既定 15.0)。')
+            'IDLE に戻るまでの秒数 (既定 30.0)。')
     parser.add_argument(
         '--client-wait-timeout', type=float, default=30.0,
         help='viser のブラウザクライアント接続を待つ 1 回あたりの秒数 '
