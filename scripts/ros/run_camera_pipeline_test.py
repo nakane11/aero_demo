@@ -147,6 +147,8 @@ from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
+from skrobot.planner.trajectory_optimization.solvers import (  # noqa: E402
+    create_solver)
 from skrobot.viewers import ViserViewer  # noqa: E402
 
 # ロボットの初期位置 (台車がワールド原点にいる姿勢) を示す Axis の大きさ
@@ -436,6 +438,11 @@ class HandshakePipelineNode(object):
         # 常に作る。
         self.verification_pairs = spik.build_collision_verification_pairs(
             self.robot, 'r')
+        # jaxls ソルバーも同じ理由 (plan_handshake_motion.main 参照) で
+        # ノードの寿命で 1 個だけ作って使い回す (人物/試行ごとに作り直すと
+        # JIT キャッシュが効かない)。
+        self.solver = create_solver(
+            'jaxls', max_iterations=args.max_iterations, verbose=False)
         self.collision_pairs = None
         if os.path.exists(args.collision_pairs):
             self.collision_pairs = spik.load_collision_pairs(
@@ -1079,7 +1086,7 @@ class HandshakePipelineNode(object):
                 args.motion_collision_verify_tolerance
             motion = phm.plan_person_motion(
                 self.robot, robot_arm, result, translated_joints, human_xy,
-                motion_args, self.verification_pairs)
+                motion_args, self.verification_pairs, self.solver)
             self._log_debug(dict(
                 event='motion', person=attempt,
                 verified=motion['verified'],
