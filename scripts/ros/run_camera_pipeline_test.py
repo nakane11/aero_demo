@@ -551,7 +551,13 @@ class HandshakePipelineNode(object):
         try:
             self.real_robot = load_aero(use_hand=True)
             print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
-            self.ri = AeroROSRobotInterface(self.real_robot)
+            # skrobot 側の既定値 (odom_topic='/base_odometry/odom') は本機で
+            # 配信されておらず、move_trajectory_sequence の先頭にある
+            # "while self.odom_msg is None: rospy.sleep(0.01)" が永久に
+            # 抜けられず、EXECUTE 時に goal を組み立てる前段階で無限に
+            # 固まっていた (実機の odom は /aero_ros_controller が配信する
+            # /odom で、base_controller もそちらを購読している)。
+            self.ri = AeroROSRobotInterface(self.real_robot, odom_topic='/odom')
             print('[execute] 実機への接続が完了しました (--execute-base={}, '
                   '--execute-arm={})。'.format(
                       args.execute_base, args.execute_arm))
