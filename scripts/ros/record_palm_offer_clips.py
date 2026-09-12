@@ -244,6 +244,15 @@ class PalmOfferClipRecorder(object):
         self._buffer_seconds = args.pre_seconds + 0.5
         self._buffers = collections.defaultdict(collections.deque)
 
+        # /tf_static (URDF 固定オフセット、r_eef_grasp_link 等) はロボット
+        # 起動時に 1 度しか配信されない (latched) ため、他のトピックと同じ
+        # スライディングウィンドウ (_buffer_append) に乗せると、記録開始
+        # までに buffer_seconds 秒以上経ってしまい単に消えてしまう (この
+        # クラスがそれで r_eef_grasp_link 等を一切バッグに書けていなかった
+        # 不具合があった)。子フレーム名をキーに最新の変換を保持し続け、
+        # クリップ開始のたびに別途書き込む (_write_latest_tf_static)。
+        self._tf_static_transforms = {}
+
         self._active_bag = None
         self._active_bag_path = None
 
@@ -329,6 +338,24 @@ class PalmOfferClipRecorder(object):
         entries.sort(key=lambda e: e[0])
         for t, topic, msg in entries:
             bag.write(topic, msg, rospy.Time.from_sec(t))
+        self._write_latest_tf_static(bag, window_start)
+
+    def _write_latest_tf_static(self, bag, stamp):
+        """保持している最新の ``/tf_static`` (子フレーム名 -> 変換) を、
+        クリップ先頭の時刻でまとめて書き込む。
+
+        ``/tf_static`` はロボット起動時に 1 度だけ配信される (latched)
+        ため、他のトピックと同じスライディングウィンドウの
+        ``_buffers``/``_buffer_append`` には乗せていない (乗せると
+        記録開始までに ``_buffer_seconds`` 秒以上経ってバッファから
+        追い出され、``r_eef_grasp_link`` のような URDF 固定オフセットが
+        クリップに一切書き込まれなくなる)。ここで別途、その時点で
+        受信済みの全 ``/tf_static`` 変換をまとめて 1 メッセージとして
+        書き込む。"""
+        if not self._tf_static_transforms:
+            return
+        msg = TFMessage(transforms=list(self._tf_static_transforms.values()))
+        bag.write(_TF_STATIC_TOPIC, msg, rospy.Time.from_sec(stamp))
 
     # ------------------------------------------------------------------
     # clip lifecycle
@@ -482,7 +509,15 @@ class PalmOfferClipRecorder(object):
         self._on_tf_message(_TF_TOPIC, msg)
 
     def _on_tf_static(self, msg):
-        self._on_tf_message(_TF_STATIC_TOPIC, msg)
+        # スライディングウィンドウ (_buffer_append) には乗せず、子フレーム
+        # 名をキーに最新の変換を保持し続ける (_write_latest_tf_static
+        # 参照)。録画中ならそのまま生でも書き込んでおく (実害はない)。
+        t = rospy.Time.now().to_sec()
+        with self._lock:
+            for tr in msg.transforms:
+                self._tf_static_transforms[tr.child_frame_id] = tr
+            self._write_if_recording(_TF_STATIC_TOPIC, t, msg)
+            self._maybe_close_clip(t)
 
     def _on_tf_message(self, topic, msg):
         t = rospy.Time.now().to_sec()
