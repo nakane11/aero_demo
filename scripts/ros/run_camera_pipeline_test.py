@@ -1421,8 +1421,19 @@ class HandshakePipelineNode(object):
                   self.args.execute_arm))
 
         arm_angle_vectors = []  # [av0, av1, ...] (angle_vector_sequence にそのまま渡す)
-        base_trajectory_points = []  # [[dx, dy, dyaw], ...] (直前 waypoint の台車向き基準の相対移動量)
-        prev_base = None  # (x, y, yaw) 直前 waypoint の台車位置姿勢 (world 系)
+        base_trajectory_points = []
+        # [[dx, dy, dyaw], ...] (先頭 waypoint = ロボットの現在の実姿勢、から
+        # の累積移動量)。skrobot.move_trajectory_sequence は各要素を「直前の
+        # 要素からの相対移動」としてではなく、呼び出し時点の実機姿勢 (odom)
+        # からその都度独立に適用する (move_base.py の実装参照: 内部で毎回
+        # 新しい Coordinates を odom の位置姿勢から作り直しており、前の
+        # trajectory_point の結果を積み上げない)。そのため、ここで waypoint
+        # 間の差分 (直前 waypoint 基準) を渡すと「本来の絶対位置」ではなく
+        # 「waypoint 間の微小差分」がそのまま原点からの移動量として実行され、
+        # 経路が大きく崩れる (経路の後半ほど実際の waypoint 位置から外れて
+        # いく) というバグになる。先頭 waypoint からの累積量を渡すことで、
+        # skrobot 側の「毎回 odom から作り直す」実装と辻褄を合わせる。
+        first_base = None  # (x, y, yaw) 先頭 waypoint の台車位置姿勢 (world 系)
         for wp in display_waypoints:
             if self.args.execute_arm:
                 name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
@@ -1434,27 +1445,25 @@ class HandshakePipelineNode(object):
             if self.args.execute_base:
                 bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
                                wp['base_yaw'])
-                if prev_base is None:
+                if first_base is None:
                     # 最初の waypoint: このノードの座標系はロボットの台車が
                     # ワールド原点にいる前提 (_initial_base_coords 参照) な
                     # ので、ロボットは今まさにこの world 原点にいるはず --
                     # 絶対座標 (bx, by, byaw) をそのまま原点からの移動量
-                    # として使える。
-                    dx_world, dy_world, dyaw = bx, by, byaw
-                    prev_yaw = 0.0
-                else:
-                    dx_world = bx - prev_base[0]
-                    dy_world = by - prev_base[1]
-                    dyaw = byaw - prev_base[2]
-                    prev_yaw = prev_base[2]
-                # world 系の移動量を、直前 waypoint での台車の向き基準
-                # (move_trajectory_sequence が要求する「現在の台車姿勢を
-                # 基準にした前後左右」) に回転させる。
-                cos_yaw, sin_yaw = math.cos(prev_yaw), math.sin(prev_yaw)
+                    # として使える。以後の waypoint もこの姿勢を基準に累積量
+                    # を計算する。
+                    first_base = (bx, by, byaw)
+                x0, y0, yaw0 = first_base
+                dx_world = bx - x0
+                dy_world = by - y0
+                dyaw = byaw - yaw0
+                # world 系の移動量を、先頭 waypoint (= 実機の現在の台車の
+                # 向き) 基準 (move_trajectory_sequence が要求する「実行開始
+                # 時点の台車姿勢を基準にした前後左右」) に回転させる。
+                cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
                 dx = cos_yaw * dx_world + sin_yaw * dy_world
                 dy = -sin_yaw * dx_world + cos_yaw * dy_world
                 base_trajectory_points.append([dx, dy, dyaw])
-                prev_base = (bx, by, byaw)
 
         # ここまでで waypoint 全部分の関節角・移動量を集め終えたので、
         # それぞれ 1 回のゴールとしてまとめて送る (どちらも非ブロッキング)。
