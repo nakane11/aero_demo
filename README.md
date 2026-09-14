@@ -50,6 +50,12 @@ MediaPipe 形式の骨格・掌の
    で全 waypoint を検証し、結果を `verified` フラグに入れる (経路上の
    許容貫通量は既定 1 cm)。
 
+   `--force-optimize` (既定 False) を付けると、pre-touch/線形補間の
+   候補が事後検証に通っていても early return せず、必ず jaxls の軌道
+   最適化まで実行する。通常運用では最適化を経ずに済むケースがほとんど
+   なので、jaxls の軌道最適化そのものの計算時間を単独で計測したいとき
+   (ベンチマーク・回帰確認用) に使う。
+
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
    ロボットモデルの 2 つを viser ビューアで表示する。IK の結果はテキストパネルに出す。
@@ -288,10 +294,26 @@ python3 scripts/ros/run_camera_pipeline_test.py \
   起動を続ける (既定では接続まで無期限に待つため、無人テストでは必須)。
   表示自体は見たい場合はこのオプションを外して普段どおり viser の URL
   をブラウザで開けばよい。
+- `--force-optimize` (既定 False): 実際の握手試行でも pre-touch/線形
+  補間の候補が事後検証に通っていても early return せず、必ず jaxls の
+  軌道最適化まで実行させる (`plan_handshake_motion.py` の同名オプション
+  参照)。通常運用では付けない -- jaxls の計算時間そのものを単独で
+  計測したいベンチマーク用。
 
 `--execute-base`/`--execute-arm` を指定しなければ実機は一切動かさない
 ので、このテストに実ロボットは不要 (`--bag` のクリップに `tf`/`tf_static`
 も含めているため、実ロボットの TF 配信も不要)。
+
+起動時のウォームアップ (`_warmup_ik`) は、左右それぞれの腕で IK
+(`solve_person_ik`) だけでなく `plan_person_motion` (jaxls の軌道最適化)
+もダミー目標に対して 1 回ずつ解いておき、JAX/jaxls の初回コンパイルを
+前倒しで済ませる。scikit-robot 側の `JaxlsSolver` はコンパイル済み問題を
+腕ごと (`collision_link_list` が変わるため l/r で構造が異なる) に別々の
+キャッシュとして保持するため、この事前ウォームアップで両腕分がキャッシュ
+された状態になり、以後 ARMED のたびに差し出し手の左右が入れ替わっても
+再コンパイルは起きない。ただし通常運用では pre-touch/線形補間だけで
+事後検証に通ることが多く、その場合は jaxls 自体が呼ばれない
+(`plan_handshake_motion.py` の `--force-optimize` 説明・上記 4.5 参照)。
 
 ## 座標系
 

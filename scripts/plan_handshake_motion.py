@@ -558,6 +558,13 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     (``solve_palm_ik.pick_verified_candidate`` のフォールバックと同じ
     考え方)。
 
+    ``args.force_optimize`` (既定 False) が真の場合は、pre-touch/線形
+    補間の候補が厳密検証に通っていても早期 return せず、必ず ``jaxls``
+    の最適化ループまで進む (warm start にはそれらの候補のうち最も貫通が
+    浅いものを使う)。軌道最適化そのものの計算時間を単独で計測したい
+    とき用 (通常の運用では最適化を経ずに済むケースがほとんどのため、
+    ``--force-optimize`` を付けないと ``optimized`` な候補が得られない)。
+
     ``solver`` は ``verification_pairs`` と同様、呼び出し側 (``main``)
     が人物ループの外で1回だけ作って使い回す ``JaxlsSolver`` インスタンス
     (人物・試行ごとに作り直すと jaxls の JIT キャッシュ
@@ -608,11 +615,12 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
                 args.n_waypoints, args.pretouch_split)))
     candidates.append(('linear', initial_traj))
 
+    force_optimize = getattr(args, 'force_optimize', False)
     best = None
     best_trajectory = None
     for kind, trajectory in candidates:
         candidate = make_candidate(trajectory, kind)
-        if candidate['verified']:
+        if candidate['verified'] and not force_optimize:
             candidate['compute_time'] = time.time() - start_time
             return candidate
         if best is None or (min(candidate['waypoint_min_distances'])
@@ -790,6 +798,14 @@ def main():
         help='numpy の乱数シード (現状の軌道最適化は決定的だが、将来の '
             '拡張に備えて solve_palm_ik.py と同じオプションを用意して '
             'ある)。')
+    parser.add_argument(
+        '--force-optimize', action='store_true',
+        help='pre-touch/線形補間の候補が事後検証に通っていても早期 '
+            'return せず、必ず jaxls の軌道最適化まで実行する (既定は '
+            'オフ -- 通常運用では最適化を経ずに済むケースがほとんどで、 '
+            '付けないと optimized な候補を得られない場合が多い)。'
+            '軌道最適化そのものの計算時間を単独で計測したいときに使う '
+            '(plan_person_motion のモジュール docstring 参照)。')
     args = parser.parse_args()
 
     files = json_io.iter_json_files(args.input_dir)

@@ -612,13 +612,14 @@ class HandshakePipelineNode(object):
     )
 
     def _warmup_ik(self):
-        """左右それぞれの腕で ``solve_person_ik`` をダミーの目標に対して
-        1 回ずつ解いておき、JAX の関数トレース (jax.jit がその形状の
-        呼び出しを初めて見たときに Python レベルで計算グラフを組み立てる
-        処理。ディスクの永続コンパイルキャッシュではカバーされない) を
-        ノード起動時に前倒しで済ませる。これをやらないと、実際の1人目の
-        差し出し手に対して IK を解くときに腕ごと数秒単位でこのトレース
-        コストがかかってしまう。
+        """左右それぞれの腕で ``solve_person_ik`` と ``plan_person_motion``
+        (jaxls 軌道最適化) をダミーの目標に対して 1 回ずつ解いておき、
+        JAX の関数トレース (jax.jit/jaxls がその形状の呼び出しを初めて
+        見たときに Python レベルで計算グラフを組み立てる処理。ディスクの
+        永続コンパイルキャッシュではカバーされない) をノード起動時に
+        前倒しで済ませる。これをやらないと、実際の1人目の差し出し手に
+        対して IK・軌道最適化を解くときに腕ごと数秒~数十秒単位でこの
+        トレースコストがかかってしまう。
 
         ``_solve_handshake`` の ``solve_person_ik`` 呼び出しと引数
         (``attempts_per_pose``/``base_limits``/``self_collision``/
@@ -628,16 +629,36 @@ class HandshakePipelineNode(object):
         positions={}`` でも ``human_body_obstacles`` は骨格検出が全身分
         揃っているときと同じ固定長のダミー障害物を返すので、実際の骨格
         なしで形状だけ実データと揃えられる。
+
+        軌道最適化側は ``self.solver`` (``JaxlsSolver``、ノード寿命で
+        使い回す、``__init__`` 参照) のコンパイル済み問題キャッシュが
+        構造 (``JaxlsSolver._make_cache_key`` 参照、腕ごとに
+        ``collision_link_list``/joint limits 等が変わるため l/r で別構造
+        になる) をキーにした辞書になっている (l/r それぞれ独立のスロットを
+        持ち、切り替えても互いを退避させない) ため、ここで l/r 両方を
+        1 回ずつ ``force_optimize=True`` (幾何的な経路で検証を通っても
+        early return せず必ず jaxls まで進める、``plan_person_motion``
+        参照) で通しておけば、以後 ARMED のたびに差し出し手の左右が
+        入れ替わって最適化が必要になっても両方ともキャッシュヒットする。
+        ダミー IK が解けなかった腕は、後続の軌道計画に渡す有効な握手姿勢
+        が無いためスキップする (通常は解ける想定、solve_person_ik と同じ
+        目標を毎回使っているため)。
         """
         args = self.args
-        print('[warmup] 左右の腕の IK トレースを事前に実行しています '
-              '(数秒かかります)...')
+        print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
+              'います (数秒~数十秒かかります)...')
         collision_obstacles = (
             [] if (args.no_human_collision or self.collision_pairs is None)
             else spik.human_body_obstacles({}))
+        warmup_human_xy = np.array([args.human_front_distance, 0.0])
+        motion_args = copy.copy(args)
+        motion_args.collision_verify_tolerance = \
+            args.motion_collision_verify_tolerance
+        motion_args.force_optimize = True
+        target_pos = spik.palm_target_position(self._WARMUP_PALM)
         for robot_arm, label in (('l', '左'), ('r', '右')):
             t0 = time.time()
-            spik.solve_person_ik(
+            picked, _, _ = spik.solve_person_ik(
                 self.robot, self._WARMUP_PALM, robot_arm, collision_obstacles,
                 attempts_per_pose=args.attempts_per_pose,
                 base_limits=self.base_limits,
@@ -646,7 +667,24 @@ class HandshakePipelineNode(object):
                 collision_pairs=self.collision_pairs,
                 joint_positions={},
                 verification_pairs=self.verification_pairs)
-            print('[warmup] {}腕: {:.1f} 秒'.format(label, time.time() - t0))
+            print('[warmup] {}腕: IK {:.1f} 秒'.format(
+                label, time.time() - t0))
+            if picked is None:
+                print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
+                      '軌道最適化のトレースはスキップします。'.format(label))
+                continue
+            turn_index, angle_vector, base_pose, post_process_result = picked
+            rots = spik.palm_to_target_rots(self._WARMUP_PALM, robot_arm)
+            handshake = spik.solved_result(
+                self.robot, robot_arm, target_pos, rots[turn_index],
+                turn_index, angle_vector, base_pose, self.base_limits,
+                post_process_result, 0.0, 0.0)
+            t0 = time.time()
+            phm.plan_person_motion(
+                self.robot, robot_arm, handshake, {}, warmup_human_xy,
+                motion_args, self.verification_pairs, self.solver)
+            print('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
+                label, time.time() - t0))
 
     def _setup_viewer(self, args):
         """viser ビューアと ``ARM``/``RESET`` ボタン・状態表示パネル・
@@ -1912,9 +1950,6 @@ def main():
     parser.add_argument(
         '--motion-attempt-perturbation', type=float, default=0.3)
     parser.add_argument(
-        '--robot-spheres-per-link', type=int,
-        default=phm.DEFAULT_ROBOT_SPHERES_PER_LINK)
-    parser.add_argument(
         '--motion-collision-verify-tolerance', type=float,
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
         help='軌道上の waypoint の事後検証で許容する最大貫通量 [m] '
@@ -1922,6 +1957,13 @@ def main():
             '(指先まで含めた事後検証) とは別物 -- plan_person_motion '
             '呼び出し時だけこちらの値に差し替える (_solve_handshake 参照)。'
             .format(phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE))
+    parser.add_argument(
+        '--force-optimize', action='store_true',
+        help='pre-touch/線形補間の候補が事後検証に通っていても早期 '
+            'return せず、必ず jaxls の軌道最適化まで実行する '
+            '(plan_handshake_motion.plan_person_motion 参照、既定は '
+            'オフ)。軌道最適化そのものの計算時間を単独で計測したい '
+            'ときに使う。')
     parser.add_argument(
         '--seed', type=int, default=None,
         help='軌道計画の warm start を揺らす際に使う numpy の乱数シード '
