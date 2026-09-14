@@ -118,6 +118,23 @@ if _SCRIPTS_DIR not in sys.path:
 # 必要な分だけ確保する設定にしておくことで、このログ自体を出さなくする。
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
+# jax の永続コンパイルキャッシュ (solve_palm_ik.py/plan_handshake_motion.py
+# と同じ設定)。jax を import する前に指定する必要がある。solve_palm_ik.py
+# 自身もこの環境変数を設定しているが、それより先に (下の `from aero_demo
+# import json_io` 経由で) palm_plane_view.py -> skrobot.model.primitives ->
+# skrobot.model.robot_model -> skrobot.pycompat が import され、
+# skrobot.pycompat が HAS_JAX 判定のため無条件に `import jax` してしまう。
+# そのため solve_palm_ik.py 側の設定では手遅れで、_warmup_ik のたびに
+# ディスクキャッシュが一切効かず (jax.config.jax_compilation_cache_dir が
+# None のまま) IK・軌道最適化の JIT コンパイルを毎回フルで行っていた
+# (ここで先に設定しておくと解消する。実測で軌道最適化の jit(solve) が
+# 44 秒程度 -> 12 秒程度まで短縮された)。
+os.environ.setdefault(
+    'JAX_COMPILATION_CACHE_DIR',
+    os.path.expanduser('~/.cache/jax_compilation_cache'))
+os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS', '0')
+os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
+
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
