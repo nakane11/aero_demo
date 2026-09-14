@@ -628,6 +628,12 @@ class HandshakePipelineNode(object):
         y_axis=[0.0, 1.0, 0.0],
     )
 
+    # ウォームアップ中だけ numpy のグローバル乱数を固定するシード
+    # (``_warmup_ik`` 参照。値そのものに意味は無く、毎回同じであれば何でも
+    # よい)。ウォームアップ後は元の乱数状態に戻すので、実運用の IK の
+    # ランダム初期値には影響しない。
+    _WARMUP_SEED = 0
+
     def _warmup_ik(self):
         """左右それぞれの腕で ``solve_person_ik`` と ``plan_person_motion``
         (jaxls 軌道最適化) をダミーの目標に対して 1 回ずつ解いておき、
@@ -660,7 +666,37 @@ class HandshakePipelineNode(object):
         ダミー IK が解けなかった腕は、後続の軌道計画に渡す有効な握手姿勢
         が無いためスキップする (通常は解ける想定、solve_person_ik と同じ
         目標を毎回使っているため)。
+
+        ここだけ numpy のグローバル乱数を ``_WARMUP_SEED`` で固定する
+        (前後で状態を退避・復元するので実運用の IK には影響しない)。
+        ``solve_person_ik`` は ``attempts_per_pose`` 個のランダムな初期値
+        から IK を解いて最初に干渉検証を通った候補を採用するため、シードを
+        固定しないと**毎回違う握手姿勢**がウォームアップの結果になる。
+        軌道最適化の問題を組むとき、ロボットの現在姿勢から読み出した FK
+        由来の値 (チェーンのリンク間変換・干渉プリミティブのリンク局所
+        オフセット。``TrajectoryProblem.fk_params`` /
+        ``_compute_collision_link_offsets``) が jaxls のトレース結果に
+        **定数として焼き込まれる**ので、ウォームアップの解が毎回違うと
+        この定数も毎回違う値になる。JAX の永続コンパイルキャッシュは
+        コンパイル前 HLO をフィンガープリントにするため、それだけで毎回
+        キャッシュミスし、起動のたびに腕あたり 20~30 秒の再コンパイルが
+        走っていた (実測: シード固定だけで 1 本目が 34 秒 -> 11 秒)。
+        残る ULP レベルのブレ (skrobot が関節角を*差分回転*で適用する
+        ため、直前の jaxls の解の下位ビットが world 座標に残る) は
+        scikit-robot 側で丸めている
+        (``JaxlsSolver`` の ``_quantize_fk_constants``)。両方揃って初めて
+        2 本目もキャッシュヒットする (実測: 33 秒 -> 10 秒)。
         """
+        # 乱数状態の退避 (finally で必ず復元する。上記 docstring 参照)。
+        random_state = np.random.get_state()
+        np.random.seed(self._WARMUP_SEED)
+        try:
+            self._warmup_ik_body()
+        finally:
+            np.random.set_state(random_state)
+
+    def _warmup_ik_body(self):
+        """``_warmup_ik`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
