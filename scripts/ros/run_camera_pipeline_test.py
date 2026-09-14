@@ -78,6 +78,15 @@ IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現�
 
     python3 scripts/ros/run_camera_pipeline_test.py
     python3 scripts/ros/run_camera_pipeline_test.py --execute-base --execute-arm
+
+``--auto-execute`` を付けると、``EXECUTE`` ボタンを押さなくても IK・軌道
+計画が成功した時点で自動的に実機を動かす。このときは
+``--execute-base``/``--execute-arm`` の指定有無に関わらず台車・関節の
+両方を動かす。``--auto-arm`` (起動直後から ARMED) と組み合わせると、
+ブラウザを一切触らずに「手を差し出す -> 握手しに行く」一連の動作を
+実行できる:
+
+    python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --auto-execute
 """
 
 import argparse
@@ -400,6 +409,15 @@ class HandshakePipelineNode(object):
 
     def __init__(self, args):
         self.args = args
+        # --auto-execute は「ビューワの EXECUTE ボタンを押さずに実機を
+        # 動かす」オプションなので、--execute-base/--execute-arm の指定
+        # 有無に関わらず台車・関節の両方を動かす。以降の判定 (EXECUTE
+        # ボタンの表示条件・_execute_on_robot 内の分岐) は全て
+        # args.execute_base/args.execute_arm を見ているので、ここで両方を
+        # 立ててしまえば他の場所で --auto-execute を特別扱いせずに済む。
+        if args.auto_execute:
+            args.execute_base = True
+            args.execute_arm = True
         # 既定の 10 秒だと、カメラ側と base_link 側の TF を配信している
         # マシン間でシステムクロックが数秒〜数十秒ズレている場合に、
         # 両者の有効期間が一度も重ならず TF が引けなくなる。根本的には
@@ -709,10 +727,19 @@ class HandshakePipelineNode(object):
             args.motion_collision_verify_tolerance
         motion_args.force_optimize = True
         target_pos = spik.palm_target_position(self._WARMUP_PALM)
+        # solve_person_ik/palm_to_target_rots に渡す差し出し手は、実際の
+        # 自動割り当て (--robot-arm auto, spik.DEFAULT_ROBOT_ARM) で各腕が
+        # 担当する側に合わせる (l 腕 <-> 人間の右手, r 腕 <-> 人間の左手)。
+        # 向きの候補順序 (turn_candidates_deg) は差し出し手ごとに異なる
+        # ため、実際の呼び出しと形を揃えておく。
+        robot_arm_to_hand = {arm: hand
+                             for hand, arm in spik.DEFAULT_ROBOT_ARM.items()}
         for robot_arm, label in (('l', '左'), ('r', '右')):
+            hand = robot_arm_to_hand[robot_arm]
             t0 = time.time()
             picked, _, _ = spik.solve_person_ik(
-                self.robot, self._WARMUP_PALM, robot_arm, collision_obstacles,
+                self.robot, self._WARMUP_PALM, hand, robot_arm,
+                collision_obstacles,
                 attempts_per_pose=args.attempts_per_pose,
                 base_limits=self.base_limits,
                 self_collision=(not args.no_self_collision
@@ -727,11 +754,11 @@ class HandshakePipelineNode(object):
                       '軌道最適化のトレースはスキップします。'.format(label))
                 continue
             turn_index, angle_vector, base_pose, post_process_result = picked
-            rots = spik.palm_to_target_rots(self._WARMUP_PALM, robot_arm)
+            rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
             handshake = spik.solved_result(
                 self.robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
-                post_process_result, 0.0, 0.0)
+                post_process_result, 0.0, 0.0, hand)
             t0 = time.time()
             phm.plan_person_motion(
                 self.robot, robot_arm, handshake, {}, warmup_human_xy,
@@ -1126,10 +1153,11 @@ class HandshakePipelineNode(object):
             else spik.human_body_obstacles(translated_joints))
 
         target_pos = spik.palm_target_position(translated_palm)
-        rots = spik.palm_to_target_rots(translated_palm, robot_arm)
+        rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
         picked, collision_ik_time, candidate_selection_time = \
             spik.solve_person_ik(
-                self.robot, translated_palm, robot_arm, collision_obstacles,
+                self.robot, translated_palm, offered_hand, robot_arm,
+                collision_obstacles,
                 attempts_per_pose=args.attempts_per_pose,
                 base_limits=self.base_limits,
                 self_collision=(not args.no_self_collision
@@ -1142,14 +1170,14 @@ class HandshakePipelineNode(object):
             result = spik.unsolved_result(
                 self.robot, robot_arm, target_pos, rots[-1],
                 self.base_limits, collision_ik_time,
-                candidate_selection_time)
+                candidate_selection_time, offered_hand)
         else:
             turn_index, angle_vector, base_pose, post_process_result = picked
             result = spik.solved_result(
                 self.robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, collision_ik_time,
-                candidate_selection_time)
+                candidate_selection_time, offered_hand)
         result['offered_hand'] = offered_hand
         result['robot_arm'] = robot_arm
 
@@ -1241,10 +1269,11 @@ class HandshakePipelineNode(object):
         # self.ri 自体は --execute-base/--execute-arm を何も指定していな
         # くても (ARM 時の首下げのために) 接続を試みるので、EXECUTE ボタン
         # の表示条件には別途フラグの指定有無を含める必要がある。
-        self.execute_button.visible = (
+        executable = (
             (self.args.execute_base or self.args.execute_arm)
             and self.ri is not None and result['solved']
             and motion is not None and display_waypoints is not None)
+        self.execute_button.visible = executable
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -1257,6 +1286,19 @@ class HandshakePipelineNode(object):
 
         if args.save_dir:
             self._save_attempt(joint_positions, palms, result, motion)
+
+        # --auto-execute: EXECUTE ボタンを押せる状態になった時点で、
+        # クリックを待たずにそのまま実機を動かす (--bag/--auto-arm での
+        # 無人テストや、ブラウザを開けない状況で使う)。EXECUTE ボタン
+        # ハンドラ (_on_execute) と同様に別スレッドへ逃がす -- この
+        # _solve_handshake はカメラフレームのコールバックスレッドで動いて
+        # おり、ここで実機の動作完了まで待つと以後のフレームを取りこぼす
+        # ため。
+        if args.auto_execute and executable:
+            print('[auto-execute] EXECUTE ボタンを押さずに実機を動かします '
+                  '(--auto-execute)。')
+            threading.Thread(
+                target=self._execute_on_robot, daemon=True).start()
 
     @staticmethod
     def _untranslate_result(result, offset):
@@ -2039,6 +2081,13 @@ def main():
         help='EXECUTE ボタンを押したとき、計画済みの軌道に沿って腕を含む '
             '全身の関節を実機で実際に動かす (AeroROSRobotInterface.'
             'angle_vector)。指定しなければ関節は動かさない (既定オフ)。')
+    parser.add_argument(
+        '--auto-execute', action='store_true',
+        help='IK・軌道計画が成功した時点で、viser の EXECUTE ボタンを '
+            '押さずに自動で実機を動かす (--auto-arm と組み合わせると '
+            'ブラウザ操作なしで一連の動作を実行できる)。このオプションを '
+            '付けたときは --execute-base/--execute-arm の指定有無に '
+            '関わらず台車・関節の両方を動かす (既定オフ)。')
     # --- 実カメラ無しでのテスト (rosbag 再生、record_palm_offer_clips.py
     # が保存したクリップを入力にする) ---
     parser.add_argument(

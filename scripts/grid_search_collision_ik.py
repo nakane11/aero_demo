@@ -279,8 +279,8 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
                          post_process_rthre=spi.DEFAULT_POST_PROCESS_IK_RTHRE):
     """1つのグリッド点 (attempts_per_pose x collision_ik_stop x
     collision_pairs設定 x 台車可動域 x 向き候補数) について全人物を解き、
-    集計結果を返す。``n_turn_candidates`` は ``TURN_CANDIDATES_DEG`` の
-    先頭から何個をバッチに載せるか (バッチの大きさは
+    集計結果を返す。``n_turn_candidates`` は ``spi.turn_candidates_deg
+    (human_hand)`` の先頭から何個をバッチに載せるか (バッチの大きさは
     ``n_turn_candidates * attempts_per_pose``)。
     ``solve_palm_ik.main()`` の1人ぶんのループ相当をここに直接書いている
     のは、``pick_verified_candidate_timed`` による段階A/B計測を差し込む
@@ -334,7 +334,8 @@ def solve_one_grid_point(robot, palm_dir, human_dir, robot_arm_arg,
         whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
         move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
         target_pos = spi.palm_target_position(palm)
-        rots = spi.palm_to_target_rots(palm, robot_arm)[:n_turn_candidates]
+        rots = spi.palm_to_target_rots(
+            palm, human_hand, robot_arm)[:n_turn_candidates]
         target_coords = [spi.Coordinates(pos=target_pos.tolist(), rot=rot)
                          for rot in rots]
 
@@ -514,16 +515,18 @@ def main():
         help='後処理IK (solve_post_process) の腕タスクの姿勢収束閾値 '
             '[deg] (既定 {:.1f})。視線タスクの閾値には影響しない。'
             .format(np.degrees(spi.DEFAULT_POST_PROCESS_IK_RTHRE)))
+    _n_turn_candidates_default = len(spi.TURN_CANDIDATES_DEG_BY_HAND['R'])
     parser.add_argument(
         '--turn-candidates', type=int, nargs='+',
-        default=[len(spi.TURN_CANDIDATES_DEG)],
-        help='バッチに載せる目標姿勢の向き候補数 (TURN_CANDIDATES_DEG {} '
-            'の先頭から何個使うか、既定 {} = 全部)。バッチの大きさは '
-            '「向き候補数 x --attempts-per-pose」なので、ここを減らすと '
-            'その分だけ1人あたりの計算量が減る一方、特定の向きでしか '
-            '解けない人物を取りこぼして成功率が下がりうる。'
-            .format(list(spi.TURN_CANDIDATES_DEG),
-                    len(spi.TURN_CANDIDATES_DEG)))
+        default=[_n_turn_candidates_default],
+        help='バッチに載せる目標姿勢の向き候補数 (TURN_CANDIDATES_DEG_BY_'
+            'HAND {} の先頭から何個使うか、既定 {} = 全部。候補の順序は '
+            '差し出す手が左右どちらかで変わる、palm_to_target_rots 参照)。'
+            'バッチの大きさは「向き候補数 x --attempts-per-pose」なので、 '
+            'ここを減らすとその分だけ1人あたりの計算量が減る一方、特定の '
+            '向きでしか解けない人物を取りこぼして成功率が下がりうる。'
+            .format(spi.TURN_CANDIDATES_DEG_BY_HAND,
+                    _n_turn_candidates_default))
     parser.add_argument('--robot-arm', choices=['auto', 'r', 'l'],
                         default='auto')
     parser.add_argument('--seed', type=int, default=0)

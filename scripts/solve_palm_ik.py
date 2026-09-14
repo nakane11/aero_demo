@@ -54,8 +54,10 @@ self-collision`` で無効化できる)。チェックする組み合わせは�
 pairs`` 参照)。このファイルが既定のパスに無ければ、干渉回避を丸ごと
 無効にして通常のヤコビアン法の IK にフォールバックする。
 
-向きを 0/±90 度 (``TURN_CANDIDATES_DEG``) ずらした目標を、それぞれ
-``--attempts-per-pose`` 個の初期値から解き、そうしてできる全候補を順に
+向きを 0/±90 度 (``TURN_CANDIDATES_DEG_BY_HAND``。ロボットの手首側が
+人間の親指側に来る向きを優先する順序で、差し出している手が左右どちらか
+で順序が変わる) ずらした目標を、それぞれ ``--attempts-per-pose`` 個の
+初期値から解き、そうしてできる全候補を順に
 試して、干渉回避付きバッチ IK が解けて (収束・事後の干渉検証を通過して)
 かつ後処理判定にも成功した最初のものを採用する (``pick_verified_
 candidate`` 参照)。``return_all_attempts=True`` を渡し、初期値ごとの解を
@@ -113,8 +115,22 @@ from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
 from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
 # 掌のローカル +Y (甲->掌方向) まわりにこの角度ずつ向きをずらした候補を
-# 順に試し、IK が解けた最初のものを採用する。
-TURN_CANDIDATES_DEG = (0.0, 90.0, -90.0)
+# 順に試し、IK が解けた最初のものを採用する。差し出している手 (offered_
+# hand, 'R'/'L') によって、ロボットの手首側 (r/l_eef_grasp_link のロー
+# カル -X 方向) が人間の親指側に来る回転方向が逆になる (親指側が右手は
+# +Y まわり +90 度、左手は -90 度。solve_palm_ik.py へのユーザーからの
+# 質問への回答/導出過程を参照) ため、親指側の向きを最優先、次に回転なし
+# (0 度)、最後に小指側が手首に来る向きの順にする。
+TURN_CANDIDATES_DEG_BY_HAND = {
+    'R': (90.0, 0.0, -90.0),
+    'L': (-90.0, 0.0, 90.0),
+}
+
+
+def turn_candidates_deg(hand):
+    """差し出している人間の手 ``hand`` ('R'/'L') に応じた、向きを振る順序
+    (度, ``TURN_CANDIDATES_DEG_BY_HAND`` 参照) を返す。"""
+    return TURN_CANDIDATES_DEG_BY_HAND[hand]
 
 # 人間の手 (掌 JSON の offered_hand) に対して既定で使うロボットの腕
 # (--robot-arm auto)。向かい合わず、人間と同じ方向を向いて反対側の手で
@@ -410,15 +426,20 @@ def _correct_grasp_frame(rot, arm):
     return np.column_stack([rot[:, 0], -rot[:, 1], -rot[:, 2]])
 
 
-def palm_to_target_rots(palm, robot_arm):
+def palm_to_target_rots(palm, hand, robot_arm):
     """掌の位置姿勢 JSON (``estimate_palm_poses.PalmPoseEstimator`` の
     出力の 1 手分) から、ロボットの手先座標系 (``{arm}_eef_grasp_link``,
     +X=指方向, +Y=甲->掌方向, +Z=+X×+Y) で表した目標姿勢の候補群
-    (``TURN_CANDIDATES_DEG`` の数だけ) を返す。
+    (``turn_candidates_deg(hand)`` の数だけ、その順序で) を返す。
 
     向かい合う握手ではなく、人間と同じ方向を向いて反対側の手で繋ぐ想定
     なので、指方向 (+X) は鏡写しにせずそのまま使う。ロボットの +Y は
     掌の法線 (``y_axis``) の逆向き (``-y_axis``、人間の掌に正対する向き)。
+
+    ``hand`` は差し出している人間の手 ('R'/'L', ``palms['offered_hand']``
+    と同じ値)。``turn_candidates_deg`` がロボットの手首側を人間の親指側に
+    優先して寄せる順序を ``hand`` ごとに変えて返すため、ここでもそれを
+    そのまま使う。
     """
     x_axis = np.asarray(palm['x_axis'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
@@ -426,7 +447,7 @@ def palm_to_target_rots(palm, robot_arm):
     z_axis = np.cross(x_axis, y_axis)
     base_rot = np.column_stack([x_axis, y_axis, z_axis])
     return [_correct_grasp_frame(_turn_about_y(base_rot, deg), robot_arm)
-           for deg in TURN_CANDIDATES_DEG]
+           for deg in turn_candidates_deg(hand)]
 
 
 def palm_target_position(palm):
@@ -1277,7 +1298,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             verification_pairs, joint_positions,
                             collision_verify_tolerance,
-                            robot_arm, palm, rots,
+                            robot_arm, palm, hand, rots,
                             attempts_per_pose=DEFAULT_ATTEMPTS_PER_POSE,
                             post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP,
                             post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
@@ -1286,7 +1307,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、添字最小 (最優先) のものから探して返す。
 
-    候補は「向き (``TURN_CANDIDATES_DEG``) × 初期値 (``attempts_per_
+    候補は「向き (``turn_candidates_deg(hand)``) × 初期値 (``attempts_per_
     pose``)」の全組み合わせで、添字は向き優先の並び (``向きの添字 = 添字
     // attempts_per_pose``) になっている。優先順位は「向きが早いもの」→
     「その向きの中で初期値が早いもの」。
@@ -1315,12 +1336,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     -------
     tuple or None
         ``(turn_index, angle_vector, base_pose, post_process_result)``。
-        ``turn_index`` は採用した候補の**向き**の添字 (``TURN_CANDIDATES_
-        DEG``/``rots`` の添字)。``post_process_result`` は
+        ``turn_index`` は採用した候補の**向き**の添字 (``turn_candidates_
+        deg(hand)``/``rots`` の添字)。``post_process_result`` は
         ``solve_post_process`` が返した後処理後の結果 dict、後処理判定に
         失敗した候補をフォールバックで採用した場合は ``None``。1・2 を
         満たす候補が 1 つも無ければ ``None`` を返す。
     """
+    turn_degs = turn_candidates_deg(hand)
     fallback = None
     for candidate_index, ok in enumerate(success_flags):
         if not ok:
@@ -1328,7 +1350,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         turn_index = candidate_index // attempts_per_pose
         attempt_index = candidate_index % attempts_per_pose
         label = 'turn={:.0f}deg/初期値 {}'.format(
-            TURN_CANDIDATES_DEG[turn_index], attempt_index)
+            turn_degs[turn_index], attempt_index)
         robot.angle_vector(angle_vectors[candidate_index])
         robot.newcoords(base_poses[candidate_index])
         min_dist = collision_pairs_min_distance(
@@ -1354,11 +1376,11 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     if fallback is not None:
         print('  [post-process] 全ての候補で後処理判定に失敗した '
               'ため、turn={:.0f}deg の候補を後処理前の解として採用 '
-              'します。'.format(TURN_CANDIDATES_DEG[fallback[0]]))
+              'します。'.format(turn_degs[fallback[0]]))
     return fallback
 
 
-def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
+def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     attempts_per_pose=DEFAULT_ATTEMPTS_PER_POSE,
                     base_limits=None,
                     collision_weight=DEFAULT_COLLISION_WEIGHT,
@@ -1378,11 +1400,13 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
                         DEFAULT_COLLISION_VERIFY_TOLERANCE),
                     post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
                     post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE):
-    """1 人分について、``TURN_CANDIDATES_DEG`` の全ての向き × 全ての初期値
-    (``attempts_per_pose`` 個) を、その人の身体 (``collision_
+    """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
+    初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
     ``self_collision=True`` (既定) のときは、ロボット自身のリンク同士の
-    干渉もソフトなペナルティとして回避する。
+    干渉もソフトなペナルティとして回避する。``hand`` は差し出している
+    人間の手 ('R'/'L') で、``palm_to_target_rots`` に渡す向きの候補順序
+    (親指側優先) の決定と、``pick_verified_candidate`` のログ表示に使う。
 
     チェックする組み合わせは ``collision_pairs`` (``load_collision_
     pairs`` が返す形式) で明示的に指定したものだけに限る -- 「対象リンク
@@ -1438,7 +1462,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
     target_pos = palm_target_position(palm)
-    rots = palm_to_target_rots(palm, robot_arm)
+    rots = palm_to_target_rots(palm, hand, robot_arm)
     target_coords = [Coordinates(pos=target_pos.tolist(), rot=rot)
                      for rot in rots]
     # collision_pairs 中の人体セグメントへの参照 (int) は
@@ -1503,7 +1527,7 @@ def solve_person_ik(robot, palm, robot_arm, collision_obstacles,
     picked = pick_verified_candidate(
         robot, success_flags, angle_vectors, base_poses,
         effective_verification_pairs, joint_positions,
-        collision_verify_tolerance, robot_arm, palm, rots,
+        collision_verify_tolerance, robot_arm, palm, hand, rots,
         attempts_per_pose=attempts_per_pose,
         post_process_thre=post_process_thre,
         post_process_rthre=post_process_rthre)
@@ -1527,8 +1551,12 @@ def base_movable_region(base_limits):
 
 def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
                   angle_vector, base_pose, base_limits, post_process_result,
-                  collision_ik_time, candidate_selection_time):
+                  collision_ik_time, candidate_selection_time, hand):
     """採用した解をロボットに反映し、結果 dict を組む.
+
+    ``hand`` は差し出している人間の手 ('R'/'L')。``turn_deg`` を
+    ``turn_candidates_deg(hand)`` から引くのに使う (``turn_index`` は
+    その並びの添字であり、実際の角度は ``hand`` によって変わるため)。
 
     バッチ IK はロボットを動かさないので、``angle_vector`` と
     ``base_pose`` を実際に反映してから手先・台車の姿勢を読み直す。
@@ -1549,7 +1577,7 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
     result = dict(
         target=True,
         solved=True,
-        turn_deg=TURN_CANDIDATES_DEG[turn_index],
+        turn_deg=turn_candidates_deg(hand)[turn_index],
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
         hand_position=[float(v) for v in hand_coords.worldpos()],
@@ -1567,12 +1595,13 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
 
 
 def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
-                    collision_ik_time, candidate_selection_time):
+                    collision_ik_time, candidate_selection_time, hand):
     """どの候補も解けなかった人物のための結果 dict.
 
     種の姿勢 (台車は ``solve_person_ik`` と同じくワールド原点) を反映して
     から手先・台車の姿勢を読む。``turn_deg``/``target_rot`` は最後に試した
-    候補のものにする。
+    候補のものにする。``hand`` は差し出している人間の手 ('R'/'L',
+    ``solved_result`` 参照)。
     """
     seed_arm_pose(robot, robot_arm)
     hand_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
@@ -1580,7 +1609,7 @@ def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
     return dict(
         target=True,
         solved=False,
-        turn_deg=TURN_CANDIDATES_DEG[-1],
+        turn_deg=turn_candidates_deg(hand)[-1],
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
         hand_position=[float(v) for v in hand_coords.worldpos()],
@@ -1871,9 +1900,9 @@ def main():
             joint_positions = None
 
         target_pos = palm_target_position(palm)
-        rots = palm_to_target_rots(palm, robot_arm)
+        rots = palm_to_target_rots(palm, human_hand, robot_arm)
         picked, collision_ik_time, candidate_selection_time = solve_person_ik(
-            robot, palm, robot_arm, collision_obstacles,
+            robot, palm, human_hand, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
             base_limits=base_limits,
             collision_weight=args.collision_weight,
@@ -1895,7 +1924,7 @@ def main():
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, target_pos, rots[-1], base_limits,
-                collision_ik_time, candidate_selection_time)
+                collision_ik_time, candidate_selection_time, human_hand)
         else:
             turn_index, angle_vector, base_pose, post_process_result \
                 = picked
@@ -1903,7 +1932,7 @@ def main():
                 robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose,
                 base_limits, post_process_result, collision_ik_time,
-                candidate_selection_time)
+                candidate_selection_time, human_hand)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1
