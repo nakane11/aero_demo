@@ -165,14 +165,12 @@ collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し
 
 ### 3. jax の永続コンパイルキャッシュ
 
-`solve_palm_ik.py` は起動時に jax の永続コンパイルキャッシュ (既定で
-`~/.cache/jax_compilation_cache`, `JAX_COMPILATION_CACHE_DIR` 環境変数で
-変更できる) を有効にする。干渉回避付きバッチ IK の JIT コンパイルは
-計算グラフの形状 (`--collision-ik-stop`/`--attempts-per-pose`/
-`--skeleton-dir` の有無/使う腕 (`--robot-arm`) などで決まる) ごとに
-初回だけ必要な重い処理 (数分〜十数分かかることがある) で、以降は同じ
-venv/jax バージョンで同じ形状の計算であればディスクキャッシュから
-即座に読み込まれる。
+`solve_palm_ik.py`/`plan_handshake_motion.py` は起動時に jax の永続
+コンパイルキャッシュ (既定で `~/.cache/jax_compilation_cache`) を有効に
+する。初回コンパイルは数秒〜数十秒かかるが、同じ venv/jax バージョンで
+同じ形状の計算であれば以降はディスクキャッシュから読み込まれる。
+コンパイル時間の内訳・キャッシュの仕様・既知の問題と対策の詳細は
+[`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) を参照。
 
 ## 使い方
 
@@ -307,13 +305,14 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 起動時のウォームアップ (`_warmup_ik`) は、左右それぞれの腕で IK
 (`solve_person_ik`) だけでなく `plan_person_motion` (jaxls の軌道最適化)
 もダミー目標に対して 1 回ずつ解いておき、JAX/jaxls の初回コンパイルを
-前倒しで済ませる。scikit-robot 側の `JaxlsSolver` はコンパイル済み問題を
-腕ごと (`collision_link_list` が変わるため l/r で構造が異なる) に別々の
-キャッシュとして保持するため、この事前ウォームアップで両腕分がキャッシュ
-された状態になり、以後 ARMED のたびに差し出し手の左右が入れ替わっても
-再コンパイルは起きない。ただし通常運用では pre-touch/線形補間だけで
-事後検証に通ることが多く、その場合は jaxls 自体が呼ばれない
-(`plan_handshake_motion.py` の `--force-optimize` 説明・上記 4.5 参照)。
+前倒しで済ませる。腕ごとにコンパイル済み問題が別キャッシュとして保持
+されるため、この事前ウォームアップで両腕分がキャッシュされた状態になり、
+以後 ARMED のたびに差し出し手の左右が入れ替わっても再コンパイルは起きない
+(コンパイル時間の内訳・キャッシュ仕様の詳細は
+[`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 参照)。
+ただし通常運用では pre-touch/線形補間だけで事後検証に通ることが多く、
+その場合は jaxls 自体が呼ばれない (`plan_handshake_motion.py` の
+`--force-optimize` 説明・上記 4.5 参照)。
 
 ## 座標系
 
