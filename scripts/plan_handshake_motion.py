@@ -78,24 +78,31 @@ obstacle_distances`` / ``jaxls_solver._make_world_collision_cost``)、
 ロボット自身の干渉ジオメトリ (``collision_link_list``, 自己干渉および
 このシリンダーとの干渉の両方で使う) は、``apply_collision_model`` が
 差し替えた実際の ``collision_mesh`` (solve_palm_ik.py と同じプリミティブ
-近似) から ``extract_collision_spheres`` が外接カプセルの球近似を作る。
-こちらは scikit-robot 側の対応する関数 (``compute_sphere_obstacle_
-distances``/自己干渉) が球同士の距離しか扱えないため、ロボット側だけは
-引き続き球近似 (既定 3 個/リンクでは細長いリンクで隙間ができるため
-``--robot-spheres-per-link`` で増やせる、``build_problem`` 参照)。
+近似) をそのまま使う (``link.collision_primitive``、1 リンク 1 個の
+box/cylinder/sphere)。以前はロボット側だけ外接カプセルを球で近似して
+いたが (scikit-robot 側の対応する関数が球同士の距離しか扱えなかった
+ため)、これは (1) 事後検証・画面表示との形状の食い違い、(2) 自己干渉
+コストの残差数増大 (リンクペアあたり 球の個数 の 2 乗) という 2 つの
+デメリットがあった。scikit-robot (fork, ``base_limit`` ブランチ) 側に
+box/cylinder/sphere 同士の符号付き距離を直接扱える微分可能な関数
+(``skrobot.planner.trajectory_optimization.fk_utils.
+primitive_pair_signed_distance`` -- 球以外の組は交互射影による近似)
+を追加し、``TrajectoryProblem`` 側もリンクごとに厳密な 1 プリミティブを
+使うようにしたことで、この球近似は不要になった (対応しているのは
+``jaxls`` バックエンドのみ)。
 
 最適化中のこれらのコストは warm start を厳密解に近づけるためのもので、
-収束が実際に干渉を解消した保証にはならない (ロボット側は依然として球
-近似であることに加え、ソフトな制約であるため)。``plan_person_motion``
-は必ず ``solve_palm_ik.collision_pairs_min_distance`` (厳密な
-``collision_mesh`` の頂点そのものを使う、``solve_palm_ik.py`` の事後検証
-と全く同じ関数) で経路上の全 waypoint を検証し、``verified`` フラグに
-反映する。
+収束が実際に干渉を解消した保証にはならない (box/cylinder 同士の交互
+射影は深い貫入時の収束を理論的に保証しないことに加え、ソフトな制約で
+もあるため)。``plan_person_motion`` は必ず ``solve_palm_ik.collision_
+pairs_min_distance`` (厳密な ``collision_mesh`` の頂点そのものを使う、
+``solve_palm_ik.py`` の事後検証と全く同じ関数) で経路上の全 waypoint
+を検証し、``verified`` フラグに反映する。
 
 ``plan_person_motion`` はまず最適化を掛けずに、上記の幾何的な構成だけで
 作った軌道 (pre-touch 経由、次に単純な線形補間) をこの厳密検証に通す --
 実測ではこれだけで干渉なしになることが多く、そのときは最適化を行わない
-(球近似のコストで最適化すると、かえって厳密検証上の余裕を削ってしまう
+(最適化コストで最適化すると、かえって厳密検証上の余裕を削ってしまう
 場合がある)。どちらも干渉が残ったときだけ ``jaxls`` で最適化し、それでも
 通らなければ warm start を揺らして ``--motion-attempts`` 回まで解き直す。
 
@@ -148,8 +155,6 @@ from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.planner.trajectory_optimization.problem import (  # noqa: E402
     TrajectoryProblem)
-from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
-    extract_collision_spheres)
 from skrobot.planner.trajectory_optimization.solvers import (  # noqa: E402
     create_solver)
 from skrobot.planner.trajectory_optimization.trajectory import (  # noqa: E402
@@ -206,14 +211,7 @@ DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 # 経路上の通過点はそこまで厳密でなくてよいとして 1 cm まで許容する。
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = 0.01  # [m]
 
-# ロボット側の 1 リンクあたりの球の個数 (``extract_collision_spheres`` の
-# ``n_spheres_per_link``)。``TrajectoryProblem.add_collision_cost`` は
-# 内部でこれを 3 固定で呼ぶため、``build_problem`` で呼び直して上書きする
-# (モジュール docstring 参照)。
-DEFAULT_ROBOT_SPHERES_PER_LINK = 6
 
-# シリンダーの軸長が実質 0 (退化した「線分」、``solve_palm_ik.human_
-# capsules`` が掌・ダミー障害物に使う) のときに与える最小の半長 [m]。
 def human_body_cylinder_obstacles(joint_positions):
     """``solve_palm_ik.human_body_obstacles`` が返す全 ``Cylinder`` (体幹・
     頭部・四肢・掌・指、関節欠損はダミーで埋め済み) を、``TrajectoryProblem.
@@ -329,8 +327,7 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
                   collision_activation_distance,
                   self_collision_activation_distance,
                   smoothness_weight, acceleration_weight,
-                  collision_weight=100.0, self_collision_weight=100.0,
-                  robot_spheres_per_link=DEFAULT_ROBOT_SPHERES_PER_LINK):
+                  collision_weight=100.0, self_collision_weight=100.0):
     """``TrajectoryProblem`` を組み立てる (始点・終点はまだ固定するだけで
     値は入れない -- 呼び出し側が初期軌道・境界値を渡す)。
 
@@ -339,8 +336,8 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
     ペナルティ項の初期重みにしかならず、収束を保証しない -- 経路上の
     干渉は必ず ``verify_waypoints`` の厳密形状による事後検証で確認する
     こと (``solve_palm_ik.py`` の ``pick_verified_candidate`` と同じ理由:
-    最適化中に使う障害物は球による近似なので、これが 0 に収束していても
-    実メッシュでは接触が残ることがある)。"""
+    最適化中の box/cylinder 同士の距離は交互射影による近似なので、これが
+    0 に収束していても実メッシュでは接触が残ることがある)。"""
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     problem = TrajectoryProblem(
         robot_model=robot, link_list=link_list, n_waypoints=n_waypoints,
@@ -353,14 +350,11 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
         weight=collision_weight,
         activation_distance=collision_activation_distance,
         as_constraint=True)
-    # add_collision_cost は内部で extract_collision_spheres(...,
-    # n_spheres_per_link=3) を固定で呼ぶ (n_spheres_per_link を指定する
-    # 引数が無い)。3 個/リンクでは細長いリンクの外接カプセルに隙間が
-    # できるため、ここで同じ関数を明示的な個数で呼び直して上書きする
-    # (add_self_collision_cost は self.collision_spheres['link_indices']
-    # をこの呼び出しの後に参照するので、必ずこの直後で行う)。
-    problem.collision_spheres = extract_collision_spheres(
-        robot, collision_link_list, n_spheres_per_link=robot_spheres_per_link)
+    # add_collision_cost が内部で collision_link_list の各リンクの
+    # link.collision_primitive (apply_collision_model が差し替えた
+    # box/cylinder/sphere, solve_palm_ik.py と全く同じ形状) から
+    # problem.collision_primitives を組み立てる (モジュール docstring
+    # 参照)。add_self_collision_cost はその結果を直後に参照する。
     problem.add_self_collision_cost(
         weight=self_collision_weight,
         activation_distance=self_collision_activation_distance,
@@ -526,8 +520,9 @@ def not_planned_result(reason):
 def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
     """warm start をランダムに揺らした軌道を作る (始点・終点は変えない)。
 
-    最適化中に使う干渉モデルは球による近似のため局所解に落ちて経路上の
-    厳密な干渉を見逃すことがある (モジュール docstring / ``build_problem``
+    最適化中に使う干渉コストは box/cylinder 同士の交互射影による近似の
+    ため局所解に落ちて経路上の厳密な干渉を見逃すことがある (モジュール
+    docstring / ``build_problem``
     参照)。``solve_palm_ik.py`` が 1 目標につき多数の初期値から並列に IK
     を解いて最初に厳密検証を通った解を採用するのと同じ発想で、warm start
     を変えた ``--motion-attempts`` 回のリトライのうち最初に厳密検証を
@@ -550,8 +545,9 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     通り抜けない最終接近になる) を優先し、次に始点と終点を単純に線形補間
     しただけのもの (``build_initial_trajectory``、pre-touch の IK が
     解けなかった場合の保険) を試す。どちらかが干渉なしならそのまま採用
-    する -- 最適化中の干渉判定はロボット側が球近似なので、無理に最適化
-    すると厳密検証上の余裕を削ってしまうことがある (実測で確認)。
+    する -- 最適化中の干渉コストは box/cylinder 同士の交互射影による
+    近似なので、無理に最適化すると厳密検証上の余裕を削ってしまうことが
+    ある (実測で確認)。
 
     どちらも干渉が残った場合だけ ``jaxls`` で最適化し、``--motion-
     attempts`` 回まで warm start を揺らして
@@ -635,8 +631,7 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
         args.self_collision_activation_distance,
         args.smoothness_weight, args.acceleration_weight,
         collision_weight=args.collision_weight,
-        self_collision_weight=args.self_collision_weight,
-        robot_spheres_per_link=args.robot_spheres_per_link)
+        self_collision_weight=args.self_collision_weight)
     solver = create_solver('jaxls', max_iterations=args.max_iterations,
                            verbose=False)
     rng = np.random.RandomState(args.seed)
@@ -736,13 +731,14 @@ def main():
             DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE))
     parser.add_argument(
         '--collision-weight', type=float, default=100.0,
-        help='人体との干渉コストの重み (既定 100.0)。最適化中の干渉判定は '
-            '球による近似なので、大きくしても厳密形状での事後検証 '
+        help='人体との干渉コストの重み (既定 100.0)。box/cylinder 同士は '
+            '交互射影による近似なので、大きくしても厳密形状での事後検証 '
             '(verified) が必ず通るとは限らない。')
     parser.add_argument(
         '--self-collision-weight', type=float, default=100.0,
         help='自己干渉コストの重み (既定 100.0)。--collision-weight と '
-            '同じ注意点 (球近似) が当てはまる。')
+            '同じ注意点 (box/cylinder 同士の交互射影による近似) が '
+            '当てはまる。')
     parser.add_argument(
         '--smoothness-weight', type=float,
         default=DEFAULT_SMOOTHNESS_WEIGHT,
@@ -757,21 +753,14 @@ def main():
         '--motion-attempts', type=int, default=3,
         help='線形補間だけでは干渉が残った場合に、warm start を変えて '
             '厳密検証に通るまで最適化を解き直す最大回数 (既定 3)。'
-            '最適化中の干渉モデルはロボット側が球による近似なので、局所解 '
-            'に落ちて経路上の干渉を見逃すことがある (perturb_initial_'
-            'trajectory 参照)。全て失敗したら最も貫通が浅い軌道を '
-            'verified: false のまま採用する。')
+            'box/cylinder 同士の交互射影による干渉コストは局所解に落ちて '
+            '経路上の干渉を見逃すことがある (perturb_initial_trajectory '
+            '参照)。全て失敗したら最も貫通が浅い軌道を verified: false の '
+            'まま採用する。')
     parser.add_argument(
         '--motion-attempt-perturbation', type=float, default=0.3,
         help='2 回目以降のリトライで中間 waypoint の腕関節角に足す '
             'ガウスノイズの標準偏差 [rad] (既定 0.3)。')
-    parser.add_argument(
-        '--robot-spheres-per-link', type=int,
-        default=DEFAULT_ROBOT_SPHERES_PER_LINK,
-        help='ロボットの各リンクの実際の干渉ジオメトリ (apply_collision_'
-            'model 適用後の collision_mesh, solve_palm_ik.py と同じ) を '
-            '近似する球の個数 (既定 {})。'.format(
-                DEFAULT_ROBOT_SPHERES_PER_LINK))
     parser.add_argument(
         '--collision-verify-tolerance', type=float,
         default=DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,

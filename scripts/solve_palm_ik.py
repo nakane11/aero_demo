@@ -1083,9 +1083,18 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False,
                if collision_link is not None else None)
         if mesh is not None:
             link.collision_mesh = mesh
+            # collision_link.collision_primitive (box/cylinder/sphere
+            # params, set by RobotModel.load_urdf_file when the URDF's
+            # <collision> is a single primitive) travels along with the
+            # mesh, so aero_demo.plan_handshake_motion's jaxls trajectory
+            # cost can use the exact same shape instead of falling back
+            # to a bounding sphere.
+            link.collision_primitive = getattr(
+                collision_link, 'collision_primitive', None)
             n_replaced += 1
         elif explicit_exclude:
             link.collision_mesh = None
+            link.collision_primitive = None
             n_excluded += 1
     print('[collision-model] {} 個のリンクの干渉ジオメトリを ({}) から '
           '差し替えました{}。'.format(
