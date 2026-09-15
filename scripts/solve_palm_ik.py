@@ -18,6 +18,10 @@ Aero は常にワールド原点・台車位置固定で IK を開始する (``s
 に来るようにしてから IK を解く (``human_translation_offset``/
 ``translate_joint_positions``/``translate_palm`` 参照)。台車の移動範囲は
 ``--base-x-range``/``--base-y-range``/``--base-yaw-range`` で指定する。
+このうち y (左右) の範囲は既定で、差し出している手の側 (人間の中心より
+実測の手の位置が y 方向にどちらへずれているか) だけに人物ごとに制限
+される (``offered_hand_side_sign``/``restrict_base_y_range_to_hand_side``
+参照。``--no-hand-side-base-constraint`` で無効化可)。
 
 人体を障害物とした干渉回避も行う。``--skeleton-dir`` から人物ごとの全身の
 関節位置を読み、体幹・頭部・四肢を ``skrobot.model.primitives.Cylinder``
@@ -618,6 +622,71 @@ def translate_palm(palm, offset):
     position[1] += dy
     translated['position'] = position
     return translated
+
+
+def offered_hand_side_sign(human_hand, joint_positions, palm):
+    """差し出している手 (``human_hand``, 'R'/'L') が、人物の立ち位置
+    (``human_standing_xy``) から見て台車の y 方向 (左右) のどちら側に
+    出ているかを符号 (+1.0/-1.0) で返す。立ち位置・手の位置のどちらかが
+    求まらない、または y 方向の差がほぼ 0 (手が体の正面付近にある)
+    場合は ``None`` を返す。
+
+    ``joint_positions``/``palm`` は ``human_translation_offset``
+    適用後 (人物が Aero 前方に平行移動済み) のものを渡す想定。この
+    平行移動で人物の立ち位置の y 座標は常に 0 になるため、実質的には
+    差し出している手の y 座標の符号がそのまま返る。手首関節
+    (``{hand}Wrist``) の位置を優先し、骨格に無ければ掌の位置
+    (``palm['position']``) で代用する。
+
+    「人間の中心よりも手を差し出している側に台車を立たせる」制約
+    (``restrict_base_y_range_to_hand_side`` 参照) は、向かい合わず
+    人間と同じ方向を向いて反対側の手で繋ぐ想定 (モジュール先頭の
+    docstring 参照) のもとで自然な位置取りにするためのもので、実測の
+    手の位置 (``hand`` の左右ラベルではなく世界座標系での実際のオフ
+    セット) を基準にすることで、人物がどちらを向いていても (体の正面
+    方向を仮定せずに) 一貫して働く。
+    """
+    if joint_positions is None:
+        return None
+    center_xy = human_standing_xy(joint_positions)
+    if center_xy is None:
+        return None
+    wrist_name = '{}Wrist'.format(human_hand)
+    if wrist_name in joint_positions:
+        hand_xy = np.asarray(
+            joint_positions[wrist_name], dtype=np.float64)[:2]
+    elif palm is not None:
+        hand_xy = np.asarray(palm['position'], dtype=np.float64)[:2]
+    else:
+        return None
+    diff_y = float(hand_xy[1] - center_xy[1])
+    if abs(diff_y) < 1e-6:
+        return None
+    return 1.0 if diff_y > 0.0 else -1.0
+
+
+def restrict_base_y_range_to_hand_side(base_y_range, side_sign):
+    """台車の y 可動範囲 ``base_y_range`` (下限, 上限) を、``side_sign``
+    (``offered_hand_side_sign`` の符号) の側だけに制限したものを返す。
+
+    人物の立ち位置は ``human_translation_offset`` により y=0 に平行移動
+    されているため、「人間の中心より手を差し出している側に立つ」制約は、
+    台車の y が ``side_sign`` と同じ符号であることに等しい (0 は境界と
+    して許容する)。``side_sign`` が ``None`` (立ち位置・手の位置が求まら
+    ない等) のときは制限せずそのまま返す。``base_y_range`` が既に
+    ``side_sign`` の側を含まない (例えば元々 y>0 側しか許可していない
+    範囲に ``side_sign=-1.0`` を指定した) 場合、制限すると空になって
+    IK が解けなくなってしまうため、制限せず ``base_y_range`` をそのまま
+    返す。
+    """
+    if side_sign is None:
+        return base_y_range
+    lo, hi = base_y_range
+    if side_sign > 0.0:
+        restricted_lo = max(lo, 0.0)
+        return (restricted_lo, hi) if restricted_lo <= hi else base_y_range
+    restricted_hi = min(hi, 0.0)
+    return (lo, restricted_hi) if lo <= restricted_hi else base_y_range
 
 
 def seed_arm_pose(robot, robot_arm):
@@ -2010,6 +2079,13 @@ def main():
         help='台車の向き (yaw) の範囲 [rad] (既定 {:.4f} {:.4f})。'.format(
             *DEFAULT_BASE_YAW_RANGE))
     parser.add_argument(
+        '--no-hand-side-base-constraint', dest='hand_side_base_constraint',
+        action='store_false',
+        help='台車の y 可動範囲を、差し出している手の側 '
+            '(``offered_hand_side_sign``) だけに制限する制約を無効にする '
+            '(既定は有効。--skeleton-dir に骨格 JSON が無い等で手の側が '
+            '判定できない人物には、指定に関わらずもともと働かない)。')
+    parser.add_argument(
         '--seed', type=int, default=None,
         help='バッチ IK の乱数初期値に使う numpy の乱数シード。指定すると '
             '実行ごとに同じ解が得られる (既定は指定なし)。')
@@ -2142,12 +2218,29 @@ def main():
             collision_obstacles = []
             joint_positions = None
 
+        # 差し出している手の側 (人間の中心より、手を差し出している側に
+        # 台車を立たせる) を、台車の y 可動範囲を制限することで反映する
+        # (offered_hand_side_sign/restrict_base_y_range_to_hand_side
+        # 参照)。この人物専用の base_limits を作るだけで、以降の
+        # solve_person_ik はこれまでどおりこの人物 1 人分を 1 回のバッチ
+        # IK で解く。
+        person_base_limits = base_limits
+        if args.hand_side_base_constraint:
+            side_sign = offered_hand_side_sign(
+                human_hand, joint_positions, palm)
+            if side_sign is not None:
+                person_base_limits = [
+                    base_limits[0],
+                    restrict_base_y_range_to_hand_side(
+                        base_limits[1], side_sign),
+                    base_limits[2]]
+
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, human_hand, robot_arm)
         picked, collision_ik_time, candidate_selection_time = solve_person_ik(
             robot, palm, human_hand, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
-            base_limits=base_limits,
+            base_limits=person_base_limits,
             collision_weight=args.collision_weight,
             collision_margin=args.collision_margin,
             self_collision=(args.self_collision and collision_pairs is not None),
@@ -2170,7 +2263,7 @@ def main():
                 and args.post_process_max_candidates > 0 else None))
         if picked is None:
             result = unsolved_result(
-                robot, robot_arm, target_pos, rots[-1], base_limits,
+                robot, robot_arm, target_pos, rots[-1], person_base_limits,
                 collision_ik_time, candidate_selection_time, human_hand,
                 palm)
         else:
@@ -2179,7 +2272,7 @@ def main():
             result = solved_result(
                 robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose,
-                base_limits, post_process_result, collision_ik_time,
+                person_base_limits, post_process_result, collision_ik_time,
                 candidate_selection_time, human_hand, palm)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
