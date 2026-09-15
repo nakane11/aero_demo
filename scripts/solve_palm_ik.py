@@ -192,6 +192,18 @@ DEFAULT_POST_PROCESS_IK_STOP = 40
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
+# pick_verified_candidate が曲げ量コスト昇順に干渉の事後検証
+# (collision_pairs_min_distance) + solve_post_process を試す候補数の上限。
+# どちらも 1 回あたりのコストが軽くない処理で、収束した候補
+# (success_flags) の数が非常に多い場合に備えた安全弁として上限を設けて
+# ある (曲げ量コストの計算自体は angle_vectors から直接計算する軽い処理
+# なので、全収束候補に対して行っても問題ない -- pick_verified_candidate
+# 参照)。それでも上限に達した場合は、そこまでに調べた中での曲げ量コスト
+# 最小の候補を後処理前のままフォールバック採用する。``None`` を指定する
+# と打ち切らず全候補を試す (計測上は既定値でも性能上問題ないことを確認
+# 済みだが、念のため上限を残してある)。
+DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
+
 # 後処理判定の視線 IK (人間の手を見る首 3 関節) の最大反復回数・収束閾値
 # (姿勢のみ, rotation_mask='xy' で視線軸まわりの回転は見ない)。
 DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
@@ -206,6 +218,43 @@ ELBOW_MIN_ANGLE_DEG = -120.0
 # 干渉回避付きバッチ IK (solve_person_ik) だけに適用する、関節可動域の
 # 上下マージン比率 (restrict_joint_range_margin 参照)。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
+
+# 候補選択 (pick_verified_candidate) で使う「関節の曲げ量コスト」の対象
+# 関節 (接尾辞, {arm}_{接尾辞}_joint) と重み。台車の移動量・首の関節・
+# ヨー軸 (shoulder_y/wrist_y, 軸まわりの回転は曲げの不自然さに寄与しない
+# ため対象外) は含めない。各関節角 (ラジアン, 0 度=ニュートラル。
+# restrict_elbow_range のとおり elbow は 0 度が腕をまっすぐ伸ばした状態)
+# からの重み付き二乗和をコストとする。重みは今のところ全関節 1.0 の
+# 定数だが、辞書にしておくことで将来関節ごとに調整しやすくしてある。
+JOINT_BEND_COST_JOINTS = {
+    'shoulder_p': 1.0,
+    'shoulder_r': 1.0,
+    'elbow': 1.0,
+    'wrist_p': 1.0,
+    'wrist_r': 1.0,
+}
+
+
+def _joint_bend_cost_indices(robot, robot_arm, weights=JOINT_BEND_COST_JOINTS):
+    """``JOINT_BEND_COST_JOINTS`` の各関節について、``robot.angle_vector()``
+    が返す配列 (= ``robot.joint_list`` の並び) 中でのインデックスと重みの
+    リストを返す。``pick_verified_candidate`` が ``batch_inverse_
+    kinematics`` の生の ``angle_vectors`` から (``robot`` の状態を書き換え
+    ずに) 直接コストを計算する際に使う。"""
+    index_by_name = {joint.name: i for i, joint in enumerate(robot.joint_list)}
+    return [(index_by_name['{}_{}_joint'.format(robot_arm, suffix)], weight)
+           for suffix, weight in weights.items()]
+
+
+def _joint_bend_cost_from_vector(angle_vector, bend_cost_indices):
+    """``angle_vector`` (``robot.angle_vector()`` と同じ並びの関節角配列)
+    から、``_joint_bend_cost_indices`` が返すインデックス・重みを使って
+    「曲げ量コスト」(対象関節角 (ラジアン) の重み付き二乗和) を計算する。
+    値が小さいほど自然な (曲がりの少ない) 姿勢とみなす。"""
+    cost = 0.0
+    for index, weight in bend_cost_indices:
+        cost += weight * float(angle_vector[index]) ** 2
+    return cost
 
 # 人体の干渉回避用ジオメトリ: (骨格の関節名 A, 関節名 B, 半径[m]) の
 # タプルの並び。BODY_JOINT_NAMES (generate_random_human_poses.py) の
@@ -1302,15 +1351,17 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             attempts_per_pose=DEFAULT_ATTEMPTS_PER_POSE,
                             post_process_ik_stop=DEFAULT_POST_PROCESS_IK_STOP,
                             post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
-                            post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE):
+                            post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
+                            post_process_max_candidates=(
+                                DEFAULT_POST_PROCESS_MAX_CANDIDATES)):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
-    以下を全て満たす候補を、添字最小 (最優先) のものから探して返す。
+    以下を全て満たす候補を、**関節の曲げ量コスト (``joint_bend_cost``)
+    が最小のものから**順に探して返す。
 
     候補は「向き (``turn_candidates_deg(hand)``) × 初期値 (``attempts_per_
     pose``)」の全組み合わせで、添字は向き優先の並び (``向きの添字 = 添字
-    // attempts_per_pose``) になっている。優先順位は「向きが早いもの」→
-    「その向きの中で初期値が早いもの」。
+    // attempts_per_pose``) になっている。
 
     1. IK が収束している (``success_flags``)。
     2. ``verification_pairs`` を実際には貫通していない
@@ -1322,10 +1373,25 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     ``collision_pairs`` ではなく、``build_collision_verification_pairs``
     が作る総当たりの組み合わせを渡す想定。
 
-    1・2 を満たすが 3 に失敗した候補は棄却し、次の添字を試す。1・2・3 を
-    全て満たす候補が見つからなかった場合のみ、1・2 を満たした最初の候補
-    (``fallback``) を後処理前のまま (``post_process_result`` を ``None``
-    にして) 採用するフォールバックを行う。
+    まず 1 を満たす候補全てについて、``angle_vectors`` の値から直接
+    (``robot`` の状態を書き換えずに) 曲げ量コストだけを計算し、昇順に
+    並べ替える (この段階は関節角配列の参照だけなので軽い)。続けてコストの
+    安い方から順に、候補ごとに ``robot`` へ姿勢を反映して 2・3
+    (``collision_pairs_min_distance`` による事後検証 -> ``solve_post_
+    process``) を試す。``collision_pairs_min_distance``/``solve_post_
+    process`` はどちらも形状の距離計算や反復 IK を伴う重い処理で、収束
+    した候補 (``success_flags``) の数が多いとき全件に対して行うと大幅に
+    遅くなるため、``post_process_max_candidates`` で調べる候補数の上限を
+    設け、それ以上はコストが低くても調べずに打ち切る。
+
+    2・3 を満たす候補が見つかればそれを採用して即座に返す。2 を満たすが
+    3 に失敗した候補は棄却し、次にコストが低い候補を試す。1 は満たすが
+    2 に失敗した (事後検証で貫通していた) 候補は完全に除外する。3 に成功
+    する候補が (上限に達するまでに) 見つからなかった場合のみ、調べた中で
+    2 を満たした曲げ量コスト最小の候補 (``fallback``。調べる順がコスト
+    昇順なので、2 を満たした最初の候補がそのままそれになる) を後処理前の
+    まま (``post_process_result`` を ``None`` にして) 採用するフォール
+    バックを行う。
 
     候補を検証するにはロボットにその候補の姿勢を反映する必要があるため、
     検証のたびに ``robot`` を書き換える -- 呼び出し後の ``robot`` は最後に
@@ -1340,17 +1406,37 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         deg(hand)``/``rots`` の添字)。``post_process_result`` は
         ``solve_post_process`` が返した後処理後の結果 dict、後処理判定に
         失敗した候補をフォールバックで採用した場合は ``None``。1・2 を
-        満たす候補が 1 つも無ければ ``None`` を返す。
+        満たす候補が (調べた範囲で) 1 つも無ければ ``None`` を返す。
     """
     turn_degs = turn_candidates_deg(hand)
+    bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
+
+    # 第1パス (安価): 収束した候補全てについて、angle_vectors から直接
+    # 曲げ量コストだけを計算し (robot の状態は書き換えない)、昇順に
+    # 並べ替える。同着コストのタイブレークは添字順 (向き優先 -> 初期値順)
+    # にする。
+    candidates = sorted(
+        ((_joint_bend_cost_from_vector(
+            angle_vectors[candidate_index], bend_cost_indices),
+          candidate_index)
+         for candidate_index, ok in enumerate(success_flags) if ok),
+        key=lambda item: (item[0], item[1]))
+
+    # 第2パス (高コスト): 曲げ量コストが小さい候補から順に、干渉の事後
+    # 検証 (collision_pairs_min_distance) -> 後処理判定 (solve_post_
+    # process) を試す。post_process_max_candidates で調べる候補数の上限
+    # を設ける (None なら無制限)。
     fallback = None
-    for candidate_index, ok in enumerate(success_flags):
-        if not ok:
-            continue
+    examined = 0
+    for cost, candidate_index in candidates:
+        if (post_process_max_candidates is not None
+                and examined >= post_process_max_candidates):
+            break
+        examined += 1
         turn_index = candidate_index // attempts_per_pose
         attempt_index = candidate_index % attempts_per_pose
-        label = 'turn={:.0f}deg/初期値 {}'.format(
-            turn_degs[turn_index], attempt_index)
+        label = 'turn={:.0f}deg/初期値 {} (bend_cost={:.4f})'.format(
+            turn_degs[turn_index], attempt_index, cost)
         robot.angle_vector(angle_vectors[candidate_index])
         robot.newcoords(base_poses[candidate_index])
         min_dist = collision_pairs_min_distance(
@@ -1360,6 +1446,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                   'したが、事後検証で {:.4f} m 貫通していたため棄却'
                   'します。'.format(label, min_dist))
             continue
+        if fallback is None:
+            fallback = (turn_index, angle_vectors[candidate_index],
+                       base_poses[candidate_index], cost)
         post_result = solve_post_process(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop,
@@ -1368,16 +1457,17 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             return (turn_index, angle_vectors[candidate_index],
                     base_poses[candidate_index], post_result)
         print('  [post-process] {} の候補は干渉検証を通過した '
-              'が、後処理判定 (押し付け/視線 IK) には失敗したため、次の '
-              '候補を試します。'.format(label))
-        if fallback is None:
-            fallback = (turn_index, angle_vectors[candidate_index],
-                       base_poses[candidate_index], None)
-    if fallback is not None:
-        print('  [post-process] 全ての候補で後処理判定に失敗した '
-              'ため、turn={:.0f}deg の候補を後処理前の解として採用 '
-              'します。'.format(turn_degs[fallback[0]]))
-    return fallback
+              'が、後処理判定 (押し付け/視線 IK) には失敗したため、次に '
+              '曲げ量コストが低い候補を試します。'.format(label))
+
+    if fallback is None:
+        return None
+    turn_index, angle_vector, base_pose, fallback_cost = fallback
+    print('  [post-process] 調べた範囲の候補で後処理判定に全て失敗 '
+          'した (または上限に達した) ため、turn={:.0f}deg '
+          '(bend_cost={:.4f}) の候補を後処理前の解として採用します。'
+          .format(turn_degs[turn_index], fallback_cost))
+    return (turn_index, angle_vector, base_pose, None)
 
 
 def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
@@ -1399,7 +1489,9 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     collision_verify_tolerance=(
                         DEFAULT_COLLISION_VERIFY_TOLERANCE),
                     post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
-                    post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE):
+                    post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
+                    post_process_max_candidates=(
+                        DEFAULT_POST_PROCESS_MAX_CANDIDATES)):
     """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
     初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
@@ -1530,7 +1622,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         collision_verify_tolerance, robot_arm, palm, hand, rots,
         attempts_per_pose=attempts_per_pose,
         post_process_thre=post_process_thre,
-        post_process_rthre=post_process_rthre)
+        post_process_rthre=post_process_rthre,
+        post_process_max_candidates=post_process_max_candidates)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -1724,7 +1817,11 @@ def _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
             verification_pairs=verification_pairs,
             collision_verify_tolerance=args.collision_verify_tolerance,
             post_process_thre=args.post_process_thre,
-            post_process_rthre=math.radians(args.post_process_rthre))
+            post_process_rthre=math.radians(args.post_process_rthre),
+            post_process_max_candidates=(
+                args.post_process_max_candidates
+                if args.post_process_max_candidates
+                and args.post_process_max_candidates > 0 else None))
         print('[warmup] {}腕: バッチIKのトレース/コンパイル {:.1f} 秒'
               .format(robot_arm, time.time() - t0))
 
@@ -1845,6 +1942,12 @@ def main():
         help='後処理判定 (solve_post_process) の腕タスクの姿勢収束閾値 '
             '[deg] (既定 {:.1f})。視線タスクの閾値には影響しない。'
             .format(math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE)))
+    parser.add_argument(
+        '--post-process-max-candidates', type=int,
+        default=DEFAULT_POST_PROCESS_MAX_CANDIDATES,
+        help='pick_verified_candidate が関節の曲げ量コスト昇順に '
+            '干渉の事後検証 + solve_post_process を試す候補数の上限 '
+            '(既定は無制限)。0 以下を指定すると無制限に試す。')
     parser.add_argument(
         '--base-x-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
         default=list(DEFAULT_BASE_X_RANGE),
@@ -2014,7 +2117,11 @@ def main():
             verification_pairs=verification_pairs,
             collision_verify_tolerance=args.collision_verify_tolerance,
             post_process_thre=args.post_process_thre,
-            post_process_rthre=math.radians(args.post_process_rthre))
+            post_process_rthre=math.radians(args.post_process_rthre),
+            post_process_max_candidates=(
+                args.post_process_max_candidates
+                if args.post_process_max_candidates
+                and args.post_process_max_candidates > 0 else None))
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, target_pos, rots[-1], base_limits,
