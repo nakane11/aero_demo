@@ -54,10 +54,11 @@ self-collision`` で無効化できる)。チェックする組み合わせは�
 pairs`` 参照)。このファイルが既定のパスに無ければ、干渉回避を丸ごと
 無効にして通常のヤコビアン法の IK にフォールバックする。
 
-向きを 0/±90 度 (``TURN_CANDIDATES_DEG_BY_HAND``。ロボットの手首側が
-人間の親指側に来る向きを優先する順序で、差し出している手が左右どちらか
-で順序が変わる) ずらした目標を、それぞれ ``--attempts-per-pose`` 個の
-初期値から解き、そうしてできる全候補を順に
+向きを 0/±90 度 (``turn_candidates_deg``。ロボットの手首側が人間の親指
+側/小指側どちらに来る向きを優先するかは、差し出している手が左右どちら
+か、および掌が上/下どちらを向いているかで変わる) ずらした目標を、それ
+ぞれ ``--attempts-per-pose`` 個の初期値から解き、そうしてできる全候補を
+順に
 試して、干渉回避付きバッチ IK が解けて (収束・事後の干渉検証を通過して)
 かつ後処理判定にも成功した最初のものを採用する (``pick_verified_
 candidate`` 参照)。``return_all_attempts=True`` を渡し、初期値ごとの解を
@@ -117,20 +118,60 @@ from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 # 掌のローカル +Y (甲->掌方向) まわりにこの角度ずつ向きをずらした候補を
 # 順に試し、IK が解けた最初のものを採用する。差し出している手 (offered_
 # hand, 'R'/'L') によって、ロボットの手首側 (r/l_eef_grasp_link のロー
-# カル -X 方向) が人間の親指側に来る回転方向が逆になる (親指側が右手は
-# +Y まわり +90 度、左手は -90 度。solve_palm_ik.py へのユーザーからの
-# 質問への回答/導出過程を参照) ため、親指側の向きを最優先、次に回転なし
-# (0 度)、最後に小指側が手首に来る向きの順にする。
-TURN_CANDIDATES_DEG_BY_HAND = {
-    'R': (90.0, 0.0, -90.0),
-    'L': (-90.0, 0.0, 90.0),
-}
+# カル -X 方向) が人間の親指側/小指側に来る回転方向が逆になる (親指側が
+# 右手は +Y まわり +90 度、左手は -90 度。solve_palm_ik.py へのユーザー
+# からの質問への回答/導出過程を参照)。
+THUMB_SIDE_DEG_BY_HAND = {'R': 90.0, 'L': -90.0}
+PINKY_SIDE_DEG_BY_HAND = {'R': -90.0, 'L': 90.0}
+
+# 掌の法線 (``palm['y_axis']``、甲->掌方向) の世界座標系 (base_link) の
+# 鉛直成分 (z 成分) に対する、上向き/下向きと判定するしきい値。
+# |normal_z| がこれ未満 (法線がほぼ水平 = 掌が横 (人間から見て左右) を
+# 向いている) の場合は、上向き/下向きのどちらとも言えないため、ひねりを
+# 加えない (0 度、= 推定した掌の向きをそのまま使う) 候補を最優先にする。
+# しきい値は法線と鉛直線のなす角が 30 度未満/150 度超なら「上/下向き」、
+# 60〜120 度なら「横向き」とみなす目安 (sin(30度) = 0.5)。
+PALM_VERTICAL_THRESHOLD = math.sin(math.radians(30.0))
 
 
-def turn_candidates_deg(hand):
-    """差し出している人間の手 ``hand`` ('R'/'L') に応じた、向きを振る順序
-    (度, ``TURN_CANDIDATES_DEG_BY_HAND`` 参照) を返す。"""
-    return TURN_CANDIDATES_DEG_BY_HAND[hand]
+def turn_candidates_deg(hand, palm):
+    """差し出している人間の手 ``hand`` ('R'/'L') と、その掌の位置姿勢
+    ``palm`` (``estimate_palm_poses.PalmPoseEstimator`` の出力の 1 手分)
+    に応じた、向きを振る順序 (度) を返す。
+
+    掌の法線 (``palm['y_axis']``、甲->掌方向) の鉛直成分から、掌が上を
+    向いている (手のひらを上に差し出している) か、甲が上を向いている
+    (手の甲を上に差し出している) かを判定し、以下の優先順位にする。
+
+    - 甲が上向き: ロボットの手首側が人間の小指側に来る向きを最優先。
+      (手の甲側から握手すると想定した場合、ロボットの手が小指側から
+      被さる方が不自然に手をひねらずに済むため。)
+    - 掌が上向き: ロボットの手首側が人間の親指側に来る向きを最優先。
+      (通常の握手と同じ向きになるため。)
+    - どちらとも言えない (掌がほぼ横 (左右) を向いている,
+      ``PALM_VERTICAL_THRESHOLD`` 参照): 親指側/小指側どちらを優先すべき
+      か自明でないため、ひねりを加えない 0 度 (推定した掌の向きそのまま)
+      を最優先にする。
+
+    いずれの場合も、最優先の向きの次点として 0 度 (甲/掌が上下どちらか
+    はっきりしている場合)、または親指側 (0 度を最優先にした場合) を
+    2 番目、最後に残りの向きを試す。
+    """
+    thumb_deg = THUMB_SIDE_DEG_BY_HAND[hand]
+    pinky_deg = PINKY_SIDE_DEG_BY_HAND[hand]
+    normal_z = float(np.asarray(palm['y_axis'], dtype=np.float64)[2])
+    if normal_z > PALM_VERTICAL_THRESHOLD:
+        return (thumb_deg, 0.0, pinky_deg)
+    if normal_z < -PALM_VERTICAL_THRESHOLD:
+        return (pinky_deg, 0.0, thumb_deg)
+    return (0.0, thumb_deg, pinky_deg)
+
+
+# ``turn_candidates_deg`` が返す候補数 (常に 3: 親指側/0 度/小指側)。実際の
+# 角度・順序は ``hand``/``palm`` に応じて変わるため、候補数だけを外部
+# (``grid_search_collision_ik.py`` の ``--turn-candidates`` 既定値等) から
+# 参照したい場合はこちらを使う。
+NUM_TURN_CANDIDATES = 3
 
 # 人間の手 (掌 JSON の offered_hand) に対して既定で使うロボットの腕
 # (--robot-arm auto)。向かい合わず、人間と同じ方向を向いて反対側の手で
@@ -500,7 +541,7 @@ def palm_to_target_rots(palm, hand, robot_arm):
     z_axis = np.cross(x_axis, y_axis)
     base_rot = np.column_stack([x_axis, y_axis, z_axis])
     return [_correct_grasp_frame(_turn_about_y(base_rot, deg), robot_arm)
-           for deg in turn_candidates_deg(hand)]
+           for deg in turn_candidates_deg(hand, palm)]
 
 
 def palm_target_position(palm):
@@ -1412,7 +1453,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         失敗した候補をフォールバックで採用した場合は ``None``。1・2 を
         満たす候補が (調べた範囲で) 1 つも無ければ ``None`` を返す。
     """
-    turn_degs = turn_candidates_deg(hand)
+    turn_degs = turn_candidates_deg(hand, palm)
     bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
 
     # 第1パス (安価): 収束した候補全てについて、angle_vectors から直接
@@ -1648,12 +1689,13 @@ def base_movable_region(base_limits):
 
 def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
                   angle_vector, base_pose, base_limits, post_process_result,
-                  collision_ik_time, candidate_selection_time, hand):
+                  collision_ik_time, candidate_selection_time, hand, palm):
     """採用した解をロボットに反映し、結果 dict を組む.
 
-    ``hand`` は差し出している人間の手 ('R'/'L')。``turn_deg`` を
-    ``turn_candidates_deg(hand)`` から引くのに使う (``turn_index`` は
-    その並びの添字であり、実際の角度は ``hand`` によって変わるため)。
+    ``hand`` は差し出している人間の手 ('R'/'L')、``palm`` はその掌の位置
+    姿勢。``turn_deg`` を ``turn_candidates_deg(hand, palm)`` から引くのに
+    使う (``turn_index`` はその並びの添字であり、実際の角度は ``hand``/
+    ``palm`` によって変わるため)。
 
     バッチ IK はロボットを動かさないので、``angle_vector`` と
     ``base_pose`` を実際に反映してから手先・台車の姿勢を読み直す。
@@ -1674,7 +1716,7 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
     result = dict(
         target=True,
         solved=True,
-        turn_deg=turn_candidates_deg(hand)[turn_index],
+        turn_deg=turn_candidates_deg(hand, palm)[turn_index],
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
         hand_position=[float(v) for v in hand_coords.worldpos()],
@@ -1692,13 +1734,13 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
 
 
 def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
-                    collision_ik_time, candidate_selection_time, hand):
+                    collision_ik_time, candidate_selection_time, hand, palm):
     """どの候補も解けなかった人物のための結果 dict.
 
     種の姿勢 (台車は ``solve_person_ik`` と同じくワールド原点) を反映して
     から手先・台車の姿勢を読む。``turn_deg``/``target_rot`` は最後に試した
-    候補のものにする。``hand`` は差し出している人間の手 ('R'/'L',
-    ``solved_result`` 参照)。
+    候補のものにする。``hand``/``palm`` は差し出している人間の手 ('R'/'L')
+    とその掌の位置姿勢 (``solved_result`` 参照)。
     """
     seed_arm_pose(robot, robot_arm)
     hand_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
@@ -1706,7 +1748,7 @@ def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
     return dict(
         target=True,
         solved=False,
-        turn_deg=turn_candidates_deg(hand)[-1],
+        turn_deg=turn_candidates_deg(hand, palm)[-1],
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
         hand_position=[float(v) for v in hand_coords.worldpos()],
@@ -2129,7 +2171,8 @@ def main():
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, target_pos, rots[-1], base_limits,
-                collision_ik_time, candidate_selection_time, human_hand)
+                collision_ik_time, candidate_selection_time, human_hand,
+                palm)
         else:
             turn_index, angle_vector, base_pose, post_process_result \
                 = picked
@@ -2137,7 +2180,7 @@ def main():
                 robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose,
                 base_limits, post_process_result, collision_ik_time,
-                candidate_selection_time, human_hand)
+                candidate_selection_time, human_hand, palm)
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1

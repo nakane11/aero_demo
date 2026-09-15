@@ -758,7 +758,7 @@ class HandshakePipelineNode(object):
             handshake = spik.solved_result(
                 self.robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
-                post_process_result, 0.0, 0.0, hand)
+                post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
             t0 = time.time()
             phm.plan_person_motion(
                 self.robot, robot_arm, handshake, {}, warmup_human_xy,
@@ -1170,14 +1170,14 @@ class HandshakePipelineNode(object):
             result = spik.unsolved_result(
                 self.robot, robot_arm, target_pos, rots[-1],
                 self.base_limits, collision_ik_time,
-                candidate_selection_time, offered_hand)
+                candidate_selection_time, offered_hand, translated_palm)
         else:
             turn_index, angle_vector, base_pose, post_process_result = picked
             result = spik.solved_result(
                 self.robot, robot_arm, target_pos, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, collision_ik_time,
-                candidate_selection_time, offered_hand)
+                candidate_selection_time, offered_hand, translated_palm)
         result['offered_hand'] = offered_hand
         result['robot_arm'] = robot_arm
 

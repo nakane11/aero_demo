@@ -28,7 +28,11 @@ MediaPipe 形式の骨格・掌の
    IK に使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
    1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512)。
    初期値ごとの解は全て (向き 3 通り × 初期値の数) が干渉検証・後処理判定に
-   回され、最初に通ったものが採用される。干渉回避ペナルティの重み・
+   回され、最初に通ったものが採用される。向き 3 通り (ロボットの手首側が
+   人間の親指側/回転なし/小指側に来る候補) を試す優先順序は、掌が上を
+   向いていれば親指側、甲が上を向いていれば小指側、どちらとも言えない
+   (掌がほぼ横向き) 場合は回転なしを最優先にする
+   (`solve_palm_ik.turn_candidates_deg` 参照)。干渉回避ペナルティの重み・
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
    再現性は `--seed` で指定する。
@@ -163,15 +167,6 @@ collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し
 `FEETECH_HAND_DIR` 環境変数でそのディレクトリを指定する。
 
 
-### 3. jax の永続コンパイルキャッシュ
-
-`solve_palm_ik.py`/`plan_handshake_motion.py` は起動時に jax の永続
-コンパイルキャッシュ (既定で `~/.cache/jax_compilation_cache`) を有効に
-する。初回コンパイルは数秒〜数十秒かかるが、同じ venv/jax バージョンで
-同じ形状の計算であれば以降はディスクキャッシュから読み込まれる。
-コンパイル時間の内訳・キャッシュの仕様・既知の問題と対策の詳細は
-[`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) を参照。
-
 ## 使い方
 
 SMPL のモデルファイル (`.pkl`) はライセンス上リポジトリに同梱されていない
@@ -301,18 +296,6 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 `--execute-base`/`--execute-arm` を指定しなければ実機は一切動かさない
 ので、このテストに実ロボットは不要 (`--bag` のクリップに `tf`/`tf_static`
 も含めているため、実ロボットの TF 配信も不要)。
-
-起動時のウォームアップ (`_warmup_ik`) は、左右それぞれの腕で IK
-(`solve_person_ik`) だけでなく `plan_person_motion` (jaxls の軌道最適化)
-もダミー目標に対して 1 回ずつ解いておき、JAX/jaxls の初回コンパイルを
-前倒しで済ませる。腕ごとにコンパイル済み問題が別キャッシュとして保持
-されるため、この事前ウォームアップで両腕分がキャッシュされた状態になり、
-以後 ARMED のたびに差し出し手の左右が入れ替わっても再コンパイルは起きない
-(コンパイル時間の内訳・キャッシュ仕様の詳細は
-[`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 参照)。
-ただし通常運用では pre-touch/線形補間だけで事後検証に通ることが多く、
-その場合は jaxls 自体が呼ばれない (`plan_handshake_motion.py` の
-`--force-optimize` 説明・上記 4.5 参照)。
 
 ## 座標系
 
