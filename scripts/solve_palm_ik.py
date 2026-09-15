@@ -1656,6 +1656,78 @@ def save_json(result, path):
 iter_palm_files = json_io.iter_json_files
 load_skeleton_json = json_io.load_skeleton_json
 
+# バッチIKのウォームアップ用のダミー掌目標 (run_camera_pipeline_test.py の
+# _WARMUP_PALM と同じ値。値そのものに意味は無く、shape さえ本番と同じで
+# あれば何でもよい)。
+_WARMUP_PALM = dict(
+    position=[0.5, 0.0, 1.0],
+    x_axis=[1.0, 0.0, 0.0],
+    y_axis=[0.0, 1.0, 0.0],
+)
+
+
+def _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
+                     base_limits):
+    """人物ループに入る前に、ダミー目標で ``solve_person_ik`` (jax の
+    ``batch_inverse_kinematics``, backend='jax') を 1 回ずつ解いておき、
+    JIT のトレース/コンパイルを前倒しで済ませる
+    (``run_camera_pipeline_test.py`` の ``_warmup_ik`` と同じ手法)。
+
+    これをやらないと、最初に IK 対象になった人物の ``collision_ik_time``
+    に、本来はプロセス起動時に 1 回だけ払えばよいトレース/コンパイル時間
+    (jax 永続キャッシュがヒットしていても ``lower`` だけで数秒かかる。
+    docs/jax_compilation_cache.md 3節参照) がそのまま乗ってしまい、
+    「1 人あたりの処理時間」の実測値が不安定になる (対象人数が少ない
+    ほど影響が大きい)。実行結果は使い捨てる。
+
+    ``--robot-arm auto`` (既定) のときは、対象人物がどちらの手を差し出す
+    か事前に分からないため、両腕分ウォームアップする。``--robot-arm``
+    で腕を固定している場合は、実際に使われる腕 1 つだけをウォームアップ
+    する (もう片方は使われないため無駄になる)。
+
+    呼び出し側 (``main``) は、IK 対象 (``offered_hand`` が L/R) が 1 人も
+    いないバッチではこの関数自体を呼ばない -- このスクリプトは
+    run_pipeline_test.py から人物全員分まとめて 1 回だけ subprocess 起動
+    されるため、対象者が 0 人ならバッチIK自体が一度も呼ばれず、ここで
+    払うトレース/コンパイルのコストが丸ごと無駄になるため。
+    """
+    collision_obstacles = (
+        [] if (args.no_human_collision or collision_pairs is None)
+        else human_body_obstacles({}))
+    if args.robot_arm == 'auto':
+        arms_to_warm = (('l', 'R'), ('r', 'L'))
+    else:
+        # hand は turn_candidates_deg の順序決めにしか使わず、jit の
+        # トレース形状には影響しない (向き候補の個数はどの hand でも
+        # 同じ) ので、robot_arm に対応する hand を適当に選べばよい。
+        hand = 'R' if args.robot_arm == 'l' else 'L'
+        arms_to_warm = ((args.robot_arm, hand),)
+    for robot_arm, hand in arms_to_warm:
+        t0 = time.time()
+        solve_person_ik(
+            robot, _WARMUP_PALM, hand, robot_arm, collision_obstacles,
+            attempts_per_pose=args.attempts_per_pose,
+            base_limits=base_limits,
+            collision_weight=args.collision_weight,
+            collision_margin=args.collision_margin,
+            self_collision=(args.self_collision
+                            and collision_pairs is not None),
+            collision_pairs=collision_pairs,
+            self_collision_weight=args.self_collision_weight,
+            self_collision_margin=args.self_collision_margin,
+            collision_ik_stop=args.collision_ik_stop,
+            collision_ik_thre=args.collision_ik_thre,
+            collision_ik_rthre=args.collision_ik_rthre,
+            collision_joint_limit_margin_ratio=(
+                args.collision_joint_limit_margin),
+            joint_positions={},
+            verification_pairs=verification_pairs,
+            collision_verify_tolerance=args.collision_verify_tolerance,
+            post_process_thre=args.post_process_thre,
+            post_process_rthre=math.radians(args.post_process_rthre))
+        print('[warmup] {}腕: バッチIKのトレース/コンパイル {:.1f} 秒'
+              .format(robot_arm, time.time() - t0))
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1809,6 +1881,14 @@ def main():
             'model とは併用できない。IK を解くロボット本体のキネマティクス '
             'は変えず、干渉回避に使うリンクの集合・ジオメトリだけを '
             '(リンク名で対応づけて) 差し替える。')
+    parser.add_argument(
+        '--no-warmup', dest='warmup', action='store_false',
+        help='起動直後のダミー目標によるバッチIKのウォームアップ '
+            '(run_camera_pipeline_test.py の _warmup_ik と同じ手法) を '
+            '無効にする。無効にすると、最初に IK 対象になった人物の '
+            'collision_ik_time に jax の JIT トレース/コンパイル時間が '
+            'そのまま乗る (既定は有効。ただし IK 対象が 1 人もいない '
+            'バッチでは、指定に関わらずそもそも実行されない)。')
     args = parser.parse_args()
 
     files = iter_palm_files(args.input_dir)
@@ -1853,6 +1933,20 @@ def main():
 
     base_limits = [tuple(args.base_x_range), tuple(args.base_y_range),
                    tuple(args.base_yaw_range)]
+
+    # IK 対象 (offered_hand が L/R) が 1 人もいなければバッチIKは一度も
+    # 呼ばれないので、ウォームアップ自体が完全な無駄になる (2〜9 秒程度)。
+    # このスクリプトは run_pipeline_test.py から人物全員分まとめて 1 回だけ
+    # subprocess 起動されるので (人物ごとに起動されるわけではない)、対象者
+    # が 1 人でもいればウォームアップのコストはその全員に償却される一方、
+    # 対象者 0 人のバッチではまるごと無駄になる非対称な効果があるため、
+    # 事前に対象者の有無だけ確認してから判断する。
+    has_target = any(
+        load_palm_json(path).get('offered_hand') in ('L', 'R')
+        for path in files)
+    if args.warmup and has_target:
+        _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
+                         base_limits)
 
     n_solved = 0
     n_total = 0
