@@ -224,14 +224,18 @@ DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
 # ヨー軸 (shoulder_y/wrist_y, 軸まわりの回転は曲げの不自然さに寄与しない
 # ため対象外) は含めない。各関節角 (ラジアン, 0 度=ニュートラル。
 # restrict_elbow_range のとおり elbow は 0 度が腕をまっすぐ伸ばした状態)
-# からの重み付き二乗和をコストとする。重みは今のところ全関節 1.0 の
-# 定数だが、辞書にしておくことで将来関節ごとに調整しやすくしてある。
+# からの重み付き二乗和をコストとする。
+#
+# wrist_r (手首の左右方向の曲げ = 親指側/小指側への傾き, 橈屈・尺屈) は
+# 見た目に不自然になりやすいため重みを大きくし、優先的に避けるようにする。
+# shoulder_p/shoulder_r (肩) は他の関節より曲げても不自然さが目立ちにくい
+# ため重みを小さくし、候補選択で他関節より優先度を下げる。
 JOINT_BEND_COST_JOINTS = {
-    'shoulder_p': 1.0,
-    'shoulder_r': 1.0,
+    'shoulder_p': 0.3,
+    'shoulder_r': 1.5,
     'elbow': 1.0,
     'wrist_p': 1.0,
-    'wrist_r': 1.0,
+    'wrist_r': 3.0,
 }
 
 
