@@ -6,12 +6,10 @@
 推定して JSON として保存する。
 
 ``RandomSkeletonGenerator`` (``generate_random_human_poses.py``) が出力
-する合成骨格でも、``fake_people_pose_estimator_ros.
-FakeRosPeoplePoseEstimator`` のような実カメラ (MediaPipe) ベースの
-推定を骨格の生成元として使う場合でも、同じ
-``PalmPoseEstimator.estimate(joint_positions)`` で掌の位置姿勢を求められる
-ようにしてある。骨格の生成元が変わっても入力形式 (関節名 -> [x, y, z] の
-dict) は変わらないので、この推定器は生成元を一切区別しない。
+する合成骨格でも、実カメラ (MediaPipe) ベースの推定でも、同じ
+``PalmPoseEstimator.estimate(joint_positions)`` で掌の位置姿勢を求め
+られる。骨格の生成元が変わっても入力形式 (関節名 -> [x, y, z] の dict)
+は変わらないので、この推定器は生成元を一切区別しない。
 
 手のランドマーク (MediaPipe の ``RHand0``..``RHand20`` / ``LHand*``,
 ``RandomSkeletonGenerator(include_hand=True)`` や実際の MediaPipe 推定が
@@ -420,10 +418,9 @@ class OfferedHandSelector(object):
             :data:`ROBOT_HAND_HEIGHT` の点を人物ごとに使う。
         side_prior : dict or None
             ``{'R': float, 'L': float}``。スコアに直接足し込む事前分布。
-            既定 (``None``) は左右とも 0.0。例えば Aero は右手しか差し
-            出せない (``aero_demo.right_hand_offer``) ので、対面では人の
-            左手の方が正対しやすい、といった事情を入れたい場合に使う。
-            データセットに偏りを入れないよう既定では効かせない。
+            既定 (``None``) は左右とも 0.0。ロボット側の事情 (例えば
+            片腕しか差し出せない等) で左右どちらかを優先したい場合に
+            使う。データセットに偏りを入れないよう既定では効かせない。
         weights : dict or None
             特徴量の重み。既定は :data:`OFFER_FEATURE_WEIGHTS`
             (``face_to_robot`` は含まない -- 下記 ``face_away_penalty``)。

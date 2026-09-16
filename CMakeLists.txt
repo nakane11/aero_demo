@@ -9,8 +9,6 @@ project(aero_demo)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   rospy
-  jsk_recognition_msgs
-  jsk_topic_tools
 )
 
 ## System dependencies are found with CMake's conventions
@@ -157,21 +155,6 @@ include_directories(
 
 # all install targets should use catkin DESTINATION variables
 # See http://ros.org/doc/api/catkin/html/adv_user_guide/variables.html
-
-## Mark executable scripts (Python etc.) for installation
-## in contrast to setup.py, you can choose the destination
-catkin_install_python(PROGRAMS
-  scripts/head_pose_estimation.py
-  scripts/human_following_control.py
-  scripts/human_gaze_control.py
-  scripts/human_handover_behavior.py
-  scripts/human_parallel_planner.py
-  scripts/human_tracker.py
-  scripts/neck_tracker.py
-  scripts/palm_plane_visualizer.py
-  scripts/people_pose_estimation_mediapipe.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html

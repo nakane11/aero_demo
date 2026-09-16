@@ -21,6 +21,14 @@ venv/jax バージョンで同じ形状の計算であればディスクキャ�
 **定数として焼き込む値**(ロボットの姿勢由来の FK パラメータなど)が
 1 bit でも違うと別計算とみなされ再コンパイルになる(対策は 4. 参照)。
 
+## 1.5. 環境変数の設定順序 (`run_camera_pipeline_test.py`)
+
+`JAX_COMPILATION_CACHE_DIR` 等は jax を import する前に設定する必要が
+ある。`run_camera_pipeline_test.py` では `from aero_demo import json_io`
+が `skrobot.pycompat` の `HAS_JAX` 判定経由で無条件に `import jax` して
+しまうため、その import より前 (ファイル冒頭) でこれらの環境変数を
+設定している。
+
 ## 2. warmup とキャッシュの単位(腕ごとに別キャッシュ)
 
 起動時のウォームアップ(`run_camera_pipeline_test.py` の `_warmup_ik`)は、

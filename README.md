@@ -104,7 +104,8 @@ human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
 (1〜5) とカメラ入力パイプライン (`scripts/ros/run_camera_pipeline_test.py`) の
 依存関係はすべて [`pyproject.toml`](pyproject.toml) にまとまっており、
 `uv sync` 一回で揃う (venv 内で個別に `pip install` する必要はない)。
-バッチIKのバックエンドには jax を使う。
+バッチIKのバックエンドには jax を使う (コンパイル・永続キャッシュの仕様は
+[`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 参照)。
 
 ### 0. scikit-robot (fork の `base_limit` ブランチ) を隣に clone する
 

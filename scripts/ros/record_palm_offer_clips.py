@@ -60,7 +60,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from aero_demo import json_io  # noqa: E402
-from aero_demo import palm_plane_view  # noqa: E402
+from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
@@ -85,88 +85,6 @@ _TF_STATIC_TOPIC = '/tf_static'
 # TF がまだ引けない (ロボット未接続、/aero_state_publisher 未起動など) 間
 # だけ使うフォールバック値 (Aero の右腕初期姿勢の手先位置に近い概算値)。
 _FALLBACK_ROBOT_HAND_POSITION = (0.32, -0.55, 0.93)
-
-# 骨格の関節同士のつながり (関節名のペア) と、それを画像に描画する関数
-# (run_camera_pipeline_test.py の BONE_NAME_PAIRS/_fill_missing_wrist_from_
-# hand/draw_skeleton_overlay と同じもの。scripts/ros/ 層は各ファイル単独で
-# 完結させる方針 (run_camera_pipeline_test.py のモジュール docstring 付近
-# のコメント参照) のためここにも複製してある)。
-BODY_BONE_PAIRS = [
-    ('Neck', 'Nose'), ('Nose', 'LEye'), ('Nose', 'REye'),
-    ('LShoulder', 'LEar'), ('RShoulder', 'REar'),
-    ('Neck', 'RShoulder'), ('Neck', 'LShoulder'),
-    ('RShoulder', 'RElbow'), ('RElbow', 'RWrist'),
-    ('LShoulder', 'LElbow'), ('LElbow', 'LWrist'),
-    ('Neck', 'RHip'), ('RHip', 'RKnee'), ('RKnee', 'RAnkle'),
-    ('Neck', 'LHip'), ('LHip', 'LKnee'), ('LKnee', 'LAnkle'),
-    ('REye', 'REar'), ('LEye', 'LEar'),
-]
-HAND_SEQUENCE = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
-]
-HAND_WRIST_PAIRS = [('RWrist', 'RHand0'), ('LWrist', 'LHand0')]
-BONE_NAME_PAIRS = BODY_BONE_PAIRS + HAND_WRIST_PAIRS + [
-    ('{}Hand{}'.format(side, a), '{}Hand{}'.format(side, b))
-    for side in ('R', 'L') for a, b in HAND_SEQUENCE]
-
-
-def _fill_missing_wrist_from_hand(positions):
-    """手首 (``RWrist``/``LWrist``) が未検出でも、Hand モデルの手首
-    ランドマーク (``RHand0``/``LHand0``) が検出できていればその位置を
-    手首として補って返す (辞書のコピー、``positions`` 自体は書き換えない)。"""
-    filled = dict(positions)
-    for wrist_name, hand_wrist_name in (('RWrist', 'RHand0'),
-                                        ('LWrist', 'LHand0')):
-        if wrist_name not in filled and hand_wrist_name in filled:
-            filled[wrist_name] = filled[hand_wrist_name]
-    return filled
-
-
-_OFFERED_HAND_BGR = (0, 0, 255)  # 差し出し手と判定された側を描く赤 (BGR)
-
-
-def _is_offered_hand_joint(name, offered_side):
-    return offered_side is not None and name.startswith(offered_side + 'Hand')
-
-
-def _is_offered_hand_bone(start_name, end_name, offered_side):
-    return (_is_offered_hand_joint(start_name, offered_side)
-           or _is_offered_hand_joint(end_name, offered_side))
-
-
-def draw_skeleton_overlay(color_bgr, joints_2d, offered_side=None):
-    """カメラ画像 (BGR) に、検出できた 2D 関節位置を重ねて描いた画像を
-    返す (元の ``color_bgr`` は書き換えない)。``joints_2d`` は
-    ``PeoplePoseEstimator.estimate_3d`` が返す 1 人分の
-    ``[{"limb": str, "x": float, "y": float, "score": float}, ...]``
-    (画像座標、score < 0 は未検出)。``offered_side`` (``'R'``/``'L'``/
-    ``None``) を渡すと、差し出し手と判定された側の手だけ赤で描く。"""
-    overlay = color_bgr.copy()
-    positions = {j['limb']: (int(round(j['x'])), int(round(j['y'])))
-                for j in joints_2d if j['score'] >= 0}
-    positions = _fill_missing_wrist_from_hand(positions)
-    for start_name, end_name in BONE_NAME_PAIRS:
-        if start_name not in positions or end_name not in positions:
-            continue
-        if _is_offered_hand_bone(start_name, end_name, offered_side):
-            bgr = _OFFERED_HAND_BGR
-        else:
-            color = palm_plane_view.bone_color(
-                '{}->{}'.format(start_name, end_name))
-            bgr = (int(color[2]), int(color[1]), int(color[0]))
-        cv2.line(overlay, positions[start_name], positions[end_name],
-                 bgr, 2, cv2.LINE_AA)
-    for name, point in positions.items():
-        dot_bgr = (_OFFERED_HAND_BGR
-                  if _is_offered_hand_joint(name, offered_side)
-                  else (255, 255, 255))
-        cv2.circle(overlay, point, 3, dot_bgr, -1, cv2.LINE_AA)
-    return overlay
-
 
 class ClipWindowTracker(object):
     """``offered_hand`` の ``None -> 'R'/'L'`` への遷移 (立ち上がり) を
@@ -371,8 +289,8 @@ class PalmOfferClipRecorder(object):
         self._active_bag_path = path
 
         snapshot_path = path[:-len('.bag')] + '.png'
-        overlay = (draw_skeleton_overlay(color, joints_2d, offered_side=side)
-                  if joints_2d else color)
+        overlay = (skeleton_drawing.draw_skeleton_overlay(
+            color, joints_2d, offered_side=side) if joints_2d else color)
         cv2.imwrite(snapshot_path, overlay)
 
         print('[record-palm-offer-clips] 差し出し ({}) を検出、クリップ '
@@ -499,8 +417,8 @@ class PalmOfferClipRecorder(object):
         # ず毎フレーム publish する (クールダウン中だけ止める)。
         if (not in_cooldown_now and color is not None
                and self.skeleton_image_pub.get_num_connections() > 0):
-            overlay = (draw_skeleton_overlay(color, person_joints_2d,
-                                             offered_side=offered_hand)
+            overlay = (skeleton_drawing.draw_skeleton_overlay(
+                color, person_joints_2d, offered_side=offered_hand)
                       if person_joints_2d else color)
             self.skeleton_image_pub.publish(
                 ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))

@@ -3,55 +3,38 @@
 
 """合成骨格 (``generate_random_human_poses.py``) の代わりに、実カメラ +
 ``PeoplePoseEstimator`` (MediaPipe) で推定した骨格に対して掌推定・IK・
-軌道計画までのパイプラインを試すための ROS ノード。
-
-``run_pipeline_test.py`` が subprocess + JSON ファイル経由で「多数の人物を
-まとめて処理」するのに対し、実カメラは 1 フレームにつき 0〜1 人しか
-検出できず、人物もロボットに対して任意の位置に立つ。そのためこのノードは
+軌道計画までのパイプラインを試す、「ボタンを押すと1人分やる」形の
+対話的な ROS ノード。
 
 * 検出した骨格 (base_link 座標系) と Aero のロボットモデルを scikit-robot
-  の viser ビューアに重ねて常時プレビュー表示し、位置関係を確認できる
-  ようにする (骨格は線を重ねて描くだけ、ARMED でない限り IK は解かない)
-* viser 画面の ``ARM`` ボタンを押すと ``ARMED`` 状態になり、以後の
-  フレームで毎回掌推定をやり直し続け、``offered_hand`` (差し出し手) が
-  決まった瞬間の骨格でその 1 人分だけ IK を解く
+  の viser ビューアに重ねて常時プレビュー表示する (ARMED でない限り
+  IK は解かない)
+* viser 画面の ``ARM`` ボタンを押すと ``ARMED`` 状態になり、
+  ``offered_hand`` (差し出し手) が決まった瞬間の骨格でその 1 人分だけ
+  IK を解く
 * IK が解けたら続けて ``plan_handshake_motion.py`` と同じ要領で、
-  ロボットの初期姿勢 (腕を下ろし、最終台車位置から人間の反対方向へ
-  ``--approach-distance`` 下がった位置) から握手姿勢へ至る干渉回避付きの
-  軌道 (waypoint 列) を計画する
+  ロボットの初期姿勢から握手姿勢へ至る干渉回避付きの軌道 (waypoint 列)
+  を計画する
 * ``--armed-timeout`` 秒たっても決まらなければ諦めて ``IDLE`` に戻る
 
-IK 自体は指なしロボット (``self.robot``) で解く (指を含めると自己干渉
-ペアの組み合わせが無駄に増えるため)。そのため画面の状態表示では、
-``view_handshake_poses.py`` と同様に、指ありモデル (``self.display_robot``
-と同じ形状の overlay) で事後検証を別に行い、指先まで含めて実際に貫通して
-いる組み合わせ (自己干渉・人体との干渉) をテキストパネルに出す
-(``colliding_link_pairs``/``collision_pairs_text`` 参照)。IK の探索自体が
-指先まで考慮するわけではないことに注意。
+IK 自体は指なしロボット (``self.robot``) で解く (自己干渉ペアの組み合わせ
+を抑えるため)。画面の状態表示では指ありモデルで事後検証を別に行い、
+指先まで含めて実際に貫通している組み合わせをテキストパネルに出す
+(``colliding_link_pairs``/``collision_pairs_text`` 参照)。
 
-という「ボタンを押すと1人分やる」形の対話的なテストを行う。viser 画面は
-``view_handshake_motion.py`` と同様に、計画した軌道を waypoint スライダー/
-Play ボタンで初期姿勢から握手姿勢まで確認できる。viser はブラウザで表示
-するビューアなので、実行するとブラウザが開く (WSLg 環境などでは自動で
-開く)。ブラウザが自動で開かない場合は、標準出力に表示される URL を手動で
-開くこと。
-
-``estimate_palm_poses.py``/``solve_palm_ik.py``/``plan_handshake_motion.py``
-の関数・クラスをそのまま import して使う (骨格の入力形式は
-``PeoplePoseEstimator.estimate_3d`` が返す ``{limb_name: [x, y, z]}`` の
-dict で、合成骨格の ``skeleton.joint_positions`` と同じ形なので、生成元
-による処理の違いは無い)。``plan_handshake_motion.py`` は ``jaxls``
-(``pip install "git+https://github.com/brentyi/jaxls.git"``) が別途必要。
+viser 画面は ``view_handshake_motion.py`` と同様に、計画した軌道を
+waypoint スライダー/Play ボタンで確認できる。``estimate_palm_poses.py``/
+``solve_palm_ik.py``/``plan_handshake_motion.py`` の関数・クラスをそのまま
+import して使う (骨格の入力形式 ``{limb_name: [x, y, z]}`` は合成骨格と
+同じ)。``plan_handshake_motion.py`` は ``jaxls`` (``pip install
+"git+https://github.com/brentyi/jaxls.git"``) が別途必要。
 
 実カメラ特有の 2 つの問題への対策も入れてある。
 
 * 深度が単発で背景側に飛ぶ (``aero_demo.skeleton_filters.OneEuroFilter``):
   関節位置に One Euro Filter (Casiez et al. 2012) をかけて時間方向に
-  平滑化してから使う。``scripts/record_skeleton_data.py`` で録った実データ
-  を ``scripts/filter_skeleton_data.py`` で分析した結果、単純な移動中央値
-  (旧 ``_JointSmoother``) よりも跳びを抑えつつ追従の遅れが小さかったため
-  採用した (``--joint-smoothing-mincutoff``/``--joint-smoothing-beta``、
-  既定はそのときに良かった設定)。
+  平滑化してから使う (``--joint-smoothing-mincutoff``/
+  ``--joint-smoothing-beta`` で調整できる)。
 * ARM を押しても差し出し手が見つからない: ``OfferedHandSelector`` は
   合成骨格向けにスコア閾値 (``--offer-score-min``, 既定は ``estimate_
   palm_poses.OFFER_SCORE_MIN``) が調整されているため、実カメラの姿勢では
@@ -100,7 +83,6 @@ import sys
 import threading
 import time
 
-import cv2
 import numpy as np
 
 import rospy
@@ -128,16 +110,9 @@ if _SCRIPTS_DIR not in sys.path:
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
 # jax の永続コンパイルキャッシュ (solve_palm_ik.py/plan_handshake_motion.py
-# と同じ設定)。jax を import する前に指定する必要がある。solve_palm_ik.py
-# 自身もこの環境変数を設定しているが、それより先に (下の `from aero_demo
-# import json_io` 経由で) palm_plane_view.py -> skrobot.model.primitives ->
-# skrobot.model.robot_model -> skrobot.pycompat が import され、
-# skrobot.pycompat が HAS_JAX 判定のため無条件に `import jax` してしまう。
-# そのため solve_palm_ik.py 側の設定では手遅れで、_warmup_ik のたびに
-# ディスクキャッシュが一切効かず (jax.config.jax_compilation_cache_dir が
-# None のまま) IK・軌道最適化の JIT コンパイルを毎回フルで行っていた
-# (ここで先に設定しておくと解消する。実測で軌道最適化の jit(solve) が
-# 44 秒程度 -> 12 秒程度まで短縮された)。
+# と同じ設定)。jax を import する前 (下の `from aero_demo import json_io`
+# 経由で skrobot が無条件に `import jax` するより前) に設定する必要がある
+# (詳細: docs/jax_compilation_cache.md)。
 os.environ.setdefault(
     'JAX_COMPILATION_CACHE_DIR',
     os.path.expanduser('~/.cache/jax_compilation_cache'))
@@ -146,10 +121,10 @@ os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
+from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
-from aero_demo.people_pose_types import Bone  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo.ros_camera_utils import (  # noqa: E402
     imgmsg_to_ndarray, lookup_camera_to_base, lookup_frame_position,
@@ -231,88 +206,6 @@ SKELETON_HOLD_TIMEOUT = 1.0
 # などの状態変化は間引かず即座に反映する。
 SKELETON_REDRAW_INTERVAL = 0.5
 
-# 骨格の関節同士のつながり (関節名のペア)。draw_random_human_poses.py の
-# BONE_NAME_PAIRS と同じ (PeoplePoseEstimator.limb_sequence/index2limbname
-# と同じ骨格のつながり)。scripts/ros/ 層はこのファイル単独で完結させたい
-# ので複製してある (draw_random_human_poses.py の module docstring にある
-# 複製方針と同じ)。
-BODY_BONE_PAIRS = [
-    ('Neck', 'Nose'), ('Nose', 'LEye'), ('Nose', 'REye'),
-    ('LShoulder', 'LEar'), ('RShoulder', 'REar'),
-    ('Neck', 'RShoulder'), ('Neck', 'LShoulder'),
-    ('RShoulder', 'RElbow'), ('RElbow', 'RWrist'),
-    ('LShoulder', 'LElbow'), ('LElbow', 'LWrist'),
-    ('Neck', 'RHip'), ('RHip', 'RKnee'), ('RKnee', 'RAnkle'),
-    ('Neck', 'LHip'), ('LHip', 'LKnee'), ('LKnee', 'LAnkle'),
-    ('REye', 'REar'), ('LEye', 'LEar'),
-]
-# 手のランドマーク (MediaPipe の並び) 同士のつながり。
-# PeoplePoseEstimator.hand_sequence と同じ。
-HAND_SEQUENCE = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
-]
-# 腕の手首と手ランドマーク index 0 (手首) の接続を追加
-HAND_WRIST_PAIRS = [('RWrist', 'RHand0'), ('LWrist', 'LHand0')]
-BONE_NAME_PAIRS = BODY_BONE_PAIRS + HAND_WRIST_PAIRS + [
-    ('{}Hand{}'.format(side, a), '{}Hand{}'.format(side, b))
-    for side in ('R', 'L') for a, b in HAND_SEQUENCE]
-
-
-def _fill_missing_wrist_from_hand(positions):
-    """手首 (``RWrist``/``LWrist``) が未検出でも、Hand モデルの手首
-    ランドマーク (``RHand0``/``LHand0``) が検出できていればその位置を
-    手首として補って返す (辞書のコピー、``positions`` 自体は書き換えない)。
-
-    Pose モデルの手首 (``RWrist``/``LWrist``) と Hand モデルの手首
-    (``RHand0``/``LHand0``) は別々に検出されるランドマークなので
-    (``PeoplePoseEstimator._prune_implausible_hand_wrist_offset`` 参照)、
-    人にカメラから見て手が体の陰に隠れる等で Pose 側の手首だけ未検出に
-    なっても Hand 側は検出できていることがある。これを補わずに描画すると
-    ``RElbow``-``RWrist`` と ``RWrist``-``RHand0`` のどちらのボーンも
-    (``RWrist`` が無いので) 引けず、手のランドマークだけが肘から浮いて見え
-    (肘から先が骨格線として繋がって見えない) てしまう。
-    """
-    filled = dict(positions)
-    for wrist_name, hand_wrist_name in (('RWrist', 'RHand0'),
-                                        ('LWrist', 'LHand0')):
-        if wrist_name not in filled and hand_wrist_name in filled:
-            filled[wrist_name] = filled[hand_wrist_name]
-    return filled
-
-
-def build_skeleton_links(joint_positions):
-    """骨格を部位ごとに色分けした線 (``skrobot.model.primitives.
-    LineString``) のリストにする。
-
-    ``draw_random_human_poses.build_skeleton_links`` と同じ
-    ``palm_plane_view.bone_line``/``bone_color`` を使うので、見た目
-    (部位ごとの色) も同じになる。欠損した関節の補間や SMPL メッシュの
-    表示は行わない (``_fill_missing_wrist_from_hand`` による手首の補完を
-    除く) 。実際に検出できた関節だけを線でつなぐ。
-
-    Parameters
-    ----------
-    joint_positions : dict
-        関節名 -> ``np.ndarray([x, y, z])`` (base_link 座標系)。
-        ``PeoplePoseEstimator.estimate_3d`` が返す形式。
-    """
-    joint_positions = _fill_missing_wrist_from_hand(joint_positions)
-    links = []
-    for start_name, end_name in BONE_NAME_PAIRS:
-        if start_name not in joint_positions or end_name not in joint_positions:
-            continue
-        bone = Bone(name='{}->{}'.format(start_name, end_name),
-                   start_point=joint_positions[start_name],
-                   end_point=joint_positions[end_name])
-        color = palm_plane_view.bone_color(bone.name)
-        links.append(palm_plane_view.bone_line(bone, color))
-    return links
-
-
 # apply_result_pose (handshake_viewer_common.apply_robot_pose)/
 # apply_waypoint_pose/build_robot_collision_overlay/
 # sync_robot_collision_overlay/colliding_link_pairs/build_display_waypoints
@@ -376,33 +269,6 @@ def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
             joint_angle_vector=[float(v) for v in angle_vec],
         ))
     return waypoints
-
-def draw_skeleton_overlay(color_bgr, joints_2d):
-    """カメラ画像 (BGR) に、検出できた 2D 関節位置を重ねて描いた画像を
-    返す (デバッグ用の publish 専用、元の ``color_bgr`` は書き換えない)。
-
-    ``joints_2d`` は ``PeoplePoseEstimator.estimate``/``estimate_3d`` が
-    返す 1 人分の ``[{"limb": str, "x": float, "y": float, "score": float},
-    ...]`` (画像座標、score < 0 は未検出)。viser の 3D 骨格表示
-    (``build_skeleton_links``) と同じ ``BONE_NAME_PAIRS``/
-    ``palm_plane_view.bone_color`` を使うので、部位ごとの色も揃う。
-    """
-    overlay = color_bgr.copy()
-    positions = {j['limb']: (int(round(j['x'])), int(round(j['y'])))
-                for j in joints_2d if j['score'] >= 0}
-    positions = _fill_missing_wrist_from_hand(positions)
-    for start_name, end_name in BONE_NAME_PAIRS:
-        if start_name not in positions or end_name not in positions:
-            continue
-        color = palm_plane_view.bone_color(
-            '{}->{}'.format(start_name, end_name))
-        bgr = (int(color[2]), int(color[1]), int(color[0]))
-        cv2.line(overlay, positions[start_name], positions[end_name],
-                 bgr, 2, cv2.LINE_AA)
-    for point in positions.values():
-        cv2.circle(overlay, point, 3, (255, 255, 255), -1, cv2.LINE_AA)
-    return overlay
-
 
 class HandshakePipelineNode(object):
     """カメラ入力 -> 骨格推定 -> (ARM ボタン押下時) 掌推定・IK を行うノード."""
@@ -516,9 +382,7 @@ class HandshakePipelineNode(object):
 
         # 深度ノイズによる関節位置の単発の飛び (「デプスが後ろの方に一瞬
         # 飛ぶ」) を抑える時間方向の平滑化 (aero_demo.skeleton_filters.
-        # OneEuroFilter 参照。record_skeleton_data.py で録った実データを
-        # filter_skeleton_data.py で比較し、単純な移動中央値より跳びを
-        # 抑えつつ追従の遅れが小さかったため採用)。
+        # OneEuroFilter 参照)。
         self._joint_smoother = skeleton_filters.OneEuroFilter(
             mincutoff=args.joint_smoothing_mincutoff,
             beta=args.joint_smoothing_beta,
@@ -593,12 +457,10 @@ class HandshakePipelineNode(object):
         try:
             self.real_robot = load_aero(use_hand=True)
             print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
-            # skrobot 側の既定値 (odom_topic='/base_odometry/odom') は本機で
-            # 配信されておらず、move_trajectory_sequence の先頭にある
-            # "while self.odom_msg is None: rospy.sleep(0.01)" が永久に
-            # 抜けられず、EXECUTE 時に goal を組み立てる前段階で無限に
-            # 固まっていた (実機の odom は /aero_ros_controller が配信する
-            # /odom で、base_controller もそちらを購読している)。
+            # skrobot 側の既定値 (odom_topic='/base_odometry/odom') は本機
+            # では配信されておらず、move_trajectory_sequence が odom 待ちで
+            # 無限に固まる。実機の odom は /odom (/aero_ros_controller) な
+            # のでそちらを明示する。
             self.ri = AeroROSRobotInterface(self.real_robot, odom_topic='/odom')
             print('[execute] 実機への接続が完了しました (--execute-base={}, '
                   '--execute-arm={})。'.format(
@@ -655,55 +517,24 @@ class HandshakePipelineNode(object):
     def _warmup_ik(self):
         """左右それぞれの腕で ``solve_person_ik`` と ``plan_person_motion``
         (jaxls 軌道最適化) をダミーの目標に対して 1 回ずつ解いておき、
-        JAX の関数トレース (jax.jit/jaxls がその形状の呼び出しを初めて
-        見たときに Python レベルで計算グラフを組み立てる処理。ディスクの
-        永続コンパイルキャッシュではカバーされない) をノード起動時に
-        前倒しで済ませる。これをやらないと、実際の1人目の差し出し手に
-        対して IK・軌道最適化を解くときに腕ごと数秒~数十秒単位でこの
-        トレースコストがかかってしまう。
+        JAX の関数トレース (JIT の初回コンパイルより手前の、Python
+        レベルで計算グラフを組み立てる処理。永続コンパイルキャッシュでは
+        カバーされない) をノード起動時に前倒しで済ませる。
 
-        ``_solve_handshake`` の ``solve_person_ik`` 呼び出しと引数
-        (``attempts_per_pose``/``base_limits``/``self_collision``/
-        ``collision_pairs``/``verification_pairs``) を完全に一致させる
-        必要がある -- 1 つでも違うと JAX には「別の関数」に見えて別途
-        トレースされ直し、ウォームアップの意味がなくなる。``joint_
-        positions={}`` でも ``human_body_obstacles`` は骨格検出が全身分
-        揃っているときと同じ固定長のダミー障害物を返すので、実際の骨格
-        なしで形状だけ実データと揃えられる。
+        ``_solve_handshake`` の ``solve_person_ik`` 呼び出しと引数を
+        完全に一致させる必要がある -- 1 つでも違うと JAX には「別の
+        関数」に見えて別途トレースされ直し、ウォームアップの意味が
+        なくなる。同様の理由で、乱数シード (``_WARMUP_SEED``) を固定し、
+        FK 由来の定数を量子化する (``JaxlsSolver._quantize_fk_constants``)
+        必要がある -- ウォームアップと実運用で jaxls のトレース結果に
+        焼き込まれる定数が 1 ビットでも変われば、コンパイル前 HLO の
+        フィンガープリントが変わってキャッシュミスする。
 
         軌道最適化側は ``self.solver`` (``JaxlsSolver``、ノード寿命で
-        使い回す、``__init__`` 参照) のコンパイル済み問題キャッシュが
-        構造 (``JaxlsSolver._make_cache_key`` 参照、腕ごとに
-        ``collision_link_list``/joint limits 等が変わるため l/r で別構造
-        になる) をキーにした辞書になっている (l/r それぞれ独立のスロットを
-        持ち、切り替えても互いを退避させない) ため、ここで l/r 両方を
-        1 回ずつ ``force_optimize=True`` (幾何的な経路で検証を通っても
-        early return せず必ず jaxls まで進める、``plan_person_motion``
-        参照) で通しておけば、以後 ARMED のたびに差し出し手の左右が
-        入れ替わって最適化が必要になっても両方ともキャッシュヒットする。
-        ダミー IK が解けなかった腕は、後続の軌道計画に渡す有効な握手姿勢
-        が無いためスキップする (通常は解ける想定、solve_person_ik と同じ
-        目標を毎回使っているため)。
-
-        ここだけ numpy のグローバル乱数を ``_WARMUP_SEED`` で固定する
-        (前後で状態を退避・復元するので実運用の IK には影響しない)。
-        ``solve_person_ik`` は ``attempts_per_pose`` 個のランダムな初期値
-        から IK を解いて最初に干渉検証を通った候補を採用するため、シードを
-        固定しないと**毎回違う握手姿勢**がウォームアップの結果になる。
-        軌道最適化の問題を組むとき、ロボットの現在姿勢から読み出した FK
-        由来の値 (チェーンのリンク間変換・干渉プリミティブのリンク局所
-        オフセット。``TrajectoryProblem.fk_params`` /
-        ``_compute_collision_link_offsets``) が jaxls のトレース結果に
-        **定数として焼き込まれる**ので、ウォームアップの解が毎回違うと
-        この定数も毎回違う値になる。JAX の永続コンパイルキャッシュは
-        コンパイル前 HLO をフィンガープリントにするため、それだけで毎回
-        キャッシュミスし、起動のたびに腕あたり 20~30 秒の再コンパイルが
-        走っていた (実測: シード固定だけで 1 本目が 34 秒 -> 11 秒)。
-        残る ULP レベルのブレ (skrobot が関節角を*差分回転*で適用する
-        ため、直前の jaxls の解の下位ビットが world 座標に残る) は
-        scikit-robot 側で丸めている
-        (``JaxlsSolver`` の ``_quantize_fk_constants``)。両方揃って初めて
-        2 本目もキャッシュヒットする (実測: 33 秒 -> 10 秒)。
+        使い回す) が l/r 腕それぞれ独立にキャッシュを持つため、両方を
+        1 回ずつ ``force_optimize=True`` で通しておけば、以後 ARMED の
+        たびに差し出し手の左右が入れ替わっても両方ともキャッシュヒット
+        する。
         """
         # 乱数状態の退避 (finally で必ず復元する。上記 docstring 参照)。
         random_state = np.random.get_state()
@@ -1018,10 +849,9 @@ class HandshakePipelineNode(object):
     def _on_frame(self, color_msg, depth_msg, info_msg):
         if self._busy:
             return
-        # TF が引けなくてもプレビューは止めない (master ブランチの
-        # people_pose_estimator_ros.py と同じ考え方: 変換できなければ
-        # カメラ座標系のまま推定を続ける)。ARMED での掌推定・IK だけは
-        # base_link 座標系が要るので、変換できたフレームでのみ行う。
+        # TF が引けなくてもプレビューは止めない (変換できなければカメラ
+        # 座標系のまま推定を続ける)。ARMED での掌推定・IK だけは base_link
+        # 座標系が要るので、変換できたフレームでのみ行う。
         transform = self._lookup_camera_to_base(color_msg.header)
         camera_to_base = (None if transform is None
                           else transform_to_matrix(transform.transform))
@@ -1036,7 +866,7 @@ class HandshakePipelineNode(object):
             color, depth_m, intrinsics, output_transform=camera_to_base)
 
         if self.skeleton_image_pub.get_num_connections() > 0:
-            overlay = (draw_skeleton_overlay(color, joints_2d[0])
+            overlay = (skeleton_drawing.draw_skeleton_overlay(color, joints_2d[0])
                       if joints_2d else color)
             self.skeleton_image_pub.publish(
                 ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
@@ -1506,28 +1336,15 @@ class HandshakePipelineNode(object):
 
         台車移動には ``AeroROSRobotInterface.move_to`` (``move_base``
         経由、costmap を使う) ではなく ``move_trajectory_sequence``
-        (``go_pos_unsafe`` が内部の 1 点版として使っているのと同じ、
-        costmap を見ず ``base_controller`` の ``FollowJointTrajectoryAction``
-        へ直接軌道を送るだけの相対移動) を使う。カメラで検出した人物に
-        対する計画済みの軌道をそのまま素直になぞらせたいこのユースケース
-        に向いている (costmap 上の障害物回避や大域的な経路計画はそもそも
-        不要で、干渉回避は ``plan_handshake_motion.py`` 側で waypoint
-        単位に検証済み)。
-
-        以前は waypoint ごとに ``angle_vector``/``go_pos_unsafe`` を個別の
-        ゴールとして送り、毎回 ``wait_interpolation()``/
-        ``go_pos_unsafe_wait()`` で完全に停止するまで待ってから次を送って
-        いた。そのため waypoint の境界ごとに関節・台車の速度がゼロへ
-        リセットされ、動きが小刻みに (「かくかく」) 見えていた。
-        ``angle_vector_sequence``/``move_trajectory_sequence`` は全
-        waypoint 分の関節角・移動量をまとめて 1 つの
-        ``FollowJointTrajectoryAction`` ゴールとして送るため (内部で
-        隣接区間の移動方向が同じであれば waypoint 通過時の速度をゼロに
-        せず補間する、``RobotInterface.angle_vector_sequence`` 参照)、
-        waypoint の境界で止まらない滑らかな軌道になる。そのため送信は
-        最初にまとめて 1 回だけ行い (どちらも ``wait``/``send_action`` を
-        揃えて非ブロッキングにする)、完了待ちも最後にまとめて 1 回だけ
-        行う (台車・腕は並行して動く)。
+        (costmap を見ず ``base_controller`` の
+        ``FollowJointTrajectoryAction`` へ直接軌道を送るだけの相対移動)
+        を使う。干渉回避は ``plan_handshake_motion.py`` 側で waypoint
+        単位に検証済みのため、costmap 上の障害物回避や大域的な経路計画は
+        不要。全 waypoint 分の関節角・移動量をまとめて 1 つのゴールとして
+        送る (``angle_vector_sequence``/``move_trajectory_sequence``) こと
+        で waypoint の境界で止まらない滑らかな軌道になるため、送信は最初に
+        まとめて 1 回だけ行い、完了待ちも最後にまとめて 1 回だけ行う
+        (台車・腕は並行して動く)。
 
         ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
         動かすかどうかを独立に切り替えられる (どちらも指定しなければ
@@ -1561,18 +1378,11 @@ class HandshakePipelineNode(object):
                   self.args.execute_arm))
 
         arm_angle_vectors = []  # [av0, av1, ...] (angle_vector_sequence にそのまま渡す)
+        # [[dx, dy, dyaw], ...] (先頭 waypoint からの累積移動量)。
+        # move_trajectory_sequence は各要素をその都度 odom から独立に
+        # 適用する (直前要素からの相対移動として積み上げない) ため、
+        # 差分ではなく先頭 waypoint からの累積量を渡す必要がある。
         base_trajectory_points = []
-        # [[dx, dy, dyaw], ...] (先頭 waypoint = ロボットの現在の実姿勢、から
-        # の累積移動量)。skrobot.move_trajectory_sequence は各要素を「直前の
-        # 要素からの相対移動」としてではなく、呼び出し時点の実機姿勢 (odom)
-        # からその都度独立に適用する (move_base.py の実装参照: 内部で毎回
-        # 新しい Coordinates を odom の位置姿勢から作り直しており、前の
-        # trajectory_point の結果を積み上げない)。そのため、ここで waypoint
-        # 間の差分 (直前 waypoint 基準) を渡すと「本来の絶対位置」ではなく
-        # 「waypoint 間の微小差分」がそのまま原点からの移動量として実行され、
-        # 経路が大きく崩れる (経路の後半ほど実際の waypoint 位置から外れて
-        # いく) というバグになる。先頭 waypoint からの累積量を渡すことで、
-        # skrobot 側の「毎回 odom から作り直す」実装と辻褄を合わせる。
         first_base = None  # (x, y, yaw) 先頭 waypoint の台車位置姿勢 (world 系)
         for wp in display_waypoints:
             if self.args.execute_arm:
@@ -1665,7 +1475,7 @@ class HandshakePipelineNode(object):
                 self.viewer.delete(link)
             self._skeleton_links = (
                 [] if joint_positions is None
-                else build_skeleton_links(joint_positions))
+                else skeleton_drawing.build_skeleton_links(joint_positions))
             for link in self._skeleton_links:
                 self.viewer.add(link)
 
@@ -1911,8 +1721,7 @@ def main():
         help='関節位置の時間方向の平滑化 (One Euro Filter, aero_demo.'
             'skeleton_filters.OneEuroFilter 参照) の最小カットオフ周波数 '
             '[Hz] (既定 0.5)。下げるほど静止時のジッタが減るが追従が '
-            '遅れる。record_skeleton_data.py で録った実データを '
-            'filter_skeleton_data.py で比較して決めた値。')
+            '遅れる。')
     parser.add_argument(
         '--joint-smoothing-beta', type=float, default=0.3,
         help='One Euro Filter の速度依存カットオフの係数 (既定 0.3)。'

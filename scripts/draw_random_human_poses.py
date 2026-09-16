@@ -24,12 +24,8 @@ SMPL メッシュは JSON に保存済みの ``smpl.pose``/``smpl.betas``/``smpl
 root_pos``/``smpl.gender`` から ``aero_demo.smpl_body.forward_world`` で
 直接組み立てる。骨格 (``generate_random_human_poses.RandomSkeletonGen
 erator`` が作ったもの、既に SMPL と同じ関節位置から作られているので手の
-位置もメッシュの手と一致する) は、共通の骨格描画 (``aero_demo.
-palm_plane_view`` の ``bone_line``/``bone_color``, 部位ごとに色分けした
-線) で重ねて描く。以前
-あった「(SMPL に依存しない) 骨格から SMPL の姿勢を推定し直す」処理
-(``aero_demo.smpl_body.retarget_and_pose``) はもう要らないので、この
-ファイルはそれを一切使わない。
+位置もメッシュの手と一致する) は、``aero_demo.skeleton_drawing`` で
+部位ごとに色分けした線として重ねて描く。
 
 SMPL のモデルファイル自体はライセンス上リポジトリに同梱されていないので、
 呼び出し側がローカルパスを渡す (既定値は smpl_body.py と同じ
@@ -72,9 +68,9 @@ if _THIS_DIR not in sys.path:
 from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 from aero_demo import palm_plane  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
+from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import smpl_body  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
-from aero_demo.people_pose_types import Bone  # noqa: E402
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
 
@@ -105,35 +101,6 @@ COLOR_NOT_OFFERED_HAND = [255, 255, 255, 255]
 # 突き合わせられる。
 OFFERED_HAND_BUTTONS = [('Right', 'R'), ('Left', 'L'), ('Null', None)]
 OFFERED_HAND_LABEL_NAMES = {'R': 'Right', 'L': 'Left', None: 'Null'}
-
-# 骨格の関節同士のつながり (関節名のペア)。people_pose_estimator.
-# PeoplePoseEstimator の limb_sequence/index2limbname と同じ骨格の
-# つながりを、名前のペアとして書き下したもの (MediaPipe/mediapipe 無しで
-# 使えるよう、この描画専用ファイルに複製してある -- fake_people_pose_
-# estimator_ros.py の hand_sequence も同様に複製する方針, module
-# docstring 参照)。
-BODY_BONE_PAIRS = [
-    ('Neck', 'Nose'), ('Nose', 'LEye'), ('Nose', 'REye'),
-    ('LShoulder', 'LEar'), ('RShoulder', 'REar'),
-    ('Neck', 'RShoulder'), ('Neck', 'LShoulder'),
-    ('RShoulder', 'RElbow'), ('RElbow', 'RWrist'),
-    ('LShoulder', 'LElbow'), ('LElbow', 'LWrist'),
-    ('Neck', 'RHip'), ('RHip', 'RKnee'), ('RKnee', 'RAnkle'),
-    ('Neck', 'LHip'), ('LHip', 'LKnee'), ('LKnee', 'LAnkle'),
-    ('REye', 'REar'), ('LEye', 'LEar'),
-]
-# 手のランドマーク (MediaPipe の並び) 同士のつながり。people_pose_
-# estimator.PeoplePoseEstimator.hand_sequence と同じ。
-HAND_SEQUENCE = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
-]
-BONE_NAME_PAIRS = BODY_BONE_PAIRS + [
-    ('{}Hand{}'.format(side, a), '{}Hand{}'.format(side, b))
-    for side in ('R', 'L') for a, b in HAND_SEQUENCE]
 
 def load_person_json(path):
     """``generate_random_human_poses.build_person_json`` が保存した 1 人分
@@ -280,40 +247,6 @@ def build_mesh(model, person, skin_color):
     return mesh
 
 
-def build_skeleton_links(joint_positions, hand_colors=None):
-    """骨格を部位ごとに色分けした線 (``skrobot.model.primitives.
-    LineString``) のリストにする.
-
-    ``aero_demo.palm_plane_view.PalmPlaneScene`` が SMPL メッシュに重ねて
-    骨格を描くのと同じ ``palm_plane_view.bone_line``/``bone_color`` を
-    使うので、見た目 (部位ごとの色, ``palm_plane_view.COLOR_BONES``) も
-    同じになる。
-
-    Parameters
-    ----------
-    joint_positions : dict
-        関節名 -> ``np.ndarray([x, y, z])``。
-    hand_colors : dict or None
-        ``offered_hand_colors`` の戻り値 (``{'R': rgba, 'L': rgba}``)。
-        渡すと手のランドマークのボーン (``RHand*``/``LHand*``) だけ
-        ``palm_plane_view`` の左右の色分けの代わりにこの色で描く -- 手繋ぎ
-        に使うと判定された手を見分けるため。``None`` なら従来どおり。
-    """
-    links = []
-    for start_name, end_name in BONE_NAME_PAIRS:
-        if start_name not in joint_positions or end_name not in joint_positions:
-            continue
-        bone = Bone(name='{}->{}'.format(start_name, end_name),
-                   start_point=joint_positions[start_name],
-                   end_point=joint_positions[end_name])
-        color = palm_plane_view.bone_color(bone.name)
-        group = palm_plane_view.bone_group(bone.name)
-        if hand_colors is not None and group in ('rhand', 'lhand'):
-            color = hand_colors['R' if group == 'rhand' else 'L']
-        links.append(palm_plane_view.bone_line(bone, color))
-    return links
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='generate_random_human_poses.py が出力した SMPL の '
@@ -450,7 +383,8 @@ def main():
 
         for old_link in current_skeleton_links:
             viewer.delete(old_link)
-        current_skeleton_links = build_skeleton_links(joints, hand_colors)
+        current_skeleton_links = skeleton_drawing.build_skeleton_links(
+            joints, hand_colors)
         for skeleton_link in current_skeleton_links:
             viewer.add(skeleton_link)
 

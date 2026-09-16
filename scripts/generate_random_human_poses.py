@@ -18,19 +18,17 @@
 
 ``RandomSkeletonGenerator``
     ``RandomSmplHumanGenerator`` が作った SMPL の人モデルを入力として
-    受け取り、その姿勢済み関節位置から MediaPipe 形式の骨格 (``aero_
-    demo.people_pose_types.Person3D`` / ``fake_people_pose_estimator_
-    ros.py`` の ``index2limbname`` と同じ関節名, ``Neck``, ``RShoulder``,
-    ``LShoulder``, ``RElbow``, ``LElbow``, ``RWrist``, ``LWrist``,
-    ``RHip``, ``LHip``, ``RKnee``, ``LKnee``, ``RAnkle``, ``LAnkle``,
-    ``Nose``, ``REye``, ``LEye``, ``REar``, ``LEar``) を作る。手首から
-    先は SMPL に関節が無いので、SMPL の前腕 (肘->手首) の実際の姿勢
-    (回転) から手のランドマーク (``include_hand`` 既定 True,
-    ``RHand0``..``RHand20`` / ``LHand0``..``LHand20``, 21 点 x 2 手,
-    ``fake_people_pose_estimator_ros.py`` の ``index2handname`` /
-    ``HAND_LOCAL`` と同じ MediaPipe 形式) を組み立てるので、手首の位置
-    もその向きも SMPL の前腕とちょうど一致する (``_hand_frame`` 参照)。
-    座標はロボット座標系 (x=前, y=左, z=上)。
+    受け取り、その姿勢済み関節位置から MediaPipe 形式の骨格
+    (``aero_demo.people_pose_types.INDEX2LIMBNAME`` と同じ関節名,
+    ``Neck``, ``RShoulder``, ``LShoulder``, ``RElbow``, ``LElbow``,
+    ``RWrist``, ``LWrist``, ``RHip``, ``LHip``, ``RKnee``, ``LKnee``,
+    ``RAnkle``, ``LAnkle``, ``Nose``, ``REye``, ``LEye``, ``REar``,
+    ``LEar``) を作る。手首から先は SMPL に関節が無いので、SMPL の前腕
+    (肘->手首) の実際の姿勢 (回転) から手のランドマーク (``include_hand``
+    既定 True, ``RHand0``..``RHand20`` / ``LHand0``..``LHand20``,
+    21 点 x 2 手, ``HAND_LOCAL`` と同じ MediaPipe 形式) を組み立てるので、
+    手首の位置もその向きも SMPL の前腕とちょうど一致する
+    (``_hand_frame`` 参照)。座標はロボット座標系 (x=前, y=左, z=上)。
 
 出力する JSON には、骨格 (``skeleton``, 上記の ``joint_positions`` と
 ``height``) と SMPL の人モデル (``smpl``, ``pose``/``betas``/``root_
@@ -66,16 +64,16 @@ from aero_demo import people_pose_types  # noqa: E402
 from aero_demo import smpl_body  # noqa: E402
 from aero_demo import vector_utils  # noqa: E402
 
-# MediaPipe と同じ関節名 (fake_people_pose_estimator_ros.py の
-# index2limbname と同じ並び, 'Bkg' を除く)。
+# MediaPipe と同じ関節名 (people_pose_types.INDEX2LIMBNAME と同じ並び,
+# 'Bkg' を除く)。
 BODY_JOINT_NAMES = [
     'Nose', 'Neck', 'RShoulder', 'LShoulder', 'RElbow', 'LElbow',
     'RWrist', 'LWrist', 'RHip', 'LHip', 'RKnee', 'LKnee',
     'RAnkle', 'LAnkle', 'REye', 'LEye', 'REar', 'LEar',
 ]
 
-# MediaPipe の手のランドマーク名 (fake_people_pose_estimator_ros.py の
-# index2handname と同じ, 'RHand0'..'RHand20' / 'LHand0'..'LHand20')。
+# MediaPipe の手のランドマーク名 (people_pose_types.INDEX2HANDNAME と
+# 同じ, 'RHand0'..'RHand20' / 'LHand0'..'LHand20')。
 HAND_JOINT_NAMES = ['{}Hand{}'.format(side, i)
                     for side in ('R', 'L') for i in range(21)]
 
@@ -446,9 +444,7 @@ class RandomSkeletonGenerator(object):
         ----------
         include_hand : bool, optional
             MediaPipe の手のランドマーク (``RHand0``..``RHand20`` /
-            ``LHand0``..``LHand20``, 21 点 x 2 手) も生成するか。既定
-            True (fake_people_pose_estimator_ros.py の ``~hand/enable``
-            と同じ既定値)。
+            ``LHand0``..``LHand20``, 21 点 x 2 手) も生成するか。既定 True。
         """
         self.include_hand = include_hand
 

@@ -3,14 +3,8 @@
 
 """3 次元関節位置の時系列を平滑化する、ROS 非依存のフィルタ群.
 
-``scripts/filter_skeleton_data.py`` が ``scripts/ros/record_skeleton_data.py``
-で録った生データにオフラインで適用し、パラメータ (window/mincutoff/beta 等)
-を比較検討するために使う。``run_camera_pipeline_test.py`` はこのモジュールの
-``OneEuroFilter`` をオンライン (フレームごとに ``update`` を呼ぶ) でそのまま
-使っている -- 実データで比較した結果、``MedianFilter`` (旧
-``run_camera_pipeline_test._JointSmoother`` と同じ移動中央値のアルゴリズム)
-よりも跳びを抑えつつ追従の遅れが小さかったため。
-
+``run_camera_pipeline_test.py`` は ``OneEuroFilter`` をオンライン
+(フレームごとに ``update`` を呼ぶ) で使っている。
 
 Examples
 --------

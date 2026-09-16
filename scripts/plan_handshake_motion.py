@@ -5,112 +5,55 @@
 そこへ至る「最後の接近」の軌道 (waypoint 列) を干渉回避付きで生成し、
 JSON として保存する。
 
-``solve_palm_ik.py`` は最終姿勢 1 点だけを干渉回避付き IK で解いており、
-そこへ至るまでの移動・腕の動き (経路上の干渉) は一切保証しない。本
-スクリプトは scikit-robot (fork, ``base_limit`` ブランチ) の
-``skrobot.planner.trajectory_optimization.TrajectoryProblem`` を使い、
-台車 (平面 3 自由度: x, y, yaw) と腕の関節をまとめて 1 本の軌道として
-最適化することで、経路上も人体・自己干渉を避けるようにする。
+計画するのは人間の近くまで来てからの区間だけ (遠方からの長距離走行は
+ナビゲーションの仕事とし対象外)。軌道の始点は ``build_start_and_goal``
+が次のように決める:
 
-計画するのは人間の近くまで来てからの区間だけで、遠方 (ワールド原点付近)
-からの長距離走行は対象にしない -- そこはナビゲーションの仕事であり、
-人間から離れている間は干渉回避を軌道最適化で扱う必要がないため。
-したがって軌道の始点は ``build_start_and_goal`` が次のように決める:
-
-* 台車: 最終台車位置から見て人間の反対方向 (人間の立ち位置を中心とした
-  半径方向の外向き) へ ``--approach-distance`` [m] 下がった位置。向きは
-  最終姿勢と同じ (ナビゲーションが既に向きを合わせている想定)。
+* 台車: 最終台車位置から見て人間の反対方向へ ``--approach-distance``
+  [m] 下がった位置。向きは最終姿勢と同じ。
 * 腕: 肩は ``Aero.reset_pose`` のまま、肘を伸ばして体の横に自然に
   下ろした姿勢 (``arms_down_angles`` 参照)。
 
-つまり「腕を下ろしたまま人間へ正面から寄り、近づくのと同時に腕を上げて
-手を合わせる」動きになる。台車をワールド原点から出発させると、人間の脇を
-すり抜けて最終位置へ回り込む直線経路が人体をかすめてしまい (腕を全く
-動かさなくても数 cm から 12 cm 貫通することを実測で確認)、腕をどう
-迂回させても解消できなかった。始点をこのように定義し直すことでこの問題は
-根本的に無くなる。
+終点の手前には **pre-touch 姿勢** を挟む: 目標手先姿勢を人間の掌の法線
+方向へ ``--pretouch-standoff`` [m] 引き戻した位置を通常のヤコビアン法
+IK で解き、軌道を「始点 → pre-touch 姿勢 → 終点」の 2 区間に分ける
+(``build_pretouch_trajectory``)。最後の接近を法線方向の直線にすることで
+手先が掌を通り抜けないようにする。
 
-さらに、終点までを単純に線形補間すると、手先が人間の掌を通り過ぎてから
-戻ってくる軌道になり、前腕が掌を突き抜けることがある (実測)。そのため
-終点の手前に **pre-touch 姿勢** を挟む: 目標手先姿勢を人間の掌の法線
-方向へ ``--pretouch-standoff`` [m] 引き戻した位置 (向きは目標と同じ) を
-通常のヤコビアン法 IK で解き、軌道を
-
-1. 始点 (腕を下ろした姿勢, 接近開始位置) → pre-touch 姿勢 (台車は最終
-   位置に到達, 腕は掌の正面に構える)
-2. pre-touch 姿勢 → 終点 (掌の法線方向に沿ってまっすぐ寄る)
-
-の 2 区間に分ける (``build_pretouch_trajectory``)。把持動作の
-pre-grasp approach と同じ考え方で、最後の接近が法線方向の直線になるため
-掌を通り抜けようがない。
-
-この終点は干渉回避付き IK が収束した「掌の少し手前」の位置
-(``solve_palm_ik.TARGET_HOVER_OFFSET``) までで、実際に人間に触れる位置
-ではない。実際に掌へわずかにめり込む位置まで詰める後処理判定
+終点は干渉回避付き IK が収束した「掌の少し手前」の位置
+(``solve_palm_ik.TARGET_HOVER_OFFSET``) までで、実際に人間に触れる
+位置ではない。掌へわずかにめり込む位置まで詰める後処理判定
 (``solve_palm_ik.solve_post_process``、結果は握手姿勢 JSON の
-``post_process`` キー) は、ここでは経路として計画・検証しない -- 台車を
-動かさない小さな (腕を少し詰め、首を振るだけの) 動きで、それ自体が
-「人間の掌へ意図的に接触する」動きなので、この後の waypoint と同じ
-干渉検証にはなじまない (接触そのものを干渉として弾いてしまう)。表示上
-だけ必要であれば ``view_handshake_motion.py`` が ``post_process`` を
+``post_process`` キー) はここでは経路として計画・検証しない。表示上
+必要であれば ``view_handshake_motion.py`` が ``post_process`` を
 直接読んで最後に描き足す。
 
 対象にするのは ``solve_palm_ik.py`` の出力のうち ``target`` かつ
-``solved`` が ``true`` の人物だけ (対象外/IK 失敗の人物は経路の目標が
-無いため、``planned: false`` の JSON をそのまま書き出す)。
+``solved`` が ``true`` の人物だけ (それ以外は ``planned: false`` の
+JSON をそのまま書き出す)。
 
-障害物 (人体) には ``solve_palm_ik.human_body_obstacles`` が返す
-``Cylinder`` (体幹・頭部・四肢・掌・指、``solve_palm_ik.py``/``view_
-handshake_poses.py`` 等が実際の干渉回避・画面表示に使うものと全く同じ
-ジオメトリ) を、``TrajectoryProblem.add_collision_cost`` の
-``world_obstacles`` に ``'cylinder'`` 型 (中心・回転・半径・軸方向半長)
-としてそのまま渡す
-(``human_body_cylinder_obstacles`` 参照)。``'cylinder'`` 型は scikit-robot
-(fork, ``base_limit`` ブランチ) 側にこの実装のために追加したもので
-(``skrobot.planner.trajectory_optimization.fk_utils.compute_cylinder_
-obstacle_distances`` / ``jaxls_solver._make_world_collision_cost``)、
-球のように隙間ができる近似を挟まず、solve_palm_ik.py と全く同じ形状を
-最適化のコストにそのまま使える (対応しているのは ``jaxls`` バックエンド
-のみ)。関節が欠けている部位のダミーカプセルも含め、常に同じ個数の
-シリンダーに変換する -- 人物によって障害物の個数 (=最適化問題の形状) が
-変わると jax の JIT が人物ごとに再コンパイルされてしまうため。
+障害物 (人体) には ``solve_palm_ik.human_body_obstacles`` と同じ
+``Cylinder`` ジオメトリを ``TrajectoryProblem.add_collision_cost`` の
+``world_obstacles`` に ``'cylinder'`` 型として渡す
+(``human_body_cylinder_obstacles`` 参照、scikit-robot fork の
+``jaxls`` バックエンドのみ対応)。ロボット自身の干渉ジオメトリ
+(``collision_link_list``) も ``apply_collision_model`` が差し替えた
+box/cylinder/sphere のプリミティブ近似 (``solve_palm_ik.py`` と同じ) を
+そのまま使う。
 
-ロボット自身の干渉ジオメトリ (``collision_link_list``, 自己干渉および
-このシリンダーとの干渉の両方で使う) は、``apply_collision_model`` が
-差し替えた実際の ``collision_mesh`` (solve_palm_ik.py と同じプリミティブ
-近似) をそのまま使う (``link.collision_primitive``、1 リンク 1 個の
-box/cylinder/sphere)。以前はロボット側だけ外接カプセルを球で近似して
-いたが (scikit-robot 側の対応する関数が球同士の距離しか扱えなかった
-ため)、これは (1) 事後検証・画面表示との形状の食い違い、(2) 自己干渉
-コストの残差数増大 (リンクペアあたり 球の個数 の 2 乗) という 2 つの
-デメリットがあった。scikit-robot (fork, ``base_limit`` ブランチ) 側に
-box/cylinder/sphere 同士の符号付き距離を直接扱える微分可能な関数
-(``skrobot.planner.trajectory_optimization.fk_utils.
-primitive_pair_signed_distance`` -- 球以外の組は交互射影による近似)
-を追加し、``TrajectoryProblem`` 側もリンクごとに厳密な 1 プリミティブを
-使うようにしたことで、この球近似は不要になった (対応しているのは
-``jaxls`` バックエンドのみ)。
+最適化中のコストは warm start を厳密解に近づけるためのもので、収束が
+実際に干渉を解消した保証にはならない。``plan_person_motion`` は必ず
+``solve_palm_ik.collision_pairs_min_distance`` (厳密な ``collision_
+mesh`` を使う事後検証) で経路上の全 waypoint を検証し、``verified``
+フラグに反映する。まず最適化を掛けずに幾何的な構成だけで作った軌道
+(pre-touch 経由の線形補間) をこの厳密検証に通し、通れば最適化しない。
+干渉が残ったときだけ ``jaxls`` で最適化し、それでも通らなければ warm
+start を揺らして ``--motion-attempts`` 回まで解き直す。
 
-最適化中のこれらのコストは warm start を厳密解に近づけるためのもので、
-収束が実際に干渉を解消した保証にはならない (box/cylinder 同士の交互
-射影は深い貫入時の収束を理論的に保証しないことに加え、ソフトな制約で
-もあるため)。``plan_person_motion`` は必ず ``solve_palm_ik.collision_
-pairs_min_distance`` (厳密な ``collision_mesh`` の頂点そのものを使う、
-``solve_palm_ik.py`` の事後検証と全く同じ関数) で経路上の全 waypoint
-を検証し、``verified`` フラグに反映する。
-
-``plan_person_motion`` はまず最適化を掛けずに、上記の幾何的な構成だけで
-作った軌道 (pre-touch 経由、次に単純な線形補間) をこの厳密検証に通す --
-実測ではこれだけで干渉なしになることが多く、そのときは最適化を行わない
-(最適化コストで最適化すると、かえって厳密検証上の余裕を削ってしまう
-場合がある)。どちらも干渉が残ったときだけ ``jaxls`` で最適化し、それでも
-通らなければ warm start を揺らして ``--motion-attempts`` 回まで解き直す。
-
-台車を含む複数 waypoint の最適化は ``n_base_dof`` を受け付ける ``jaxls``
-バックエンド (``create_solver('jaxls')``) でしか実装されていない
-(``augmented_lagrangian``/``scipy``/``gradient_descent`` は台車の自由度を
-扱えない) ため、ソルバーは固定で ``jaxls`` を使う。``pip install
-"git+https://github.com/brentyi/jaxls.git"`` が別途必要 (PyPI には無い)。
+台車を含む複数 waypoint の最適化は ``jaxls`` バックエンド
+(``create_solver('jaxls')``) でのみ実装されている (台車の自由度を扱える
+唯一のバックエンド)。``pip install "git+https://github.com/brentyi/
+jaxls.git"`` が別途必要 (PyPI には無い)。
 
 Usage
 -----
@@ -240,13 +183,9 @@ def human_body_cylinder_obstacles(joint_positions):
 def arms_down_angles(robot, joint_list):
     """腕を体の横に自然に下ろした姿勢を、``joint_list`` の順で返す。
 
-    ``Aero.reset_pose`` は肘を目一杯曲げた (``r_elbow_joint``/
-    ``l_elbow_joint`` を -135 度にする) 姿勢だが、これは前腕を肩の高さ
-    まで持ち上げた「構え」のような姿勢になる (実測で確認: 肘 -135 度では
-    手先の高さが肩とほぼ同じになる。腕を下ろした姿勢ではない)。肩の角度
-    は ``reset_pose`` のままに、肘だけ伸ばした状態 (0 度, 可動域の上限)
-    にすると、手先が肩よりはっきり下がった自然な「気を付け」に近い姿勢に
-    なる (実測)。
+    ``Aero.reset_pose`` は肘を -135 度まで曲げるが、これだと手先が
+    肩の高さまで上がった「構え」の姿勢になるため、肩の角度はそのままに
+    肘だけ伸ばす (0 度) ことで自然に下ろした姿勢にする。
     """
     robot.reset_pose()
     for side in ('r', 'l'):

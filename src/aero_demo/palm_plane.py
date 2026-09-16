@@ -19,8 +19,7 @@ import numpy as np
 from aero_demo.vector_utils import unit as _unit
 
 # --- MediaPipe hand-landmark indices -------------------------------------
-# published by people_pose_estimation_mediapipe.py as "RHand0".."RHand20"
-# (and "LHand0".."LHand20") when ~hand/enable is true.
+# Landmark names follow "RHand0".."RHand20" / "LHand0".."LHand20".
 WRIST_INDEX = 0
 MCP_INDICES = (5, 9, 13, 17)          # index / middle / ring / pinky knuckles
 
@@ -84,10 +83,7 @@ def collect_palm_points(person, hand='R', min_score=0.1,
     Parameters
     ----------
     person : people_pose_types.Person3D
-        推定クラス (people_pose_estimator_ros / fake_people_pose_estimator_ros)
-        が返す ``EstimationResult.people`` の 1 人分。点は既に
-        ``EstimationResult.frame_id`` (既定 base_link) 相対なので、ここでは
-        座標変換をしない。
+        1 人分の姿勢。点は base_link 相対で、ここでは座標変換をしない。
     hand : str
         ``'R'`` or ``'L'`` -- which hand's landmarks to read.
     min_score : float

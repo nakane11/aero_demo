@@ -12,68 +12,52 @@ Aeroが全身 IK (台車移動を含む) を解いて手を繋ぐ姿勢を求め
 ``target: false`` の JSON (IK の結果は持たない) を書き出す。使うロボットの
 腕は既定で人間の手の反対側 (``--robot-arm`` で上書き可)。
 
-Aero は常にワールド原点・台車位置固定で IK を開始する (``seed_arm_pose``
-参照) ため、人物側 (骨格の全関節位置・掌の目標位置) を x/y 方向に平行移動
-し、その人物の立ち位置がちょうど Aero の前方 ``HUMAN_FRONT_DISTANCE`` [m]
-に来るようにしてから IK を解く (``human_translation_offset``/
-``translate_joint_positions``/``translate_palm`` 参照)。台車の移動範囲は
-``--base-x-range``/``--base-y-range``/``--base-yaw-range`` で指定する。
-このうち y (左右) の範囲は既定で、差し出している手の側 (人間の中心より
-実測の手の位置が y 方向にどちらへずれているか) だけに人物ごとに制限
-される (``offered_hand_side_sign``/``restrict_base_y_range_to_hand_side``
-参照。``--no-hand-side-base-constraint`` で無効化可)。台車の向き
-(yaw) も既定で、人間の正面方向 (``human_facing_yaw``) を中心に
-±``--base-yaw-facing-margin`` 度 (既定 30 度) の範囲に人物ごとに
-制限される (``restrict_base_yaw_range_to_human_facing`` 参照。
-``--no-facing-base-constraint`` で無効化可)。
+Aero は常にワールド原点・台車位置固定で IK を開始するため、人物側
+(骨格の全関節位置・掌の目標位置) を x/y 方向に平行移動し、その人物の
+立ち位置がちょうど Aero の前方 ``HUMAN_FRONT_DISTANCE`` [m] に来るように
+してから IK を解く (``human_translation_offset``/``translate_joint_
+positions``/``translate_palm`` 参照)。台車の移動範囲は ``--base-x-
+range``/``--base-y-range``/``--base-yaw-range`` で指定する。y (左右) の
+範囲は既定で差し出している手の側だけに、yaw は人間の正面方向
+±``--base-yaw-facing-margin`` 度 (既定 30 度) に人物ごとに制限される
+(``--no-hand-side-base-constraint``/``--no-facing-base-constraint`` で
+無効化可)。
 
 人体を障害物とした干渉回避も行う。``--skeleton-dir`` から人物ごとの全身の
 関節位置を読み、体幹・頭部・四肢を ``skrobot.model.primitives.Cylinder``
 で近似し、``batch_inverse_kinematics`` の ``collision_obstacles`` に渡す。
 干渉を避ける対象のロボットリンクは台車・胴体・頭部・両腕を含む全身
 (``collision_link_list_for_arm`` 参照)。ロボット側の干渉ジオメトリは実
-メッシュではなく、``view_aero_collision_model.py`` と同じ方法で生成・
-キャッシュした box/cylinder/sphere のプリミティブ近似形状を使う
+メッシュではなく box/cylinder/sphere のプリミティブ近似形状を使う
 (``apply_collision_model`` 参照)。IK の目標位置は掌から ``TARGET_HOVER_
-OFFSET`` だけ浮かせ、目標そのものが人体の干渉回避ジオメトリと重ならない
-ようにしている。``batch_inverse_kinematics`` の収束判定はこの干渉ペナル
-ティの残差を見ないため、``solve_person_ik`` は収束した候補について採用前
-に必ず ``collision_pairs_min_distance`` で厳密な形状による事後検証を行い、
-実際に貫通したままの解は棄却する (``--collision-verify-tolerance`` 参照)。
+OFFSET`` だけ浮かせてあり、``batch_inverse_kinematics`` の収束判定は
+干渉ペナルティの残差を見ないため、``solve_person_ik`` は収束した候補
+について採用前に必ず ``collision_pairs_min_distance`` で厳密な形状に
+よる事後検証を行い、実際に貫通したままの解は棄却する
+(``--collision-verify-tolerance`` 参照)。
 
-さらに、干渉検証まで通った候補についても、``TARGET_HOVER_OFFSET`` で
-浮かせた目標に届いただけでは実際に人間に掌を押し付けられる保証は無い
-ため、``pick_verified_candidate`` は候補ごとに最後に後処理判定
-(``solve_post_process``) を行う。台車を動かさない通常のヤコビアン法 IK
-で、腕を目標位置が掌へわずかにめり込む位置 (``POST_PROCESS_TARGET_HOVER_
-OFFSET``) まで詰め直すのと、ロボットが人間の差し出している手を見るよう
-首を向けるのを 1 回の IK 呼び出しで同時に解く。後処理判定に失敗した候補
-は棄却し、次の候補を試す。全ての候補で後処理判定に失敗した場合のみ、
-干渉検証を通過した最初の候補を後処理前のまま (``post_process`` キーを
-``null`` にして) 採用するフォールバックを行う (``pick_verified_candidate``
-参照)。
+干渉検証を通った候補についても、``pick_verified_candidate`` は最後に
+後処理判定 (``solve_post_process``) を行う。台車を動かさない通常の
+ヤコビアン法 IK で、目標位置を掌へわずかにめり込む位置
+(``POST_PROCESS_TARGET_HOVER_OFFSET``) まで詰め直すのと、差し出している
+手を見るよう首を向けるのを同時に解く。全ての候補で後処理判定に失敗した
+場合のみ、干渉検証を通過した最初の候補を後処理前のまま (``post_process``
+キーを ``null`` にして) 採用する。
 
 人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉) も既定で回避
-する (``batch_inverse_kinematics`` の ``self_collision=True``、``--no-
-self-collision`` で無効化できる)。チェックする組み合わせは常に
-``--collision-pairs`` (JSON: 2 要素の名前のリストのリスト。
-``build_collision_pairs.py`` が ``analyze_collision_pairs.py`` の出力から
-生成する) で明示的に指定した組み合わせだけに限る (``load_collision_
-pairs`` 参照)。このファイルが既定のパスに無ければ、干渉回避を丸ごと
-無効にして通常のヤコビアン法の IK にフォールバックする。
+する (``--no-self-collision`` で無効化できる)。チェックする組み合わせは
+常に ``--collision-pairs`` (JSON、``build_collision_pairs.py`` が生成)
+で明示的に指定した組み合わせだけに限る。このファイルが既定のパスに
+無ければ、干渉回避を丸ごと無効にして通常のヤコビアン法の IK に
+フォールバックする。
 
-向きを 0/±90 度 (``turn_candidates_deg``。ロボットの手首側が人間の親指
-側/小指側どちらに来る向きを優先するかは、差し出している手が左右どちら
-か、および掌が上/下どちらを向いているかで変わる) ずらした目標を、それ
-ぞれ ``--attempts-per-pose`` 個の初期値から解き、そうしてできる全候補を
-順に
-試して、干渉回避付きバッチ IK が解けて (収束・事後の干渉検証を通過して)
-かつ後処理判定にも成功した最初のものを採用する (``pick_verified_
-candidate`` 参照)。``return_all_attempts=True`` を渡し、初期値ごとの解を
-集約させず全て候補として受け取る (``solve_person_ik`` 参照)。IK は
-``batch_inverse_kinematics`` で人物 1 人ごとに 1 回解く (その人の全向き
-× 全初期値を 1 バッチにまとめる。``collision_obstacles`` は 1 回の
-バッチ呼び出し全体で 1 つの集合しか渡せないため)。
+向きを 0/±90 度 (``turn_candidates_deg``、優先順序は差し出している手の
+左右・掌の向きで変わる) ずらした目標を、それぞれ ``--attempts-per-pose``
+個の初期値から解き、干渉回避付きバッチ IK が解けて (収束・事後の干渉
+検証を通過して) かつ後処理判定にも成功した最初の候補を採用する
+(``pick_verified_candidate`` 参照)。IK は ``batch_inverse_kinematics``
+で人物 1 人ごとに 1 回解く (その人の全向き × 全初期値を 1 バッチに
+まとめる)。
 
 Usage
 -----

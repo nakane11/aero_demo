@@ -3,9 +3,9 @@
 
 """ROS non-dependent people pose estimation with MediaPipe.
 
-people_pose_estimation_mediapipe.py の推定処理を、ROS の publish/subscribe から
-切り離してクラス化したもの。画像 (numpy BGR) を渡すと素の Python
-オブジェクトで結果が返る。
+MediaPipe による姿勢推定処理を、ROS の publish/subscribe から切り離して
+クラス化したもの。画像 (numpy BGR) を渡すと素の Python オブジェクトで
+結果が返る。
 """
 
 import logging
@@ -19,7 +19,6 @@ import matplotlib
 matplotlib.use('Agg')  # Prevent GUI issues
 import matplotlib.cm
 
-# 2D 関節の型は偽推定 (scripts/ros/fake_people_pose_estimator_ros.py) と共有する
 from aero_demo.people_pose_types import CameraIntrinsics
 from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2HANDNAME
 from aero_demo.people_pose_types import INDEX2LIMBNAME, LIMB_SEQUENCE

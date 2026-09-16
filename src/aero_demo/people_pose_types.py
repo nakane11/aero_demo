@@ -3,13 +3,6 @@
 
 """people pose 推定結果を保持する ROS 非依存のデータ型.
 
-scripts/ros/fake_people_pose_estimator_ros.py (カメラ無しの偽推定) が
-EstimationResult/Person3D/Bone として結果を返すのに使う型。
-people_pose_estimator.PeoplePoseEstimator (MediaPipe による実推定) は
-3 次元の推定結果を ``{関節名: [x, y, z]}`` の dict で返すだけなので、
-これらの型は使わない (2D 関節の型・関節名の定数だけ共有する)。
-MediaPipe に依存しないので、偽推定側だけを使うときは MediaPipe が無くてもよい。
-
   Person3D / Bone / CameraIntrinsics … 1 人分の姿勢とカメラ内部パラメータ
   EstimationResult                   … 1 フレーム分の推定結果
   LIMB_SEQUENCE / INDEX2LIMBNAME /
@@ -96,26 +89,11 @@ class Bone:
 
 @dataclass
 class Person3D:
-    """カメラ座標系での 1 人分の 3 次元姿勢.
-
-    ``hidden_limb_names`` / ``hidden_positions`` は、可視性が足りない・
-    画角の外・深度が取れない等の理由で ``limb_names`` / ``positions`` から
-    除かれた関節を並行して保持する (最終的に人物とすら認識されない場合は
-    空)。fake_people_pose_estimator_ros.py だけが埋める -- 本物の推定は
-    見えていない関節の 3 次元位置を知りようがないので常に空のまま。
-    viewer (aero_demo.palm_plane_view) がこれを薄く描くのに使う。
-    """
+    """カメラ座標系での 1 人分の 3 次元姿勢."""
     limb_names: list = field(default_factory=list)
     scores: list = field(default_factory=list)
     positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
     bones: list = field(default_factory=list)      # Bone
-    hidden_limb_names: list = field(default_factory=list)
-    hidden_positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
-    hidden_bones: list = field(default_factory=list)      # Bone, >=1 endpoint hidden
-    # SMPL の体型パラメータ (10,), aero_demo.smpl_body.retarget_and_pose に
-    # そのまま渡す想定。fake_people_pose_estimator_ros.py だけが埋める --
-    # 本物の推定は体型を推定しないので常に None (平均体型として描かれる)。
-    betas: np.ndarray = None
 
     def position_of(self, limb_name):
         if limb_name not in self.limb_names:
@@ -133,11 +111,9 @@ class EstimationResult:
     joint_positions: list = field(default_factory=list)  # 2D 関節 (dict のリスト)
     people: list = field(default_factory=list)           # Person3D
     # カメラの内部パラメータ・画像サイズ・frame_id 相対のカメラ姿勢。
-    # viewer (aero_demo.palm_plane_view) が画角の四角すいを描くのに使う。
-    # 本物は CameraInfo + TF から、偽推定は既知の仮想カメラ設定から埋める。
-    # TF が引けず people がカメラ座標系のまま返ってきた場合や、実推定で
-    # まだ CameraInfo を受け取っていない場合は camera_pose / camera_intrinsics
-    # が None のままのことがある。
+    # CameraInfo + TF から埋める。TF が引けず people がカメラ座標系の
+    # まま返ってきた場合や、まだ CameraInfo を受け取っていない場合は
+    # camera_pose / camera_intrinsics が None のままのことがある。
     camera_intrinsics: object = None             # CameraIntrinsics or None
     camera_width: int = 0
     camera_height: int = 0
