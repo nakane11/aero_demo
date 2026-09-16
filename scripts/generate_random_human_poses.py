@@ -175,6 +175,16 @@ class RandomSmplHumanGenerator(object):
     _SHOULDER_ELEVATION_UP_DEG = 90.0
     _SHOULDER_AZIMUTH_DEG_RANGE = (-40.0, 110.0)
 
+    # 前腕軸まわりの手首のひねり (回内/回外)。肩 (仰角・方位角) と肘
+    # (ヒンジ) の合成回転 (``swing()``, 最小回転) だけでは前腕軸まわりの
+    # 捻りが偶然の副産物にしかならず、掌の向き (法線 n, ``_hand_frame``
+    # 参照) が水平・鉛直のどちらにもなり得る分布にならない。そのため
+    # ここで独立に一様分布からサンプリングし、前腕軸 (``forearm_dir``)
+    # まわりの回転として合成する (掌の法線だけを変え、前腕の向き自体は
+    # 変えない)。中立 (0 度) を中心に左右対称、実測の可動域 (回内外とも
+    # 概ね 90 度) を目安にする。
+    _WRIST_TWIST_MAX_DEG = 90.0
+
     # SMPL の体型パラメータ (betas) のばらつき。正規分布からサンプルし、
     # 極端な体型 (メッシュが破綻して見える) にならないようクリップする。
     _BETAS_STD = 1.5
@@ -250,8 +260,12 @@ class RandomSmplHumanGenerator(object):
             ``root_pos`` ((3,) ndarray, pelvis の位置, 床 z=0 に接地),
             ``vertices`` ((6890, 3) ndarray), ``joints`` ((24, 3)
             ndarray, SMPL 関節順序, いずれもロボット座標系), ``wrist_
-            rots`` (``{'L': (3, 3) ndarray, 'R': (3, 3) ndarray}``, 前腕
-            (肘->手首) の T-pose からの累積回転行列), ``head_rot``
+            rots`` (``{'L': (3, 3) ndarray, 'R': (3, 3) ndarray}``,
+            手首 (``pose[L_WRIST]``/``pose[R_WRIST]``, 独立サンプリング
+            した回内/回外のひねり ``_WRIST_TWIST_MAX_DEG`` を反映済み)
+            の T-pose からの累積回転行列 -- ``pose``/``vertices`` から
+            ``smpl_body.forward_world`` で再構成する SMPL メッシュの
+            手のジオメトリと同じ回転), ``head_rot``
             ((3, 3) ndarray, 首 (Neck) の T-pose からの累積回転行列 --
             首のひねりを頭部ランドマークに反映するために使う,
             ``RandomSkeletonGenerator.generate`` 参照)。
@@ -315,19 +329,20 @@ class RandomSmplHumanGenerator(object):
         pose[smpl_body.NECK] = smpl_body.mat_to_axis_angle(smpl_body.to_smpl_rotation(neck_rot))
         cumulative[smpl_body.NECK] = cumulative[9].dot(neck_rot)
 
-        # --- 腕: 肩の仰角・方位角 (T-pose = 真横基準) + 肘のヒンジ曲げ。
-        # 左右は独立にランダムな角度を割り当てる (例: 片手だけ前に出す、
-        # 片手だけ下ろす、といった姿勢も許容する)。手首・手先の pose は
-        # 0 のまま (手のランドマークは前腕の向きだけから組み立てるので、
-        # 手首の捻りは中立姿勢を仮定する, RandomSkeletonGenerator._hand_
-        # frame 参照)。---
-        # 前腕 (肘->手首) の T-pose からの累積回転行列 (``cumulative[elbow_
-        # idx]``, swing() が肩の回転もすでに合成した状態で作る full 3x3
-        # 回転行列)。手首・手先の pose は 0 のままなので、この行列が前腕・
-        # 手のボーンの実際の向き (捻り込み) をそのまま表す。手のランド
-        # マークをこの行列で組み立てる (``RandomSkeletonGenerator.
-        # _hand_frame`` 参照) ことで、SMPL メッシュの前腕が肩・肘の回転で
-        # 蓄積する前腕軸まわりの捻りを、手のランドマークにも反映できる。
+        # --- 腕: 肩の仰角・方位角 (T-pose = 真横基準) + 肘のヒンジ曲げ +
+        # 手首の捻り (回内/回外)。左右は独立にランダムな角度を割り当てる
+        # (例: 片手だけ前に出す、片手だけ下ろす、といった姿勢も許容する)。
+        # 手首の捻りは実際に pose[wrist_idx] (SMPL の手首関節角パラメータ)
+        # に書き込む -- 肩・肘の合成 (最小回転, swing() 参照) だけでは
+        # 前腕軸まわりの捻りが偶然の副産物にしかならず、掌の向きを水平・
+        # 鉛直どちらにもなり得る分布にできない一方、pose 配列を素通りして
+        # ``wrist_rots`` だけを捻ると、SMPL メッシュ (forward_world が
+        # pose から再構成する手のジオメトリ, 手首関節 L_WRIST/R_WRIST に
+        # スキニングされている) の掌の向きと、手のランドマーク
+        # (``wrist_rots`` から組み立てる, RandomSkeletonGenerator._hand_
+        # frame 参照) の掌の向きが食い違ってしまう。pose[wrist_idx] に
+        # 直接書けば両方が同じ回転行列 (``cumulative[wrist_idx]``) を
+        # 参照することになり、一致する。---
         wrist_rots = {}
         for shoulder_idx, elbow_idx, wrist_idx, side, sign in (
                 (smpl_body.L_SHOULDER, smpl_body.L_ELBOW, smpl_body.L_WRIST,
@@ -347,7 +362,21 @@ class RandomSmplHumanGenerator(object):
             flex = math.radians(rng.uniform(0.0, self._ELBOW_FLEX_MAX_DEG))
             forearm_dir = _rotate(upper_dir, xb, flex * sign)
             swing(elbow_idx, wrist_idx, forearm_dir)
-            wrist_rots[side] = cumulative[elbow_idx].copy()
+
+            # 前腕軸 (T-pose での肘->手首方向, elbow の局所フレームでの
+            # 軸) まわりに手首を独立にひねる。回転軸をこの局所軸に取る
+            # ことで、前腕の向き (forearm_dir, u) 自体は変えずに掌の法線
+            # (n) と親指方向 (v) だけを回せる (swing() が rest_dir_robot
+            # として使うのと同じ軸)。
+            forearm_rest_dir = _unit(
+                smpl_body.PERM.dot(model.J[wrist_idx] - model.J[elbow_idx]))
+            twist = math.radians(
+                rng.uniform(-self._WRIST_TWIST_MAX_DEG, self._WRIST_TWIST_MAX_DEG))
+            R_local = smpl_body.rodrigues(forearm_rest_dir * twist)
+            pose[wrist_idx] = smpl_body.mat_to_axis_angle(
+                smpl_body.to_smpl_rotation(R_local))
+            cumulative[wrist_idx] = cumulative[elbow_idx].dot(R_local)
+            wrist_rots[side] = cumulative[wrist_idx]
 
         vertices, joints = smpl_body.forward_world(
             model, pose, betas, root_pos=np.zeros(3))
@@ -384,12 +413,12 @@ class RandomSkeletonGenerator(object):
 
     骨格の関節位置は SMPL の姿勢済み関節 (``smpl_body.forward_world``)
     をそのまま読むだけなので、SMPL メッシュと骨格の胴体・四肢の関節位置
-    は常に一致する。手首から先だけは SMPL に関節が無いので、手のランド
-    マークは SMPL の前腕 (肘->手首) の実際の姿勢 (``RandomSmplHuman
-    Generator.generate`` が計算したのと同じ累積回転行列 ``wrist_rots``)
-    から組み立てる -- SMPL の前腕ボーンをそのまま回転させたのと同じ行列
-    を使うので、手首の位置・向き (指先方向の軸まわりの捻りを含む) は
-    SMPL モデルの前腕とちょうど一致する。
+    は常に一致する。手首から先だけは SMPL に (指の) 関節が無いので、手の
+    ランドマークは SMPL の手首 (``pose[L_WRIST]``/``pose[R_WRIST]``, 独立
+    サンプリングした回内/回外のひねりを含む) の実際の姿勢 (``RandomSmpl
+    HumanGenerator.generate`` が計算する累積回転行列 ``wrist_rots``) から
+    組み立てる -- 手首の位置・向き (前腕の軸と、その軸まわりの掌の捻り
+    の両方) が SMPL メッシュの手のジオメトリとちょうど一致する。
 
     Examples
     --------
@@ -428,13 +457,13 @@ class RandomSkeletonGenerator(object):
         """手首の局所座標系 (u=指方向, v=親指側, n=掌の向き) を作る.
 
         指のランドマークは持たないので手首の捻り (回内/回外) を直接は
-        観測できないが、SMPL 側は手首・手先の pose を 0 (捻りなし) の
-        まま生成しているので、前腕ボーン (肘->手首) の T-pose からの
-        累積回転 ``wrist_rot`` (``RandomSmplHumanGenerator.generate`` が
-        返す ``wrist_rots[side]``, 肩・肘の回転をすでに合成した full 3x3
-        回転行列) を T-pose での基準フレームにそのまま適用すれば、SMPL
-        メッシュの前腕とちょうど同じ向き (肩・肘の回転で前腕軸まわりに
-        溜まる捻りも込み) になる。
+        観測できないが、SMPL 側で ``pose[L_WRIST]``/``pose[R_WRIST]`` に
+        独立サンプリングした捻りを実際に書き込んで生成しているので、
+        肩・肘・手首の回転をすでに合成した ``wrist_rot``
+        (``RandomSmplHumanGenerator.generate`` が返す ``wrist_rots[side]``,
+        full 3x3 回転行列) を T-pose での基準フレームにそのまま適用すれば、
+        SMPL メッシュの手のジオメトリ (掌の法線 n を含む) とちょうど
+        同じ向きになる。
 
         T-pose での基準フレームは、u0=前腕の T-pose 方向 (``rest_dir_
         robot``, ほぼ体の左右軸), n0=T-pose で掌が向く向き (実測により
