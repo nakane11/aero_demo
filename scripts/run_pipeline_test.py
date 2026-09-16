@@ -21,6 +21,7 @@ Usage
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,8 @@ from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 
 
 def run_step(label, script_name, extra_args):
-    """``script_name`` を子プロセスで実行し、壁時計時間 [秒] を返す。
+    """``script_name`` を子プロセスで実行し、``(壁時計時間 [秒], 標準出力)``
+    を返す。
 
     人物ごとの進捗行など生の標準出力はそのまま流さず捕捉するだけにし、
     失敗したとき (exit code != 0) だけ末尾を表示してから中断する。
@@ -52,7 +54,22 @@ def run_step(label, script_name, extra_args):
         print('[{}] {} が exit code {} で失敗しました。'.format(
             label, script_name, result.returncode))
         sys.exit(1)
-    return elapsed
+    return elapsed, result.stdout
+
+
+def extract_warmup_lines(stdout):
+    """``solve_palm_ik.py`` の標準出力から ``_warmup_batch_ik`` が出す
+    ``[warmup] ...`` 行を抜き出し、``(行のリスト, 合計秒数)`` を返す。
+    ``--no-warmup`` 指定時など該当行が無ければ ``([], 0.0)``。
+    """
+    lines = [line for line in stdout.splitlines()
+            if line.startswith('[warmup]')]
+    total = 0.0
+    for line in lines:
+        match = re.search(r'([\d.]+)\s*秒\s*$', line)
+        if match:
+            total += float(match.group(1))
+    return lines, total
 
 
 def load_json_files(directory):
@@ -186,7 +203,7 @@ def main():
           '({})'.format(n_generated, skeleton_dir))
 
     # 2. estimate_palm_poses.py
-    palm_elapsed = run_step(
+    palm_elapsed, _ = run_step(
         '2/5', 'estimate_palm_poses.py',
         ['--input-dir', skeleton_dir, '--output-dir', palm_dir])
     n_palms, offered = summarize_palms(palm_dir)
@@ -196,14 +213,24 @@ def main():
               offered.get(None, 0)))
 
     # 4. solve_palm_ik.py
-    run_step('4/5', 'solve_palm_ik.py', [
+    solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py', [
         '--input-dir', palm_dir, '--output-dir', handshake_dir,
         '--skeleton-dir', skeleton_dir])
+    warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)
     summary = summarize_handshakes(handshake_dir)
     print('[4/5] solve_palm_ik.py: IK 対象 {} 人中 {} 人 solved '
           '(対象外 {} 人)'.format(
               summary['n_target'], summary['n_solved'],
               summary['n_total'] - summary['n_target']))
+    if warmup_lines:
+        for line in warmup_lines:
+            print('[4/5] {}'.format(line))
+        print('[4/5] warmup 合計 {:.1f} 秒 (solve_palm_ik.py の壁時計時間 '
+              '{:.1f} 秒中)'.format(warmup_total, solve_elapsed))
+    else:
+        print('[4/5] warmup 行が見つかりませんでした '
+              '(--no-warmup 指定、または IK 対象が 0 人でスキップされた '
+              '可能性があります)。壁時計時間 {:.1f} 秒'.format(solve_elapsed))
 
     # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
     motion_summary = None
@@ -254,6 +281,13 @@ def main():
             and palm_time_per_person is not None):
         print('  掌推定込みの全体 (掌推定 + IK 1+2段階目): {:.3f} 秒/人'
               .format(palm_time_per_person + summary['avg_total_ik_time']))
+    print('  (上記の IK 1/2段階目は solve_palm_ik.py が出力する JSON の '
+          'collision_ik_time/candidate_selection_time の平均であり、'
+          'warmup (jax の JIT トレース/コンパイル、人物ループに入る前に '
+          '1 回だけ払う) の時間は含まない。warmup 自体の実測は '
+          '[4/5] 実行直後の行を参照。IK 1段階目が warmup 後も長い場合は '
+          'warmup 漏れではなく、人物ごとに再コンパイルが起きている '
+          '(docs/jax_compilation_cache.md 参照) 可能性を疑うこと。)')
 
     # 5. view_handshake_poses.py / view_handshake_motion.py
     #    (--viewer のときだけ実際に起動する。--plan-motion も指定されて

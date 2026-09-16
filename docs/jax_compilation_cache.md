@@ -185,3 +185,41 @@ warmup(両腕とも hit): 左腕 IK 2.7秒+軌道最適化11.9秒、右腕 IK 1.
 本番(warmup後、pre-touch経由で事後検証に通りjaxls本体は未使用):
 IK 合計約0.26秒(`collision_ik_time` 0.19秒+`candidate_selection_time`
 0.06秒)、軌道計画 `compute_time` 0.86秒(`kind: pretouch`)。
+
+## 9. 台車可動域の動的制限による人物ごとの再コンパイル(未対策・既知の制限)
+
+2026-09-16 の調査で、`run_pipeline_test.py` (`--seed 0`、複数人まとめて
+1 プロセスで処理) で warmup 後も IK 1段階目 (バッチIK) が 6〜8秒/人と
+`_warmup_batch_ik` 導入時の実測(8節、0.142秒/人) より大幅に遅い現象が
+再発した。原因は warmup とは別の箇所にある。
+
+`solve_palm_ik.py` の `restrict_base_yaw_range_to_human_facing`/
+`restrict_base_y_range_to_hand_side` (`solve_person_ik` 呼び出し前、
+`person_base_limits` を作る箇所) が、台車の可動域 (`base_limits`) を
+**人物ごとに異なる連続値** (特に yaw は人物の向き `human_yaw` に依存) へ
+制限している。`base_limits` は `batch_inverse_kinematics` 内部で仮想
+台車関節 (`_attach_batch_virtual_base_chain`) の `min_angle`/`max_angle`
+になり、最終的に `jnp.array(...)` として `solve_batched` (jax.jit)
+のクロージャに焼き込まれる (4節の FK 定数と同じ機構)。そのため人物ごとに
+HLO フィンガープリントが変わり、`_warmup_batch_ik` が固定の
+`base_limits` で先に払ったコンパイルの恩恵を本番の各人物が受けられず、
+事実上「人物 1 人につき 1 回」再コンパイルが起きる。
+
+検証 (同じ 10 人・3 人が IK 対象、`~/.cache/jax_compilation_cache` の
+ファイル数増分で判定):
+
+| 条件 | 3人分のIK所要時間(warmup除く) | キャッシュファイル増分 |
+|---|---|---|
+| 既定 (動的制約あり) | 約26.5秒 (≒8.8秒/人) | +4 |
+| `--no-facing-base-constraint --no-hand-side-base-constraint` | 約3.7秒 (≒1.2秒/人) | +1 |
+
+約7倍の差があり、再コンパイルが支配的であることを確認した。
+
+**現状は未対策。** 対策候補 (yaw/y 範囲を粗い bin に量子化してキャッシュ
+再利用性を上げる等) は IK 到達性・台車の向きの自然さとのトレードオフを
+伴う設計判断が必要なため、別途検討する。`run_pipeline_test.py` のように
+複数人をまとめて処理する場面で顕著だが、実運用 (`run_camera_pipeline_
+test.py`、1人ずつ処理) でも warmup 時の `base_limits` (人物非依存の
+既定値) と本番の `person_base_limits` (人物依存) が異なる以上、warmup
+の効果が本番の最初の呼び出しに引き継がれない点は同様に当てはまる可能性が
+ある (未検証)。
