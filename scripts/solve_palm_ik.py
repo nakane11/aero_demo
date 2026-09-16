@@ -21,7 +21,11 @@ Aero は常にワールド原点・台車位置固定で IK を開始する (``s
 このうち y (左右) の範囲は既定で、差し出している手の側 (人間の中心より
 実測の手の位置が y 方向にどちらへずれているか) だけに人物ごとに制限
 される (``offered_hand_side_sign``/``restrict_base_y_range_to_hand_side``
-参照。``--no-hand-side-base-constraint`` で無効化可)。
+参照。``--no-hand-side-base-constraint`` で無効化可)。台車の向き
+(yaw) も既定で、人間の正面方向 (``human_facing_yaw``) を中心に
+±``--base-yaw-facing-margin`` 度 (既定 30 度) の範囲に人物ごとに
+制限される (``restrict_base_yaw_range_to_human_facing`` 参照。
+``--no-facing-base-constraint`` で無効化可)。
 
 人体を障害物とした干渉回避も行う。``--skeleton-dir`` から人物ごとの全身の
 関節位置を読み、体幹・頭部・四肢を ``skrobot.model.primitives.Cylinder``
@@ -624,6 +628,39 @@ def translate_palm(palm, offset):
     return translated
 
 
+def human_facing_direction(joint_positions):
+    """人物の正面方向 (world xy 平面, 単位ベクトル) を、右肩->左肩
+    (無ければ右腰->左腰) のベクトルから求める。人物がどちらを向いて
+    いても一貫して「差し出した手が前方に来る」向きを返す (右肩->左肩
+    ベクトルを v として、v と鉛直上向きの外積が正面方向になる)。
+    どちらのペアも骨格に無ければ None を返す。
+    """
+    def get(name):
+        v = joint_positions.get(name)
+        return None if v is None else np.asarray(v, dtype=np.float64)
+
+    for a, b in (('RShoulder', 'LShoulder'), ('RHip', 'LHip')):
+        pa, pb = get(a), get(b)
+        if pa is None or pb is None:
+            continue
+        right_to_left = pb - pa
+        right_to_left[2] = 0.0
+        if np.linalg.norm(right_to_left) < 1e-6:
+            continue
+        forward = np.cross(right_to_left, np.array([0.0, 0.0, 1.0]))
+        return forward[:2] / np.linalg.norm(forward[:2])
+    return None
+
+
+def human_facing_yaw(joint_positions):
+    """``human_facing_direction`` を world yaw [rad] (atan2) に変換する。
+    求まらなければ None。"""
+    direction = human_facing_direction(joint_positions)
+    if direction is None:
+        return None
+    return math.atan2(direction[1], direction[0])
+
+
 def offered_hand_side_sign(human_hand, joint_positions, palm):
     """差し出している手 (``human_hand``, 'R'/'L') が、人物の立ち位置
     (``human_standing_xy``) から見て台車の y 方向 (左右) のどちら側に
@@ -687,6 +724,37 @@ def restrict_base_y_range_to_hand_side(base_y_range, side_sign):
         return (restricted_lo, hi) if restricted_lo <= hi else base_y_range
     restricted_hi = min(hi, 0.0)
     return (lo, restricted_hi) if lo <= restricted_hi else base_y_range
+
+
+# 台車の向きを人間の正面方向にどれだけ揃えるかの許容幅 (既定 ±30度)。
+DEFAULT_BASE_YAW_FACING_MARGIN_DEG = 30.0
+
+
+def restrict_base_yaw_range_to_human_facing(base_yaw_range, human_yaw,
+                                            margin=math.radians(
+                                                DEFAULT_BASE_YAW_FACING_MARGIN_DEG)):
+    """台車の yaw 可動範囲を、人間の正面方向 (``human_yaw`` [rad],
+    world 絶対角) を中心とした ``±margin`` の窓に絞ったものを返す。
+
+    ``base_yaw_range`` (既定 ``DEFAULT_BASE_YAW_RANGE``,
+    ワールド原点基準の絶対角) は「ロボットが人間の立ち位置の方向
+    (world +x 付近) を向く」ことを想定した範囲であり、人間自身の
+    向き (``human_yaw``, SMPL でランダムなので世界のどの向きも
+    あり得る) とは無関係に決まっている。そのため単純に
+    ``base_yaw_range`` と ``(human_yaw - margin, human_yaw + margin)``
+    の積集合を取ると、人間の向きが ``base_yaw_range`` の外側に
+    あるときほぼ必ず空集合になってしまう。
+
+    ``restrict_base_y_range_to_hand_side`` (既存レンジとの積集合、
+    空になったら諦めて既存レンジのまま) とは異なり、ここでは
+    積集合ではなく ``human_yaw`` を中心とした窓 ``(human_yaw -
+    margin, human_yaw + margin)`` をそのまま返す (既存レンジを
+    置き換える)。``human_yaw`` が ``None`` の場合は制限せず
+    ``base_yaw_range`` をそのまま返す。
+    """
+    if human_yaw is None:
+        return base_yaw_range
+    return (human_yaw - margin, human_yaw + margin)
 
 
 def seed_arm_pose(robot, robot_arm):
@@ -2086,6 +2154,20 @@ def main():
             '(既定は有効。--skeleton-dir に骨格 JSON が無い等で手の側が '
             '判定できない人物には、指定に関わらずもともと働かない)。')
     parser.add_argument(
+        '--no-facing-base-constraint', dest='facing_base_constraint',
+        action='store_false',
+        help='台車の yaw 可動範囲を、人間の正面方向 (``human_facing_yaw``) '
+            '中心の ±--base-yaw-facing-margin 度に制限する制約を無効に '
+            'する (既定は有効。--skeleton-dir に骨格 JSON が無い等で '
+            '正面方向が判定できない人物には、指定に関わらずもともと '
+            '働かない)。')
+    parser.add_argument(
+        '--base-yaw-facing-margin', type=float,
+        default=DEFAULT_BASE_YAW_FACING_MARGIN_DEG,
+        help='--facing-base-constraint が有効なときの、台車 yaw の '
+            '人間の正面方向からの許容幅 [deg] (既定 {:.1f})。'.format(
+                DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
+    parser.add_argument(
         '--seed', type=int, default=None,
         help='バッチ IK の乱数初期値に使う numpy の乱数シード。指定すると '
             '実行ごとに同じ解が得られる (既定は指定なし)。')
@@ -2234,6 +2316,20 @@ def main():
                     restrict_base_y_range_to_hand_side(
                         base_limits[1], side_sign),
                     base_limits[2]]
+
+        # 台車の向き (人間の正面方向 ±--base-yaw-facing-margin に制限) を
+        # 反映する (human_facing_yaw/restrict_base_yaw_range_to_human_facing
+        # 参照)。手の左右の制約と異なり既存レンジとの積集合ではなく、
+        # 人間の正面方向中心の窓で置き換える (詳細は関数の docstring 参照)。
+        if args.facing_base_constraint and joint_positions is not None:
+            human_yaw = human_facing_yaw(joint_positions)
+            if human_yaw is not None:
+                person_base_limits = [
+                    person_base_limits[0],
+                    person_base_limits[1],
+                    restrict_base_yaw_range_to_human_facing(
+                        person_base_limits[2], human_yaw,
+                        margin=math.radians(args.base_yaw_facing_margin))]
 
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, human_hand, robot_arm)

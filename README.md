@@ -35,7 +35,11 @@ MediaPipe 形式の骨格・掌の
    (`solve_palm_ik.turn_candidates_deg` 参照)。干渉回避ペナルティの重み・
    マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
    `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
-   再現性は `--seed` で指定する。
+   再現性は `--seed` で指定する。台車の y 可動範囲は既定で差し出している
+   手の側だけに、台車の向き (yaw) は既定で人間の正面方向 ±30°
+   (`--base-yaw-facing-margin` で変更可) にそれぞれ人物ごとに制限される
+   (`--no-hand-side-base-constraint`/`--no-facing-base-constraint` で
+   無効化可)。
    人体側の干渉回避ジオメトリはIK 最適化中の干渉コスト・候補採用前の事後検証
    ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。
 
