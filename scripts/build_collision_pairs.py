@@ -217,10 +217,6 @@ def main():
             '直前の組数を採用する (ランキングを使い切っても超えなければ '
             '全組を採用する)。')
     parser.add_argument(
-        '--human-front-distance', type=float, default=HUMAN_FRONT_DISTANCE,
-        help='solve_palm_ik.py に渡すのと同じ --human-front-distance '
-            '(既定 {:.1f})。'.format(HUMAN_FRONT_DISTANCE))
-    parser.add_argument(
         '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
         help='solve_palm_ik.py に渡す --robot-arm (既定 auto)。')
     parser.add_argument(
@@ -294,7 +290,7 @@ def main():
         print('\n=== 手順 4: 干渉頻度をランキング ===')
         ranking = rank_collision_candidates(
             args.handshake_dir, args.human_poses_dir,
-            args.human_front_distance, args.collision_dist_threshold)
+            HUMAN_FRONT_DISTANCE, args.collision_dist_threshold)
         if not ranking:
             print('干渉した組み合わせが見つかりませんでした。')
             sys.exit(1)
@@ -302,7 +298,7 @@ def main():
              .format(len(ranking)))
         candidates_dict = find_collision_candidates(
             args.handshake_dir, args.human_poses_dir,
-            args.human_front_distance, args.collision_dist_threshold)
+            HUMAN_FRONT_DISTANCE, args.collision_dist_threshold)
         for pair in ranking[:10]:
             print('  {} ({} / {} 人で干渉)'.format(
                 pair, candidates_dict[pair], n_ik_people))

@@ -1104,11 +1104,21 @@ def cylinder_surface_samples(obstacle, n_theta=16, n_height=5):
     return local_pts @ obstacle.worldrot().T + center, center, radius
 
 
+# link_collision_shape の結果は link.collision_mesh (apply_collision_model
+# が起動時に一度だけ差し替える) だけで決まり、リンクの姿勢にもプロセス中の
+# 時刻にも依存しないため、collision_pairs_min_distance の呼び出しごと
+# (waypoint ごと・人物ごと) に作り直さず、プロセス全体で 1 リンクにつき
+# 1 回だけ計算してこの辞書に持つ (id(link) がキー -- Link に __eq__/
+# __hash__ の override は無いのでデフォルトの id ベースの同一性比較でよい)。
+_LINK_COLLISION_SHAPE_CACHE = {}
+
+
 def link_collision_shape(link):
     """``link.collision_mesh`` (``apply_collision_model`` が差し替えた
     box/cylinder/sphere のプリミティブ = 凸形状) を、``obstacle_into_link_
     depth`` が使う形でローカル座標のまま返す。リンクの姿勢には依存しない
-    ので、呼び出し側でリンクごとにキャッシュして使い回す想定。
+    ので、プロセス全体で 1 回だけ計算して ``_LINK_COLLISION_SHAPE_CACHE``
+    に持ち、以降は呼び出しごとに作り直さず使い回す。
 
     Returns
     -------
@@ -1119,6 +1129,9 @@ def link_collision_shape(link):
         がこの凸形状の内部にある (厳密判定用)。``radius`` はリンク原点を
         中心とする包含球の半径 (同じく足切り用)。
     """
+    cached = _LINK_COLLISION_SHAPE_CACHE.get(id(link))
+    if cached is not None:
+        return cached
     mesh = link.collision_mesh
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces)
@@ -1132,7 +1145,9 @@ def link_collision_shape(link):
     normals = normals * np.where(outward < 0.0, -1.0, 1.0)[:, np.newaxis]
     offsets = np.einsum('ij,ij->i', normals, face_points)
     radius = float(np.linalg.norm(verts, axis=1).max())
-    return ((verts.min(axis=0), verts.max(axis=0)), normals, offsets, radius)
+    shape = ((verts.min(axis=0), verts.max(axis=0)), normals, offsets, radius)
+    _LINK_COLLISION_SHAPE_CACHE[id(link)] = shape
+    return shape
 
 
 def obstacle_into_link_depth(samples, link, shape):
@@ -1158,8 +1173,15 @@ def obstacle_into_link_depth(samples, link, shape):
     """
     points, obstacle_center, obstacle_radius = samples
     (lo, hi), normals, offsets, link_radius = shape
-    if (np.linalg.norm(obstacle_center - link.worldpos())
-            > link_radius + obstacle_radius):
+    # np.linalg.norm はスカラー1本の距離判定には割高 (引数チェック等の
+    # オーバーヘッドが大きい) なので、この足切り判定は math.sqrt で軽量に
+    # 計算する (830 リンク・障害物ペア x waypoint 数だけ呼ばれるホット
+    # パスのため)。
+    center_diff = obstacle_center - link.worldpos()
+    center_dist = math.sqrt(
+        center_diff[0] * center_diff[0] + center_diff[1] * center_diff[1]
+        + center_diff[2] * center_diff[2])
+    if center_dist > link_radius + obstacle_radius:
         return -float('inf')
     local_pts = (points - link.worldpos()) @ link.worldrot()
     bbox_depth = np.minimum(local_pts - lo, hi - local_pts).min(axis=1)
@@ -1170,7 +1192,8 @@ def obstacle_into_link_depth(samples, link, shape):
     return float(-plane_dist.max(axis=1).min())
 
 
-def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
+def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
+                                 obstacle_links=None, obstacle_samples=None):
     """``robot`` の現在の姿勢 (``angle_vector``/``base_pose`` 適用済み) で、
     ``collision_pairs`` (``load_collision_pairs`` が返す ``(Link, Link)``/
     ``(Link, int)`` 混在のリスト) の中で最も干渉している (最小の) 距離
@@ -1206,11 +1229,28 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
     からの逆向きの判定
     (``obstacle_into_link_depth``) も併せて行い、両方の深さの大きい方
     (より貫通している方) を採用する。
+
+    ``obstacle_links`` を指定すると、``human_body_obstacles(joint_
+    positions)`` を内部で呼ばず、渡された ``Cylinder`` のリストをそのまま
+    使う。人体の姿勢が変わらないまま同じ ``joint_positions`` に対して本
+    関数を何度も呼ぶ場合 (``plan_handshake_motion.verify_waypoints`` の
+    waypoint ループ、``pick_verified_candidate`` の候補ループなど)、
+    ``human_body_obstacles`` は姿勢に依存しない (毎回同じ結果になる) にも
+    関わらず呼び出しごとに ``Cylinder``/trimesh メッシュを作り直しており
+    無駄が大きいため、呼び出し側でループの外で 1 回だけ作って使い回せる
+    ようにする。未指定 (``None``) の場合は従来通り内部で構築する。
+
+    ``obstacle_samples`` も同様の理由で ``cylinder_surface_samples(obstacle
+    _links[i])`` を要素ごとに事前計算したリストを渡せる (``obstacle_links``
+    と同じ、waypoint ごと/候補ごとに姿勢が変わらないループで使い回す想定)。
+    未指定なら従来通り本関数の中で (呼び出し 1 回につき障害物ごとに 1 回)
+    計算する。
     """
     if not collision_pairs:
         return float('inf')
-    obstacle_links = human_body_obstacles(joint_positions) \
-        if joint_positions else None
+    if obstacle_links is None:
+        obstacle_links = human_body_obstacles(joint_positions) \
+            if joint_positions else None
     min_dist = float('inf')
     world_vertices_by_link = {}
     shape_by_link = {}
@@ -1229,32 +1269,68 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions):
         return shape_by_link[link]
 
     def _samples(index):
+        if obstacle_samples is not None:
+            return obstacle_samples[index]
         if index not in samples_by_obstacle:
             samples_by_obstacle[index] = cylinder_surface_samples(
                 obstacle_links[index])
         return samples_by_obstacle[index]
 
+    def _center_dist(pos_a, pos_b):
+        # np.linalg.norm はスカラー1本の距離判定には割高 (830 リンク・
+        # 障害物ペア x waypoint 数のホットパス) なので math.sqrt で計算する
+        # (obstacle_into_link_depth の同種の足切りと同じ理由)。
+        diff = pos_b - pos_a
+        return math.sqrt(diff[0] * diff[0] + diff[1] * diff[1]
+                         + diff[2] * diff[2])
+
     for link_a, other in collision_pairs:
-        verts_a = _world_vertices(link_a)
+        shape_a = _shape(link_a)
+        link_radius = shape_a[3]
         if isinstance(other, int):
             if obstacle_links is None:
                 continue
             obstacle = obstacle_links[other]
-            local_pts = ((verts_a - obstacle.worldpos())
-                        @ obstacle.worldrot())
-            radial = np.linalg.norm(local_pts[:, :2], axis=1)
-            axial = np.abs(local_pts[:, 2])
-            depth = float(np.minimum(
-                obstacle.radius - radial,
-                obstacle.height / 2.0 - axial).max())
-            depth = max(depth, obstacle_into_link_depth(
-                _samples(other), link_a, _shape(link_a)))
-            dist = -depth
+            samples = _samples(other)
+            _, obstacle_center, obstacle_radius = samples
+            # 包含球同士 (リンクの頂点を包む球、円柱障害物を包む球) が
+            # 重なっていなければこの対は絶対に貫通し得ないので、頂点ベースの
+            # 厳密な形状判定 (radial/axial の解析計算 + obstacle_into_link_
+            # depth の表面サンプル判定) を丸ごと省略できる。省略時は
+            # 包含球間の隙間 (実際の最短距離の安全側=過小な下界) を dist
+            # としてそのまま使う (min_dist の計算にとって、真の距離より
+            # 小さい値を使うのは常に安全側で、verified/貫通判定を誤って
+            # 甘くすることはない)。
+            margin = _center_dist(link_a.worldpos(), obstacle_center) \
+                - link_radius - obstacle_radius
+            if margin > 0.0:
+                dist = margin
+            else:
+                verts_a = _world_vertices(link_a)
+                local_pts = ((verts_a - obstacle.worldpos())
+                            @ obstacle.worldrot())
+                # np.linalg.norm(axis=1) は少数の頂点 (数個〜十数個) に
+                # 対して呼ぶには割高なので、同じ計算を素の要素積・和で行う。
+                radial = np.sqrt(local_pts[:, 0] ** 2 + local_pts[:, 1] ** 2)
+                axial = np.abs(local_pts[:, 2])
+                depth = float(np.minimum(
+                    obstacle.radius - radial,
+                    obstacle.height / 2.0 - axial).max())
+                depth = max(depth, obstacle_into_link_depth(
+                    samples, link_a, shape_a))
+                dist = -depth
         else:
-            verts_b = _world_vertices(other)
-            dist = float(np.linalg.norm(
-                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
-                axis=-1).min())
+            shape_b = _shape(other)
+            margin = _center_dist(link_a.worldpos(), other.worldpos()) \
+                - link_radius - shape_b[3]
+            if margin > 0.0:
+                dist = margin
+            else:
+                verts_a = _world_vertices(link_a)
+                verts_b = _world_vertices(other)
+                dist = float(np.linalg.norm(
+                    verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
+                    axis=-1).min())
         if dist < min_dist:
             min_dist = dist
     return min_dist
@@ -1592,6 +1668,16 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     # 検証 (collision_pairs_min_distance) -> 後処理判定 (solve_post_
     # process) を試す。post_process_max_candidates で調べる候補数の上限
     # を設ける (None なら無制限)。
+    # human_body_obstacles は joint_positions だけで決まり、候補ループ中
+    # ずっと同じ人体姿勢を使うため、候補ごとに作り直さずここで 1 回だけ
+    # 構築して collision_pairs_min_distance に使い回させる。障害物の表面
+    # サンプル (cylinder_surface_samples) も同じ理由で 1 回だけ計算する。
+    obstacle_links = human_body_obstacles(joint_positions) \
+        if joint_positions else None
+    obstacle_samples = (
+        [cylinder_surface_samples(o) for o in obstacle_links]
+        if obstacle_links else None)
+
     fallback = None
     examined = 0
     for cost, candidate_index in candidates:
@@ -1606,7 +1692,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         robot.angle_vector(angle_vectors[candidate_index])
         robot.newcoords(base_poses[candidate_index])
         min_dist = collision_pairs_min_distance(
-            robot, verification_pairs, joint_positions)
+            robot, verification_pairs, joint_positions,
+            obstacle_links=obstacle_links, obstacle_samples=obstacle_samples)
         if min_dist < -collision_verify_tolerance:
             print('  [collision-verify] {} の候補は IK は収束'
                   'したが、事後検証で {:.4f} m 貫通していたため棄却'
@@ -1951,9 +2038,7 @@ def _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
     されるため、対象者が 0 人ならバッチIK自体が一度も呼ばれず、ここで
     払うトレース/コンパイルのコストが丸ごと無駄になるため。
     """
-    collision_obstacles = (
-        [] if (args.no_human_collision or collision_pairs is None)
-        else human_body_obstacles({}))
+    collision_obstacles = human_body_obstacles({})
     if args.robot_arm == 'auto':
         arms_to_warm = (('l', 'R'), ('r', 'L'))
     else:
@@ -1968,23 +2053,22 @@ def _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
             robot, _WARMUP_PALM, hand, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
             base_limits=base_limits,
-            collision_weight=args.collision_weight,
-            collision_margin=args.collision_margin,
-            self_collision=(args.self_collision
-                            and collision_pairs is not None),
+            collision_weight=DEFAULT_COLLISION_WEIGHT,
+            collision_margin=DEFAULT_COLLISION_MARGIN,
+            self_collision=(collision_pairs is not None),
             collision_pairs=collision_pairs,
-            self_collision_weight=args.self_collision_weight,
-            self_collision_margin=args.self_collision_margin,
-            collision_ik_stop=args.collision_ik_stop,
-            collision_ik_thre=args.collision_ik_thre,
-            collision_ik_rthre=args.collision_ik_rthre,
+            self_collision_weight=None,
+            self_collision_margin=DEFAULT_SELF_COLLISION_MARGIN,
+            collision_ik_stop=DEFAULT_COLLISION_IK_STOP,
+            collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
+            collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
             collision_joint_limit_margin_ratio=(
-                args.collision_joint_limit_margin),
+                DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
             joint_positions={},
             verification_pairs=verification_pairs,
-            collision_verify_tolerance=args.collision_verify_tolerance,
-            post_process_thre=args.post_process_thre,
-            post_process_rthre=math.radians(args.post_process_rthre),
+            collision_verify_tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE,
+            post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
+            post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
             post_process_max_candidates=(
                 args.post_process_max_candidates
                 if args.post_process_max_candidates
@@ -2028,26 +2112,6 @@ def main():
             'のディレクトリ (既定 random_human_poses/)。干渉回避の障害物 '
             '(この人物の身体) を作るのに使う。')
     parser.add_argument(
-        '--human-front-distance', type=float,
-        default=HUMAN_FRONT_DISTANCE,
-        help='Aero の前方どれだけの位置に人物を置くか [m] (既定 {:.1f})。'
-            .format(HUMAN_FRONT_DISTANCE))
-    parser.add_argument(
-        '--collision-weight', type=float,
-        default=DEFAULT_COLLISION_WEIGHT,
-        help='人体との干渉回避ペナルティの重み (既定 {})。'.format(
-            DEFAULT_COLLISION_WEIGHT))
-    parser.add_argument(
-        '--collision-margin', type=float,
-        default=DEFAULT_COLLISION_MARGIN,
-        help='人体との干渉回避ペナルティが働き始める距離 [m] '
-            '(既定 {})。'.format(DEFAULT_COLLISION_MARGIN))
-    parser.add_argument(
-        '--no-self-collision', dest='self_collision', action='store_false',
-        help='ロボット自身のリンク同士の干渉を回避するペナルティを無効に '
-            'する (既定は有効。--collision-pairs が使えない場合はどのみち '
-            '無効になる)。')
-    parser.add_argument(
         '--collision-pairs', type=str,
         default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
         help='干渉回避で実際にチェックする組み合わせ (自己干渉のロボット '
@@ -2057,129 +2121,11 @@ def main():
             '既定のパスにファイルが無ければ、自己干渉・人体との干渉の両方 '
             'を無効にして通常のヤコビアン法の IK を解く。')
     parser.add_argument(
-        '--no-human-collision', action='store_true',
-        help='人体を障害物とした干渉回避を無効にする (既定は --skeleton-dir '
-            'に骨格 JSON があれば有効)。人物の立ち位置の平行移動は従来 '
-            'どおり働く。')
-    parser.add_argument(
-        '--self-collision-weight', type=float, default=None,
-        help='自己干渉回避ペナルティの重み (既定は --collision-weight と '
-            '同じ値を使う)。')
-    parser.add_argument(
-        '--self-collision-margin', type=float,
-        default=DEFAULT_SELF_COLLISION_MARGIN,
-        help='自己干渉回避ペナルティが働き始めるリンク間距離 [m] '
-            '(既定 {})。'.format(DEFAULT_SELF_COLLISION_MARGIN))
-    parser.add_argument(
-        '--collision-ik-stop', type=int,
-        default=DEFAULT_COLLISION_IK_STOP,
-        help='干渉回避付きバッチ IK (backend=jax の勾配降下法) の最大反復 '
-            '回数 (既定 {})。'.format(DEFAULT_COLLISION_IK_STOP))
-    parser.add_argument(
-        '--collision-ik-thre', type=float,
-        default=DEFAULT_COLLISION_IK_THRE,
-        help='干渉回避付きバッチ IK の位置収束閾値 [m] (既定 {})。'.format(
-            DEFAULT_COLLISION_IK_THRE))
-    parser.add_argument(
-        '--collision-ik-rthre', type=float,
-        default=DEFAULT_COLLISION_IK_RTHRE,
-        help='干渉回避付きバッチ IK の姿勢収束閾値 [rad] (既定 {:.4f})。'
-            .format(DEFAULT_COLLISION_IK_RTHRE))
-    parser.add_argument(
-        '--collision-joint-limit-margin', type=float,
-        default=DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO,
-        help='干渉回避付きバッチ IK だけに適用する関節可動域の上下 '
-            'マージン比率 (既定 {})。0 を指定すると制限しない。'.format(
-                DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO))
-    parser.add_argument(
-        '--collision-verify-tolerance', type=float,
-        default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
-        help='収束した候補の事後の干渉検証 (collision_pairs_min_distance) '
-            'で、この距離 [m] を超えて貫通していれば棄却する (既定 {})。'
-            .format(DEFAULT_COLLISION_VERIFY_TOLERANCE))
-    parser.add_argument(
-        '--post-process-thre', type=float,
-        default=DEFAULT_POST_PROCESS_IK_THRE,
-        help='後処理判定 (solve_post_process) の腕タスクの位置収束閾値 '
-            '[m] (既定 {})。視線タスクの閾値には影響しない。'.format(
-                DEFAULT_POST_PROCESS_IK_THRE))
-    parser.add_argument(
-        '--post-process-rthre', type=float,
-        default=math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE),
-        help='後処理判定 (solve_post_process) の腕タスクの姿勢収束閾値 '
-            '[deg] (既定 {:.1f})。視線タスクの閾値には影響しない。'
-            .format(math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE)))
-    parser.add_argument(
         '--post-process-max-candidates', type=int,
         default=DEFAULT_POST_PROCESS_MAX_CANDIDATES,
         help='pick_verified_candidate が関節の曲げ量コスト昇順に '
             '干渉の事後検証 + solve_post_process を試す候補数の上限 '
             '(既定は無制限)。0 以下を指定すると無制限に試す。')
-    parser.add_argument(
-        '--base-x-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
-        default=list(DEFAULT_BASE_X_RANGE),
-        help='台車の前後方向 (x) の移動範囲 [m]。IK 開始時の台車位置を '
-            '原点とする (既定 {} {})。'.format(*DEFAULT_BASE_X_RANGE))
-    parser.add_argument(
-        '--base-y-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
-        default=list(DEFAULT_BASE_Y_RANGE),
-        help='台車の左右方向 (y) の移動範囲 [m] (既定 {} {})。'.format(
-            *DEFAULT_BASE_Y_RANGE))
-    parser.add_argument(
-        '--base-yaw-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
-        default=list(DEFAULT_BASE_YAW_RANGE),
-        help='台車の向き (yaw) の範囲 [rad] (既定 {:.4f} {:.4f})。'.format(
-            *DEFAULT_BASE_YAW_RANGE))
-    parser.add_argument(
-        '--no-hand-side-base-constraint', dest='hand_side_base_constraint',
-        action='store_false',
-        help='台車の y 可動範囲を、差し出している手の側 '
-            '(``offered_hand_side_sign``) だけに制限する制約を無効にする '
-            '(既定は有効。--skeleton-dir に骨格 JSON が無い等で手の側が '
-            '判定できない人物には、指定に関わらずもともと働かない)。')
-    parser.add_argument(
-        '--no-facing-base-constraint', dest='facing_base_constraint',
-        action='store_false',
-        help='台車の yaw 可動範囲を、人間の正面方向 (``human_facing_yaw``) '
-            '中心の ±--base-yaw-facing-margin 度に制限する制約を無効に '
-            'する (既定は有効。--skeleton-dir に骨格 JSON が無い等で '
-            '正面方向が判定できない人物には、指定に関わらずもともと '
-            '働かない)。')
-    parser.add_argument(
-        '--base-yaw-facing-margin', type=float,
-        default=DEFAULT_BASE_YAW_FACING_MARGIN_DEG,
-        help='--facing-base-constraint が有効なときの、台車 yaw の '
-            '人間の正面方向からの許容幅 [deg] (既定 {:.1f})。'.format(
-                DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
-    parser.add_argument(
-        '--seed', type=int, default=None,
-        help='バッチ IK の乱数初期値に使う numpy の乱数シード。指定すると '
-            '実行ごとに同じ解が得られる (既定は指定なし)。')
-    parser.add_argument(
-        '--collision-primitive-type', choices=['box', 'cylinder', 'sphere'],
-        default=None,
-        help='干渉回避に使うロボット自身のジオメトリを、指定した形状に '
-            '全リンク強制変換する (既定 (未指定) はリンクごとに自動選択)。')
-    parser.add_argument(
-        '--force-convert-collision-model', action='store_true',
-        help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
-            'を使わず毎回作り直す。')
-    parser.add_argument(
-        '--collision-urdf', type=str, default=None,
-        help='干渉回避のジオメトリ・対象リンクの読み込み元 URDF を明示的に '
-            '指定する (既定は自動生成・キャッシュされるプリミティブ近似 '
-            'URDF)。--collision-primitive-type/--force-convert-collision-'
-            'model とは併用できない。IK を解くロボット本体のキネマティクス '
-            'は変えず、干渉回避に使うリンクの集合・ジオメトリだけを '
-            '(リンク名で対応づけて) 差し替える。')
-    parser.add_argument(
-        '--no-warmup', dest='warmup', action='store_false',
-        help='起動直後のダミー目標によるバッチIKのウォームアップ '
-            '(run_camera_pipeline_test.py の _warmup_ik と同じ手法) を '
-            '無効にする。無効にすると、最初に IK 対象になった人物の '
-            'collision_ik_time に jax の JIT トレース/コンパイル時間が '
-            'そのまま乗る (既定は有効。ただし IK 対象が 1 人もいない '
-            'バッチでは、指定に関わらずそもそも実行されない)。')
     args = parser.parse_args()
 
     files = iter_palm_files(args.input_dir)
@@ -2189,19 +2135,13 @@ def main():
                   args.input_dir))
         return
 
-    if args.seed is not None:
-        np.random.seed(args.seed)
-
+    np.random.seed(0)
     os.makedirs(args.output_dir, exist_ok=True)
     # r/l_eef_grasp_link (IK が使う手先フレーム) は手あり/なし両方の URDF に
     # あるので、指の関節が要らないこのスクリプトでは手なしモデルを使う。
     robot = Aero(use_hand=False)
     restrict_elbow_range(robot)
-    apply_collision_model(
-        robot,
-        primitive_type=args.collision_primitive_type,
-        force_convert=args.force_convert_collision_model,
-        collision_urdf_path=args.collision_urdf)
+    apply_collision_model(robot)
 
     # 干渉回避で実際にチェックする組み合わせは常に collision_pairs
     # (--collision-pairs の JSON) だけで決める。JSON が無ければ干渉回避
@@ -2222,8 +2162,8 @@ def main():
               '・人体との干渉の両方) を無効にして IK を解きます。'.format(
                   args.collision_pairs))
 
-    base_limits = [tuple(args.base_x_range), tuple(args.base_y_range),
-                   tuple(args.base_yaw_range)]
+    base_limits = [DEFAULT_BASE_X_RANGE, DEFAULT_BASE_Y_RANGE,
+                   DEFAULT_BASE_YAW_RANGE]
 
     # IK 対象 (offered_hand が L/R) が 1 人もいなければバッチIKは一度も
     # 呼ばれないので、ウォームアップ自体が完全な無駄になる (2〜9 秒程度)。
@@ -2235,7 +2175,7 @@ def main():
     has_target = any(
         load_palm_json(path).get('offered_hand') in ('L', 'R')
         for path in files)
-    if args.warmup and has_target:
+    if has_target:
         _warmup_batch_ik(robot, args, collision_pairs, verification_pairs,
                          base_limits)
 
@@ -2271,11 +2211,11 @@ def main():
         if os.path.exists(skeleton_path):
             joint_positions = load_skeleton_json(skeleton_path)
             offset = human_translation_offset(
-                joint_positions, front_distance=args.human_front_distance)
+                joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
             joint_positions = translate_joint_positions(
                 joint_positions, offset)
             collision_obstacles = (
-                [] if (args.no_human_collision or collision_pairs is None)
+                [] if collision_pairs is None
                 else human_body_obstacles(joint_positions))
             palm = translate_palm(palm, offset)
         else:
@@ -2291,21 +2231,20 @@ def main():
         # solve_person_ik はこれまでどおりこの人物 1 人分を 1 回のバッチ
         # IK で解く。
         person_base_limits = base_limits
-        if args.hand_side_base_constraint:
-            side_sign = offered_hand_side_sign(
-                human_hand, joint_positions, palm)
-            if side_sign is not None:
-                person_base_limits = [
-                    base_limits[0],
-                    restrict_base_y_range_to_hand_side(
-                        base_limits[1], side_sign),
-                    base_limits[2]]
+        side_sign = offered_hand_side_sign(
+            human_hand, joint_positions, palm)
+        if side_sign is not None:
+            person_base_limits = [
+                base_limits[0],
+                restrict_base_y_range_to_hand_side(
+                    base_limits[1], side_sign),
+                base_limits[2]]
 
-        # 台車の向き (人間の正面方向 ±--base-yaw-facing-margin に制限) を
+        # 台車の向き (人間の正面方向 ±margin に制限) を
         # 反映する (human_facing_yaw/restrict_base_yaw_range_to_human_facing
         # 参照)。手の左右の制約と異なり既存レンジとの積集合ではなく、
         # 人間の正面方向中心の窓で置き換える (詳細は関数の docstring 参照)。
-        if args.facing_base_constraint and joint_positions is not None:
+        if joint_positions is not None:
             human_yaw = human_facing_yaw(joint_positions)
             if human_yaw is not None:
                 person_base_limits = [
@@ -2313,7 +2252,7 @@ def main():
                     person_base_limits[1],
                     restrict_base_yaw_range_to_human_facing(
                         person_base_limits[2], human_yaw,
-                        margin=math.radians(args.base_yaw_facing_margin))]
+                        margin=math.radians(DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
 
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, human_hand, robot_arm)
@@ -2321,22 +2260,22 @@ def main():
             robot, palm, human_hand, robot_arm, collision_obstacles,
             attempts_per_pose=args.attempts_per_pose,
             base_limits=person_base_limits,
-            collision_weight=args.collision_weight,
-            collision_margin=args.collision_margin,
-            self_collision=(args.self_collision and collision_pairs is not None),
+            collision_weight=DEFAULT_COLLISION_WEIGHT,
+            collision_margin=DEFAULT_COLLISION_MARGIN,
+            self_collision=(collision_pairs is not None),
             collision_pairs=collision_pairs,
-            self_collision_weight=args.self_collision_weight,
-            self_collision_margin=args.self_collision_margin,
-            collision_ik_stop=args.collision_ik_stop,
-            collision_ik_thre=args.collision_ik_thre,
-            collision_ik_rthre=args.collision_ik_rthre,
+            self_collision_weight=None,
+            self_collision_margin=DEFAULT_SELF_COLLISION_MARGIN,
+            collision_ik_stop=DEFAULT_COLLISION_IK_STOP,
+            collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
+            collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
             collision_joint_limit_margin_ratio=(
-                args.collision_joint_limit_margin),
+                DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
             joint_positions=joint_positions,
             verification_pairs=verification_pairs,
-            collision_verify_tolerance=args.collision_verify_tolerance,
-            post_process_thre=args.post_process_thre,
-            post_process_rthre=math.radians(args.post_process_rthre),
+            collision_verify_tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE,
+            post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
+            post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
             post_process_max_candidates=(
                 args.post_process_max_candidates
                 if args.post_process_max_candidates

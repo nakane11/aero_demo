@@ -426,8 +426,29 @@ def trajectory_waypoints(robot, joint_list, trajectory):
     return waypoints
 
 
+def build_obstacle_cache(joint_positions):
+    """``human_body_obstacles``/``cylinder_surface_samples`` を 1 回だけ
+    計算し、``verify_waypoints`` に ``obstacle_cache`` として渡せる形
+    (``(obstacle_links, obstacle_samples)``) にまとめる。
+
+    どちらも ``joint_positions`` だけで決まり人物の姿勢が変わらない限り
+    不変なので、1 人分の ``plan_person_motion`` 呼び出し全体
+    (pre-touch/線形補間の初期候補 + ``--motion-attempts`` 回の最適化
+    リトライ、それぞれが ``verify_waypoints`` を 1 回呼ぶ) を通して
+    ここで 1 回だけ構築したものを使い回す (``verify_waypoints`` 単体では
+    従来通り waypoint ごとの使い回ししかできず、候補・リトライをまたいだ
+    再構築の無駄までは防げなかったため)。
+    """
+    obstacle_links = spik.human_body_obstacles(joint_positions) \
+        if joint_positions else None
+    obstacle_samples = (
+        [spik.cylinder_surface_samples(o) for o in obstacle_links]
+        if obstacle_links else None)
+    return obstacle_links, obstacle_samples
+
+
 def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
-                     joint_positions):
+                     joint_positions, obstacle_cache=None):
     """各 waypoint を ``robot`` に反映し、厳密な形状による事後検証
     (``solve_palm_ik.collision_pairs_min_distance``。IK 側の事後検証と
     同じ関数) で最小距離を計測する。
@@ -437,6 +458,20 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
     list of float
         waypoint ごとの最小距離 [m] (負なら貫通)。
     """
+    # human_body_obstacles は joint_positions だけで決まり、軌道上の全
+    # waypoint を通して人体の姿勢は変わらないため、waypoint ごとに作り
+    # 直さずここで 1 回だけ構築して使い回す。同じ理由で、各障害物の表面
+    # サンプル (cylinder_surface_samples、collision_pairs_min_distance が
+    # 円柱の逆向き貫通判定に使う) も obstacle_links と同様に姿勢に依存
+    # しないため、ここで 1 回だけ計算して使い回す。呼び出し側 (``plan_
+    # person_motion``) が候補・リトライをまたいで使い回せるよう事前計算
+    # 済みの ``obstacle_cache`` (``build_obstacle_cache`` の戻り値) を
+    # 渡してきた場合はそれを使い、未指定ならここで 1 回だけ構築する。
+    if obstacle_cache is not None:
+        obstacle_links, obstacle_samples = obstacle_cache
+    else:
+        obstacle_links, obstacle_samples = build_obstacle_cache(
+            joint_positions)
     distances = []
     for wp in waypoints:
         name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
@@ -447,7 +482,8 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
             pos=wp['base_position'],
             rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
         distances.append(spik.collision_pairs_min_distance(
-            robot, verification_pairs, joint_positions))
+            robot, verification_pairs, joint_positions,
+            obstacle_links=obstacle_links, obstacle_samples=obstacle_samples))
     return distances
 
 
@@ -513,8 +549,13 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     start_time = time.time()
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         build_start_and_goal(robot, robot_arm, handshake, human_xy,
-                             args.approach_distance)
+                             DEFAULT_APPROACH_DISTANCE)
     n_joints = len(q_start)
+    # pre-touch/線形補間の初期候補 + 最適化リトライのすべてが同じ人物
+    # (joint_positions 不変) を検証するので、build_obstacle_cache を
+    # ここで 1 回だけ呼んで使い回す (verify_waypoints のモジュール docstring
+    # 参照)。
+    obstacle_cache = build_obstacle_cache(joint_positions)
 
     def make_candidate(trajectory, kind, attempt=None, cost=None,
                        solve_time=0.0):
@@ -522,18 +563,18 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
         joint_names = [j.name for j in robot.joint_list]
         distances = verify_waypoints(
             robot, joint_names, waypoints, verification_pairs,
-            joint_positions)
+            joint_positions, obstacle_cache=obstacle_cache)
         return dict(
             planned=True,
             kind=kind,
             optimized=kind == 'optimized',
-            verified=min(distances) >= -args.collision_verify_tolerance,
+            verified=min(distances) >= -DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
             attempt=attempt,
             cost=cost,
             n_waypoints=args.n_waypoints,
-            dt=args.dt,
+            dt=DEFAULT_DT,
             robot_arm=robot_arm,
-            approach_distance=args.approach_distance,
+            approach_distance=DEFAULT_APPROACH_DISTANCE,
             joint_names=joint_names,
             waypoints=waypoints,
             waypoint_min_distances=[float(d) for d in distances],
@@ -547,11 +588,11 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     if normal is not None:
         q_pre = solve_pretouch_pose(
             robot, robot_arm, link_list, joint_list, handshake, q_goal,
-            base_goal, normal, args.pretouch_standoff)
+            base_goal, normal, DEFAULT_PRETOUCH_STANDOFF)
         if q_pre is not None:
             candidates.append(('pretouch', build_pretouch_trajectory(
                 q_start, base_start, q_pre, q_goal, base_goal,
-                args.n_waypoints, args.pretouch_split)))
+                args.n_waypoints, DEFAULT_PRETOUCH_SPLIT)))
     candidates.append(('linear', initial_traj))
 
     force_optimize = getattr(args, 'force_optimize', False)
@@ -566,6 +607,14 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
                             > min(best['waypoint_min_distances'])):
             best = candidate
             best_trajectory = trajectory
+        if candidate['verified']:
+            # force_optimize でもここで打ち切ってよい: candidates は
+            # pre-touch -> 線形補間の優先順で並んでおり (モジュール
+            # docstring 参照)、既に厳密検証を通った候補が見つかった
+            # 時点でそれ以上に「良い」warm start は原理上ありえない
+            # (verify_waypoints は 1 候補あたり n_waypoints 回の厳密形状
+            # 干渉チェックを伴う重い処理なので、後続候補の検証は無駄)。
+            break
 
     # solve_pretouch_pose が台車を最終位置へ動かしているので、最適化問題を
     # 組む前に基準の姿勢 (台車=ワールド原点, 腕=始点) に戻す
@@ -578,20 +627,32 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     world_obstacles = human_body_cylinder_obstacles(joint_positions)
     collision_link_list = spik.collision_link_list_for_arm(robot, robot_arm)
     problem = build_problem(
-        robot, robot_arm, link_list, args.n_waypoints, args.dt,
+        robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
         world_obstacles, collision_link_list,
-        args.collision_activation_distance,
-        args.self_collision_activation_distance,
-        args.smoothness_weight, args.acceleration_weight,
-        collision_weight=args.collision_weight,
-        self_collision_weight=args.self_collision_weight)
-    rng = np.random.RandomState(args.seed)
+        DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+        DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
+        DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
+        collision_weight=100.0,
+        self_collision_weight=100.0)
+    rng = np.random.RandomState(0)
 
-    for attempt in range(args.motion_attempts):
+    # warm start を揺らした ``--motion-attempts`` 回のリトライ
+    # (perturb_initial_trajectory) は、``best`` (pre-touch/線形補間の候補)
+    # がまだ厳密検証を通っていない (verified: False -- 干渉が残っている)
+    # ときに局所解を抜け出すためのもの。``best`` が既に verified: True
+    # なら、そもそも改善する必要が無い候補を warm start にして何度も
+    # 揺らして解き直す意味が無く (``force_optimize`` で早期 return せず
+    # ここまで来た場合のみ起こる)、1 回だけ最適化を試す
+    # (``force_optimize`` は軌道最適化の計算時間そのものを計測したい
+    # ときに使うので、最適化を全く試さずに終わらせるわけにはいかない --
+    # モジュール docstring 参照)。
+    max_attempts = args.motion_attempts if not best['verified'] else 1
+
+    for attempt in range(max_attempts):
         warm_start = best_trajectory if attempt == 0 \
             else perturb_initial_trajectory(
                 best_trajectory, n_joints, rng,
-                args.motion_attempt_perturbation)
+                0.3)
         solve_start = time.time()
         result = solver.solve(problem, warm_start)
         candidate = make_candidate(
@@ -606,6 +667,56 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
 
     best['compute_time'] = time.time() - start_time
     return best
+
+
+def _warmup_solver(robot, solver, args):
+    """人物ループに入る前に、左右両腕分の軌道最適化問題を一度ずつ
+    ``solver`` に解かせ、jaxls の JIT トレース/コンパイルを済ませておく
+    (``solve_palm_ik.py`` の ``_warmup_batch_ik`` と同じ考え方)。
+
+    ``JaxlsSolver`` はコンパイル済み問題を腕ごと (``joint_limits_lower``/
+    ``upper`` が cache key に含まれるため 'l'/'r' で自動的に別エントリに
+    なる) にキャッシュして使い回す (``_cache`` 参照) が、人物ループの中で
+    初めてその腕を最適化する人物がこのトレース/コンパイルを肩代わりして
+    しまうと、その人物だけ計算時間が数秒〜数十秒突出してしまう。事前に
+    ここで両腕分済ませておけば、人物ループ中の ``solver.solve()`` は
+    どちらの腕でも最初からキャッシュヒットする。
+
+    障害物の中身 (人体の姿勢) は cache key に含まれない
+    (``JaxlsSolver._make_cache_key`` の ``obstacle_key`` はシリンダー
+    個数だけを見る) ので、実際の人物の骨格ではなく空の ``joint_positions``
+    (``human_body_obstacles`` がダミーで埋めた、個数だけ実物と同じ
+    シリンダー列) で十分。始点・終点の関節角/台車位置も適当な値でよく、
+    ここでの計算結果 (収束したかどうか) 自体は使わずに捨てる。
+    """
+    world_obstacles = human_body_cylinder_obstacles({})
+    for robot_arm in ('l', 'r'):
+        warmup_start = time.time()
+        robot.newcoords(Coordinates())
+        robot.base_link.newcoords(Coordinates())
+        link_list = getattr(
+            robot, '{}arm_whole_body'.format(robot_arm)).link_list
+        joint_list = [link.joint for link in link_list]
+        q_start = arms_down_angles(robot, joint_list)
+        q_goal = q_start
+        base_start = np.array([0.0, 0.0, 0.0])
+        base_goal = np.array([0.3, 0.0, 0.1])
+        collision_link_list = spik.collision_link_list_for_arm(
+            robot, robot_arm)
+        problem = build_problem(
+            robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
+            world_obstacles, collision_link_list,
+            DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+            DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
+            DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
+            collision_weight=100.0, self_collision_weight=100.0)
+        initial_traj = build_initial_trajectory(
+            q_start, base_start, q_goal, base_goal, args.n_waypoints)
+        solver.solve(problem, initial_traj)
+        print('[warmup] {}腕: 軌道最適化のトレース/コンパイル {:.1f} 秒'
+              .format(robot_arm, time.time() - warmup_start))
+    robot.newcoords(Coordinates())
+    robot.base_link.newcoords(Coordinates())
 
 
 def main():
@@ -633,73 +744,13 @@ def main():
         help='軌道 JSON の保存先ディレクトリ (既定 random_motion_poses/。'
             '入力と同じファイル名で保存する)。')
     parser.add_argument(
-        '--human-front-distance', type=float,
-        default=spik.HUMAN_FRONT_DISTANCE,
-        help='solve_palm_ik.py の --human-front-distance と同じ値を渡す '
-            '(既定 {:.1f})。骨格 JSON の人物をこの距離だけ Aero の前方に '
-            '平行移動してから障害物にする -- solve_palm_ik.py 実行時と '
-            '揃っていないと、干渉回避の対象がずれる。'.format(
-                spik.HUMAN_FRONT_DISTANCE))
-    parser.add_argument(
-        '--approach-distance', type=float,
-        default=DEFAULT_APPROACH_DISTANCE,
-        help='軌道の始点で、最終台車位置から人間の反対方向へ下がる距離 '
-            '[m] (既定 {})。これより遠方からの走行はナビゲーションの担当 '
-            'として計画・検証しない (モジュール docstring 参照)。'.format(
-                DEFAULT_APPROACH_DISTANCE))
-    parser.add_argument(
-        '--pretouch-standoff', type=float,
-        default=DEFAULT_PRETOUCH_STANDOFF,
-        help='pre-touch 姿勢を、目標手先位置から人間の掌の法線方向へ '
-            '引き戻す距離 [m] (既定 {})。最後の接近をこの法線方向の直線に '
-            'することで、手先が掌を通り抜けるのを防ぐ (モジュール '
-            'docstring 参照)。'.format(DEFAULT_PRETOUCH_STANDOFF))
-    parser.add_argument(
-        '--pretouch-split', type=float, default=DEFAULT_PRETOUCH_SPLIT,
-        help='軌道全体のうち pre-touch 姿勢に到達するまでに使う割合 '
-            '(既定 {})。残りが法線方向の最終接近になる。'.format(
-                DEFAULT_PRETOUCH_SPLIT))
-    parser.add_argument(
         '--n-waypoints', type=int, default=DEFAULT_N_WAYPOINTS,
         help='軌道の waypoint 数 (始点・終点を含む。既定 {})。'.format(
             DEFAULT_N_WAYPOINTS))
     parser.add_argument(
-        '--dt', type=float, default=DEFAULT_DT,
-        help='waypoint 間の時間刻み [秒] (既定 {})。'.format(DEFAULT_DT))
-    parser.add_argument(
         '--max-iterations', type=int, default=DEFAULT_MAX_ITERATIONS,
         help='軌道最適化 (jaxls) の最大反復回数 (既定 {})。'.format(
             DEFAULT_MAX_ITERATIONS))
-    parser.add_argument(
-        '--collision-activation-distance', type=float,
-        default=DEFAULT_COLLISION_ACTIVATION_DISTANCE,
-        help='人体との干渉コストが働き始める距離 [m] (既定 {})。'.format(
-            DEFAULT_COLLISION_ACTIVATION_DISTANCE))
-    parser.add_argument(
-        '--self-collision-activation-distance', type=float,
-        default=DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
-        help='自己干渉コストが働き始める距離 [m] (既定 {})。'.format(
-            DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE))
-    parser.add_argument(
-        '--collision-weight', type=float, default=100.0,
-        help='人体との干渉コストの重み (既定 100.0)。box/cylinder 同士は '
-            '交互射影による近似なので、大きくしても厳密形状での事後検証 '
-            '(verified) が必ず通るとは限らない。')
-    parser.add_argument(
-        '--self-collision-weight', type=float, default=100.0,
-        help='自己干渉コストの重み (既定 100.0)。--collision-weight と '
-            '同じ注意点 (box/cylinder 同士の交互射影による近似) が '
-            '当てはまる。')
-    parser.add_argument(
-        '--smoothness-weight', type=float,
-        default=DEFAULT_SMOOTHNESS_WEIGHT,
-        help='軌道の滑らかさ (速度) コストの重み (既定 {})。'.format(
-            DEFAULT_SMOOTHNESS_WEIGHT))
-    parser.add_argument(
-        '--acceleration-weight', type=float,
-        default=DEFAULT_ACCELERATION_WEIGHT,
-        help='軌道の加速度コストの重み (既定 {})。'.format(
-            DEFAULT_ACCELERATION_WEIGHT))
     parser.add_argument(
         '--motion-attempts', type=int, default=3,
         help='線形補間だけでは干渉が残った場合に、warm start を変えて '
@@ -709,35 +760,6 @@ def main():
             '参照)。全て失敗したら最も貫通が浅い軌道を verified: false の '
             'まま採用する。')
     parser.add_argument(
-        '--motion-attempt-perturbation', type=float, default=0.3,
-        help='2 回目以降のリトライで中間 waypoint の腕関節角に足す '
-            'ガウスノイズの標準偏差 [rad] (既定 0.3)。')
-    parser.add_argument(
-        '--collision-verify-tolerance', type=float,
-        default=DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
-        help='事後検証で、この距離 [m] を超えて貫通している waypoint が '
-            '1 つでもあれば verified を false にする (既定 {})。'
-            'solve_palm_ik.py の最終姿勢の判定 ({} m) より緩い -- '
-            '経路上は最終姿勢に到達するまでの通過点であり、最終姿勢ほど '
-            '厳密な接触判定を必要としないため。'.format(
-                DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
-                spik.DEFAULT_COLLISION_VERIFY_TOLERANCE))
-    parser.add_argument(
-        '--collision-primitive-type', choices=['box', 'cylinder', 'sphere'],
-        default=None,
-        help='干渉回避に使うロボット自身のジオメトリを、指定した形状に '
-            '全リンク強制変換する (solve_palm_ik.py と同じオプション。 '
-            '揃えないと事後検証のジオメトリがずれる)。')
-    parser.add_argument(
-        '--force-convert-collision-model', action='store_true',
-        help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
-            'を使わず毎回作り直す。')
-    parser.add_argument(
-        '--seed', type=int, default=None,
-        help='numpy の乱数シード (現状の軌道最適化は決定的だが、将来の '
-            '拡張に備えて solve_palm_ik.py と同じオプションを用意して '
-            'ある)。')
-    parser.add_argument(
         '--force-optimize', action='store_true',
         help='pre-touch/線形補間の候補が事後検証に通っていても早期 '
             'return せず、必ず jaxls の軌道最適化まで実行する (既定は '
@@ -745,6 +767,13 @@ def main():
             '付けないと optimized な候補を得られない場合が多い)。'
             '軌道最適化そのものの計算時間を単独で計測したいときに使う '
             '(plan_person_motion のモジュール docstring 参照)。')
+    parser.add_argument(
+        '--no-warmup', action='store_true',
+        help='人物ループに入る前の左右両腕分の軌道最適化ウォームアップ '
+            '(``_warmup_solver``) をスキップする (既定はウォームアップ '
+            'する)。スキップすると、人物ループ中に初めてその腕を最適化 '
+            'する人物がトレース/コンパイルを肩代わりして突出して遅く '
+            'なる。')
     args = parser.parse_args()
 
     files = json_io.iter_json_files(args.input_dir)
@@ -753,16 +782,10 @@ def main():
               'を実行してください。'.format(args.input_dir))
         return
 
-    if args.seed is not None:
-        np.random.seed(args.seed)
-
     os.makedirs(args.output_dir, exist_ok=True)
     robot = Aero(use_hand=False)
     spik.restrict_elbow_range(robot)
-    spik.apply_collision_model(
-        robot,
-        primitive_type=args.collision_primitive_type,
-        force_convert=args.force_convert_collision_model)
+    spik.apply_collision_model(robot)
     # 事後検証 (verify_waypoints) の総当たりペアは、ロボットの構造だけで
     # 決まり人物ごとの姿勢に依存しないので人物ループの外で 1 回だけ作る
     # (solve_palm_ik.py の main と同じ理由。robot_arm 引数は結果に
@@ -770,10 +793,12 @@ def main():
     verification_pairs = spik.build_collision_verification_pairs(robot, 'r')
     # jaxls ソルバーも人物ループの外で 1 個だけ作って使い回す。人物・試行
     # ごとに作り直すと JaxlsSolver の JIT キャッシュ (_cached_problem) が
-    # 3 回の --motion-attempts リトライの間しか効かず、次の人物では毎回
+    # 3 回の motion-attempts リトライの間しか効かず、次の人物では毎回
     # 初回コンパイルが走ってしまう (実測で人物あたり最大 23 秒)。
-    solver = create_solver('jaxls', max_iterations=args.max_iterations,
+    solver = create_solver('jaxls', max_iterations=DEFAULT_MAX_ITERATIONS,
                            verbose=False)
+    if not args.no_warmup:
+        _warmup_solver(robot, solver, args)
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     for i, path in enumerate(files):
@@ -792,7 +817,7 @@ def main():
                                      os.path.basename(path))
         joint_positions = spik.load_skeleton_json(skeleton_path)
         offset = spik.human_translation_offset(
-            joint_positions, front_distance=args.human_front_distance)
+            joint_positions, front_distance=spik.HUMAN_FRONT_DISTANCE)
         joint_positions = spik.translate_joint_positions(
             joint_positions, offset)
         # 接近開始位置は人間の立ち位置を基準に決める (approach_base_start)。
@@ -800,7 +825,7 @@ def main():
         # solve_palm_ik.py と同じ公称位置 (Aero の前方) を使う。
         human_xy = spik.human_standing_xy(joint_positions)
         if human_xy is None:
-            human_xy = np.array([args.human_front_distance, 0.0])
+            human_xy = np.array([spik.HUMAN_FRONT_DISTANCE, 0.0])
 
         result = plan_person_motion(
             robot, handshake['robot_arm'], handshake, joint_positions,

@@ -462,17 +462,6 @@ def main():
             'random_handshake_poses/。skeleton-dir と同じファイル名で '
             '対応させる)。')
     parser.add_argument(
-        '--human-front-distance', type=float,
-        default=HUMAN_FRONT_DISTANCE,
-        help='solve_palm_ik.py の --human-front-distance と同じ値を渡す '
-            '(既定 {:.1f})。solve_palm_ik.py は骨格 JSON の人物を、Aero '
-            '(常にワールド原点で IK を開始する) の前方この距離になるよう '
-            '平行移動してから IK を解いている (human_translation_offset '
-            '参照) ため、ここでも骨格 JSON (SMPL メッシュ・干渉回避 '
-            'ジオメトリの元) に同じ平行移動を適用しないと、IK 結果の '
-            'ロボットと SMPL メッシュの位置がずれて表示されてしまう。'
-            .format(HUMAN_FRONT_DISTANCE))
-    parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
             '~/SMPL_python_v.1.0.0/smpl/models/'
@@ -496,30 +485,6 @@ def main():
     parser.add_argument('--no-open-browser', action='store_true',
                         help='ブラウザの自動起動を無効にする '
                              '(URL を自分で開く場合)。')
-    parser.add_argument(
-        '--collision-primitive-type', choices=['box', 'cylinder', 'sphere'],
-        default=None,
-        help='ロボット自身の干渉モデル (オレンジ色の球, '
-            'ROBOT_COLLISION_LINK_COLOR) の元になるジオメトリを、指定した '
-            '形状に全リンク強制変換する (solve_palm_ik.py / '
-            'view_aero_collision_model.py の --collision-primitive-type / '
-            '--primitive-type と同じ。既定 (未指定) はリンクごとに自動選択 '
-            '-- solve_palm_ik.py を同じオプションで実行した場合はそれと '
-            '揃える)。')
-    parser.add_argument(
-        '--force-convert-collision-model', action='store_true',
-        help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
-            'を使わず毎回作り直す (solve_palm_ik.py / '
-            'view_aero_collision_model.py の --force-convert-collision-model '
-            '/ --force-convert と同じ)。')
-    parser.add_argument(
-        '--collision-verify-tolerance', type=float,
-        default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
-        help='表示中の人間とロボットの干渉・ロボットの自己干渉を判定する '
-            '距離の許容誤差 [m] (solve_palm_ik.py の '
-            '--collision-verify-tolerance と同じ意味。既定 {})。この値を '
-            '超えて貫通している組み合わせだけをテキストパネルに列挙する。'
-            .format(DEFAULT_COLLISION_VERIFY_TOLERANCE))
     args = parser.parse_args()
 
     names = iter_common_names(args.skeleton_dir, args.handshake_dir)
@@ -616,10 +581,7 @@ def main():
     # ジオメトリ (view_aero_collision_model.py と同じもの) を、人物を
     # またいで一度だけ作って重ねて表示する (毎フレーム作り直す必要はなく、
     # sync_robot_collision_overlay で robot の姿勢に追従させるだけでよい)。
-    robot_collision_overlay = build_robot_collision_overlay(
-        robot,
-        primitive_type=args.collision_primitive_type,
-        force_convert=args.force_convert_collision_model)
+    robot_collision_overlay = build_robot_collision_overlay(robot)
     viewer.add(robot_collision_overlay)
     # solve_palm_ik.py の事後検証 (pick_verified_candidate) と全く同じ
     # 総当たりの組み合わせ (自己干渉のロボットリンク同士、および人体との
@@ -675,7 +637,7 @@ def main():
         # 位置姿勢) と揃えるために同じ平行移動を適用する。
         joint_positions = load_joint_positions(skeleton_path)
         offset = human_translation_offset(
-            joint_positions, front_distance=args.human_front_distance)
+            joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
         joint_positions = translate_joint_positions(joint_positions, offset)
         if offset != (0.0, 0.0):
             person = dict(person)
@@ -744,7 +706,7 @@ def main():
         colliding_pairs = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
             current_obstacle_links,
-            tolerance=args.collision_verify_tolerance)
+            tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
 
         # IK が失敗したときは、どちらの手に合わせようとしていたのかが
         # 分かるように人間の手とロボットの腕もあわせて出す。

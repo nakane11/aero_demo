@@ -67,13 +67,6 @@ def main():
         '--no-hand', action='store_true',
         help='ハンドなしモデル(aero_nohand)を使用する')
     parser.add_argument(
-        '--primitive-type', choices=['box', 'cylinder', 'sphere'],
-        default=None,
-        help='全リンクを指定した形状に強制変換する(未指定なら自動選択)')
-    parser.add_argument(
-        '--force-convert', action='store_true',
-        help='干渉モデルURDFを毎回作り直す')
-    parser.add_argument(
         '--alpha', type=float, default=0.35,
         help='干渉モデルの半透明度(0.0=透明, 1.0=不透明)')
     parser.add_argument(
@@ -89,11 +82,7 @@ def main():
 
     # 元のURDFファイルパスを取得し、干渉モデル(プリミティブ近似)URDFを生成
     urdf_path = robot.urdf_path
-    collision_urdf_path = build_collision_model_urdf(
-        urdf_path,
-        primitive_type=args.primitive_type,
-        force=args.force_convert,
-    )
+    collision_urdf_path = build_collision_model_urdf(urdf_path)
 
     # 干渉モデルを別ロボットとして読み込み、姿勢をAeroに同期させる
     collision_robot = RobotModel()

@@ -93,7 +93,7 @@ from skrobot.model import Link  # noqa: E402
 # test.py と共通なので handshake_viewer_common.py に一本化してある。
 
 # waypoint 自動再生の既定の速さ [waypoint/秒]。
-DEFAULT_PLAYBACK_FPS = 20.0
+DEFAULT_PLAYBACK_FPS = 40.0
 
 # 採用した軌道の作り方 (plan_handshake_motion.KIND_LABELS と同じ内容を
 # ここでも持つ -- plan_handshake_motion は jaxls 依存で import が重い
@@ -286,11 +286,6 @@ def main():
         help='plan_handshake_motion.py が出力した軌道 JSON のディレクトリ '
             '(既定 random_motion_poses/)。')
     parser.add_argument(
-        '--human-front-distance', type=float, default=HUMAN_FRONT_DISTANCE,
-        help='solve_palm_ik.py/plan_handshake_motion.py の '
-            '--human-front-distance と同じ値を渡す (既定 {:.1f})。'.format(
-                HUMAN_FRONT_DISTANCE))
-    parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
             '~/SMPL_python_v.1.0.0/smpl/models/'
@@ -315,21 +310,6 @@ def main():
                              '秒数 (繰り返し待つ)。')
     parser.add_argument('--no-open-browser', action='store_true',
                         help='ブラウザの自動起動を無効にする。')
-    parser.add_argument(
-        '--collision-primitive-type', choices=['box', 'cylinder', 'sphere'],
-        default=None,
-        help='ロボット自身の干渉モデルの元になるジオメトリを、指定した '
-            '形状に全リンク強制変換する (solve_palm_ik.py / '
-            'plan_handshake_motion.py と同じオプション)。')
-    parser.add_argument(
-        '--force-convert-collision-model', action='store_true',
-        help='ロボット自身の干渉モデル (プリミティブ近似 URDF) のキャッシュ '
-            'を使わず毎回作り直す。')
-    parser.add_argument(
-        '--collision-verify-tolerance', type=float,
-        default=DEFAULT_COLLISION_VERIFY_TOLERANCE,
-        help='表示中の干渉をテキストパネルに列挙する距離の許容誤差 [m] '
-            '(既定 {})。'.format(DEFAULT_COLLISION_VERIFY_TOLERANCE))
     args = parser.parse_args()
 
     names = iter_common_names(
@@ -355,10 +335,7 @@ def main():
         '干渉回避用モデルの表示', initial_value=True)
 
     viewer.add(robot)
-    robot_collision_overlay = build_robot_collision_overlay(
-        robot,
-        primitive_type=args.collision_primitive_type,
-        force_convert=args.force_convert_collision_model)
+    robot_collision_overlay = build_robot_collision_overlay(robot)
     viewer.add(robot_collision_overlay)
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
@@ -402,7 +379,7 @@ def main():
 
         joint_positions = load_joint_positions(skeleton_path)
         offset = human_translation_offset(
-            joint_positions, front_distance=args.human_front_distance)
+            joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
         joint_positions = translate_joint_positions(joint_positions, offset)
         if offset != (0.0, 0.0):
             person = dict(person)
@@ -465,7 +442,7 @@ def main():
         colliding = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
             current_obstacle_links,
-            tolerance=args.collision_verify_tolerance)
+            tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
         label_text.content = status_text(
             current['name'], controls.person_index, controls.n_people,
             motion, len(current['display_waypoints']), current['n_approach'],

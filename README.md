@@ -41,7 +41,10 @@ MediaPipe 形式の骨格・掌の
    (`--no-hand-side-base-constraint`/`--no-facing-base-constraint` で
    無効化可)。
    人体側の干渉回避ジオメトリはIK 最適化中の干渉コスト・候補採用前の事後検証
-   ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。
+   ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。事後検証
+   (候補ごとの `collision_pairs_min_distance` 呼び出し)はこの人体ジオメトリ
+   を候補ループの前に 1 回だけ作って使い回す(人物の姿勢は候補間で変わらない
+   ため)。
 
 4.5. **`scripts/plan_handshake_motion.py`**
    手順 4 の握手姿勢を目標として、そこへ至る接近の軌道 (waypoints) を干渉回避
@@ -56,7 +59,9 @@ MediaPipe 形式の骨格・掌の
    採用前には必ず、`solve_palm_ik.py` が最終姿勢の判定に使うのと同じ
    厳密な形状 (実メッシュ)・同じ人体ジオメトリ (`human_body_obstacles`)
    で全 waypoint を検証し、結果を `verified` フラグに入れる (経路上の
-   許容貫通量は既定 1 cm)。
+   許容貫通量は既定 1 cm)。人体ジオメトリは人物の姿勢が waypoint 間で
+   変わらないため、waypoint ごとに作り直さず検証ループの前に 1 回だけ
+   構築して使い回す。
 
    `--force-optimize` (既定 False) を付けると、pre-touch/線形補間の
    候補が事後検証に通っていても early return せず、必ず jaxls の軌道

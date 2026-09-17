@@ -454,23 +454,30 @@ class HandshakePipelineNode(object):
         # 参照)。
         self.real_robot = None
         self.ri = None
-        try:
-            self.real_robot = load_aero(use_hand=True)
-            print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
-            # skrobot 側の既定値 (odom_topic='/base_odometry/odom') は本機
-            # では配信されておらず、move_trajectory_sequence が odom 待ちで
-            # 無限に固まる。実機の odom は /odom (/aero_ros_controller) な
-            # のでそちらを明示する。
-            self.ri = AeroROSRobotInterface(self.real_robot, odom_topic='/odom')
-            print('[execute] 実機への接続が完了しました (--execute-base={}, '
-                  '--execute-arm={})。'.format(
-                      args.execute_base, args.execute_arm))
-        except Exception as exc:  # noqa: BLE001  (実機/ROS 環境が無くても viewer 単体としては動作を継続したい)
-            self.real_robot = None
-            self.ri = None
-            print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗した '
-                  'ため、ARM 時の首下げ/EXECUTE による実機操作は無効の '
-                  'ままになります ({})。'.format(exc))
+        if args.no_robot_interface:
+            # rosbag での実機なし動作確認用 (--no-robot-interface)。接続を
+            # 試みること自体をやめる (self.ri は None のままになり、ARM 時の
+            # 首下げ/EXECUTE による実機操作は無効のままになる)。
+            print('[execute] --no-robot-interface が指定されたため、実機 '
+                  '(AeroROSRobotInterface) への接続を試みません。')
+        else:
+            try:
+                self.real_robot = load_aero(use_hand=True)
+                print('[execute] 実機 (AeroROSRobotInterface) に接続しています...')
+                # skrobot 側の既定値 (odom_topic='/base_odometry/odom') は本機
+                # では配信されておらず、move_trajectory_sequence が odom 待ちで
+                # 無限に固まる。実機の odom は /odom (/aero_ros_controller) な
+                # のでそちらを明示する。
+                self.ri = AeroROSRobotInterface(self.real_robot, odom_topic='/odom')
+                print('[execute] 実機への接続が完了しました (--execute-base={}, '
+                      '--execute-arm={})。'.format(
+                          args.execute_base, args.execute_arm))
+            except Exception as exc:  # noqa: BLE001  (実機/ROS 環境が無くても viewer 単体としては動作を継続したい)
+                self.real_robot = None
+                self.ri = None
+                print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗した '
+                      'ため、ARM 時の首下げ/EXECUTE による実機操作は無効の '
+                      'ままになります ({})。'.format(exc))
 
         # デバッグ用: カメラ画像に検出できた 2D 骨格を重ねた画像を publish
         # する (draw_skeleton_overlay 参照)。rqt_image_view 等で購読すれば、
@@ -982,6 +989,32 @@ class HandshakePipelineNode(object):
             [] if (args.no_human_collision or self.collision_pairs is None)
             else spik.human_body_obstacles(translated_joints))
 
+        # solve_palm_ik.py の main() と同じく、差し出している手の側・人間の
+        # 正面方向に合わせてこの人物専用の base_limits (台車の可動域) を
+        # 作る (docs/jax_compilation_cache.md 9節参照)。以前は
+        # run_camera_pipeline_test.py だけこの制約を行っておらず
+        # solve_palm_ik.py と挙動が食い違っていたが、台車の可動域を人物
+        # ごとに変えても jax の再コンパイルが起きないことが確認できた
+        # (scikit-robot フォークの案B、同節) ため、ここでも揃える。
+        person_base_limits = self.base_limits
+        side_sign = spik.offered_hand_side_sign(
+            offered_hand, translated_joints, translated_palm)
+        if side_sign is not None:
+            person_base_limits = [
+                person_base_limits[0],
+                spik.restrict_base_y_range_to_hand_side(
+                    person_base_limits[1], side_sign),
+                person_base_limits[2]]
+        human_yaw = spik.human_facing_yaw(translated_joints)
+        if human_yaw is not None:
+            person_base_limits = [
+                person_base_limits[0],
+                person_base_limits[1],
+                spik.restrict_base_yaw_range_to_human_facing(
+                    person_base_limits[2], human_yaw,
+                    margin=math.radians(
+                        spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
+
         target_pos = spik.palm_target_position(translated_palm)
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
         picked, collision_ik_time, candidate_selection_time = \
@@ -989,7 +1022,7 @@ class HandshakePipelineNode(object):
                 self.robot, translated_palm, offered_hand, robot_arm,
                 collision_obstacles,
                 attempts_per_pose=args.attempts_per_pose,
-                base_limits=self.base_limits,
+                base_limits=person_base_limits,
                 self_collision=(not args.no_self_collision
                                 and self.collision_pairs is not None),
                 collision_pairs=self.collision_pairs,
@@ -999,13 +1032,13 @@ class HandshakePipelineNode(object):
         if picked is None:
             result = spik.unsolved_result(
                 self.robot, robot_arm, target_pos, rots[-1],
-                self.base_limits, collision_ik_time,
+                person_base_limits, collision_ik_time,
                 candidate_selection_time, offered_hand, translated_palm)
         else:
             turn_index, angle_vector, base_pose, post_process_result = picked
             result = spik.solved_result(
                 self.robot, robot_arm, target_pos, rots[turn_index],
-                turn_index, angle_vector, base_pose, self.base_limits,
+                turn_index, angle_vector, base_pose, person_base_limits,
                 post_process_result, collision_ik_time,
                 candidate_selection_time, offered_hand, translated_palm)
         result['offered_hand'] = offered_hand
@@ -1637,7 +1670,13 @@ class HandshakePipelineNode(object):
             self._update_status_text(joint_positions, is_base_frame, is_frozen)
             with self._viewer_lock:
                 self.viewer.redraw()
-            rate.sleep()
+            try:
+                rate.sleep()
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                # rosbag 再生時などにシミュレーション時刻が巻き戻ると
+                # rate.sleep() が例外を投げてループごと落ちる (viewer が
+                # 閉じてしまう) ため、無視してループを継続する。
+                pass
         self.pose_estimator.close()
         self.viewer.close()
 
@@ -1919,6 +1958,12 @@ def main():
         help='起動直後に viser の ARM ボタンを押した状態 (ARMED) から '
             '始める。--bag での無人テスト時に、ブラウザで ARM ボタンを '
             'クリックする代わりに使う。')
+    parser.add_argument(
+        '--no-robot-interface', action='store_true',
+        help='実機 (AeroROSRobotInterface) への接続を試みない (既定は '
+            '--execute-base/--execute-arm の指定に関わらず常に接続を '
+            '試みる)。実機なしで rosbag のみを使って動作確認する際に '
+            '指定する。')
     # argparse は roslaunch が付ける残りの引数 (__name/__log 等) を無視する
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 

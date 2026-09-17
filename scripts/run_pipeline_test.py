@@ -151,6 +151,12 @@ def summarize_motions(motion_dir):
         if data.get('compute_time') is not None:
             compute_times.append(data['compute_time'])
 
+    # 軌道最適化 (jaxls) を要した人だけの平均は、その人数・顔ぶれが実行の
+    # たびに変わる (pre-touch/線形補間の候補が厳密検証を通るかどうかは
+    # GPU 上の jax 計算の非決定性の影響を受けうる境界ケースがあるため) 母
+    # 集団に依存する指標になってしまい安定した比較に向かない。そのため
+    # ここでは最適化が不要だった人も含めた全 planned 人物の compute_time
+    # の平均だけを返す。
     avg_compute_time = (sum(compute_times) / len(compute_times)
                         if compute_times else None)
     return dict(n_planned=n_planned, n_verified=n_verified, kinds=kinds,
@@ -183,6 +189,12 @@ def main():
             '付きの軌道も生成する。jaxls (pip install "git+https://'
             'github.com/brentyi/jaxls.git") が別途必要で、1 人あたり '
             '数十秒かかるため既定では実行しない。')
+    parser.add_argument(
+        '--force-optimize', action='store_true',
+        help='--plan-motion 指定時、plan_handshake_motion.py に '
+            '--force-optimize を渡す (pre-touch/線形補間の候補が事後検証 '
+            'に通っていても必ず jaxls の軌道最適化まで実行させ、全員分の '
+            '軌道最適化の計算時間を計測できるようにする)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -235,9 +247,15 @@ def main():
     # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
     motion_summary = None
     if args.plan_motion:
-        run_step('4.5/5', 'plan_handshake_motion.py', [
-            '--input-dir', handshake_dir, '--output-dir', motion_dir,
-            '--skeleton-dir', skeleton_dir])
+        motion_args = ['--input-dir', handshake_dir,
+                      '--output-dir', motion_dir,
+                      '--skeleton-dir', skeleton_dir]
+        if args.force_optimize:
+            motion_args.append('--force-optimize')
+        motion_elapsed, motion_stdout = run_step(
+            '4.5/5', 'plan_handshake_motion.py', motion_args)
+        motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
+            motion_stdout)
         motion_summary = summarize_motions(motion_dir)
         print('[4.5/5] plan_handshake_motion.py: 軌道計画対象 {} 人中 '
               '{} 人 verified (厳密形状で経路上の干渉なしを確認)。'
@@ -246,6 +264,17 @@ def main():
                   ', '.join('{}={}'.format(k, v) for k, v
                             in sorted(motion_summary['kinds'].items(),
                                       key=lambda kv: str(kv[0])))))
+        if motion_warmup_lines:
+            for line in motion_warmup_lines:
+                print('[4.5/5] {}'.format(line))
+            print('[4.5/5] warmup 合計 {:.1f} 秒 '
+                  '(plan_handshake_motion.py の壁時計時間 {:.1f} 秒中)'
+                  .format(motion_warmup_total, motion_elapsed))
+        else:
+            print('[4.5/5] warmup 行が見つかりませんでした '
+                  '(--no-warmup 指定、または軌道計画対象が 0 人でスキップ '
+                  'された可能性があります)。壁時計時間 {:.1f} 秒'
+                  .format(motion_elapsed))
 
     print()
     print('=== 結果 ===')
@@ -259,8 +288,11 @@ def main():
               '検証できた人数 (verified): {} / {}'.format(
                   motion_summary['n_verified'], n_generated))
         if motion_summary['avg_compute_time'] is not None:
-            print('  軌道計画の 1人あたり平均計算時間: {:.1f} 秒/人'.format(
-                motion_summary['avg_compute_time']))
+            print('  軌道計画の 1人あたり平均計算時間 '
+                  '(最適化を要さなかった人も含む全 {} 人の平均): '
+                  '{:.3f} 秒/人'.format(
+                      motion_summary['n_planned'],
+                      motion_summary['avg_compute_time']))
 
     palm_time_per_person = palm_elapsed / n_generated if n_generated else None
     print()

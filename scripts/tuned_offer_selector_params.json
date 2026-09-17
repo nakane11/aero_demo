@@ -1,0 +1,26 @@
+{
+  "accuracy": 0.631578947368421,
+  "score_min": -0.13109804777989323,
+  "params": {
+    "axis_blend": 0.0,
+    "finger_ramp_upper": 0.3,
+    "approach_height_scale": 0.0,
+    "separation_weight": 0.1
+  },
+  "confusion": {
+    "None": {
+      "None": 5,
+      "R": 3
+    },
+    "R": {
+      "R": 6,
+      "L": 1
+    },
+    "L": {
+      "None": 3,
+      "L": 1
+    }
+  },
+  "n_samples": 19,
+  "default_accuracy": 0.631578947368421
+}
