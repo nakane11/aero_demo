@@ -35,8 +35,24 @@
     <param name="filter_limit_max" value="5.0" />
   </node>
 
-<node name="head_to_camera_link"
-      pkg="tf" type="static_transform_publisher"
-      args="0.06700 0.01038  0.18521 0.032565 -0.0105949 -0.012757 0.999332 head_link camera_link 100" />
-
+<node name="head_to_camera_marker"
+      pkg="jsk_interactive_marker" type="marker_6dof"
+      output="screen">
+  <param name="object_type"            value="cube"/>
+  <param name="frame_id"               value="head_link"/>
+  <param name="publish_tf"             value="true"/>
+  <param name="tf_frame"               value="camera_link"/>
+  <param name="tf_duration"            value="0.01"/>
+  <param name="publish_pose_periodically" value="true"/>
+  <param name="initial_x"              value="0.066"/>
+  <param name="initial_y"              value="0.009"/>
+  <param name="initial_z"              value="0.19"/>
+  <param name="initial_orientation_x"  value="0"/>
+  <param name="initial_orientation_y"  value="0"/>
+  <param name="initial_orientation_z"  value="0"/>
+  <param name="initial_orientation_w"  value="1"/>
+  <param name="object_x"              value="0.3"/>
+  <param name="object_y"              value="0.3"/>
+  <param name="object_z"              value="0.3"/>
+</node>
 </launch>
