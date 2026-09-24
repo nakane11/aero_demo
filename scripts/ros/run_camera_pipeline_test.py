@@ -176,6 +176,24 @@ ARM_HEAD_NOD_PITCH_DEG = 25.0
 # ゆっくりめにしてある。
 ARM_HEAD_NOD_MOVE_TIME = 5
 
+# 押し込み (post_process) 動作の直前で行う台車の位置補正
+# (_correct_base_residual 参照) のパラメータ。maxvel/maxrad は実機の
+# base_controller が実際に使っている上限 (jsk_aero_startup/config/
+# aero_base_link.yaml の base_link_x/y/pan の max_velocity、いずれも
+# 0.2) に合わせてある。当初 skrobot (ROSRobotMoveBaseInterface.
+# go_pos_unsafe_wait) の値 (0.295/0.495、Aero の実際の設定とは無関係の
+# 値) をそのまま流用していたところ、実機ログで sec (残差解消にかける
+# 時間) を実際の 2.5 倍速く見積もってしまい、時間切れで毎回残差の
+# 3-5 割程度しか補正できず 3 回で収束しなかった (2026-09-24 実機検証、
+# 回頭残差 68.2 度に対し sec=3.0s で実移動 31.9 度 = 0.2rad/s 換算の
+# 34.4 度とほぼ一致)。
+BASE_CORRECTION_MAX_ATTEMPTS = 3
+BASE_CORRECTION_MAX_VEL = 0.2  # [m/s] (aero_base_link.yaml base_link_x/y)
+BASE_CORRECTION_MAX_ANGVEL = 0.2  # [rad/s] (aero_base_link.yaml base_link_pan)
+BASE_CORRECTION_VEL_RATIO = 0.8
+BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
+BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
+
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
 # なので handshake_viewer_common.py に一本化してある
@@ -313,6 +331,7 @@ class HandshakePipelineNode(object):
         # (view_handshake_poses.py と同じ見た目にするため)。
         self.robot = Aero(use_hand=False)
         spik.restrict_elbow_range(self.robot)
+        spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
         # self.robot の関節角ベクトル (motion['joint_names'] と同じ並び) での
         # 「初期姿勢」(両腕を体の横に下ろした姿勢, plan_handshake_motion.
@@ -1365,7 +1384,7 @@ class HandshakePipelineNode(object):
     def _execute_on_robot(self):
         """``EXECUTE`` ボタン押下時、計画済みの waypoint 列
         (``self._display_waypoints``、waypoint スライダー/Play で画面
-        確認しているのと同じもの) を実機にまとめて送る。
+        確認しているのと同じもの) を実機に送る。
 
         台車移動には ``AeroROSRobotInterface.move_to`` (``move_base``
         経由、costmap を使う) ではなく ``move_trajectory_sequence``
@@ -1373,11 +1392,22 @@ class HandshakePipelineNode(object):
         ``FollowJointTrajectoryAction`` へ直接軌道を送るだけの相対移動)
         を使う。干渉回避は ``plan_handshake_motion.py`` 側で waypoint
         単位に検証済みのため、costmap 上の障害物回避や大域的な経路計画は
-        不要。全 waypoint 分の関節角・移動量をまとめて 1 つのゴールとして
-        送る (``angle_vector_sequence``/``move_trajectory_sequence``) こと
-        で waypoint の境界で止まらない滑らかな軌道になるため、送信は最初に
-        まとめて 1 回だけ行い、完了待ちも最後にまとめて 1 回だけ行う
-        (台車・腕は並行して動く)。
+        不要。
+
+        ``display_waypoints`` は ``build_display_waypoints`` により
+        2 区間から成る (``self._display_n_prepend``/``_display_n_approach``
+        参照): 「接近区間」(初期位置 -> 経路計画の始点 -> 人間の手から
+        オフセット分離した hover 目標 (掌の少し手前) まで) と、その続きの
+        「押し込み区間」(``result['post_process']`` -- hover 目標から掌へ
+        わずかにめり込む位置までの表示専用の補間、``plan_handshake_motion.py``
+        は干渉検証していない) である。接近区間の中では waypoint の境界で
+        止まらない滑らかな軌道にするため、まとめて 1 つのゴールとして送り
+        台車・腕を並行に動かす (従来通り)。ただし押し込みは台車が hover
+        目標姿勢にいる前提の動きなので、接近区間の完了後・押し込み区間の
+        開始前に、台車のスリップ等による位置ずれを odom 基準で検出・補正し
+        (``_correct_base_residual``)、補正が収束してから押し込みへ進む。
+        腕はこの補正の間、待たされない (接近区間の腕動作は既に完了して
+        いる)。
 
         ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
         動かすかどうかを独立に切り替えられる (どちらも指定しなければ
@@ -1389,6 +1419,8 @@ class HandshakePipelineNode(object):
             result = self._current_result
             motion = self._current_motion
             display_waypoints = self._display_waypoints
+            n_prepend = self._display_n_prepend
+            n_approach = self._display_n_approach
         if not (self.args.execute_base or self.args.execute_arm):
             print('[execute] --execute-base/--execute-arm のいずれも指定 '
                   'されていないため実機を動かせません。')
@@ -1405,19 +1437,55 @@ class HandshakePipelineNode(object):
 
         joint_names = motion['joint_names']
         move_time = max(motion['dt'], 0.01)
+        # 接近区間 (display_waypoints[:reach_boundary]) は hover 目標
+        # (waypoint index reach_boundary - 1) で終わり、押し込み区間
+        # (display_waypoints[reach_boundary - 1:]、先頭に hover 目標を含む)
+        # がそれに続く。
+        reach_boundary = min(max(n_prepend + n_approach, 1),
+                             len(display_waypoints))
         print('[execute] 実機で waypoint を {} 個実行します '
-              '(--execute-base={}, --execute-arm={})。'.format(
+              '(--execute-base={}, --execute-arm={}, 接近={}個+押し込み='
+              '{}個)。'.format(
                   len(display_waypoints), self.args.execute_base,
-                  self.args.execute_arm))
+                  self.args.execute_arm, reach_boundary,
+                  len(display_waypoints) - reach_boundary))
 
+        start_odom_coords, final_traj_point = self._execute_waypoint_segment(
+            display_waypoints[:reach_boundary], joint_names, move_time)
+
+        if self.args.execute_base:
+            self._correct_base_residual(start_odom_coords, final_traj_point)
+
+        if reach_boundary < len(display_waypoints):
+            self._execute_waypoint_segment(
+                display_waypoints[reach_boundary - 1:], joint_names,
+                move_time)
+
+        print('[execute] 実行を終了しました。')
+
+    def _execute_waypoint_segment(self, waypoints, joint_names, move_time):
+        """``waypoints`` (先頭要素を基準にした 1 区間分) を、waypoint の
+        境界で止まらない滑らかな軌道として実機で実行する (台車・腕は並行
+        して動く、``_execute_on_robot`` が分割前に行っていたのと同じ処理)。
+
+        Returns
+        -------
+        (start_odom_coords, final_traj_point)
+            ``start_odom_coords`` は台車の軌道を送信した瞬間の odom
+            (``self.ri.odom``、``--execute-base`` 未指定/台車移動なしの
+            場合は None)。``final_traj_point`` はこの区間の最終 waypoint
+            を ``waypoints[0]`` 基準に変換した ``[dx, dy, dyaw]``
+            (同じく該当なしの場合は None)。いずれも
+            ``_correct_base_residual`` にそのまま渡すためのもの。
+        """
         arm_angle_vectors = []  # [av0, av1, ...] (angle_vector_sequence にそのまま渡す)
-        # [[dx, dy, dyaw], ...] (先頭 waypoint からの累積移動量)。
+        # [[dx, dy, dyaw], ...] (この区間の先頭 waypoint からの累積移動量)。
         # move_trajectory_sequence は各要素をその都度 odom から独立に
         # 適用する (直前要素からの相対移動として積み上げない) ため、
         # 差分ではなく先頭 waypoint からの累積量を渡す必要がある。
         base_trajectory_points = []
-        first_base = None  # (x, y, yaw) 先頭 waypoint の台車位置姿勢 (world 系)
-        for wp in display_waypoints:
+        first_base = None  # (x, y, yaw) この区間の先頭 waypoint の台車位置姿勢 (world 系)
+        for wp in waypoints:
             if self.args.execute_arm:
                 name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
                 for joint in self.real_robot.joint_list:
@@ -1429,33 +1497,67 @@ class HandshakePipelineNode(object):
                 bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
                                wp['base_yaw'])
                 if first_base is None:
-                    # 最初の waypoint: このノードの座標系はロボットの台車が
-                    # ワールド原点にいる前提 (_initial_base_coords 参照) な
-                    # ので、ロボットは今まさにこの world 原点にいるはず --
-                    # 絶対座標 (bx, by, byaw) をそのまま原点からの移動量
-                    # として使える。以後の waypoint もこの姿勢を基準に累積量
-                    # を計算する。
+                    # この区間の最初の waypoint: 実機は今まさにこの姿勢に
+                    # いる前提 (区間の先頭が接近区間なら "台車がワールド
+                    # 原点にいる" という起動時の前提、押し込み区間なら
+                    # 直前の _correct_base_residual で合わせ込んだ hover
+                    # 目標姿勢) なので、絶対座標をそのまま原点からの移動量
+                    # として使える。以後の waypoint もこの姿勢を基準に
+                    # 累積量を計算する。
                     first_base = (bx, by, byaw)
                 x0, y0, yaw0 = first_base
                 dx_world = bx - x0
                 dy_world = by - y0
                 dyaw = byaw - yaw0
-                # world 系の移動量を、先頭 waypoint (= 実機の現在の台車の
-                # 向き) 基準 (move_trajectory_sequence が要求する「実行開始
-                # 時点の台車姿勢を基準にした前後左右」) に回転させる。
+                # world 系の移動量を、この区間の先頭 waypoint (= 実行開始
+                # 時点の台車の向き) 基準 (move_trajectory_sequence が要求
+                # する「実行開始時点の台車姿勢を基準にした前後左右」) に
+                # 回転させる。
                 cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
                 dx = cos_yaw * dx_world + sin_yaw * dy_world
                 dy = -sin_yaw * dx_world + cos_yaw * dy_world
                 base_trajectory_points.append([dx, dy, dyaw])
 
-        # ここまでで waypoint 全部分の関節角・移動量を集め終えたので、
-        # それぞれ 1 回のゴールとしてまとめて送る (どちらも非ブロッキング)。
+        # ここまでで区間分の関節角・移動量を集め終えたので、それぞれ 1 回の
+        # ゴールとしてまとめて送る (どちらも非ブロッキング)。
+        #
+        # waypoint 間の所要時間は一律 move_time (=motion['dt']) ではなく、
+        # 実機の base_controller の最大速度で物理的に間に合う時間まで
+        # 必要に応じて延ばす (_scaled_time_list 参照)。特に
+        # build_initial_approach_waypoints が生成する表示専用の初期接近
+        # 区間は、大きな回頭を少ない waypoint 数に均等割りするため
+        # motion['dt'] のままでは実機が追従できないことが実機検証
+        # (2026-09-24) で判明した。腕 (angle_vector_sequence) にも同じ
+        # time_list を渡し、台車と腕のタイミングがずれないようにする。
+        time_list = (
+            self._scaled_time_list(base_trajectory_points, move_time)
+            if base_trajectory_points else [move_time] * len(waypoints))
+        start_odom_coords = None
         if self.args.execute_arm and arm_angle_vectors:
-            self.ri.angle_vector_sequence(arm_angle_vectors, move_time)
+            self.ri.angle_vector_sequence(arm_angle_vectors, time_list)
         if self.args.execute_base and base_trajectory_points:
+            # move_trajectory_sequence 自身がこの直後に読む odom (基準
+            # 座標) と同じものを、補正計算用に控えておく。
+            start_odom_coords = self.ri.odom
+            # [debug] 79 度規模の大きな残差が発生する原因調査用。この区間で
+            # move_trajectory_sequence に渡す計画上の総回頭量・区間内の
+            # waypoint 数・送信直前の odom yaw を記録しておき、
+            # _correct_base_residual 側のログと突き合わせて、どの区間の
+            # 送信が追従できていないかを切り分ける。
+            print('[debug][segment] waypoint数={} 計画上のdyaw={:.1f}deg '
+                  '(=[{}]) 送信直前odom_yaw={:.1f}deg '
+                  'time_list合計={:.3f}s (=[{}])'
+                  .format(
+                      len(base_trajectory_points),
+                      math.degrees(base_trajectory_points[-1][2]),
+                      ', '.join('{:.1f}'.format(math.degrees(p[2]))
+                               for p in base_trajectory_points),
+                      math.degrees(start_odom_coords.rpy_angle()[0][0]),
+                      sum(time_list),
+                      ', '.join('{:.2f}'.format(t) for t in time_list)))
             self.ri.move_trajectory_sequence(
                 base_trajectory_points,
-                [move_time] * len(base_trajectory_points),
+                time_list,
                 stop=True, send_action=True, wait=False)
 
         # 送信は上でまとめて 1 回だけ行っているので、完了待ちも最後に
@@ -1464,7 +1566,154 @@ class HandshakePipelineNode(object):
             self.ri.wait_interpolation()
         if self.args.execute_base and base_trajectory_points:
             self.ri.move_base_trajectory_action.wait_for_result()
-        print('[execute] 実行を終了しました。')
+            # [debug] wait_for_result() が返った直後 (=このトラジェクトリを
+            # 「完了」とみなした瞬間) の実際の odom yaw。計画上の
+            # target_yaw (start_odom_yaw + dyaw) とここが既に大きく違って
+            # いれば、base_controller が今回の送信区間内で回頭を追従
+            # しきれていないことになる。
+            odom_after = self.ri.odom
+            expected_yaw = (start_odom_coords.rpy_angle()[0][0]
+                            + base_trajectory_points[-1][2])
+            actual_yaw = odom_after.rpy_angle()[0][0]
+            print('[debug][segment] wait_for_result 直後 odom_yaw={:.1f}deg '
+                  '(期待値={:.1f}deg, 差={:.1f}deg)'.format(
+                      math.degrees(actual_yaw), math.degrees(expected_yaw),
+                      math.degrees(
+                          (expected_yaw - actual_yaw + math.pi)
+                          % (2 * math.pi) - math.pi)))
+
+        final_traj_point = (
+            base_trajectory_points[-1] if base_trajectory_points else None)
+        return start_odom_coords, final_traj_point
+
+    @staticmethod
+    def _scaled_time_list(base_trajectory_points, default_time):
+        """``base_trajectory_points`` (区間先頭からの累積 ``[dx, dy,
+        dyaw]`` 列) から、waypoint 間の所要時間 (``move_trajectory_
+        sequence``/``angle_vector_sequence`` の time_list) を求める。
+
+        既定は ``default_time`` (通常 ``motion['dt']``) だが、実機の
+        base_controller の最大速度 (``BASE_CORRECTION_MAX_VEL``/
+        ``BASE_CORRECTION_MAX_ANGVEL``、安全率 ``BASE_CORRECTION_VEL_
+        RATIO``) で物理的に間に合わない区間だけ、間に合うだけの時間まで
+        個別に延ばす (間に合う区間は ``default_time`` のまま、全体を
+        一律に遅くしたりはしない)。
+
+        ``build_initial_approach_waypoints`` が生成する表示専用の初期
+        接近区間は、大きな回頭を ``INITIAL_APPROACH_DISPLAY_WAYPOINTS``
+        個の waypoint に均等割りするだけなので、``motion['dt']`` を
+        一律に使うと大きな回頭が必要な人物では実機が追従しきれない
+        (実機検証 2026-09-24: 141.9 度の回頭に 2.0 秒しか割り当てられて
+        おらず、実機の最大回頭速度 0.2 rad/s では本来 12.4 秒程度必要
+        だったため waypoint 完了時点で 77.5 度もの残差が残った)。
+        """
+        time_list = []
+        prev = (0.0, 0.0, 0.0)
+        for point in base_trajectory_points:
+            distance = math.hypot(point[0] - prev[0], point[1] - prev[1])
+            d_yaw = abs(point[2] - prev[2])
+            required = max(
+                distance / (BASE_CORRECTION_MAX_VEL * BASE_CORRECTION_VEL_RATIO),
+                d_yaw / (BASE_CORRECTION_MAX_ANGVEL * BASE_CORRECTION_VEL_RATIO))
+            time_list.append(max(default_time, required))
+            prev = point
+        return time_list
+
+    def _correct_base_residual(
+            self, start_odom_coords, final_traj_point,
+            max_attempts=BASE_CORRECTION_MAX_ATTEMPTS,
+            position_tolerance=BASE_CORRECTION_POSITION_TOLERANCE,
+            angle_tolerance=BASE_CORRECTION_ANGLE_TOLERANCE):
+        """接近区間の完了直後、押し込み (post_process) に進む前に台車の
+        位置ずれ (スリップ等による ``move_trajectory_sequence`` のオープン
+        ループ指令と実際の到達姿勢との差) を odom 基準で検出し、収束する
+        まで相対移動で補正する。
+
+        ``start_odom_coords``/``final_traj_point`` は接近区間を実行した
+        ``_execute_waypoint_segment`` の戻り値そのもの --
+        ``start_odom_coords`` は軌道送信時に基準として使われた odom、
+        ``final_traj_point`` はその区間の最終 waypoint (= hover 目標) を
+        区間先頭からの相対量 ``[dx, dy, dyaw]`` で表したもの。両者から
+        ``move_trajectory_sequence`` が内部で行うのと同じ変換で目標の
+        絶対姿勢 (odom 系) を求め、実行後の実際の odom との残差を
+        ロボット正面基準に回転させて相対移動として送り返す。収束閾値は
+        skrobot の ``go_pos_unsafe_wait`` と同じ (位置2.5cm/角度2.5度)。
+        sec (所要時間) の換算に使う最大速度は実機の base_controller
+        の設定 (``aero_base_link.yaml``、並進・回頭とも 0.2) に安全率
+        0.8 を掛けたもの (``BASE_CORRECTION_MAX_VEL``/
+        ``BASE_CORRECTION_MAX_ANGVEL`` 参照)。
+
+        台車移動を行っていない (``--execute-base`` 未指定、または接近
+        区間に台車移動が無かった) 場合は何もしない。
+        """
+        if start_odom_coords is None or final_traj_point is None:
+            return
+        dx, dy, dyaw = final_traj_point
+        start_yaw = start_odom_coords.rpy_angle()[0][0]
+        start_x, start_y = start_odom_coords.translation[:2]
+        target_x = start_x + math.cos(start_yaw) * dx - math.sin(start_yaw) * dy
+        target_y = start_y + math.sin(start_yaw) * dx + math.cos(start_yaw) * dy
+        target_yaw = start_yaw + dyaw
+        # [debug] 79 度規模の大きな残差の原因調査用。ここで求めた
+        # target_yaw が「意図した hover 目標の向き」と一致しているかを
+        # 見るためのログ (_execute_waypoint_segment の [debug][segment]
+        # ログの start_odom_yaw/dyaw と同じ値になっているはず)。
+        print('[debug][correct] start_odom(x={:.3f} y={:.3f} yaw={:.1f}deg) '
+              'final_traj_point(dx={:.3f} dy={:.3f} dyaw={:.1f}deg) '
+              '-> target(x={:.3f} y={:.3f} yaw={:.1f}deg)'.format(
+                  start_x, start_y, math.degrees(start_yaw),
+                  dx, dy, math.degrees(dyaw),
+                  target_x, target_y, math.degrees(target_yaw)))
+
+        err_norm = 0.0
+        err_yaw = 0.0
+        for attempt in range(max_attempts):
+            odom = self.ri.odom
+            cur_x, cur_y = odom.translation[:2]
+            cur_yaw = odom.rpy_angle()[0][0]
+            err_x_world = target_x - cur_x
+            err_y_world = target_y - cur_y
+            err_yaw = (target_yaw - cur_yaw + math.pi) % (2 * math.pi) - math.pi
+            # world 系の残差を、ロボットの現在の向き基準 (前後左右) に
+            # 回転させる (move_trajectory に渡す相対移動量はこの基準)。
+            err_x = math.cos(cur_yaw) * err_x_world + math.sin(cur_yaw) * err_y_world
+            err_y = -math.sin(cur_yaw) * err_x_world + math.cos(cur_yaw) * err_y_world
+            err_norm = math.hypot(err_x, err_y)
+            # [debug] 生の odom 値そのもの (回転方向の符号が想定通りかも
+            # ここで確認できる)。
+            print('[debug][correct] attempt={} odom(x={:.3f} y={:.3f} '
+                  'yaw={:.1f}deg) err_yaw={:.1f}deg'.format(
+                      attempt, cur_x, cur_y, math.degrees(cur_yaw),
+                      math.degrees(err_yaw)))
+
+            if err_norm <= position_tolerance and abs(err_yaw) <= angle_tolerance:
+                if attempt > 0:
+                    print('[execute] 押し込み前に台車の位置ずれを補正し '
+                          'ました ({} 回、残差 {:.3f}m / {:.1f}deg)。'.format(
+                              attempt, err_norm, math.degrees(abs(err_yaw))))
+                return
+
+            print('[execute] 押し込み前の hover 目標に対して台車の位置ずれ '
+                  'を検出 (残差 {:.3f}m / {:.1f}deg)、補正します '
+                  '({}/{})。'.format(
+                      err_norm, math.degrees(abs(err_yaw)), attempt + 1,
+                      max_attempts))
+            sec = max(
+                err_norm / (BASE_CORRECTION_MAX_VEL * BASE_CORRECTION_VEL_RATIO),
+                abs(err_yaw) / (BASE_CORRECTION_MAX_ANGVEL
+                                * BASE_CORRECTION_VEL_RATIO),
+                1.0)
+            # move_trajectory は send_action=True かつ wait 省略 (既定
+            # True) のとき move_trajectory_sequence を通じて完了まで
+            # ブロックするので、ここでは改めて wait_for_result を呼ぶ
+            # 必要はない。
+            self.ri.move_trajectory(err_x, err_y, err_yaw, sec, stop=True,
+                                    send_action=True)
+
+        print('[execute][WARN] 押し込み前の台車の位置ずれ補正が {} 回で '
+              '収束しませんでした (残差 {:.3f}m / {:.1f}deg)。このまま '
+              '押し込み動作へ進みます。'.format(
+                  max_attempts, err_norm, math.degrees(abs(err_yaw))))
 
     def _play_loop(self):
         """``Play`` チェックボックスがオンの間、``--fps`` の周期で waypoint
