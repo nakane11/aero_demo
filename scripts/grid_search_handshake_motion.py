@@ -542,6 +542,7 @@ def main():
 
     robot = Aero(use_hand=False)
     spik.restrict_elbow_range(robot)
+    spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
     # 事後検証 (verify_waypoints) の総当たりペアはロボット構造だけで決まり
     # グリッドパラメータに依存しないので1回だけ作る (plan_handshake_motion.

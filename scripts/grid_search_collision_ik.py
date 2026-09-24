@@ -549,6 +549,7 @@ def main():
 
     robot = Aero(use_hand=False)
     spi.restrict_elbow_range(robot)
+    spi.lock_fixed_joints(robot)
     spi.apply_collision_model(robot)
 
     combos = list(itertools.product(

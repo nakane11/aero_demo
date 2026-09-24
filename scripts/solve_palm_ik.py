@@ -501,11 +501,18 @@ def _turn_about_y(rot, turn_deg):
 
 
 def _correct_grasp_frame(rot, arm):
-    """左腕用に +Y/+Z を反転する.
+    """左腕用に +Y/+Z を反転する (180 度、局所 +X=指方向 まわり).
 
-    ``l_eef_grasp_link`` は ``r_eef_grasp_link`` に対して +X (指方向)
-    まわりに 180 度ずれている (URDF が左右ミラーで作られているため) ので、
-    右腕用に組んだ ``rot`` を左腕で使うにはこの補正が要る。
+    URDF が左右ミラーで作られているため、``l_eef_grasp_joint`` の原点は
+    ``l_hand_link`` の -Y 側 (右は +Y 側) = 掌の側にあるのに、姿勢は右と
+    同じ (rpy=(0, pi/2, 0)) なので、``l_eef_grasp_link`` の +Y は右とは
+    逆に掌->甲 を向く。右腕用 (+Y=甲->掌) に組んだ ``rot`` を左腕で使う
+    にはこの補正が要る (削除するとロボット左腕が手の甲を人間の掌へ押し
+    付ける向きになることを実機・viewer で確認済み)。
+
+    なお実機と viewer で左手の向きが 180 度ずれていたのはこの補正のせい
+    ではなく、実機に無い ``l_hand_y_joint`` を IK が回していたため
+    (``lock_fixed_joints`` 参照)。
     """
     if arm != 'l':
         return rot
@@ -521,6 +528,7 @@ def palm_to_target_rots(palm, hand, robot_arm):
     向かい合う握手ではなく、人間と同じ方向を向いて反対側の手で繋ぐ想定
     なので、指方向 (+X) は鏡写しにせずそのまま使う。ロボットの +Y は
     掌の法線 (``y_axis``) の逆向き (``-y_axis``、人間の掌に正対する向き)。
+    ロボット左腕については ``_correct_grasp_frame`` 参照。
 
     ``hand`` は差し出している人間の手 ('R'/'L', ``palms['offered_hand']``
     と同じ値)。``turn_candidates_deg`` がロボットの手首側を人間の親指側に
@@ -789,6 +797,28 @@ def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
     min_angle = math.radians(min_angle_deg)
     for arm in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
+
+
+def lock_fixed_joints(robot):
+    """実機にモータが無い関節 (``Aero._FIXED_JOINT_NAMES``,
+    ``{r,l}_hand_y_joint``) の可動域を 0 のみに潰し、IK・軌道計画で
+    動かないようにする。
+
+    ``Aero._limb`` はこれらを ``joint_list`` から除いているが、
+    ``batch_inverse_kinematics``/軌道計画は ``link_list`` の各
+    ``link.joint`` を最適化対象にする (除かれるのは URDF 上 fixed 型の
+    関節だけ) ため、``{arm}arm_whole_body.link_list`` を渡すとこの関節も
+    動いてしまう (URDF 上の可動域は左 ±3.2 rad、右 ±2.0 rad)。viewer は
+    その角度で手先を表示する一方、実機ではこの関節は回らないので、実機
+    の手先だけが大きく (左腕で 180 度前後) ずれていた。
+    ``restrict_elbow_range`` と同様、``robot`` 側を書き換えれば
+    ``*_whole_body`` にも反映される。
+    """
+    for name in robot._FIXED_JOINT_NAMES:
+        joint = getattr(robot, name)
+        joint.min_angle = 0.0
+        joint.max_angle = 0.0
+        joint.joint_angle(0.0)
 
 
 def restrict_joint_range_margin(link_list, margin_ratio):
@@ -2141,6 +2171,7 @@ def main():
     # あるので、指の関節が要らないこのスクリプトでは手なしモデルを使う。
     robot = Aero(use_hand=False)
     restrict_elbow_range(robot)
+    lock_fixed_joints(robot)
     apply_collision_model(robot)
 
     # 干渉回避で実際にチェックする組み合わせは常に collision_pairs
