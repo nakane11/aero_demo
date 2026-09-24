@@ -37,6 +37,12 @@ static const uint32_t COLOR_STOPPED = 0xFF0000;      // 赤
 static const uint32_t COLOR_RUNNING = 0x00FF00;      // 緑
 static const uint32_t COLOR_CONNECTING = 0xFFFF00;   // 黄 (WiFi接続待ち)
 
+// ボタンの機械的なチャタリング対策。M5Unified 内部の debounce だけでは
+// 実機で wasPressed() が 1 回の押下で複数回発火することがあり (STOP から
+// RESUME に戻す際、奇数/偶数回トグルされて画面がバタつく形で顕在化した)、
+// ここで最後にトグルしてからこの時間内の再トグルは無視する。
+static const uint32_t DEBOUNCE_MS = 300;
+
 void fillScreen(uint32_t color);
 void connectWiFi();
 void sendCommand(const char *command);
@@ -44,6 +50,7 @@ void applyState();
 
 WiFiUDP udp;
 bool stopped = false;  // 起動直後は RESUME (通常動作) 扱い
+uint32_t lastToggleMs = 0;
 
 void fillScreen(uint32_t color) {
   M5.Display.fillScreen(color);
@@ -110,8 +117,12 @@ void loop() {
   }
 
   if (M5.BtnA.wasPressed()) {
-    stopped = !stopped;
-    applyState();
+    uint32_t now = millis();
+    if (now - lastToggleMs >= DEBOUNCE_MS) {
+      lastToggleMs = now;
+      stopped = !stopped;
+      applyState();
+    }
   }
 
   delay(10);
