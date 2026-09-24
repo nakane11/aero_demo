@@ -5,12 +5,21 @@
 そこへ至る「最後の接近」の軌道 (waypoint 列) を干渉回避付きで生成し、
 JSON として保存する。
 
-計画するのは人間の近くまで来てからの区間だけ (遠方からの長距離走行は
-ナビゲーションの仕事とし対象外)。軌道の始点は ``build_start_and_goal``
-が次のように決める:
+軌道の始点は次のように決める (``plan_person_motion`` 参照):
 
-* 台車: 最終台車位置から見て人間の反対方向へ ``--approach-distance``
-  [m] 下がった位置。向きは最終姿勢と同じ。
+* 台車: 最終台車位置から人間の反対方向 (人間の立ち位置から最終台車位置
+  へ向かう半径方向、``approach_direction``) へ ``--approach-distance``
+  [m] 下がった接近開始位置 (途中目標)。最後の区間を、人間に向かって
+  まっすぐ近づく動きにするためのもの。ただしロボットの初期位置
+  (このスクリプトでは IK と同じく ``INITIAL_BASE_POSE`` = ワールド原点・
+  向き +x) がその軸上でそれより手前にある場合は、初期位置の位置まで
+  縮める (後退しない。縮めた結果ほぼ 0 なら初期位置から直接計画する。
+  ``approach_base_start`` 参照)。以前は初期位置を考慮せず常に人間の
+  反対方向へ 1 m 下がっていたため、人が近いと一度後退してから前進する・
+  人が斜め前にいると横に大きくふくらむ、という大回りになっていた。
+  初期位置から接近開始位置までの直進 (``build_lead_in_waypoints``) は
+  最適化せず、人間から ``LEAD_IN_CHECK_RADIUS`` 以内に入る waypoint だけ
+  干渉を検証する (結果の ``lead_in_*``)。
 * 腕: 肩は ``Aero.reset_pose`` のまま、肘を伸ばして体の横に自然に
   下ろした姿勢 (``arms_down_angles`` 参照)。
 
@@ -126,10 +135,37 @@ DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE = (
 DEFAULT_SMOOTHNESS_WEIGHT = 1.0
 DEFAULT_ACCELERATION_WEIGHT = 1.0
 
-# 軌道の始点で、最終台車位置から人間の反対方向へどれだけ下がるか [m]
-# (モジュール docstring / ``approach_base_start`` 参照)。これより遠方は
-# ナビゲーションの担当なので計画・検証しない。
-DEFAULT_APPROACH_DISTANCE = 1.0  # [m]
+# 軌道の始点にするロボットの初期台車姿勢 ``[x, y, yaw]`` (IK を解く座標系
+# = 人物を ``solve_palm_ik.HUMAN_FRONT_DISTANCE`` 前方へ平行移動した座標系
+# で、Aero は常にワールド原点・向き +x から IK を開始する。
+# ``solve_palm_ik.human_translation_offset`` 参照)。実カメラで人物の実際の
+# 位置が分かっている場合 (``run_camera_pipeline_test.py``) は、この座標系
+# での実機の現在地を ``initial_base_pose`` として別に渡す。
+INITIAL_BASE_POSE = (0.0, 0.0, 0.0)
+
+# 接近開始位置 (途中目標) を最終台車位置から人間の反対方向へどれだけ
+# 下げるか [m] の上限 (モジュール docstring / ``approach_base_start``
+# 参照)。大きいほど「人間に向かってまっすぐ近づく」区間が長くなるが、
+# ロボットがその向きからずれた位置にいるときの横へのふくらみも大きくなる。
+# 以前は 1.0 m だったが、合成人物 7 人 x 初期位置 9 通り (向きのずれ
+# 0/30/60 度 x ゴールまで 1/2/3 m) の比較で、干渉検証を通る数・計算時間は
+# 1.0/0.5/0.3 m で変わらず、横ずれの最大値 (平均) だけが 0.40 -> 0.23 ->
+# 0.14 m と減ったため、まっすぐ近づく区間の長さとの兼ね合いで 0.5 m にした
+# (2026-09-24)。
+DEFAULT_APPROACH_DISTANCE = 0.5  # [m]
+
+# 初期位置の方が人間に近く、接近開始位置を縮めた結果がこれ未満になった
+# ら、接近開始位置を置かずに初期位置から直接計画する [m]。
+MIN_APPROACH_DISTANCE = 0.05  # [m]
+
+# 初期位置から接近開始位置までの直進 (lead-in) のうち、台車が人間の
+# 立ち位置からこの距離以内に入る waypoint だけ干渉を検証する [m]
+# (それより遠ければ人体に届かないとみなす)。
+LEAD_IN_CHECK_RADIUS = 1.0  # [m]
+
+# lead-in の waypoint の間隔 (台車の並進 [m] / 回頭 [rad] の上限)。
+LEAD_IN_STEP = 0.1  # [m]
+LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
 
 # pre-touch 姿勢を、目標手先位置から掌の法線方向へどれだけ引き戻すか [m]
 # (モジュール docstring / ``build_pretouch_trajectory`` 参照)。0.10/0.15 で
@@ -195,30 +231,152 @@ def arms_down_angles(robot, joint_list):
         for joint in joint_list])
 
 
-def approach_base_start(base_goal, human_xy, distance):
-    """接近開始位置の台車姿勢 ``[x, y, yaw]`` を返す。
+def handshake_base_goal(handshake):
+    """``handshake`` (``solve_palm_ik.py`` の出力) の最終台車姿勢
+    ``[x, y, yaw]``。"""
+    return np.array([handshake['base_position'][0],
+                     handshake['base_position'][1],
+                     handshake['base_yaw']])
 
-    最終台車位置から見て人間の立ち位置の反対方向 (人間を中心とした半径
-    方向の外向き) へ ``distance`` [m] 下がった位置。向きは最終姿勢と同じ
-    -- ここまで来る移動と向き合わせはナビゲーションの担当という前提
-    (モジュール docstring 参照)。
+
+def wrap_angle(angle):
+    """``angle`` [rad] を [-π, π) に正規化する。"""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def approach_direction(human_xy, base_goal):
+    """接近開始位置 (途中目標) を最終台車位置からどちら向きに置くかの
+    水平単位ベクトル (``approach_base_start`` 参照): 人間の立ち位置から
+    最終台車位置へ向かう半径方向。
     """
     direction = np.array([base_goal[0] - human_xy[0],
                           base_goal[1] - human_xy[1]], dtype=np.float64)
     norm = float(np.linalg.norm(direction))
     # 台車の目標が人間の立ち位置と重なることは実際には無いが、0 除算だけ
     # は避けて後方 (-x) へ下がる向きにしておく。
-    direction = np.array([-1.0, 0.0]) if norm < 1e-6 else direction / norm
+    return np.array([-1.0, 0.0]) if norm < 1e-6 else direction / norm
+
+
+def approach_base_start(base_goal, direction, distance,
+                        initial_base_pose=None):
+    """軌道の始点にする接近開始位置 (途中目標) の台車姿勢 ``[x, y, yaw]``
+    を返す。
+
+    最終台車位置から ``direction`` (``approach_direction``、人間の立ち位置
+    から最終台車位置へ向かう向き) へ ``distance`` [m] 離れた位置で、向きは
+    最終姿勢と同じ (最後の区間を、人間に向かってまっすぐ近づく動きにする
+    ため)。
+
+    ``initial_base_pose`` (ロボットの初期台車姿勢) を渡すと、接近開始位置が
+    ``direction`` の軸上で初期位置より先 (初期位置から見て後ろ側) に
+    ならないよう、離す距離を初期位置の ``direction`` 方向の位置までに縮める
+    (一度後退してから前進する大回りをしないため)。縮めた距離が
+    ``MIN_APPROACH_DISTANCE`` 未満なら、接近開始位置を置かずに初期位置
+    そのものを返す (初期位置から直接計画する)。ただし初期位置が最終台車
+    位置から見て ``direction`` と反対側 (人間を挟んだ向こう側など、回り
+    込んで近づく必要がある側) にある場合は縮めない (縮めると初期位置から
+    直進することになり、人体を横切ってしまうため)。
+    """
+    if initial_base_pose is not None:
+        initial = np.asarray(initial_base_pose, dtype=np.float64)
+        along = float(np.dot(initial[:2] - base_goal[:2], direction))
+        if along > 0.0:
+            distance = min(distance, along)
+            if distance < MIN_APPROACH_DISTANCE:
+                return initial.copy()
     return np.array([base_goal[0] + direction[0] * distance,
                      base_goal[1] + direction[1] * distance,
                      base_goal[2]])
 
 
-def build_start_and_goal(robot, robot_arm, handshake, human_xy,
-                         approach_distance):
-    """始点 (腕を下ろした姿勢 + 接近開始位置) と終点 (``handshake`` =
-    ``solve_palm_ik.py`` の出力 JSON) の関節角ベクトル・台車位置姿勢を、
-    ``{robot_arm}arm_whole_body`` の関節順序 (``joint_list``) で求める。
+def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
+                            start_joint_angles=None):
+    """ロボットの初期台車姿勢 ``initial_base_pose`` から軌道の始点
+    ``first_waypoint`` (``waypoints[0]``) までを直線的に補間した waypoint
+    列 (lead-in) を返す (末尾は ``first_waypoint`` 自身を含まない。始点が
+    初期位置と一致していれば空)。
+
+    台車は並進 ``LEAD_IN_STEP``・回頭 ``LEAD_IN_ANGLE_STEP`` 以下の刻みで
+    補間する。yaw は終点側 (``first_waypoint``、この直後に続く waypoint と
+    連続している必要がある) を変えずに、始点側を 2π の整数倍ずらして近い
+    回り方にする (``unwrap_start_yaw`` と同じ考え方)。関節角は
+    ``start_joint_angles`` (``{関節名: 角度}``、実機の初期姿勢など) から
+    ``first_waypoint`` の関節角へ線形補間する (省略時は ``first_waypoint``
+    の関節角のまま)。
+    """
+    end_base = np.array([first_waypoint['base_position'][0],
+                         first_waypoint['base_position'][1],
+                         first_waypoint['base_yaw']])
+    start_base = unwrap_start_yaw(initial_base_pose, end_base)
+    delta = end_base - start_base
+    n = int(max(math.ceil(np.linalg.norm(delta[:2]) / LEAD_IN_STEP),
+                math.ceil(abs(delta[2]) / LEAD_IN_ANGLE_STEP)))
+    if n == 0:
+        return []
+    end_vec = np.asarray(first_waypoint['joint_angle_vector'],
+                         dtype=np.float64)
+    if start_joint_angles is None:
+        start_vec = end_vec
+    else:
+        start_vec = np.array([
+            start_joint_angles.get(name, angle)
+            for name, angle in zip(joint_names, end_vec)])
+    waypoints = []
+    for t in np.linspace(0.0, 1.0, n, endpoint=False):
+        base = start_base + delta * t
+        waypoints.append(dict(
+            base_position=[float(base[0]), float(base[1]), 0.0],
+            base_yaw=float(base[2]),
+            joint_angle_vector=[
+                float(v) for v in start_vec + (end_vec - start_vec) * t],
+        ))
+    return waypoints
+
+
+def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
+                   joint_positions, human_xy, obstacle_cache):
+    """lead-in の waypoint のうち、台車が人間の立ち位置から
+    ``LEAD_IN_CHECK_RADIUS`` 以内に入るものだけ ``verify_waypoints`` で
+    干渉を検証し、waypoint ごとの最小距離 (検証しなかったものは ``None``)
+    を返す。"""
+    near = [i for i, wp in enumerate(lead_in)
+            if math.hypot(wp['base_position'][0] - human_xy[0],
+                          wp['base_position'][1] - human_xy[1])
+            <= LEAD_IN_CHECK_RADIUS]
+    distances = [None] * len(lead_in)
+    if near:
+        checked = verify_waypoints(
+            robot, joint_names, [lead_in[i] for i in near],
+            verification_pairs, joint_positions,
+            obstacle_cache=obstacle_cache)
+        for i, d in zip(near, checked):
+            distances[i] = float(d)
+    return distances
+
+
+def unwrap_start_yaw(base_start, base_goal):
+    """``base_start`` の yaw を、``base_goal`` の yaw から見て ±π 以内の
+    等価な角度に置き換えたコピーを返す。
+
+    軌道は台車の yaw を始点・終点の間で線形補間するため、差が π を超えて
+    いると逆回り (遠回り) に回頭してしまう。終点側 (``handshake`` の
+    ``base_yaw``、押し込みの後処理 ``post_process`` も同じ値を基準にする)
+    は変えずに、始点側だけを 2π の整数倍ずらして合わせる。
+    """
+    base_start = np.array(base_start, dtype=np.float64)
+    base_start[2] = base_goal[2] + wrap_angle(base_start[2] - base_goal[2])
+    return base_start
+
+
+def build_start_and_goal(robot, robot_arm, handshake, base_start):
+    """始点 (腕を下ろした姿勢 + 台車姿勢 ``base_start``) と終点
+    (``handshake`` = ``solve_palm_ik.py`` の出力 JSON) の関節角ベクトル・
+    台車位置姿勢を、``{robot_arm}arm_whole_body`` の関節順序
+    (``joint_list``) で求める。
+
+    ``base_start`` は IK と同じ座標系の ``[x, y, yaw]`` (接近開始位置
+    ``approach_base_start``。``plan_person_motion`` 参照)。yaw は終点から
+    見て逆回りにならないよう ``unwrap_start_yaw`` で調整する。
 
     Returns
     -------
@@ -244,10 +402,8 @@ def build_start_and_goal(robot, robot_arm, handshake, human_xy,
         if joint.name in name_to_angle:
             joint.joint_angle(name_to_angle[joint.name])
     q_goal = np.array([j.joint_angle() for j in joint_list])
-    base_goal = np.array([handshake['base_position'][0],
-                          handshake['base_position'][1],
-                          handshake['base_yaw']])
-    base_start = approach_base_start(base_goal, human_xy, approach_distance)
+    base_goal = handshake_base_goal(handshake)
+    base_start = unwrap_start_yaw(base_start, base_goal)
 
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
@@ -512,10 +668,24 @@ def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
 
 
 def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
-                       args, verification_pairs, solver):
+                       args, verification_pairs, solver,
+                       initial_base_pose=INITIAL_BASE_POSE):
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
-    まず最適化を掛けずに、幾何的に構成した軌道を厳密検証に通す:
+    軌道の始点は接近開始位置 (``approach_base_start``。最終台車位置から
+    人間の反対方向 (``approach_direction``) へ
+    ``args.approach_distance`` (既定 ``DEFAULT_APPROACH_DISTANCE``) 離れた
+    位置を、ロボットの初期台車姿勢 ``initial_base_pose`` より先にならない
+    よう縮めたもの)。
+    初期位置からそこまでの直進 (lead-in, ``build_lead_in_waypoints``) は
+    最適化せず、人間の近く (``LEAD_IN_CHECK_RADIUS`` 以内) の waypoint
+    だけ干渉を検証して、結果の ``lead_in_waypoints``/``lead_in_min_
+    distances`` (検証しなかった waypoint は ``None``)/``lead_in_verified``
+    に入れる。``verified``/``waypoint_min_distances`` は従来通り接近開始
+    位置から先の軌道 (``waypoints``) だけの結果。
+
+    接近開始位置から先はまず最適化を掛けずに、幾何的に構成した軌道を
+    厳密検証に通す:
     pre-touch 姿勢を経由するもの (``build_pretouch_trajectory``、掌を
     通り抜けない最終接近になる) を優先し、次に始点と終点を単純に線形補間
     しただけのもの (``build_initial_trajectory``、pre-touch の IK が
@@ -547,15 +717,45 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     走ってしまうため)。
     """
     start_time = time.time()
-    link_list, joint_list, q_start, base_start, q_goal, base_goal = \
-        build_start_and_goal(robot, robot_arm, handshake, human_xy,
-                             DEFAULT_APPROACH_DISTANCE)
-    n_joints = len(q_start)
-    # pre-touch/線形補間の初期候補 + 最適化リトライのすべてが同じ人物
-    # (joint_positions 不変) を検証するので、build_obstacle_cache を
-    # ここで 1 回だけ呼んで使い回す (verify_waypoints のモジュール docstring
-    # 参照)。
+    # pre-touch/線形補間の初期候補 + 最適化リトライ + lead-in のすべてが
+    # 同じ人物 (joint_positions 不変) を検証するので、build_obstacle_cache
+    # をここで 1 回だけ呼んで使い回す (verify_waypoints のモジュール
+    # docstring 参照)。
     obstacle_cache = build_obstacle_cache(joint_positions)
+
+    approach_distance = getattr(args, 'approach_distance',
+                                DEFAULT_APPROACH_DISTANCE)
+    base_goal = handshake_base_goal(handshake)
+    base_start = approach_base_start(
+        base_goal, approach_direction(human_xy, base_goal),
+        approach_distance, initial_base_pose=initial_base_pose)
+    best = _plan_from_start(
+        robot, robot_arm, handshake, joint_positions, base_start, args,
+        verification_pairs, solver, obstacle_cache)
+    best['approach_distance'] = approach_distance
+
+    lead_in = build_lead_in_waypoints(
+        initial_base_pose, best['waypoints'][0], best['joint_names'])
+    lead_in_distances = verify_lead_in(
+        robot, best['joint_names'], lead_in, verification_pairs,
+        joint_positions, human_xy, obstacle_cache)
+    best['lead_in_waypoints'] = lead_in
+    best['lead_in_min_distances'] = lead_in_distances
+    best['lead_in_verified'] = all(
+        d is None or d >= -DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE
+        for d in lead_in_distances)
+    best['compute_time'] = time.time() - start_time
+    return best
+
+
+def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
+                     args, verification_pairs, solver, obstacle_cache):
+    """台車の始点 ``base_start`` から 1 人分の軌道を計画する
+    (``plan_person_motion`` の docstring 参照)。``compute_time`` は呼び出し
+    側が入れる。"""
+    link_list, joint_list, q_start, base_start, q_goal, base_goal = \
+        build_start_and_goal(robot, robot_arm, handshake, base_start)
+    n_joints = len(q_start)
 
     def make_candidate(trajectory, kind, attempt=None, cost=None,
                        solve_time=0.0):
@@ -574,7 +774,6 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
             n_waypoints=args.n_waypoints,
             dt=DEFAULT_DT,
             robot_arm=robot_arm,
-            approach_distance=DEFAULT_APPROACH_DISTANCE,
             joint_names=joint_names,
             waypoints=waypoints,
             waypoint_min_distances=[float(d) for d in distances],
@@ -601,7 +800,6 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     for kind, trajectory in candidates:
         candidate = make_candidate(trajectory, kind)
         if candidate['verified'] and not force_optimize:
-            candidate['compute_time'] = time.time() - start_time
             return candidate
         if best is None or (min(candidate['waypoint_min_distances'])
                             > min(best['waypoint_min_distances'])):
@@ -664,8 +862,6 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
         if (min(candidate['waypoint_min_distances'])
                 > min(best['waypoint_min_distances'])):
             best = candidate
-
-    best['compute_time'] = time.time() - start_time
     return best
 
 
@@ -744,6 +940,13 @@ def main():
         help='軌道 JSON の保存先ディレクトリ (既定 random_motion_poses/。'
             '入力と同じファイル名で保存する)。')
     parser.add_argument(
+        '--approach-distance', type=float, default=DEFAULT_APPROACH_DISTANCE,
+        help='接近開始位置 (途中目標) を最終台車位置から人間の反対方向へ '
+            '下げる距離の上限 [m] (既定 {})。小さいほど、ロボットがその '
+            '向きからずれているときの横へのふくらみが小さくなる '
+            '(approach_base_start 参照)。'.format(
+                DEFAULT_APPROACH_DISTANCE))
+    parser.add_argument(
         '--n-waypoints', type=int, default=DEFAULT_N_WAYPOINTS,
         help='軌道の waypoint 数 (始点・終点を含む。既定 {})。'.format(
             DEFAULT_N_WAYPOINTS))
@@ -821,9 +1024,11 @@ def main():
             joint_positions, front_distance=spik.HUMAN_FRONT_DISTANCE)
         joint_positions = spik.translate_joint_positions(
             joint_positions, offset)
-        # 接近開始位置は人間の立ち位置を基準に決める (approach_base_start)。
-        # 骨格から立ち位置が求まらない場合は、平行移動が行われていないので
-        # solve_palm_ik.py と同じ公称位置 (Aero の前方) を使う。
+        # ロボットの初期位置は IK と同じくワールド原点 (INITIAL_BASE_POSE、
+        # plan_person_motion の既定)。人間の立ち位置は接近開始位置の向き
+        # (approach_direction) と lead-in の検証範囲に使う。骨格から立ち位置が
+        # 求まらない場合は、平行移動が行われていないので solve_palm_ik.py
+        # と同じ公称位置 (Aero の前方) を使う。
         human_xy = spik.human_standing_xy(joint_positions)
         if human_xy is None:
             human_xy = np.array([spik.HUMAN_FRONT_DISTANCE, 0.0])
@@ -835,10 +1040,10 @@ def main():
         n_optimized += int(result['optimized'])
         n_verified += int(result['verified'])
         json_io.save_json(out_path, result)
-        print('[{}/{}] {} -> {} (verified={}, min_dist={:.4f} m, '
-              '{}, {:.1f} 秒)'.format(
+        print('[{}/{}] {} -> {} (verified={}, lead_in_verified={}, '
+              'min_dist={:.4f} m, {}, {:.1f} 秒)'.format(
                   i + 1, len(files), os.path.basename(path), out_path,
-                  result['verified'],
+                  result['verified'], result['lead_in_verified'],
                   min(result['waypoint_min_distances']),
                   KIND_LABELS.get(result['kind'], result['kind']),
                   result['compute_time']))

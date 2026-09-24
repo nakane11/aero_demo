@@ -200,14 +200,6 @@ BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
 # (ROBOT_COLLISION_LINK_COLOR/HUMAN_COLLISION_OBSTACLE_COLOR/
 # PRESS_IN_DISPLAY_WAYPOINTS)。
 
-# 経路の先頭に表示専用で追加する、ロボットの初期位置 (台車=ワールド原点,
-# 関節=reset_pose) から経路計算の始点 (motion['waypoints'][0]、腕を下ろし
-# 接近開始位置まで台車が下がった姿勢) までの補間フレーム数。
-# plan_handshake_motion.py が計画するのは経路計算の始点から先だけなので、
-# それより手前 (ロボットが実際にどこからその場所まで来るか) は干渉を
-# 考慮せず単純な線形補間で表示するだけにする。
-INITIAL_APPROACH_DISPLAY_WAYPOINTS = 10
-
 # 骨格が一瞬未検出になるたびに viewer 画面の骨格表示を消して描き直すと
 # ちらついて見づらいため、検出が途切れてもこの秒数の間は直前に検出できた
 # 骨格をそのまま表示し続け、この秒数を超えて未検出が続いたときだけ消す
@@ -242,51 +234,6 @@ def collision_pairs_text(colliding):
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
-def build_initial_approach_waypoints(initial_base_position, initial_base_yaw,
-                                     initial_joint_names,
-                                     initial_joint_angle_vector,
-                                     first_waypoint, motion_joint_names):
-    """ロボットの初期位置 (``initial_base_position``/``initial_base_yaw``、
-    関節角 ``initial_joint_angle_vector``) から、経路計画上の始点
-    ``first_waypoint`` (``motion['waypoints'][0]``、腕を下ろし接近開始位置
-    まで台車が下がった姿勢) までを線形補間した、表示専用の waypoint 列を
-    返す。
-
-    ``plan_handshake_motion.py`` が干渉回避付きで計画するのは
-    ``first_waypoint`` から先 (接近開始位置 -> 握手姿勢) だけで、それより
-    手前 (ロボットの初期位置から接近開始位置まで) は計画対象外 -- 実機では
-    ナビゲーションが別途担当する区間 (モジュール docstring 参照)。ここでは
-    干渉は考慮せず、台車位置姿勢・関節角をそれぞれ単純に線形補間するだけの
-    表示アニメーションにする (``build_display_waypoints`` の後処理補間と
-    同じ考え方)。
-
-    戻り値の末尾は ``first_waypoint`` 自身を含まない (呼び出し側で
-    ``motion['waypoints']`` をそのまま続ける前提)。
-    """
-    start_name_to_angle = dict(zip(initial_joint_names,
-                                   initial_joint_angle_vector))
-    start_vec = np.array(
-        [start_name_to_angle.get(name, 0.0) for name in motion_joint_names],
-        dtype=np.float64)
-    end_vec = np.asarray(first_waypoint['joint_angle_vector'],
-                         dtype=np.float64)
-    base_start = np.array([initial_base_position[0], initial_base_position[1],
-                           initial_base_yaw])
-    base_end = np.array([first_waypoint['base_position'][0],
-                         first_waypoint['base_position'][1],
-                         first_waypoint['base_yaw']])
-
-    waypoints = []
-    for t in np.linspace(0.0, 1.0, INITIAL_APPROACH_DISPLAY_WAYPOINTS,
-                         endpoint=False):
-        angle_vec = start_vec + (end_vec - start_vec) * t
-        base_vec = base_start + (base_end - base_start) * t
-        waypoints.append(dict(
-            base_position=[float(base_vec[0]), float(base_vec[1]), 0.0],
-            base_yaw=float(base_vec[2]),
-            joint_angle_vector=[float(v) for v in angle_vec],
-        ))
-    return waypoints
 
 class HandshakePipelineNode(object):
     """カメラ入力 -> 骨格推定 -> (ARM ボタン押下時) 掌推定・IK を行うノード."""
@@ -340,8 +287,8 @@ class HandshakePipelineNode(object):
         # ままだと肘を曲げた「構え」のような姿勢になる、同関数の docstring
         # 参照)。以降 self.robot は robot_position の計算 (seed_arm_pose) や
         # IK で上書きされ続けるため、ここで確保しておく (初期位置 -> 経路
-        # 開始点の表示用アニメーション waypoint に使う、
-        # build_initial_approach_waypoints 参照)。
+        # 開始点の直進 (lead-in) の関節角の補間に使う、
+        # plan_handshake_motion.build_lead_in_waypoints 参照)。
         self._initial_joint_names = [j.name for j in self.robot.joint_list]
         self._initial_joint_angle_vector = [
             float(v) for v in
@@ -1085,12 +1032,18 @@ class HandshakePipelineNode(object):
             motion_args = copy.copy(args)
             motion_args.collision_verify_tolerance = \
                 args.motion_collision_verify_tolerance
+            # 軌道の始点はまず最終台車位置と実機の現在地 (base_link 原点、
+            # 向き +x) を結ぶ線分上に取る (plan_person_motion 参照)。IK と
+            # 同じ仮想座標系 (実座標 + offset) に直した値を渡す。
+            initial_base_pose = np.array([offset[0], offset[1], 0.0])
             motion = phm.plan_person_motion(
                 self.robot, robot_arm, result, translated_joints, human_xy,
-                motion_args, self.verification_pairs, self.solver)
+                motion_args, self.verification_pairs, self.solver,
+                initial_base_pose=initial_base_pose)
             self._log_debug(dict(
                 event='motion', person=attempt,
                 verified=motion['verified'],
+                lead_in_verified=motion['lead_in_verified'],
                 min_dist=float(min(motion['waypoint_min_distances'])),
                 waypoint_min_distances=[
                     float(d) for d in motion['waypoint_min_distances']],
@@ -1127,14 +1080,19 @@ class HandshakePipelineNode(object):
             display_waypoints, n_approach = build_display_waypoints(
                 motion, result)
             # 経路計画は接近開始位置 (motion['waypoints'][0]) から始まる
-            # ため、その手前にロボットの初期位置 (台車=ワールド原点,
-            # 関節=reset_pose) からの表示専用アニメーションを継ぎ足す
-            # (干渉は考慮しない、build_initial_approach_waypoints 参照)。
+            # ため、その手前にロボットの初期位置 (台車=ワールド原点, 関節=
+            # 腕を下ろした初期姿勢) からの直進 (lead-in) を継ぎ足す。台車の
+            # 動きは plan_person_motion が人間の近くだけ干渉を検証した
+            # motion['lead_in_waypoints'] と同じで (phm.build_lead_in_
+            # waypoints)、関節角だけ実機の初期姿勢から補間する。始点が初期
+            # 位置と一致していれば空。
             initial_pos = self._initial_base_coords.worldpos()
-            prepend_waypoints = build_initial_approach_waypoints(
-                initial_pos, 0.0, self._initial_joint_names,
-                self._initial_joint_angle_vector, motion['waypoints'][0],
-                motion['joint_names'])
+            prepend_waypoints = phm.build_lead_in_waypoints(
+                [initial_pos[0], initial_pos[1], 0.0],
+                motion['waypoints'][0], motion['joint_names'],
+                start_joint_angles=dict(zip(
+                    self._initial_joint_names,
+                    self._initial_joint_angle_vector)))
             n_prepend = len(prepend_waypoints)
             display_waypoints = prepend_waypoints + display_waypoints
         else:
@@ -1212,12 +1170,12 @@ class HandshakePipelineNode(object):
 
     @staticmethod
     def _untranslate_motion(motion, offset):
-        """``_untranslate_result`` と同じ理由で、``motion['waypoints']``
-        (仮想座標系の台車位置) を実際の ``base_link`` 座標系へ戻す
-        (破壊的に書き換える)。waypoint の関節角は台車位置に依存しないので
-        そのままでよい。"""
+        """``_untranslate_result`` と同じ理由で、``motion['waypoints']``/
+        ``motion['lead_in_waypoints']`` (仮想座標系の台車位置) を実際の
+        ``base_link`` 座標系へ戻す (破壊的に書き換える)。waypoint の関節角は
+        台車位置に依存しないのでそのままでよい。"""
         dx, dy = offset
-        for wp in motion['waypoints']:
+        for wp in motion['waypoints'] + motion.get('lead_in_waypoints', []):
             wp['base_position'][0] -= dx
             wp['base_position'][1] -= dy
 
@@ -1523,9 +1481,9 @@ class HandshakePipelineNode(object):
         #
         # waypoint 間の所要時間は一律 move_time (=motion['dt']) ではなく、
         # 実機の base_controller の最大速度で物理的に間に合う時間まで
-        # 必要に応じて延ばす (_scaled_time_list 参照)。特に
-        # build_initial_approach_waypoints が生成する表示専用の初期接近
-        # 区間は、大きな回頭を少ない waypoint 数に均等割りするため
+        # 必要に応じて延ばす (_scaled_time_list 参照)。特に初期位置から
+        # 接近開始位置までの直進 (lead-in) は、以前は大きな回頭を少ない
+        # waypoint 数に均等割りしていたため
         # motion['dt'] のままでは実機が追従できないことが実機検証
         # (2026-09-24) で判明した。腕 (angle_vector_sequence) にも同じ
         # time_list を渡し、台車と腕のタイミングがずれないようにする。
@@ -1599,9 +1557,8 @@ class HandshakePipelineNode(object):
         個別に延ばす (間に合う区間は ``default_time`` のまま、全体を
         一律に遅くしたりはしない)。
 
-        ``build_initial_approach_waypoints`` が生成する表示専用の初期
-        接近区間は、大きな回頭を ``INITIAL_APPROACH_DISPLAY_WAYPOINTS``
-        個の waypoint に均等割りするだけなので、``motion['dt']`` を
+        初期位置から接近開始位置までの直進 (lead-in、当時は大きな回頭を
+        固定の 10 個の waypoint に均等割りしていた) で ``motion['dt']`` を
         一律に使うと大きな回頭が必要な人物では実機が追従しきれない
         (実機検証 2026-09-24: 141.9 度の回頭に 2.0 秒しか割り当てられて
         おらず、実機の最大回頭速度 0.2 rad/s では本来 12.4 秒程度必要
@@ -1821,14 +1778,24 @@ class HandshakePipelineNode(object):
                 kind = phm.KIND_LABELS.get(motion['kind'], motion['kind'])
                 verified_text = ('OK (経路全体で干渉なし)' if motion['verified']
                                  else 'NG (経路上に干渉が残る waypoint あり)')
+                lead_in_text = (
+                    'OK' if motion.get('lead_in_verified', True)
+                    else 'NG (人間の近くで干渉あり)')
                 waypoint_index = int(self.waypoint_slider.value)
-                content += ('\n\n**軌道:** {} / 計画時 (指なし) の検証: {}\n\n'
+                content += ('\n\n**軌道:** {} / 計画時 (指なし) の検証: {} / '
+                           '初期位置からの直進の検証: {}\n\n'
                            'waypoint {}/{}'.format(
-                               kind, verified_text, waypoint_index,
-                               self.waypoint_slider.max))
+                               kind, verified_text, lead_in_text,
+                               waypoint_index, self.waypoint_slider.max))
                 if waypoint_index < n_prepend:
-                    content += (' (初期位置から経路開始点への移動、経路計画の'
-                               '干渉検証の対象外)')
+                    lead_in_dists = motion.get('lead_in_min_distances', [])
+                    dist = (lead_in_dists[waypoint_index]
+                            if waypoint_index < len(lead_in_dists) else None)
+                    content += (
+                        ' (初期位置から接近開始位置への直進、人間から離れて'
+                        'いるため干渉検証の対象外)' if dist is None
+                        else ' (初期位置から接近開始位置への直進、計画時 '
+                             '(指なし) の干渉余裕: {:+.4f} m)'.format(dist))
                 elif waypoint_index < n_prepend + n_approach:
                     dist = motion['waypoint_min_distances'][
                         waypoint_index - n_prepend]
@@ -2097,7 +2064,7 @@ def main():
     parser.add_argument(
         '--approach-distance', type=float,
         default=phm.DEFAULT_APPROACH_DISTANCE,
-        help='軌道の始点で、最終台車位置から人間の反対方向へ下がる距離 '
+        help='軌道の始点で、最終台車位置から人間の反対方向へ下がる距離の上限 '
             '[m] (既定 {})。'.format(phm.DEFAULT_APPROACH_DISTANCE))
     parser.add_argument(
         '--pretouch-standoff', type=float,

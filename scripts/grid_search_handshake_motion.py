@@ -254,8 +254,15 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
     注意。"""
     start_time = time.time()
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
-        phm.build_start_and_goal(robot, robot_arm, handshake, human_xy,
-                                 args.approach_distance)
+        phm.build_start_and_goal(
+            robot, robot_arm, handshake,
+            # 最適化条件そのものの比較用なので、初期位置による接近開始位置
+            # の縮小 (plan_person_motion の initial_base_pose) は行わない。
+            phm.approach_base_start(
+                phm.handshake_base_goal(handshake),
+                phm.approach_direction(
+                    human_xy, phm.handshake_base_goal(handshake)),
+                args.approach_distance))
     n_joints = len(q_start)
 
     def make_candidate(trajectory, attempt, cost, solve_time):
