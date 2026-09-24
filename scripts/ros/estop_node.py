@@ -99,7 +99,17 @@ class EstopNode(object):
         if not already_stopped:
             rospy.logwarn('[estop_node] STOP を受信、全ゴールを cancel します')
         self._estop_pub.publish(Bool(data=True))
-        self._publish_cancels()
+        # _publish_cancels は sleep を挟みながら複数回 publish するため
+        # (最大 CANCEL_REPEAT_COUNT * CANCEL_REPEAT_INTERVAL 秒ブロックする)、
+        # ここで同期的に呼ぶと UDP 受信ループ (シングルスレッド) がその間
+        # 次のパケットを受信できなくなる。AtomS3 は 1 回の押下で同じコマンド
+        # を連続送信してくる (取りこぼし対策) ため、同期呼び出しのままだと
+        # 1 回の押下の処理だけで最大数百ms〜1秒近くブロックし、直後に来る
+        # 反対方向のコマンド (例: STOP 連投の直後の RESUME) の処理が遅れて
+        # 「ボタンを押しても反応が変わらない/遅れて切り替わる」ように見える
+        # 原因になっていた。バックグラウンドスレッドにして受信ループを
+        # 塞がないようにする。
+        threading.Thread(target=self._publish_cancels, daemon=True).start()
 
     def _publish_cancels(self):
         empty_goal_id = GoalID()  # id="", stamp=0 -> 対象アクションの
@@ -112,8 +122,16 @@ class EstopNode(object):
 
     def trigger_resume(self):
         with self._lock:
+            was_stopped = self._stopped
             self._stopped = False
-        rospy.logwarn('[estop_node] RESUME を受信、停止を解除します')
+        # trigger_stop の already_stopped と対称に、実際に状態が変わった
+        # ときだけ警告ログを出す。AtomS3 は 1 回の押下で RESUME を連続
+        # 送信してくるため、ここにガードが無いと重複パケットのたびに
+        # 警告ログが連続で出て「チャタリングしている」ように見えていた
+        # (実際には /estop の値自体は毎回 False で一貫しており、振動は
+        # していなかった)。
+        if was_stopped:
+            rospy.logwarn('[estop_node] RESUME を受信、停止を解除します')
         self._estop_pub.publish(Bool(data=False))
 
     @property
@@ -128,6 +146,14 @@ class EstopNode(object):
         line = line.strip()
         if not line:
             return
+        # 診断用に受信した生コマンドをログに残すが、AtomS3 は 1 回の押下で
+        # 同じコマンドを連続送信してくる (取りこぼし対策) ため、既定の
+        # loginfo のままだと 1 回の押下で毎回 5 行ずつ表示されてしまう。
+        # 通常はここは無表示にし、状態が実際に変わったときの WARN
+        # (trigger_stop/trigger_resume 側) だけを見せる。必要なときは
+        # `rosrun aero_demo estop_node.py _log_level:=debug` 等で
+        # DEBUG ログを有効にすれば、全パケットの受信タイミングを確認できる。
+        rospy.logdebug('[estop_node] %s から受信: %r', addr, line)
         if line == 'STOP':
             self.trigger_stop()
         elif line == 'RESUME':
