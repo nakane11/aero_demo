@@ -148,6 +148,7 @@ from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
+from skrobot.coordinates.math import matrix2ypr  # noqa: E402
 from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
@@ -1540,7 +1541,7 @@ class HandshakePipelineNode(object):
                       math.degrees(base_trajectory_points[-1][2]),
                       ', '.join('{:.1f}'.format(math.degrees(p[2]))
                                for p in base_trajectory_points),
-                      math.degrees(start_odom_coords.rpy_angle()[0][0]),
+                      math.degrees(matrix2ypr(start_odom_coords.rotation)[0]),
                       sum(time_list),
                       ', '.join('{:.2f}'.format(t) for t in time_list)))
             self.ri.move_trajectory_sequence(
@@ -1560,9 +1561,9 @@ class HandshakePipelineNode(object):
             # いれば、base_controller が今回の送信区間内で回頭を追従
             # しきれていないことになる。
             odom_after = self.ri.odom
-            expected_yaw = (start_odom_coords.rpy_angle()[0][0]
+            expected_yaw = (matrix2ypr(start_odom_coords.rotation)[0]
                             + base_trajectory_points[-1][2])
-            actual_yaw = odom_after.rpy_angle()[0][0]
+            actual_yaw = matrix2ypr(odom_after.rotation)[0]
             print('[debug][segment] wait_for_result 直後 odom_yaw={:.1f}deg '
                   '(期待値={:.1f}deg, 差={:.1f}deg)'.format(
                       math.degrees(actual_yaw), math.degrees(expected_yaw),
@@ -1636,7 +1637,7 @@ class HandshakePipelineNode(object):
         if start_odom_coords is None or final_traj_point is None:
             return
         dx, dy, dyaw = final_traj_point
-        start_yaw = start_odom_coords.rpy_angle()[0][0]
+        start_yaw = matrix2ypr(start_odom_coords.rotation)[0]
         start_x, start_y = start_odom_coords.translation[:2]
         target_x = start_x + math.cos(start_yaw) * dx - math.sin(start_yaw) * dy
         target_y = start_y + math.sin(start_yaw) * dx + math.cos(start_yaw) * dy
@@ -1657,7 +1658,7 @@ class HandshakePipelineNode(object):
         for attempt in range(max_attempts):
             odom = self.ri.odom
             cur_x, cur_y = odom.translation[:2]
-            cur_yaw = odom.rpy_angle()[0][0]
+            cur_yaw = matrix2ypr(odom.rotation)[0]
             err_x_world = target_x - cur_x
             err_y_world = target_y - cur_y
             err_yaw = (target_yaw - cur_yaw + math.pi) % (2 * math.pi) - math.pi
