@@ -49,7 +49,10 @@ Usage
 
 IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現れ、押すと
 計画済みの waypoint 列を 1 つの軌道としてまとめて実機に送る
-(``_execute_on_robot`` 参照)。
+(``_execute_on_robot`` 参照)。ただし軌道の干渉検証 (経路計画の区間・
+初期位置からの直進の両方) に通らなかった場合は、干渉が残る軌道で実機を
+動かさないよう ``EXECUTE`` ボタンを表示せず、``--auto-execute`` でも
+動かさない (画面の「軌道」欄に NG と表示される)。
 ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に動かすか
 どうかを独立に指定できる (既定はどちらもオフで、EXECUTE ボタン自体が
 表示されない)。実機 (``AeroROSRobotInterface``) への接続自体はこれらの
@@ -1109,10 +1112,19 @@ class HandshakePipelineNode(object):
         # self.ri 自体は --execute-base/--execute-arm を何も指定していな
         # くても (ARM 時の首下げのために) 接続を試みるので、EXECUTE ボタン
         # の表示条件には別途フラグの指定有無を含める必要がある。
+        # 軌道の干渉検証 (verified/lead_in_verified) に通らなかった場合も
+        # 表示しない (--auto-execute でも動かさない) -- 人との干渉が残った
+        # ままの軌道で実機を動かさないため (_motion_verified 参照)。
         executable = (
             (self.args.execute_base or self.args.execute_arm)
             and self.ri is not None and result['solved']
-            and motion is not None and display_waypoints is not None)
+            and motion is not None and display_waypoints is not None
+            and self._motion_verified(motion))
+        if motion is not None and not self._motion_verified(motion):
+            print('[execute] 軌道の干渉検証に通らなかったため (verified={}, '
+                  'lead_in_verified={})、EXECUTE ボタンを表示せず、'
+                  '--auto-execute でも実機を動かしません。'.format(
+                      motion['verified'], motion['lead_in_verified']))
         self.execute_button.visible = executable
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
@@ -1139,6 +1151,16 @@ class HandshakePipelineNode(object):
                   '(--auto-execute)。')
             threading.Thread(
                 target=self._execute_on_robot, daemon=True).start()
+
+    @staticmethod
+    def _motion_verified(motion):
+        """軌道 ``motion`` (``plan_person_motion`` の戻り値) が、経路計画の
+        区間 (``verified``) と初期位置からの直進 (lead-in、
+        ``lead_in_verified``) の両方で干渉検証に通っているか。どちらかが
+        False なら実機を動かさない (EXECUTE ボタン・``--auto-execute``・
+        ``_execute_on_robot`` の全てでこれを見る)。
+        """
+        return bool(motion['verified']) and bool(motion['lead_in_verified'])
 
     @staticmethod
     def _untranslate_result(result, offset):
@@ -1391,6 +1413,14 @@ class HandshakePipelineNode(object):
                or display_waypoints is None:
             print('[execute] IK・軌道計画が完了していないため実機を動かせ '
                   'ません。')
+            return
+        # EXECUTE ボタンは検証 NG なら表示されないが (_solve_handshake
+        # 参照)、呼び出し元に依らず干渉が残る軌道では動かさないよう
+        # ここでも改めて確認する。
+        if not self._motion_verified(motion):
+            print('[execute] 軌道の干渉検証に通っていないため実機を動かせ '
+                  'ません (verified={}, lead_in_verified={})。'.format(
+                      motion['verified'], motion['lead_in_verified']))
             return
 
         joint_names = motion['joint_names']
