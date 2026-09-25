@@ -47,30 +47,25 @@ Usage
     python3 scripts/ros/run_camera_pipeline_test.py
     python3 scripts/ros/run_camera_pipeline_test.py --save-dir /tmp/camera_handshake_poses
 
-IK・軌道計画 (state 'result') まで進むと ``EXECUTE`` ボタンが現れ、押すと
-計画済みの waypoint 列を 1 つの軌道としてまとめて実機に送る
-(``_execute_on_robot`` 参照)。ただし軌道の干渉検証 (経路計画の区間・
-初期位置からの直進の両方) に通らなかった場合は、干渉が残る軌道で実機を
-動かさないよう ``EXECUTE`` ボタンを表示せず、``--auto-execute`` でも
-動かさない (画面の「軌道」欄に NG と表示される)。
-``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に動かすか
-どうかを独立に指定できる (既定はどちらもオフで、EXECUTE ボタン自体が
-表示されない)。実機 (``AeroROSRobotInterface``) への接続自体はこれらの
+IK・軌道計画 (state 'result') まで進むと、``--auto-execute`` を付けて
+いれば計画済みの waypoint 列を 1 つの軌道としてまとめて自動的に実機へ
+送る (``_execute_on_robot`` 参照)。``--auto-execute`` を付けていなければ
+実機は一切動かさず、viser 画面の waypoint スライダー/Play チェックボックス
+での確認 (viewer 上の再生) のみができる。ただし軌道の干渉検証 (経路計画の
+区間・初期位置からの直進の両方) に通らなかった場合は、``--auto-execute``
+を付けていても実機を動かさない (画面の「軌道」欄に NG と表示される)。
+実機 (``AeroROSRobotInterface``) への接続自体は ``--auto-execute`` の
 指定に関わらず起動時に常に試みるため、接続に成功していれば
-(``--execute-base``/``--execute-arm`` を何も指定していなくても) ``ARM``
-ボタンを押した瞬間に実機の首を少し下げると同時に腕を初期姿勢 (体の横に
-下ろした姿勢) まで戻し、人間が手を差し出しやすい姿勢にする
-(``_nod_head_for_arm`` 参照):
+(``--auto-execute`` を指定していなくても) ``ARM`` ボタンを押した瞬間に
+実機の首を少し下げると同時に腕を初期姿勢 (体の横に下ろした姿勢) まで
+戻し、人間が手を差し出しやすい姿勢にする (``_nod_head_for_arm`` 参照):
 
     python3 scripts/ros/run_camera_pipeline_test.py
-    python3 scripts/ros/run_camera_pipeline_test.py --execute-base --execute-arm
 
-``--auto-execute`` を付けると、``EXECUTE`` ボタンを押さなくても IK・軌道
-計画が成功した時点で自動的に実機を動かす。このときは
-``--execute-base``/``--execute-arm`` の指定有無に関わらず台車・関節の
-両方を動かす。``--auto-arm`` (起動直後から ARMED) と組み合わせると、
-ブラウザを一切触らずに「手を差し出す -> 握手しに行く」一連の動作を
-実行できる:
+``--auto-execute`` を付けると、IK・軌道計画が成功した時点で自動的に
+台車・関節の両方を動かして実機を実行する。``--auto-arm`` (起動直後から
+ARMED) と組み合わせると、ブラウザを一切触らずに「手を差し出す ->
+握手しに行く」一連の動作を実行できる:
 
     python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --auto-execute
 """
@@ -167,8 +162,8 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 DEFAULT_PLAYBACK_FPS = 40.0
 
 # ARM ボタンを押した瞬間 (実機 self.ri への接続に成功している状態のとき
-# に、--execute-base/--execute-arm の指定有無に関わらず、_nod_head_for_arm
-# 参照) に実機の首を下げる目標角度 [deg]。``Aero.reset_pose`` の既定
+# に、--auto-execute の指定有無に関わらず、_nod_head_for_arm 参照) に
+# 実機の首を下げる目標角度 [deg]。``Aero.reset_pose`` の既定
 # (neck_p_joint = 25 度、以後このパイプライン全体の「見ている」基準姿勢)
 # からさらに下げ、まっすぐ人の顔の高さを見続けるより控えめにうつむかせる
 # ことで、人間が手 (ロボットの手先の高さ) を差し出しやすい・近づきやすい
@@ -180,23 +175,90 @@ ARM_HEAD_NOD_PITCH_DEG = 25.0
 # ゆっくりめにしてある。
 ARM_HEAD_NOD_MOVE_TIME = 5
 
+# 実機で軌道を再生するときの速度倍率。waypoint 間の既定所要時間
+# (motion['dt'] = --dt) をこの値で割って実行する (_execute_on_robot
+# 参照)。--dt は軌道最適化の速度/加速度コストの正規化にも使われるため、
+# 実行速度だけを変えたいときは --dt ではなくこちらを変える。台車の
+# 最大速度で間に合わない区間は _scaled_time_list で別途延ばされ、この
+# 場合は EXECUTION_SPEED_SCALE を上げても実際の所要時間は変わらない
+# (2026-09-25 実機検証、腕の関節可動速度制限で move_time が自動的に
+# 引き延ばされる場合も同様)。台車の回頭・並進もこの倍率の恩恵を受ける
+# ようにするには、BASE_CORRECTION_MAX_VEL/ANGVEL を実機の
+# base_controller (aero_base_link.yaml、ロボット本体側にあり、この
+# リポジトリの jsk_aero_startup/config/aero_base_link.yaml は単なる
+# 参考コピーで自動反映されない) の実際の設定に必ず合わせること。
+# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため、下記の
+# EXECUTION_TARGET_MAX_VEL/ANGVEL・JOINT_VEL_RATIO と揃えて 1.5 -> 1.2。
+EXECUTION_SPEED_SCALE = 1.2
+
+# 通常再生 (_scaled_time_list、waypoint 間の所要時間計算) で "実機が
+# 出せる速度としてこれ以上は使わない" という再生速度の目標上限。
+# BASE_CORRECTION_MAX_VEL/ANGVEL (実機の真の上限、下記) とは別物にして
+# あるのは、ロボット本体側 (aero_base_link.yaml) の上限を余裕を持って
+# 上げても、その分自動的にモーションが速くならないようにするため
+# (2026-09-25 ユーザー要望: 合計移動時間を約4秒程度に保ちたい)。
+# _scaled_time_list はこの値と実機の真の上限の小さい方を使う (実機の
+# 上限がこれより低ければ、無理に速い前提で時間を見積もったりしない)。
+# 現在の値は接近 (waypoint20個) + 押し込み (6個) の実測例で合計約4秒に
+# なるよう逆算したもの (詳細は run_camera_pipeline_test.py の会話ログ
+# 2026-09-25 参照)。押し込み前の残差補正 (_correct_base_residual) は
+# ここでは頭打ちにせず、引き続き実機の真の上限をそのまま使う (残差の
+# 補正はできるだけ速く収束させたいため)。
+# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため 0.3/1.0 ->
+# 0.24/0.8 (EXECUTION_SPEED_SCALE・JOINT_VEL_RATIO も同じ割合で変更)。
+EXECUTION_TARGET_MAX_VEL = 0.24    # [m/s]
+EXECUTION_TARGET_MAX_ANGVEL = 0.8  # [rad/s]
+
 # 押し込み (post_process) 動作の直前で行う台車の位置補正
 # (_correct_base_residual 参照) のパラメータ。maxvel/maxrad は実機の
-# base_controller が実際に使っている上限 (jsk_aero_startup/config/
-# aero_base_link.yaml の base_link_x/y/pan の max_velocity、いずれも
-# 0.2) に合わせてある。当初 skrobot (ROSRobotMoveBaseInterface.
-# go_pos_unsafe_wait) の値 (0.295/0.495、Aero の実際の設定とは無関係の
-# 値) をそのまま流用していたところ、実機ログで sec (残差解消にかける
-# 時間) を実際の 2.5 倍速く見積もってしまい、時間切れで毎回残差の
-# 3-5 割程度しか補正できず 3 回で収束しなかった (2026-09-24 実機検証、
-# 回頭残差 68.2 度に対し sec=3.0s で実移動 31.9 度 = 0.2rad/s 換算の
-# 34.4 度とほぼ一致)。
+# base_controller (pr2_base_trajectory_action) が実際に使っている上限
+# (aero_base_link.yaml の base_link_x/y/pan の max_velocity) に合わせて
+# あるが、この yaml は台車自身 (ロボット本体) の中にあり、
+# jsk_aero_startup/config/aero_base_link.yaml (このリポジトリのコピー、
+# 単なる参考用でロボット実機には自動反映されない) とは値が一致すると
+# は限らない。この値を超える指令は pr2_base_trajectory_action 内で
+# 頭打ちにされるため、変更するときは必ずロボット実機側の設定を確認
+# すること。2026-09-25 時点でロボット実機側は base_link_x/y=0.3,
+# base_link_pan=1.0 (ssh 先で rosparam get /base_controller/
+# joint_trajectory_action/base_link_{x,y,pan}/max_velocity で確認済み)
+# で運用されている。ロボット側でこれをさらに上げても、通常再生の
+# 速度は上記 EXECUTION_TARGET_
+# MAX_VEL/ANGVEL で頭打ちになる (_scaled_time_list 参照)。当初 skrobot
+# (ROSRobotMoveBaseInterface.go_pos_unsafe_wait) の値 (0.295/0.495、
+# Aero の実際の設定とは無関係の値) をそのまま流用していたところ、実機
+# ログで sec (残差解消にかける時間) を実際の 2.5 倍速く見積もってしまい、
+# 時間切れで毎回残差の 3-5 割程度しか補正できず 3 回で収束しなかった
+# (2026-09-24 実機検証、回頭残差 68.2 度に対し sec=3.0s で実移動 31.9
+# 度 = 0.2rad/s 換算の 34.4 度とほぼ一致)。
 BASE_CORRECTION_MAX_ATTEMPTS = 3
-BASE_CORRECTION_MAX_VEL = 0.2  # [m/s] (aero_base_link.yaml base_link_x/y)
-BASE_CORRECTION_MAX_ANGVEL = 0.2  # [rad/s] (aero_base_link.yaml base_link_pan)
-BASE_CORRECTION_VEL_RATIO = 0.8
+BASE_CORRECTION_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
+BASE_CORRECTION_MAX_ANGVEL = 1.0  # [rad/s] 実機の base_link_pan の max_velocity
+# 実機の上限のうちどこまで使うかの安全率。上げるほど速くなるが、実機が
+# 追従しきれず残差が残るリスクも上がる (2026-09-24 実機検証で 0.8 から
+# 変えずに運用してきた実績あり)。2026-09-25 ユーザー要望によりさらに
+# 少し速くするため 0.8 -> 0.9 に変更。実機で追従できているか (直後の
+# [debug][segment] の「差」ログ) を確認しながら調整すること。
+BASE_CORRECTION_VEL_RATIO = 0.9
 BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
 BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
+
+# 腕・首・腰・リフターの関節速度上限 (URDF の velocity) のうち、通常再生で
+# どこまで使うかの安全率 (台車の BASE_CORRECTION_VEL_RATIO の関節版、
+# _joint_limited_time_list 参照)。実機の aero_ros_controller は
+# PositionJointSaturationInterface で URDF の velocity を超える指令を
+# 制御周期ごとに頭打ちにする (実機の robot_description と skrobot の URDF
+# の velocity は一致、2026-09-25 確認)。skrobot の angle_vector_sequence は
+# 区間の平均速度が上限ちょうどになるまでしか時間を延ばさないため、速度 0
+# の境界を持つ区間では 3 次スプラインの瞬間速度が上限を超え、実機側で
+# 頭打ちにされて指令より遅れていた (2026-09-25 実機ログ、押し込み区間の
+# 先頭で約 6 度の追従ずれ)。そこで、スプラインの瞬間速度の最大値がこの
+# 割合以下になるまで、区間の所要時間を送信前に延ばす。
+# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため 0.9 -> 0.72
+# (= 0.9 × 0.8、EXECUTION_SPEED_SCALE・EXECUTION_TARGET_MAX_VEL/ANGVEL も
+# 同じ割合で変更)。
+JOINT_VEL_RATIO = 0.72
+# 上記を満たすまで区間の所要時間を延ばす反復の上限回数。
+JOINT_TIME_MAX_ITERATIONS = 20
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -244,15 +306,6 @@ class HandshakePipelineNode(object):
 
     def __init__(self, args):
         self.args = args
-        # --auto-execute は「ビューワの EXECUTE ボタンを押さずに実機を
-        # 動かす」オプションなので、--execute-base/--execute-arm の指定
-        # 有無に関わらず台車・関節の両方を動かす。以降の判定 (EXECUTE
-        # ボタンの表示条件・_execute_on_robot 内の分岐) は全て
-        # args.execute_base/args.execute_arm を見ているので、ここで両方を
-        # 立ててしまえば他の場所で --auto-execute を特別扱いせずに済む。
-        if args.auto_execute:
-            args.execute_base = True
-            args.execute_arm = True
         # 既定の 10 秒だと、カメラ側と base_link 側の TF を配信している
         # マシン間でシステムクロックが数秒〜数十秒ズレている場合に、
         # 両者の有効期間が一度も重ならず TF が引けなくなる。根本的には
@@ -406,12 +459,11 @@ class HandshakePipelineNode(object):
 
         self._warmup_ik()
 
-        # 実機接続 (--execute-base/--execute-arm の指定に関わらず常に
-        # AeroROSRobotInterface への接続を試みる)。ARM ボタン押下時の首下げ
-        # (_nod_head_for_arm) は台車・腕を実際に動かすフラグとは独立に、
-        # self.ri さえ使えれば行いたいため。台車・腕を実際に動かす EXECUTE
-        # ボタンの表示/実行は引き続き --execute-base/--execute-arm で
-        # 独立に制御する (_execute_on_robot 参照)。skrobot の
+        # 実機接続 (--auto-execute の指定に関わらず常に AeroROSRobotInterface
+        # への接続を試みる)。ARM ボタン押下時の首下げ (_nod_head_for_arm) は
+        # 台車・腕を実際に動かすフラグとは独立に、self.ri さえ使えれば行い
+        # たいため。台車・腕を実際に動かす実行は引き続き --auto-execute で
+        # 制御する (_execute_on_robot 参照)。skrobot の
         # ROSRobotInterfaceBase はアクションサーバ待ちに controller_timeout
         # (既定 3 秒) の上限があり無限ブロックはしないため、実機/実機用
         # ROS ノードが立っていない環境でこのスクリプトを viewer 確認だけに
@@ -427,7 +479,7 @@ class HandshakePipelineNode(object):
         if args.no_robot_interface:
             # rosbag での実機なし動作確認用 (--no-robot-interface)。接続を
             # 試みること自体をやめる (self.ri は None のままになり、ARM 時の
-            # 首下げ/EXECUTE による実機操作は無効のままになる)。
+            # 首下げ/--auto-execute による実機操作は無効のままになる)。
             print('[execute] --no-robot-interface が指定されたため、実機 '
                   '(AeroROSRobotInterface) への接続を試みません。')
         else:
@@ -439,15 +491,28 @@ class HandshakePipelineNode(object):
                 # 無限に固まる。実機の odom は /odom (/aero_ros_controller) な
                 # のでそちらを明示する。
                 self.ri = AeroROSRobotInterface(self.real_robot, odom_topic='/odom')
-                print('[execute] 実機への接続が完了しました (--execute-base={}, '
-                      '--execute-arm={})。'.format(
-                          args.execute_base, args.execute_arm))
+                print('[execute] 実機への接続が完了しました (--auto-execute={})。'
+                      .format(args.auto_execute))
             except Exception as exc:  # noqa: BLE001  (実機/ROS 環境が無くても viewer 単体としては動作を継続したい)
                 self.real_robot = None
                 self.ri = None
                 print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗した '
-                      'ため、ARM 時の首下げ/EXECUTE による実機操作は無効の '
+                      'ため、ARM 時の首下げ/--auto-execute による実機操作は無効の '
                       'ままになります ({})。'.format(exc))
+
+        # --auto-execute で実機を動かすときの発話 (動き出す直前と掌を
+        # 差し出し終えた直後、_execute_on_robot 参照)。sound_play が無い
+        # 環境でも viewer 単体としては動作を継続したいので、失敗時は
+        # self.sound_client を None のままにして発話だけ諦める。
+        self.sound_client = None
+        if args.auto_execute and self.ri is not None:
+            try:
+                from sound_play.libsoundplay import SoundClient
+                self.sound_client = SoundClient(
+                    sound_action='robotsound_jp', sound_topic='robotsound_jp')
+            except Exception as exc:  # noqa: BLE001
+                print('[speech] SoundClient の初期化に失敗したため発話し '
+                      'ません ({})。'.format(exc))
 
         # デバッグ用: カメラ画像に検出できた 2D 骨格を重ねた画像を publish
         # する (draw_skeleton_overlay 参照)。rqt_image_view 等で購読すれば、
@@ -631,19 +696,6 @@ class HandshakePipelineNode(object):
         self.reset_button = self.viewer._server.gui.add_button(
             'RESET (最初からやり直す)')
         self.reset_button.visible = False
-        # IK・軌道計画が終わって waypoint が確認できる状態 ('result') に
-        # なったら押せる、実機を動かすボタン (--execute-base/--execute-arm
-        # のどちらかが指定されているときだけ表示する。self.ri はこれらの
-        # フラグとは独立に常に接続を試みるため、表示条件は別途フラグの
-        # 指定有無で見る、_solve_handshake 参照)。
-        self.execute_button = self.viewer._server.gui.add_button(
-            'EXECUTE (実機を動かす)')
-        self.execute_button.visible = False
-
-        @self.execute_button.on_click
-        def _on_execute(_):  # noqa: ANN001
-            threading.Thread(
-                target=self._execute_on_robot, daemon=True).start()
 
         @self.arm_button.on_click
         def _on_arm(_):  # noqa: ANN001  (viser の GuiEvent は型を問わない)
@@ -654,13 +706,12 @@ class HandshakePipelineNode(object):
                 self._handshake_total_time = None
             if self.ri is not None:
                 # 首下げ・腕を初期姿勢まで下ろす動作 (_nod_head_for_arm)。
-                # self.ri は --execute-base/--execute-arm の指定に関わらず
-                # 接続を試みているため (__init__ 参照)、接続さえ成功して
-                # いれば --execute-base/--execute-arm を何も指定していない
-                # 場合でも実行する。
+                # self.ri は --auto-execute の指定に関わらず接続を試みて
+                # いるため (__init__ 参照)、接続さえ成功していれば
+                # --auto-execute を指定していない場合でも実行する。
                 # 実機通信 (joint_states 待ち/action 送信) をこの GUI
                 # コールバックのスレッドで直接行うとブロックするため、
-                # _on_execute と同様に別スレッドに逃がす。
+                # _execute_on_robot と同様に別スレッドに逃がす。
                 threading.Thread(
                     target=self._nod_head_for_arm, daemon=True).start()
             print('[ARM] ARMED になりました。{:.0f} 秒以内に手を差し出して'
@@ -679,7 +730,6 @@ class HandshakePipelineNode(object):
             self.play_checkbox.value = False
             self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
             self.reset_button.visible = False
-            self.execute_button.visible = False
             self.arm_button.visible = True
             self.state = 'idle'
             with self._viewer_lock:
@@ -1107,26 +1157,20 @@ class HandshakePipelineNode(object):
             self._display_waypoints = display_waypoints
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
-        # 実機で動かせる状態 (IK・軌道計画が成功していて、かつ --execute-base
-        # /--execute-arm のどちらかが指定されていて、実際に self.ri への
-        # 接続も成功している) になったときだけ EXECUTE ボタンを表示する。
-        # self.ri 自体は --execute-base/--execute-arm を何も指定していな
-        # くても (ARM 時の首下げのために) 接続を試みるので、EXECUTE ボタン
-        # の表示条件には別途フラグの指定有無を含める必要がある。
-        # 軌道の干渉検証 (verified/lead_in_verified) に通らなかった場合も
-        # 表示しない (--auto-execute でも動かさない) -- 人との干渉が残った
-        # ままの軌道で実機を動かさないため (_motion_verified 参照)。
+        # --auto-execute が指定されていて、実際に self.ri への接続も成功
+        # していて、IK・軌道計画が成功し、かつ軌道の干渉検証
+        # (verified/lead_in_verified) に通っている場合だけ実機を動かせる
+        # (_motion_verified 参照、人との干渉が残ったままの軌道では動かさ
+        # ない)。
         executable = (
-            (self.args.execute_base or self.args.execute_arm)
-            and self.ri is not None and result['solved']
+            args.auto_execute and self.ri is not None and result['solved']
             and motion is not None and display_waypoints is not None
             and self._motion_verified(motion))
         if motion is not None and not self._motion_verified(motion):
             print('[execute] 軌道の干渉検証に通らなかったため (verified={}, '
-                  'lead_in_verified={})、EXECUTE ボタンを表示せず、'
-                  '--auto-execute でも実機を動かしません。'.format(
+                  'lead_in_verified={})、--auto-execute でも実機を動かし'
+                  'ません。'.format(
                       motion['verified'], motion['lead_in_verified']))
-        self.execute_button.visible = executable
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -1140,26 +1184,28 @@ class HandshakePipelineNode(object):
         if args.save_dir:
             self._save_attempt(joint_positions, palms, result, motion)
 
-        # --auto-execute: EXECUTE ボタンを押せる状態になった時点で、
-        # クリックを待たずにそのまま実機を動かす (--bag/--auto-arm での
-        # 無人テストや、ブラウザを開けない状況で使う)。EXECUTE ボタン
-        # ハンドラ (_on_execute) と同様に別スレッドへ逃がす -- この
-        # _solve_handshake はカメラフレームのコールバックスレッドで動いて
-        # おり、ここで実機の動作完了まで待つと以後のフレームを取りこぼす
-        # ため。
-        if args.auto_execute and executable:
-            print('[auto-execute] EXECUTE ボタンを押さずに実機を動かします '
+        # --auto-execute: 実機を動かせる状態になった時点で自動的に実行する
+        # (--bag/--auto-arm での無人テストや、ブラウザを開けない状況で
+        # 使う)。別スレッドへ逃がす -- この _solve_handshake はカメラ
+        # フレームのコールバックスレッドで動いており、ここで実機の動作
+        # 完了まで待つと以後のフレームを取りこぼすため。
+        if executable:
+            print('[auto-execute] IK・軌道計画が成功したため実機を動かします '
                   '(--auto-execute)。')
             threading.Thread(
                 target=self._execute_on_robot, daemon=True).start()
+        elif args.auto_execute:
+            # IK が解けなかった、または軌道が干渉検証に通らなかったため
+            # 実機を動かせなかったことを人に伝える。
+            self._say(args.speech_fail_text)
 
     @staticmethod
     def _motion_verified(motion):
         """軌道 ``motion`` (``plan_person_motion`` の戻り値) が、経路計画の
         区間 (``verified``) と初期位置からの直進 (lead-in、
         ``lead_in_verified``) の両方で干渉検証に通っているか。どちらかが
-        False なら実機を動かさない (EXECUTE ボタン・``--auto-execute``・
-        ``_execute_on_robot`` の全てでこれを見る)。
+        False なら実機を動かさない (``--auto-execute``・
+        ``_execute_on_robot`` の両方でこれを見る)。
         """
         return bool(motion['verified']) and bool(motion['lead_in_verified'])
 
@@ -1316,11 +1362,11 @@ class HandshakePipelineNode(object):
         self._collision_pairs_text = collision_pairs_text(colliding)
 
     # ------------------------------------------------------------------
-    # 実機動作 (ARM ボタン押下時の首下げ・初期姿勢への復帰、EXECUTE ボタン)
+    # 実機動作 (ARM ボタン押下時の首下げ・初期姿勢への復帰、--auto-execute)
     # ------------------------------------------------------------------
     def _nod_head_for_arm(self):
-        """ARM ボタン押下時 (``--execute-base``/``--execute-arm`` の指定有無に
-        関わらず、実機 ``self.ri`` への接続に成功している状態のときのみ
+        """ARM ボタン押下時 (``--auto-execute`` の指定有無に関わらず、
+        実機 ``self.ri`` への接続に成功している状態のときのみ
         ``_on_arm`` から別スレッドで呼ばれる) に、実機の首を
         ``ARM_HEAD_NOD_PITCH_DEG`` まで下げると同時に、腕を含む全身を
         ``self._initial_joint_names``/``self._initial_joint_angle_vector``
@@ -1363,7 +1409,8 @@ class HandshakePipelineNode(object):
               .format(ARM_HEAD_NOD_PITCH_DEG))
 
     def _execute_on_robot(self):
-        """``EXECUTE`` ボタン押下時、計画済みの waypoint 列
+        """``--auto-execute`` が指定されていて実行条件を満たしたとき
+        (``_solve_handshake`` 参照)、計画済みの waypoint 列
         (``self._display_waypoints``、waypoint スライダー/Play で画面
         確認しているのと同じもの) を実機に送る。
 
@@ -1390,11 +1437,10 @@ class HandshakePipelineNode(object):
         腕はこの補正の間、待たされない (接近区間の腕動作は既に完了して
         いる)。
 
-        ``--execute-base``/``--execute-arm`` でそれぞれ台車・関節を実際に
-        動かすかどうかを独立に切り替えられる (どちらも指定しなければ
-        EXECUTE ボタン自体が表示されない、``_setup_viewer`` 参照。
-        ``self.ri`` はこれらのフラグとは別に ARM 時の首下げのため常に
-        接続を試みているので、ここでは改めてフラグの指定有無を見る)。
+        ``--auto-execute`` が指定されているとき、台車・関節は常に両方とも
+        実際に動かす (``self.ri`` はこのフラグとは別に ARM 時の首下げの
+        ため常に接続を試みているので、ここでは改めて ``--auto-execute``
+        の指定有無を見る)。
         """
         with self._lock:
             result = self._current_result
@@ -1402,9 +1448,9 @@ class HandshakePipelineNode(object):
             display_waypoints = self._display_waypoints
             n_prepend = self._display_n_prepend
             n_approach = self._display_n_approach
-        if not (self.args.execute_base or self.args.execute_arm):
-            print('[execute] --execute-base/--execute-arm のいずれも指定 '
-                  'されていないため実機を動かせません。')
+        if not self.args.auto_execute:
+            print('[execute] --auto-execute が指定されていないため実機を '
+                  '動かせません。')
             return
         if self.ri is None:
             print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗 '
@@ -1415,9 +1461,8 @@ class HandshakePipelineNode(object):
             print('[execute] IK・軌道計画が完了していないため実機を動かせ '
                   'ません。')
             return
-        # EXECUTE ボタンは検証 NG なら表示されないが (_solve_handshake
-        # 参照)、呼び出し元に依らず干渉が残る軌道では動かさないよう
-        # ここでも改めて確認する。
+        # _solve_handshake が検証 NG なら呼ばないが、呼び出し元に依らず
+        # 干渉が残る軌道では動かさないようここでも改めて確認する。
         if not self._motion_verified(motion):
             print('[execute] 軌道の干渉検証に通っていないため実機を動かせ '
                   'ません (verified={}, lead_in_verified={})。'.format(
@@ -1425,7 +1470,7 @@ class HandshakePipelineNode(object):
             return
 
         joint_names = motion['joint_names']
-        move_time = max(motion['dt'], 0.01)
+        move_time = max(motion['dt'] / EXECUTION_SPEED_SCALE, 0.01)
         # 接近区間 (display_waypoints[:reach_boundary]) は hover 目標
         # (waypoint index reach_boundary - 1) で終わり、押し込み区間
         # (display_waypoints[reach_boundary - 1:]、先頭に hover 目標を含む)
@@ -1433,24 +1478,37 @@ class HandshakePipelineNode(object):
         reach_boundary = min(max(n_prepend + n_approach, 1),
                              len(display_waypoints))
         print('[execute] 実機で waypoint を {} 個実行します '
-              '(--execute-base={}, --execute-arm={}, 接近={}個+押し込み='
-              '{}個)。'.format(
-                  len(display_waypoints), self.args.execute_base,
-                  self.args.execute_arm, reach_boundary,
+              '(接近={}個+押し込み={}個)。'.format(
+                  len(display_waypoints), reach_boundary,
                   len(display_waypoints) - reach_boundary))
+
+        self._say(self.args.speech_start_text)
 
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
             display_waypoints[:reach_boundary], joint_names, move_time)
 
-        if self.args.execute_base:
-            self._correct_base_residual(start_odom_coords, final_traj_point)
+        self._correct_base_residual(start_odom_coords, final_traj_point)
 
         if reach_boundary < len(display_waypoints):
             self._execute_waypoint_segment(
                 display_waypoints[reach_boundary - 1:], joint_names,
                 move_time)
 
+        self._say(self.args.speech_done_text)
+
         print('[execute] 実行を終了しました。')
+
+    def _say(self, text):
+        """``text`` をロボットに発話させる (非ブロッキング)。
+        ``self.sound_client`` が無い・``text`` が空のときは何もしない。
+        """
+        if self.sound_client is None or not text:
+            return
+        try:
+            self.sound_client.say(text, voice=self.args.speech_voice)
+            print('[speech] 「{}」'.format(text))
+        except Exception as exc:  # noqa: BLE001  (発話失敗で実機動作を止めない)
+            print('[speech] 発話に失敗しました ({})。'.format(exc))
 
     def _execute_waypoint_segment(self, waypoints, joint_names, move_time):
         """``waypoints`` (先頭要素を基準にした 1 区間分) を、waypoint の
@@ -1461,9 +1519,9 @@ class HandshakePipelineNode(object):
         -------
         (start_odom_coords, final_traj_point)
             ``start_odom_coords`` は台車の軌道を送信した瞬間の odom
-            (``self.ri.odom``、``--execute-base`` 未指定/台車移動なしの
-            場合は None)。``final_traj_point`` はこの区間の最終 waypoint
-            を ``waypoints[0]`` 基準に変換した ``[dx, dy, dyaw]``
+            (``self.ri.odom``、台車移動なしの場合は None)。
+            ``final_traj_point`` はこの区間の最終 waypoint を
+            ``waypoints[0]`` 基準に変換した ``[dx, dy, dyaw]``
             (同じく該当なしの場合は None)。いずれも
             ``_correct_base_residual`` にそのまま渡すためのもの。
         """
@@ -1475,37 +1533,35 @@ class HandshakePipelineNode(object):
         base_trajectory_points = []
         first_base = None  # (x, y, yaw) この区間の先頭 waypoint の台車位置姿勢 (world 系)
         for wp in waypoints:
-            if self.args.execute_arm:
-                name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
-                for joint in self.real_robot.joint_list:
-                    if joint.name in name_to_angle:
-                        joint.joint_angle(name_to_angle[joint.name])
-                arm_angle_vectors.append(self.real_robot.angle_vector())
+            name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
+            for joint in self.real_robot.joint_list:
+                if joint.name in name_to_angle:
+                    joint.joint_angle(name_to_angle[joint.name])
+            arm_angle_vectors.append(self.real_robot.angle_vector())
 
-            if self.args.execute_base:
-                bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
-                               wp['base_yaw'])
-                if first_base is None:
-                    # この区間の最初の waypoint: 実機は今まさにこの姿勢に
-                    # いる前提 (区間の先頭が接近区間なら "台車がワールド
-                    # 原点にいる" という起動時の前提、押し込み区間なら
-                    # 直前の _correct_base_residual で合わせ込んだ hover
-                    # 目標姿勢) なので、絶対座標をそのまま原点からの移動量
-                    # として使える。以後の waypoint もこの姿勢を基準に
-                    # 累積量を計算する。
-                    first_base = (bx, by, byaw)
-                x0, y0, yaw0 = first_base
-                dx_world = bx - x0
-                dy_world = by - y0
-                dyaw = byaw - yaw0
-                # world 系の移動量を、この区間の先頭 waypoint (= 実行開始
-                # 時点の台車の向き) 基準 (move_trajectory_sequence が要求
-                # する「実行開始時点の台車姿勢を基準にした前後左右」) に
-                # 回転させる。
-                cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
-                dx = cos_yaw * dx_world + sin_yaw * dy_world
-                dy = -sin_yaw * dx_world + cos_yaw * dy_world
-                base_trajectory_points.append([dx, dy, dyaw])
+            bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
+                           wp['base_yaw'])
+            if first_base is None:
+                # この区間の最初の waypoint: 実機は今まさにこの姿勢に
+                # いる前提 (区間の先頭が接近区間なら "台車がワールド
+                # 原点にいる" という起動時の前提、押し込み区間なら
+                # 直前の _correct_base_residual で合わせ込んだ hover
+                # 目標姿勢) なので、絶対座標をそのまま原点からの移動量
+                # として使える。以後の waypoint もこの姿勢を基準に
+                # 累積量を計算する。
+                first_base = (bx, by, byaw)
+            x0, y0, yaw0 = first_base
+            dx_world = bx - x0
+            dy_world = by - y0
+            dyaw = byaw - yaw0
+            # world 系の移動量を、この区間の先頭 waypoint (= 実行開始
+            # 時点の台車の向き) 基準 (move_trajectory_sequence が要求
+            # する「実行開始時点の台車姿勢を基準にした前後左右」) に
+            # 回転させる。
+            cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
+            dx = cos_yaw * dx_world + sin_yaw * dy_world
+            dy = -sin_yaw * dx_world + cos_yaw * dy_world
+            base_trajectory_points.append([dx, dy, dyaw])
 
         # ここまでで区間分の関節角・移動量を集め終えたので、それぞれ 1 回の
         # ゴールとしてまとめて送る (どちらも非ブロッキング)。
@@ -1516,15 +1572,22 @@ class HandshakePipelineNode(object):
         # 接近開始位置までの直進 (lead-in) は、以前は大きな回頭を少ない
         # waypoint 数に均等割りしていたため
         # motion['dt'] のままでは実機が追従できないことが実機検証
-        # (2026-09-24) で判明した。腕 (angle_vector_sequence) にも同じ
-        # time_list を渡し、台車と腕のタイミングがずれないようにする。
+        # (2026-09-24) で判明した。同様に、腕・首・腰・リフターの関節速度
+        # 上限で間に合わない区間も延ばす (_joint_limited_time_list 参照)。
+        # 台車と腕には同じ time_list を渡し、どちらか遅い方に合わせて
+        # その区間だけもう片方もゆっくり動かす (skrobot の angle_vector_
+        # sequence に腕側の時間だけを延ばさせると、台車とのタイミングが
+        # ずれて干渉検証済みの経路から外れるため)。
         time_list = (
             self._scaled_time_list(base_trajectory_points, move_time)
             if base_trajectory_points else [move_time] * len(waypoints))
+        if arm_angle_vectors:
+            time_list = self._joint_limited_time_list(
+                arm_angle_vectors, time_list)
         start_odom_coords = None
-        if self.args.execute_arm and arm_angle_vectors:
+        if arm_angle_vectors:
             self.ri.angle_vector_sequence(arm_angle_vectors, time_list)
-        if self.args.execute_base and base_trajectory_points:
+        if base_trajectory_points:
             # move_trajectory_sequence 自身がこの直後に読む odom (基準
             # 座標) と同じものを、補正計算用に控えておく。
             start_odom_coords = self.ri.odom
@@ -1551,9 +1614,9 @@ class HandshakePipelineNode(object):
 
         # 送信は上でまとめて 1 回だけ行っているので、完了待ちも最後に
         # まとめて 1 回だけ行う (台車・腕は並行して動く)。
-        if self.args.execute_arm and arm_angle_vectors:
+        if arm_angle_vectors:
             self.ri.wait_interpolation()
-        if self.args.execute_base and base_trajectory_points:
+        if base_trajectory_points:
             self.ri.move_base_trajectory_action.wait_for_result()
             # [debug] wait_for_result() が返った直後 (=このトラジェクトリを
             # 「完了」とみなした瞬間) の実際の odom yaw。計画上の
@@ -1581,12 +1644,16 @@ class HandshakePipelineNode(object):
         dyaw]`` 列) から、waypoint 間の所要時間 (``move_trajectory_
         sequence``/``angle_vector_sequence`` の time_list) を求める。
 
-        既定は ``default_time`` (通常 ``motion['dt']``) だが、実機の
-        base_controller の最大速度 (``BASE_CORRECTION_MAX_VEL``/
-        ``BASE_CORRECTION_MAX_ANGVEL``、安全率 ``BASE_CORRECTION_VEL_
-        RATIO``) で物理的に間に合わない区間だけ、間に合うだけの時間まで
-        個別に延ばす (間に合う区間は ``default_time`` のまま、全体を
-        一律に遅くしたりはしない)。
+        既定は ``default_time`` (通常 ``motion['dt'] / EXECUTION_SPEED_
+        SCALE``) だが、想定速度 (``EXECUTION_TARGET_MAX_VEL``/
+        ``ANGVEL`` と実機の真の上限 ``BASE_CORRECTION_MAX_VEL``/
+        ``ANGVEL`` の小さい方、安全率 ``BASE_CORRECTION_VEL_RATIO``)
+        で物理的に間に合わない区間だけ、間に合うだけの時間まで個別に
+        延ばす (間に合う区間は ``default_time`` のまま、全体を一律に
+        遅くしたりはしない)。実機の真の上限の方が優先されるので、
+        ロボット本体側の上限が目標より低いうちは目標通りには速くなら
+        ないし、逆に本体側の上限を目標より上げても再生速度は目標で
+        頭打ちになる (2026-09-25 ユーザー要望)。
 
         初期位置から接近開始位置までの直進 (lead-in、当時は大きな回頭を
         固定の 10 個の waypoint に均等割りしていた) で ``motion['dt']`` を
@@ -1597,15 +1664,108 @@ class HandshakePipelineNode(object):
         """
         time_list = []
         prev = (0.0, 0.0, 0.0)
+        # 実機の真の上限より速い前提で時間を見積もると (=それだけ短い
+        # 時間しか割り当てないと) 実機が追従できず残差が残る
+        # (2026-09-24 実機検証で発生した不具合、詳細は
+        # BASE_CORRECTION_MAX_VEL のコメント参照) ため、目標速度が
+        # 実機の真の上限を上回っている場合は必ず実機の上限を優先する。
+        target_vel = min(EXECUTION_TARGET_MAX_VEL, BASE_CORRECTION_MAX_VEL)
+        target_angvel = min(EXECUTION_TARGET_MAX_ANGVEL,
+                             BASE_CORRECTION_MAX_ANGVEL)
         for point in base_trajectory_points:
             distance = math.hypot(point[0] - prev[0], point[1] - prev[1])
             d_yaw = abs(point[2] - prev[2])
             required = max(
-                distance / (BASE_CORRECTION_MAX_VEL * BASE_CORRECTION_VEL_RATIO),
-                d_yaw / (BASE_CORRECTION_MAX_ANGVEL * BASE_CORRECTION_VEL_RATIO))
+                distance / (target_vel * BASE_CORRECTION_VEL_RATIO),
+                d_yaw / (target_angvel * BASE_CORRECTION_VEL_RATIO))
             time_list.append(max(default_time, required))
             prev = point
         return time_list
+
+    def _joint_limited_time_list(self, arm_angle_vectors, time_list):
+        """``time_list`` (``_scaled_time_list`` で台車の速度上限まで考慮
+        済みの区間ごとの所要時間) を、腕・首・腰・リフターの関節速度上限
+        (URDF の velocity × ``JOINT_VEL_RATIO``) でも間に合うよう、必要な
+        区間だけ延ばして返す。
+
+        区間 i は ``avs[i] -> avs[i + 1]`` (``avs[0]`` は送信直前の実機の
+        関節角、``angle_vector_sequence`` も同じ点から補間を始める)。まず
+        台車と同じく区間の平均速度で延ばし、続けて実機の JointTrajectory
+        Controller が補間に使う 3 次スプラインの瞬間速度の最大値
+        (``_hermite_peak_speeds``) が上限以下になるまで反復して延ばす
+        (平均速度だけ見ると、速度 0 の境界を持つ区間で瞬間速度が平均の
+        最大 1.5 倍になり実機側で頭打ちにされる、``JOINT_VEL_RATIO``
+        参照)。延ばすのは上限を超える区間だけで、他の区間はそのまま。
+        """
+        ri = self.ri
+        controller_joint_names = {
+            name for param in ri.controller_param_table[ri.controller_type]
+            for name in param['joint_names']}
+        # コントローラで動かさない関節 (指など) は上限なし (inf) として
+        # 判定から外す。
+        max_vel = np.array([
+            joint.max_joint_velocity * JOINT_VEL_RATIO
+            if (joint.name in controller_joint_names
+                and joint.max_joint_velocity > 0)
+            else np.inf
+            for joint in self.real_robot.joint_list])
+        avs = [ri.angle_vector()] + list(arm_angle_vectors)
+        deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
+                           for i in range(len(arm_angle_vectors))])
+        times = np.array(time_list, dtype=np.float64)
+        times = np.maximum(times, np.max(np.abs(deltas) / max_vel, axis=1))
+        for _ in range(JOINT_TIME_MAX_ITERATIONS):
+            ratio = np.max(self._hermite_peak_speeds(deltas, times) / max_vel,
+                           axis=1)
+            over = ratio > 1.0 + 1e-6
+            if not np.any(over):
+                break
+            times[over] *= ratio[over]
+
+        # 延ばした区間と、その区間で上限に最も近い関節 (実機ログで
+        # どの関節が律速したかを切り分けるため)。
+        peak_ratio = self._hermite_peak_speeds(deltas, times) / max_vel
+        extended = [
+            '{}:{:.2f}->{:.2f}s({})'.format(
+                i, time_list[i], times[i],
+                self.real_robot.joint_list[int(np.argmax(peak_ratio[i]))].name)
+            for i in range(len(times)) if times[i] > time_list[i] + 1e-6]
+        if extended:
+            print('[debug][segment] 関節速度上限 (×{}) により延ばした区間: {}'
+                  .format(JOINT_VEL_RATIO, ', '.join(extended)))
+        return [float(t) for t in times]
+
+    @staticmethod
+    def _hermite_peak_speeds(deltas, times):
+        """各区間 (``deltas[i]`` = 区間 i の関節角変化量、``times[i]`` =
+        所要時間) を skrobot の ``angle_vector_sequence`` と同じ規則で
+        作った点速度の 3 次エルミート補間で動かしたときの、関節ごとの
+        瞬間速度の最大値 (絶対値、形状は ``deltas`` と同じ) を返す。
+
+        点速度は前後区間の平均速度の平均で、前後で符号が逆の関節と最後の
+        点は 0 (``angle_vector_sequence`` 参照)。始点 (送信直前の実機) は
+        静止しているものとみなす。
+        """
+        n_segments = len(times)
+        seg_times = times[:, None]
+        seg_vel = deltas / seg_times
+        point_vel = np.zeros((n_segments + 1, deltas.shape[1]))
+        if n_segments > 1:
+            same_sign = deltas[:-1] * deltas[1:] >= 0.0
+            point_vel[1:n_segments] = np.where(
+                same_sign, 0.5 * (seg_vel[:-1] + seg_vel[1:]), 0.0)
+        v0 = point_vel[:-1]
+        v1 = point_vel[1:]
+        # p(t) = a t^3 + b t^2 + v0 t (p(0) = 0, p(T) = delta, p'(0) = v0,
+        # p'(T) = v1)。p'(t) は 2 次式なので、最大値は両端か頂点。
+        a = (v0 + v1) / seg_times ** 2 - 2.0 * deltas / seg_times ** 3
+        b = 3.0 * deltas / seg_times ** 2 - (2.0 * v0 + v1) / seg_times
+        peak = np.maximum(np.abs(v0), np.abs(v1))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t_star = -b / (3.0 * a)
+            v_star = v0 - b ** 2 / (3.0 * a)
+        inside = (a != 0.0) & (t_star > 0.0) & (t_star < seg_times)
+        return np.where(inside, np.maximum(peak, np.abs(v_star)), peak)
 
     def _correct_base_residual(
             self, start_odom_coords, final_traj_point,
@@ -1627,12 +1787,11 @@ class HandshakePipelineNode(object):
         ロボット正面基準に回転させて相対移動として送り返す。収束閾値は
         skrobot の ``go_pos_unsafe_wait`` と同じ (位置2.5cm/角度2.5度)。
         sec (所要時間) の換算に使う最大速度は実機の base_controller
-        の設定 (``aero_base_link.yaml``、並進・回頭とも 0.2) に安全率
-        0.8 を掛けたもの (``BASE_CORRECTION_MAX_VEL``/
-        ``BASE_CORRECTION_MAX_ANGVEL`` 参照)。
+        の設定 (並進 0.3/回頭 1.0) に安全率 (``BASE_CORRECTION_VEL_
+        RATIO``、現在0.9) を掛けたもの
+        (``BASE_CORRECTION_MAX_VEL``/``BASE_CORRECTION_MAX_ANGVEL`` 参照)。
 
-        台車移動を行っていない (``--execute-base`` 未指定、または接近
-        区間に台車移動が無かった) 場合は何もしない。
+        接近区間に台車移動が無かった場合は何もしない。
         """
         if start_odom_coords is None or final_traj_point is None:
             return
@@ -2162,27 +2321,32 @@ def main():
         '--playback-fps', type=float, default=DEFAULT_PLAYBACK_FPS,
         help='Play チェックボックスをオンにしたときの waypoint 自動再生の '
             '速さ [waypoint/秒] (既定 {})。'.format(DEFAULT_PLAYBACK_FPS))
-    # --- 実機動作 (EXECUTE ボタン、_execute_on_robot 参照) ---
-    parser.add_argument(
-        '--execute-base', action='store_true',
-        help='EXECUTE ボタンを押したとき、計画済みの軌道に沿って台車を '
-            '実機で実際に動かす (AeroROSRobotInterface.go_pos_unsafe。'
-            'move_to/move_base の costmap は使わず、現在姿勢を基準にした '
-            '相対移動を waypoint ごとに送る)。指定しなければ台車は動かさ '
-            'ない (既定オフ、--execute-arm と併せてどちらも未指定なら '
-            'EXECUTE ボタン自体を表示しない)。')
-    parser.add_argument(
-        '--execute-arm', action='store_true',
-        help='EXECUTE ボタンを押したとき、計画済みの軌道に沿って腕を含む '
-            '全身の関節を実機で実際に動かす (AeroROSRobotInterface.'
-            'angle_vector)。指定しなければ関節は動かさない (既定オフ)。')
+    # --- 実機動作 (_execute_on_robot 参照) ---
     parser.add_argument(
         '--auto-execute', action='store_true',
-        help='IK・軌道計画が成功した時点で、viser の EXECUTE ボタンを '
-            '押さずに自動で実機を動かす (--auto-arm と組み合わせると '
-            'ブラウザ操作なしで一連の動作を実行できる)。このオプションを '
-            '付けたときは --execute-base/--execute-arm の指定有無に '
-            '関わらず台車・関節の両方を動かす (既定オフ)。')
+        help='IK・軌道計画が成功した時点で、計画済みの軌道に沿って台車・'
+            '関節の両方を実機で自動的に動かす (AeroROSRobotInterface。'
+            '台車は go_pos_unsafe 相当の相対移動、move_to/move_base の '
+            'costmap は使わない。--auto-arm と組み合わせるとブラウザ操作 '
+            'なしで一連の動作を実行できる)。指定しなければ実機は動かさず、'
+            'viser 画面での waypoint スライダー/Play による確認のみになる '
+            '(既定オフ)。')
+    parser.add_argument(
+        '--speech-start-text', type=str, default='今から行きますね',
+        help='--auto-execute で実機が動き出すときに発話する文 '
+            '(空文字列で発話しない)。')
+    parser.add_argument(
+        '--speech-done-text', type=str, default='どうぞ、手を握ってください',
+        help='--auto-execute で掌を差し出し終えたときに発話する文 '
+            '(空文字列で発話しない)。')
+    parser.add_argument(
+        '--speech-fail-text', type=str,
+        default='ごめんなさい、うまく手を出せませんでした',
+        help='--auto-execute で IK・軌道計画に失敗して実機を動かせなかった '
+            'ときに発話する文 (空文字列で発話しない)。')
+    parser.add_argument(
+        '--speech-voice', type=str, default='四国めたん-ノーマル',
+        help='発話に使う声 (sound_play の voice、既定 "四国めたん-ノーマル")。')
     # --- 実カメラ無しでのテスト (rosbag 再生、record_palm_offer_clips.py
     # が保存したクリップを入力にする) ---
     parser.add_argument(
@@ -2208,9 +2372,8 @@ def main():
     parser.add_argument(
         '--no-robot-interface', action='store_true',
         help='実機 (AeroROSRobotInterface) への接続を試みない (既定は '
-            '--execute-base/--execute-arm の指定に関わらず常に接続を '
-            '試みる)。実機なしで rosbag のみを使って動作確認する際に '
-            '指定する。')
+            '--auto-execute の指定に関わらず常に接続を試みる)。実機なし '
+            'で rosbag のみを使って動作確認する際に指定する。')
     # argparse は roslaunch が付ける残りの引数 (__name/__log 等) を無視する
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 

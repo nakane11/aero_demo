@@ -330,9 +330,9 @@ python3 scripts/ros/run_camera_pipeline_test.py \
   参照)。通常運用では付けない -- jaxls の計算時間そのものを単独で
   計測したいベンチマーク用。
 
-`--execute-base`/`--execute-arm` を指定しなければ実機は一切動かさない
-ので、このテストに実ロボットは不要 (`--bag` のクリップに `tf`/`tf_static`
-も含めているため、実ロボットの TF 配信も不要)。
+`--auto-execute` を指定しなければ実機は一切動かさず viewer 上での
+確認のみになるので、このテストに実ロボットは不要 (`--bag` のクリップに
+`tf`/`tf_static` も含めているため、実ロボットの TF 配信も不要)。
 
 ## 座標系
 
