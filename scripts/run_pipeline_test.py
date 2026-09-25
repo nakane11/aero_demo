@@ -20,6 +20,7 @@ Usage
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -138,16 +139,24 @@ def summarize_motions(motion_dir):
     ``kind`` は採用した軌道の作り方 (``pretouch``/``linear``/
     ``optimized``、``plan_handshake_motion.KIND_LABELS`` 参照)。
     """
-    n_planned = n_verified = 0
+    n_planned = n_verified = n_lead_in_verified = n_both_verified = 0
     kinds = {}
+    approach_angles = {}
     compute_times = []
     for _, data in load_json_files(motion_dir):
         if not data.get('planned'):
             continue
         n_planned += 1
-        n_verified += int(bool(data.get('verified')))
+        verified = bool(data.get('verified'))
+        lead_in_verified = bool(data.get('lead_in_verified', True))
+        n_verified += int(verified)
+        n_lead_in_verified += int(lead_in_verified)
+        n_both_verified += int(verified and lead_in_verified)
         kind = data.get('kind')
         kinds[kind] = kinds.get(kind, 0) + 1
+        if data.get('approach_angle') is not None:
+            angle = int(round(math.degrees(data['approach_angle'])))
+            approach_angles[angle] = approach_angles.get(angle, 0) + 1
         if data.get('compute_time') is not None:
             compute_times.append(data['compute_time'])
 
@@ -159,7 +168,10 @@ def summarize_motions(motion_dir):
     # の平均だけを返す。
     avg_compute_time = (sum(compute_times) / len(compute_times)
                         if compute_times else None)
-    return dict(n_planned=n_planned, n_verified=n_verified, kinds=kinds,
+    return dict(n_planned=n_planned, n_verified=n_verified,
+               n_lead_in_verified=n_lead_in_verified,
+               n_both_verified=n_both_verified, kinds=kinds,
+               approach_angles=approach_angles,
                avg_compute_time=avg_compute_time)
 
 
@@ -195,6 +207,13 @@ def main():
             '--force-optimize を渡す (pre-touch/線形補間の候補が事後検証 '
             'に通っていても必ず jaxls の軌道最適化まで実行させ、全員分の '
             '軌道最適化の計算時間を計測できるようにする)。')
+    parser.add_argument(
+        '--initial-base-pose', type=float, nargs=3, default=None,
+        metavar=('X', 'Y', 'YAW'),
+        help='--plan-motion 指定時、plan_handshake_motion.py に '
+            '--initial-base-pose として渡すロボットの初期台車姿勢 '
+            '(既定は指定なし = 原点。人物は (3, 0) 付近に置かれるので、'
+            '例えば 5 0 3.14 で人の向こう側から回り込む経路を試せる)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -252,6 +271,9 @@ def main():
                       '--skeleton-dir', skeleton_dir]
         if args.force_optimize:
             motion_args.append('--force-optimize')
+        if args.initial_base_pose is not None:
+            motion_args += ['--initial-base-pose'] + [
+                str(v) for v in args.initial_base_pose]
         motion_elapsed, motion_stdout = run_step(
             '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
@@ -264,6 +286,11 @@ def main():
                   ', '.join('{}={}'.format(k, v) for k, v
                             in sorted(motion_summary['kinds'].items(),
                                       key=lambda kv: str(kv[0])))))
+        print('[4.5/5] 初期位置からの直進 (lead-in) が verified: {} 人、'
+              '接近開始位置に選んだ候補の角度 [度]: {}'.format(
+                  motion_summary['n_lead_in_verified'],
+                  ', '.join('{}={}'.format(k, v) for k, v in sorted(
+                      motion_summary['approach_angles'].items()))))
         if motion_warmup_lines:
             for line in motion_warmup_lines:
                 print('[4.5/5] {}'.format(line))
@@ -287,6 +314,9 @@ def main():
         print('初期姿勢から握手姿勢までの軌道が経路上の干渉も含めて '
               '検証できた人数 (verified): {} / {}'.format(
                   motion_summary['n_verified'], n_generated))
+        print('  うち初期位置からの直進 (lead-in) も含めて verified: '
+              '{} / {}'.format(motion_summary['n_both_verified'],
+                               n_generated))
         if motion_summary['avg_compute_time'] is not None:
             print('  軌道計画の 1人あたり平均計算時間 '
                   '(最適化を要さなかった人も含む全 {} 人の平均): '
