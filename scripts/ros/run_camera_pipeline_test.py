@@ -1019,7 +1019,7 @@ class HandshakePipelineNode(object):
         # translated_joints/translated_palm を使う仮想座標系で解いている
         # ため、軌道計画もこの座標系のまま (result を untranslate する前)
         # に行う -- plan_person_motion 自身が呼ぶ human_body_cylinder_
-        # obstacles/approach_base_start が、この座標系の joint_positions/
+        # obstacles/orbit_base_start が、この座標系の joint_positions/
         # result['base_position'] と対応している必要があるため。
         motion = None
         if result['solved']:
@@ -2095,8 +2095,8 @@ def main():
     parser.add_argument(
         '--approach-distance', type=float,
         default=phm.DEFAULT_APPROACH_DISTANCE,
-        help='軌道の始点で、最終台車位置から人間の反対方向へ下がる距離の上限 '
-            '[m] (既定 {})。'.format(phm.DEFAULT_APPROACH_DISTANCE))
+        help='接近開始位置 (人間の手を中心に公転を始める円) の半径への '
+            '上乗せ分 [m] (既定 {})。'.format(phm.DEFAULT_APPROACH_DISTANCE))
     parser.add_argument(
         '--pretouch-standoff', type=float,
         default=phm.DEFAULT_PRETOUCH_STANDOFF,

@@ -253,16 +253,20 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
     異なる (パイプライン全体ではなく、最適化条件そのものの成否) 点に
     注意。"""
     start_time = time.time()
+    base_goal = phm.handshake_base_goal(handshake)
+    # 最適化条件そのものの比較用なので、初期位置による接近開始位置の縮小
+    # (plan_person_motion の initial_base_pose) は行わない。人間の手を
+    # 中心に、人間の立ち位置から見て最終台車位置へ向かう向き (角度 0 の
+    # orbit 候補と同じ向き、approach_start_candidates 参照) に
+    # --approach-distance だけ上乗せした半径で始点を置く。
+    orbit_center = phm.orbit_center_xy(handshake)
+    orbit_dir = phm.approach_direction(human_xy, base_goal)
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         phm.build_start_and_goal(
             robot, robot_arm, handshake,
-            # 最適化条件そのものの比較用なので、初期位置による接近開始位置
-            # の縮小 (plan_person_motion の initial_base_pose) は行わない。
-            phm.approach_base_start(
-                phm.handshake_base_goal(handshake),
-                phm.approach_direction(
-                    human_xy, phm.handshake_base_goal(handshake)),
-                args.approach_distance))
+            phm.orbit_base_start(
+                base_goal, orbit_center, orbit_dir, args.approach_distance),
+            orbit=(orbit_center, human_xy))
     n_joints = len(q_start)
 
     def make_candidate(trajectory, attempt, cost, solve_time):

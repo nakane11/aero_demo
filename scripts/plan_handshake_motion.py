@@ -7,24 +7,24 @@ JSON として保存する。
 
 軌道の始点は次のように決める (``plan_person_motion`` 参照):
 
-* 台車: 最終台車位置から人間の反対方向 (人間の立ち位置から最終台車位置
-  へ向かう半径方向、``approach_direction``) へ ``--approach-distance``
-  [m] 下がった接近開始位置 (途中目標)。最後の区間を、人間に向かって
-  まっすぐ近づく動きにするためのもの。ただしロボットの初期位置
-  (このスクリプトでは IK と同じく ``INITIAL_BASE_POSE`` = ワールド原点・
-  向き +x) がその軸上でそれより手前にある場合は、初期位置の位置まで
-  縮める (後退しない。縮めた結果ほぼ 0 なら初期位置から直接計画する。
-  ``approach_base_start`` 参照)。以前は初期位置を考慮せず常に人間の
-  反対方向へ 1 m 下がっていたため、人が近いと一度後退してから前進する・
-  人が斜め前にいると横に大きくふくらむ、という大回りになっていた。
-  初期位置から接近開始位置までの直進 (``build_lead_in_waypoints``) は
-  最適化せず、人間から ``LEAD_IN_CHECK_RADIUS`` 以内に入る waypoint だけ
-  干渉を検証する (結果の ``lead_in_*``)。
-  ロボットが人の背後・横にいると、この直進や接近開始位置からの接近が
-  人体を横切ってしまうため、上記の接近開始位置で干渉検証に通らなかった
-  ときだけ、人の周りに置いた候補 (``approach_start_candidates``) から、
-  lead-in とその先の軌道の両方が干渉検証を通るもののうち、台車の経路が
-  最短のものを選ぶ (結果の ``approach_angle``)。
+* 台車: 人間の手 (``orbit_center_xy``) を中心とした半径 (手から最終台車
+  位置までの距離 + ``--approach-distance``) の円周上に接近開始位置を
+  置く。位置は初期位置からの直進 (lead-in) がその先の経路の出だしの接線
+  になるように探し、向きは進行方向にする (``orbit_tangent_start``。
+  見つからない・初期位置が既にこの円の内側なら ``orbit_base_start``)。
+  そこから最終台車位置までは、手を中心に公転と自転を同時に行う経路
+  (``orbit_base_path``: アルキメデス螺旋、終点で減速) を台車の初期軌道に
+  する。公転は人間の立ち位置の方位を通らない向きに回る。
+  手繋ぎの最終姿勢は人と同じ方向を向くため、人と向き合った配置では
+  ほぼ半回転が必要になるが、それを人から遠い lead-in ではなく人の手の
+  周りでの回り込みの中で行う (以前は lead-in で進みながら半回転し、その
+  まま横・後ろ向きに近づいていた)。初期位置から接近開始位置までの lead-in
+  はその場回転で進行方向を向いてから直進する (``build_lead_in_waypoints``)。
+  ロボットが人の背後・横にいて、この接近開始位置からの経路や lead-in が
+  人体を横切ってしまう配置では、手を中心に接近開始位置を回した候補
+  (``approach_start_candidates``) から、lead-in とその先の軌道の両方が
+  干渉検証を通るもののうち、台車の経路が最短のものを選ぶ (結果の
+  ``approach_angle``)。
 * 腕: 肩は ``Aero.reset_pose`` のまま、肘を伸ばして体の横に自然に
   下ろした姿勢 (``arms_down_angles`` 参照)。
 
@@ -148,16 +148,15 @@ DEFAULT_ACCELERATION_WEIGHT = 1.0
 # での実機の現在地を ``initial_base_pose`` として別に渡す。
 INITIAL_BASE_POSE = (0.0, 0.0, 0.0)
 
-# 接近開始位置 (途中目標) を最終台車位置から人間の反対方向へどれだけ
-# 下げるか [m] の上限 (モジュール docstring / ``approach_base_start``
-# 参照)。大きいほど「人間に向かってまっすぐ近づく」区間が長くなるが、
-# ロボットがその向きからずれた位置にいるときの横へのふくらみも大きくなる。
-# 以前は 1.0 m だったが、合成人物 7 人 x 初期位置 9 通り (向きのずれ
-# 0/30/60 度 x ゴールまで 1/2/3 m) の比較で、干渉検証を通る数・計算時間は
-# 1.0/0.5/0.3 m で変わらず、横ずれの最大値 (平均) だけが 0.40 -> 0.23 ->
-# 0.14 m と減ったため、まっすぐ近づく区間の長さとの兼ね合いで 0.5 m にした
-# (2026-09-24)。
-DEFAULT_APPROACH_DISTANCE = 0.5  # [m]
+# 接近開始位置 (途中目標) を、公転を始める円の半径 (手から最終台車位置
+# までの距離) にどれだけ上乗せするか [m] (モジュール docstring /
+# ``orbit_base_start``/``orbit_tangent_start`` 参照)。合成人物 14 人
+# (人と向き合う配置) の比較で、全員が干渉検証を通ったまま、0.5 m に比べて
+# 経路の膨らみ (初期位置 -> 目標位置の線分からの最大距離の平均) が 0.40 ->
+# 0.25 m、横向きの移動が 0.59 -> 0.34 m に減ったため 0.2 m にした。0 m に
+# するとさらに減る (0.15/0.17 m) が、向きの変化が人の手の近くの短い円弧に
+# 詰め込まれる (2026-09-25)。
+DEFAULT_APPROACH_DISTANCE = 0.2  # [m]
 
 # 初期位置の方が人間に近く、接近開始位置を縮めた結果がこれ未満になった
 # ら、接近開始位置を置かずに初期位置から直接計画する [m]。
@@ -169,6 +168,11 @@ MIN_APPROACH_DISTANCE = 0.05  # [m]
 # 位置への区間が人体を横切るようになるので置かない。
 APPROACH_CANDIDATE_ANGLE_STEP = math.radians(30.0)  # [rad]
 APPROACH_CANDIDATE_MAX_ANGLE = math.radians(120.0)  # [rad]
+
+# lead-in が公転の経路の接線になる接近開始位置を探すときの
+# 方位角の刻みと、向きのずれの許容幅 (``orbit_tangent_start`` 参照)。
+ORBIT_TANGENT_SEARCH_STEP = math.radians(0.5)  # [rad]
+ORBIT_TANGENT_MAX_MISMATCH = math.radians(3.0)  # [rad]
 
 # 初期位置から接近開始位置までの直進 (lead-in) のうち、台車が人間の
 # 立ち位置からこの距離以内に入る waypoint だけ干渉を検証する [m]
@@ -257,9 +261,8 @@ def wrap_angle(angle):
 
 
 def approach_direction(human_xy, base_goal):
-    """接近開始位置 (途中目標) を最終台車位置からどちら向きに置くかの
-    水平単位ベクトル (``approach_base_start`` 参照): 人間の立ち位置から
-    最終台車位置へ向かう半径方向。
+    """人間の立ち位置から最終台車位置へ向かう半径方向の水平単位ベクトル
+    (``orbit_direction`` が、初期位置が公転の中心と重なる場合の代用に使う)。
     """
     direction = np.array([base_goal[0] - human_xy[0],
                           base_goal[1] - human_xy[1]], dtype=np.float64)
@@ -269,59 +272,227 @@ def approach_direction(human_xy, base_goal):
     return np.array([-1.0, 0.0]) if norm < 1e-6 else direction / norm
 
 
-def approach_base_start(base_goal, direction, distance,
-                        initial_base_pose=None):
-    """軌道の始点にする接近開始位置 (途中目標) の台車姿勢 ``[x, y, yaw]``
-    を返す。
+def orbit_center_xy(handshake):
+    """公転の中心 = 人間の手 (IK の目標位置 ``target_position``、掌の
+    少し手前) の水平位置。"""
+    return np.asarray(handshake['target_position'][:2], dtype=np.float64)
 
-    最終台車位置から ``direction`` (``approach_direction``、人間の立ち位置
-    から最終台車位置へ向かう向き) へ ``distance`` [m] 離れた位置で、向きは
-    最終姿勢と同じ (最後の区間を、人間に向かってまっすぐ近づく動きにする
-    ため)。
 
-    ``initial_base_pose`` (ロボットの初期台車姿勢) を渡すと、接近開始位置が
-    ``direction`` の軸上で初期位置より先 (初期位置から見て後ろ側) に
-    ならないよう、離す距離を初期位置の ``direction`` 方向の位置までに縮める
-    (一度後退してから前進する大回りをしないため)。縮めた距離が
-    ``MIN_APPROACH_DISTANCE`` 未満なら、接近開始位置を置かずに初期位置
-    そのものを返す (初期位置から直接計画する)。ただし初期位置が最終台車
-    位置から見て ``direction`` と反対側 (人間を挟んだ向こう側など、回り
-    込んで近づく必要がある側) にある場合は縮めない (縮めると初期位置から
-    直進することになり、人体を横切ってしまうため)。
+def orbit_direction(center_xy, initial_base_pose, human_xy, base_goal):
+    """角度 0 の接近開始位置を公転の中心 ``center_xy`` からどちら向きに
+    置くかの水平単位ベクトル: 中心からロボットの初期位置へ向かう向き
+    (初期位置から手へ向かって直進してくれば、そのまま公転に入れる)。
+    初期位置が中心と重なる場合は ``approach_direction`` で代用する。"""
+    direction = (np.asarray(initial_base_pose[:2], dtype=np.float64)
+                 - center_xy)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return approach_direction(human_xy, base_goal)
+    return direction / norm
+
+
+def orbit_base_start(base_goal, center_xy, direction, distance,
+                     initial_base_pose=None):
+    """角度 0 の接近開始位置 ``[x, y, yaw]``: 公転の中心 ``center_xy`` から
+    ``direction`` へ、半径 (中心から最終台車位置までの距離 + ``distance``)
+    だけ離れた位置で、中心 (人間の手) の方を向く。
+
+    ``initial_base_pose`` を渡すと、初期位置がこの半径 (+
+    ``MIN_APPROACH_DISTANCE``) 以内にある (既に十分近い) 場合は初期位置
+    そのものを返す (初期位置からすぐ公転に入る。後退しないため)。
     """
+    center_xy = np.asarray(center_xy, dtype=np.float64)
+    radius = float(np.linalg.norm(base_goal[:2] - center_xy)) + distance
     if initial_base_pose is not None:
         initial = np.asarray(initial_base_pose, dtype=np.float64)
-        along = float(np.dot(initial[:2] - base_goal[:2], direction))
-        if along > 0.0:
-            distance = min(distance, along)
-            if distance < MIN_APPROACH_DISTANCE:
-                return initial.copy()
-    return np.array([base_goal[0] + direction[0] * distance,
-                     base_goal[1] + direction[1] * distance,
-                     base_goal[2]])
+        if (float(np.linalg.norm(initial[:2] - center_xy))
+                <= radius + MIN_APPROACH_DISTANCE):
+            return initial.copy()
+    xy = center_xy + direction * radius
+    return np.array([xy[0], xy[1],
+                     math.atan2(-direction[1], -direction[0])])
+
+
+def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
+                        initial_base_pose):
+    """角度 0 の接近開始位置 ``[x, y, yaw]``: 初期位置からの直進 (lead-in)
+    が、そこから始まる公転+自転の経路 (``orbit_base_path``) の出だしの
+    接線になる位置。
+
+    接近開始位置は公転の中心 ``center_xy`` (人間の手) を中心とした半径
+    (中心から最終台車位置までの距離 + ``distance``) の円周上に取り、その
+    方位角を ``ORBIT_TANGENT_SEARCH_STEP`` 刻みで探して、「初期位置 ->
+    接近開始位置」の向きと、そこから始めた経路の出だしの向きが最も揃う
+    ものを選ぶ (揃う位置は左右 2 か所あり得るが、公転の向きは
+    ``orbit_sweep`` が人体を避ける側に決めるので、それと矛盾しない側だけが
+    残る。両方残れば lead-in + 公転の経路長が短い方)。向き (yaw) は
+    初期位置からの進行方向にする (lead-in が前進になり、そのまま曲がり
+    始める)。
+
+    初期位置が既にこの円 (+ ``MIN_APPROACH_DISTANCE``) の内側にある、
+    または向きが ``ORBIT_TANGENT_MAX_MISMATCH`` 以内で揃う位置が無い場合は
+    ``None`` (呼び出し側が ``orbit_base_start`` にフォールバックする)。
+    """
+    center = np.asarray(center_xy, dtype=np.float64)
+    initial = np.asarray(initial_base_pose, dtype=np.float64)
+    r1 = float(np.linalg.norm(np.asarray(base_goal[:2]) - center))
+    r0 = r1 + distance
+    if float(np.linalg.norm(initial[:2] - center)) \
+            <= r0 + MIN_APPROACH_DISTANCE:
+        return None
+    min_cos = math.cos(ORBIT_TANGENT_MAX_MISMATCH)
+    best_per_side = {}  # 公転の向き (+1/-1) -> (cos_mismatch, 経路長, p0, travel)
+    for theta0 in np.arange(-math.pi, math.pi, ORBIT_TANGENT_SEARCH_STEP):
+        e_r = np.array([math.cos(theta0), math.sin(theta0)])
+        e_t = np.array([-e_r[1], e_r[0]])
+        p0 = center + r0 * e_r
+        travel = p0 - initial[:2]
+        travel_len = float(np.linalg.norm(travel))
+        sweep = orbit_sweep(np.array([p0[0], p0[1], 0.0]), base_goal,
+                            center, avoid_xy)
+        if sweep is None or travel_len < 1e-6:
+            continue
+        dtheta = sweep[1]
+        # 経路の出だしの向き (orbit_base_path は方位角・半径を同じ割合で
+        # 補間するので、半径方向 (r1 - r0) と接線方向 r0 * dtheta の比で
+        # 決まる)。
+        v = (r1 - r0) * e_r + r0 * dtheta * e_t
+        cos_mismatch = float(np.dot(v, travel)) / (
+            float(np.linalg.norm(v)) * travel_len)
+        if cos_mismatch < min_cos:
+            continue
+        # 揃う位置の近傍は探索の刻みで複数ヒットするので、公転の向きごとに
+        # 最もよく揃うものを残し、最後に経路長が短い方を選ぶ。
+        side = 1 if dtheta >= 0.0 else -1
+        length = travel_len + 0.5 * (r0 + r1) * abs(dtheta)
+        if side not in best_per_side \
+                or cos_mismatch > best_per_side[side][0]:
+            best_per_side[side] = (cos_mismatch, length, p0, travel)
+    if not best_per_side:
+        return None
+    _, _, p0, travel = min(best_per_side.values(), key=lambda b: b[1])
+    return np.array([p0[0], p0[1], math.atan2(travel[1], travel[0])])
+
+
+def orbit_sweep(base_start, base_goal, center_xy, avoid_xy=None):
+    """``base_start`` から ``base_goal`` への公転・自転の量を返す。
+
+    Returns
+    -------
+    (theta0, sweep, r0, r1, dyaw)
+        中心 ``center_xy`` から見た始点の方位角 ``theta0`` [rad]、公転角
+        ``sweep`` [rad] (正で反時計回り)、始点・終点の半径 ``r0``/``r1``
+        [m]、自転 (yaw の変化量) ``dyaw`` [rad]。どちらかの半径がほぼ 0
+        (方位角が決まらない) なら ``None``。
+
+    公転は 2 通りの回り方のうち、``avoid_xy`` (人間の立ち位置) の方位を
+    通らない方を選ぶ (``None`` なら近い方)。自転は公転と同じだけ回した上
+    で、残りの向きの差を ±π 以内で足す (手に対する向きを徐々に変える)
+    -- 始点の yaw は 2π の整数倍を無視して扱い、終点の yaw は変えない
+    (``orbit_unwrap_start`` 参照)。
+    """
+    center_xy = np.asarray(center_xy, dtype=np.float64)
+    rel0 = np.asarray(base_start[:2], dtype=np.float64) - center_xy
+    rel1 = np.asarray(base_goal[:2], dtype=np.float64) - center_xy
+    r0, r1 = float(np.linalg.norm(rel0)), float(np.linalg.norm(rel1))
+    if r0 < 1e-6 or r1 < 1e-6:
+        return None
+    theta0 = math.atan2(rel0[1], rel0[0])
+    theta1 = math.atan2(rel1[1], rel1[0])
+    ccw = (theta1 - theta0) % (2 * math.pi)
+    sweep = wrap_angle(theta1 - theta0)
+    if avoid_xy is not None:
+        rel_h = np.asarray(avoid_xy[:2], dtype=np.float64) - center_xy
+        if float(np.linalg.norm(rel_h)) > 1e-6:
+            theta_h = math.atan2(rel_h[1], rel_h[0])
+            passes_human = (theta_h - theta0) % (2 * math.pi) < ccw
+            sweep = ccw - 2 * math.pi if passes_human else ccw
+    dyaw = sweep + wrap_angle(
+        float(base_goal[2]) - float(base_start[2]) - sweep)
+    return theta0, sweep, r0, r1, dyaw
+
+
+def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy=None):
+    """``unwrap_start_yaw`` の公転版: ``base_start`` の yaw を、
+    ``orbit_sweep`` の自転量で終点へ回ってこられる等価な角度
+    (2π の整数倍ずらしたもの) に置き換えたコピーを返す。公転が決まらない
+    場合は ``unwrap_start_yaw`` と同じ。"""
+    sweep = orbit_sweep(base_start, base_goal, center_xy, avoid_xy)
+    if sweep is None:
+        return unwrap_start_yaw(base_start, base_goal)
+    base_start = np.array(base_start, dtype=np.float64)
+    base_start[2] = float(base_goal[2]) - sweep[4]
+    return base_start
+
+
+def orbit_base_path(base_start, base_goal, center_xy, avoid_xy, n):
+    """``base_start`` から ``base_goal`` まで、中心 ``center_xy`` (人間の
+    手) の周りを公転しながら同時に自転する台車の経路 ``(n, 3)`` を返す
+    (``orbit_sweep`` 参照)。始点・終点は ``base_start``/``base_goal``
+    そのもの (始点の yaw は ``orbit_unwrap_start`` 済みである前提)。公転が
+    決まらない場合は直線補間。
+
+    軌道のパラメータ s (0 -> 1) に対し、方位角・半径・yaw をいずれも
+    ``1 - (1 - s)^2`` の割合で補間する: 経路の形は半径が方位角に比例して
+    縮むアルキメデス螺旋で、速度は始点では 0 にせず (lead-in の直進から
+    止まらずに曲がり始める。``orbit_tangent_start`` が lead-in をこの経路の
+    出だしの接線にする)、終点で 0 に減速する。
+    半径を方位角より先に縮める形 (始めは手に向かって半径方向にまっすぐ入り、
+    最後は円に接して並ぶ、``r1 + (r0 - r1)(1 - s)^3``) も試したが、手を
+    正面に見たまま最終位置と同じくらいまで寄ってしまい、合成人物 14 人全員で
+    公転区間の前半に人の手・腕と 7-12 cm 貫通した (2026-09-25)。最終姿勢
+    では手は体の横にあるので、手に近づくのは向きが変わる分だけにする。
+    """
+    s = np.linspace(0.0, 1.0, n)
+    sweep = orbit_sweep(base_start, base_goal, center_xy, avoid_xy)
+    if sweep is None:
+        return np.stack([np.linspace(base_start[i], base_goal[i], n)
+                         for i in range(3)], axis=1)
+    theta0, dtheta, r0, r1, dyaw = sweep
+    turn = 1.0 - (1.0 - s) ** 2
+    theta = theta0 + dtheta * turn
+    radius = r1 + (r0 - r1) * (1.0 - turn)
+    path = np.stack([center_xy[0] + radius * np.cos(theta),
+                     center_xy[1] + radius * np.sin(theta),
+                     float(base_goal[2]) - dyaw * (1.0 - turn)], axis=1)
+    path[0] = base_start
+    path[-1] = base_goal
+    return path
 
 
 def approach_start_candidates(base_goal, human_xy, distance,
-                              initial_base_pose):
+                              initial_base_pose, orbit_center):
     """接近開始位置の候補 ``[(角度 [rad], [x, y, yaw]), ...]`` を返す。
     先頭は必ず角度 0 の候補で、残りは初期位置 → 候補 → 最終台車位置の
     台車の経路長が短い順。
 
-    角度 0 の候補は従来通りの ``approach_base_start`` (人間の反対方向へ
-    ``distance`` 下がり、初期位置の手前なら縮めたもの)。それ以外は人間の
-    立ち位置を中心に、角度 0 の方向 (``approach_direction``) を
-    ``APPROACH_CANDIDATE_ANGLE_STEP`` 刻みで ±``APPROACH_CANDIDATE_MAX_
-    ANGLE`` まで回した方向の、半径 (人間から最終台車位置までの距離 +
-    ``distance``) の円周上に置く (向きはいずれも最終姿勢と同じ)。
+    ``orbit_center`` (人間の手の位置 ``orbit_center_xy``) を中心とした
+    円周上に置く: 角度 0 は ``orbit_tangent_start`` (lead-in が公転の経路
+    の接線になる位置、進行方向を向く。見つからなければ ``orbit_base_
+    start``: 手から初期位置の方向、手の方を向く)。それ以外は、角度 0 の
+    方向を ``APPROACH_CANDIDATE_ANGLE_STEP`` 刻みで ±``APPROACH_CANDIDATE_
+    MAX_ANGLE`` まで回した方向の、半径 (手から最終台車位置までの距離 +
+    ``distance``) の円周上に、初期位置からの進行方向に向けて置く
+    (lead-in が常に前進になるように)。
     ロボットが人の背後・横にいて、初期位置からの直進 (lead-in) や角度 0
     の候補からの接近が人体を横切ってしまう配置で、人の横を回り込む経路を
     選べるようにするためのもの (``plan_person_motion`` 参照)。
     """
     human_xy = np.asarray(human_xy[:2], dtype=np.float64)
-    direction = approach_direction(human_xy, base_goal)
-    radius = float(np.linalg.norm(base_goal[:2] - human_xy)) + distance
-    zero = (0.0, approach_base_start(
-        base_goal, direction, distance, initial_base_pose=initial_base_pose))
+    center = np.asarray(orbit_center[:2], dtype=np.float64)
+    tangent = orbit_tangent_start(
+        base_goal, center, human_xy, distance, initial_base_pose)
+    if tangent is not None:
+        direction = tangent[:2] - center
+        direction /= float(np.linalg.norm(direction))
+        zero = (0.0, tangent)
+    else:
+        direction = orbit_direction(
+            center, initial_base_pose, human_xy, base_goal)
+        zero = (0.0, orbit_base_start(
+            base_goal, center, direction, distance,
+            initial_base_pose=initial_base_pose))
+    radius = float(np.linalg.norm(base_goal[:2] - center)) + distance
     candidates = []
     n_steps = int(round(APPROACH_CANDIDATE_MAX_ANGLE
                         / APPROACH_CANDIDATE_ANGLE_STEP))
@@ -331,9 +502,16 @@ def approach_start_candidates(base_goal, human_xy, distance,
             c, s = math.cos(angle), math.sin(angle)
             rotated = np.array([c * direction[0] - s * direction[1],
                                 s * direction[0] + c * direction[1]])
-            xy = human_xy + rotated * radius
-            candidates.append(
-                (angle, np.array([xy[0], xy[1], base_goal[2]])))
+            xy = center + rotated * radius
+            # 初期位置から候補へ向かう進行方向 (lead-in が前進になり、
+            # 公転はその向きから始まる)。角度 0 の候補では手の方向と一致
+            # する。候補が初期位置とほぼ重なるときは手の方を向く。
+            travel = xy - np.asarray(initial_base_pose[:2], dtype=np.float64)
+            if float(np.linalg.norm(travel)) > MIN_APPROACH_DISTANCE:
+                yaw = math.atan2(travel[1], travel[0])
+            else:
+                yaw = math.atan2(-rotated[1], -rotated[0])
+            candidates.append((angle, np.array([xy[0], xy[1], yaw])))
 
     initial_xy = np.asarray(initial_base_pose[:2], dtype=np.float64)
 
@@ -351,8 +529,13 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
     列 (lead-in) を返す (末尾は ``first_waypoint`` 自身を含まない。始点が
     初期位置と一致していれば空)。
 
-    台車は並進 ``LEAD_IN_STEP``・回頭 ``LEAD_IN_ANGLE_STEP`` 以下の刻みで
-    補間する。yaw は終点側 (``first_waypoint``、この直後に続く waypoint と
+    台車はまず初期位置でその場回転して終点の向きになり
+    (回頭 ``LEAD_IN_ANGLE_STEP`` 以下の刻み)、その向きのまま直進する
+    (並進 ``LEAD_IN_STEP`` 以下の刻み)。以前は並進と回頭を同時に線形補間
+    していたため、大きく回頭するときに体の向きと進行方向がずれたまま
+    進んでいた。回頭は人から遠い初期位置で済ませる (終点の向きが初期位置
+    からの進行方向なので、直進は前進になる)。
+    yaw は終点側 (``first_waypoint``、この直後に続く waypoint と
     連続している必要がある) を変えずに、始点側を 2π の整数倍ずらして近い
     回り方にする (``unwrap_start_yaw`` と同じ考え方)。関節角は
     ``start_joint_angles`` (``{関節名: 角度}``、実機の初期姿勢など) から
@@ -364,8 +547,9 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
                          first_waypoint['base_yaw']])
     start_base = unwrap_start_yaw(initial_base_pose, end_base)
     delta = end_base - start_base
-    n = int(max(math.ceil(np.linalg.norm(delta[:2]) / LEAD_IN_STEP),
-                math.ceil(abs(delta[2]) / LEAD_IN_ANGLE_STEP)))
+    n_rotate = int(math.ceil(abs(delta[2]) / LEAD_IN_ANGLE_STEP))
+    n_translate = int(math.ceil(np.linalg.norm(delta[:2]) / LEAD_IN_STEP))
+    n = n_rotate + n_translate
     if n == 0:
         return []
     end_vec = np.asarray(first_waypoint['joint_angle_vector'],
@@ -377,8 +561,15 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
             start_joint_angles.get(name, angle)
             for name, angle in zip(joint_names, end_vec)])
     waypoints = []
-    for t in np.linspace(0.0, 1.0, n, endpoint=False):
-        base = start_base + delta * t
+    for i in range(n):
+        t = float(i) / n
+        if i < n_rotate:
+            base = start_base + np.array(
+                [0.0, 0.0, delta[2] * float(i) / n_rotate])
+        else:
+            u = float(i - n_rotate) / n_translate
+            base = np.array([start_base[0] + delta[0] * u,
+                             start_base[1] + delta[1] * u, end_base[2]])
         waypoints.append(dict(
             base_position=[float(base[0]), float(base[1]), 0.0],
             base_yaw=float(base[2]),
@@ -423,15 +614,19 @@ def unwrap_start_yaw(base_start, base_goal):
     return base_start
 
 
-def build_start_and_goal(robot, robot_arm, handshake, base_start):
+def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit=None):
     """始点 (腕を下ろした姿勢 + 台車姿勢 ``base_start``) と終点
     (``handshake`` = ``solve_palm_ik.py`` の出力 JSON) の関節角ベクトル・
     台車位置姿勢を、``{robot_arm}arm_whole_body`` の関節順序
     (``joint_list``) で求める。
 
     ``base_start`` は IK と同じ座標系の ``[x, y, yaw]`` (接近開始位置
-    ``approach_base_start``。``plan_person_motion`` 参照)。yaw は終点から
-    見て逆回りにならないよう ``unwrap_start_yaw`` で調整する。
+    ``orbit_base_start``/``orbit_tangent_start``。``plan_person_motion``
+    参照)。yaw は終点から
+    見て逆回りにならないよう ``unwrap_start_yaw`` で調整する。``orbit``
+    (``(公転の中心, 避ける位置)``) を渡すと、代わりに ``orbit_unwrap_
+    start`` で公転の自転量に合わせる (``None`` は直線補間、``plan_person_
+    motion`` は常に渡す)。
 
     Returns
     -------
@@ -458,7 +653,10 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start):
             joint.joint_angle(name_to_angle[joint.name])
     q_goal = np.array([j.joint_angle() for j in joint_list])
     base_goal = handshake_base_goal(handshake)
-    base_start = unwrap_start_yaw(base_start, base_goal)
+    if orbit is None:
+        base_start = unwrap_start_yaw(base_start, base_goal)
+    else:
+        base_start = orbit_unwrap_start(base_start, base_goal, *orbit)
 
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
@@ -513,14 +711,24 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
     return problem
 
 
+def base_interpolation(base_start, base_goal, n, orbit=None):
+    """台車の始点から終点までの補間 ``(n, 3)``。``orbit`` (``(公転の中心,
+    避ける位置)``) を渡すと公転+自転の経路 (``orbit_base_path``)、``None``
+    なら直線補間。"""
+    if orbit is not None:
+        return orbit_base_path(base_start, base_goal, orbit[0], orbit[1], n)
+    return np.stack([np.linspace(base_start[i], base_goal[i], n)
+                     for i in range(3)], axis=1)
+
+
 def build_initial_trajectory(q_start, base_start, q_goal, base_goal,
-                             n_waypoints):
-    """始点・終点を線形補間した初期軌道 (``(n_waypoints, n_joints + 3)``)
-    を作る (jaxls ソルバーへの warm start)。"""
+                             n_waypoints, orbit=None):
+    """始点・終点を補間した初期軌道 (``(n_waypoints, n_joints + 3)``)
+    を作る (jaxls ソルバーへの warm start)。関節角は線形補間、台車は
+    ``base_interpolation`` (``orbit`` 参照)。"""
     q_interp = interpolate_trajectory(q_start, q_goal, n_waypoints)
-    base_interp = np.stack(
-        [np.linspace(base_start[i], base_goal[i], n_waypoints)
-         for i in range(3)], axis=1)
+    base_interp = base_interpolation(
+        base_start, base_goal, n_waypoints, orbit=orbit)
     traj = np.hstack([q_interp, base_interp])
     n_joints = len(q_start)
     traj[0, :n_joints] = q_start
@@ -591,12 +799,13 @@ def solve_pretouch_pose(robot, robot_arm, link_list, joint_list, handshake,
 
 
 def build_pretouch_trajectory(q_start, base_start, q_pre, q_goal, base_goal,
-                              n_waypoints, split_ratio):
+                              n_waypoints, split_ratio, orbit=None):
     """始点 → pre-touch 姿勢 → 終点 の 2 区間からなる軌道を作る。
 
     前半 (``split_ratio`` まで) で台車を最終位置まで動かしながら腕を
     pre-touch 姿勢へ持ち上げ、後半で掌の法線方向に沿ってまっすぐ終点へ
-    寄る (台車は動かさない)。モジュール docstring 参照。
+    寄る (台車は動かさない)。モジュール docstring 参照。前半の台車は
+    ``base_interpolation`` で補間する (``orbit`` 参照)。
     """
     n_joints = len(q_start)
     split = max(2, min(n_waypoints - 1, int(n_waypoints * split_ratio)))
@@ -604,9 +813,8 @@ def build_pretouch_trajectory(q_start, base_start, q_pre, q_goal, base_goal,
     traj[:split, :n_joints] = interpolate_trajectory(q_start, q_pre, split)
     traj[split - 1:, :n_joints] = interpolate_trajectory(
         q_pre, q_goal, n_waypoints - split + 1)
-    traj[:split, n_joints:] = np.stack(
-        [np.linspace(base_start[i], base_goal[i], split) for i in range(3)],
-        axis=1)
+    traj[:split, n_joints:] = base_interpolation(
+        base_start, base_goal, split, orbit=orbit)
     traj[split:, n_joints:] = base_goal
     return traj
 
@@ -727,11 +935,11 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
                        initial_base_pose=INITIAL_BASE_POSE):
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
-    軌道の始点は接近開始位置 (``approach_base_start``。最終台車位置から
-    人間の反対方向 (``approach_direction``) へ
-    ``args.approach_distance`` (既定 ``DEFAULT_APPROACH_DISTANCE``) 離れた
-    位置を、ロボットの初期台車姿勢 ``initial_base_pose`` より先にならない
-    よう縮めたもの)。
+    軌道の始点は接近開始位置 (人間の手を中心とした半径 (手から最終台車位置
+    までの距離 + ``args.approach_distance``、既定 ``DEFAULT_APPROACH_
+    DISTANCE``) の円周上の位置。ロボットの初期台車姿勢 ``initial_base_
+    pose`` からの直進がその接線になるように探す ``orbit_tangent_start``、
+    見つからなければ ``orbit_base_start``)。
     初期位置からそこまでの直進 (lead-in, ``build_lead_in_waypoints``) は
     最適化せず、人間の近く (``LEAD_IN_CHECK_RADIUS`` 以内) の waypoint
     だけ干渉を検証して、結果の ``lead_in_waypoints``/``lead_in_min_
@@ -790,17 +998,23 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     # docstring 参照)。
     obstacle_cache = build_obstacle_cache(joint_positions)
 
-    approach_distance = getattr(args, 'approach_distance',
-                                DEFAULT_APPROACH_DISTANCE)
+    approach_distance = getattr(args, 'approach_distance', None)
+    if approach_distance is None:
+        approach_distance = DEFAULT_APPROACH_DISTANCE
     base_goal = handshake_base_goal(handshake)
+    # 人間の手を中心に公転+自転して最終台車位置に至る (公転は人間の立ち
+    # 位置の方位を通らない向き。モジュール docstring 参照)。
+    orbit = (orbit_center_xy(handshake),
+            np.asarray(human_xy[:2], dtype=np.float64))
     candidates = approach_start_candidates(
-        base_goal, human_xy, approach_distance, initial_base_pose)
+        base_goal, human_xy, approach_distance, initial_base_pose,
+        orbit_center=orbit[0])
 
     def check_lead_in(base_start):
         # lead-in は軌道の始点 (腕を下ろした姿勢 + base_start) だけで決まる
         # ので、軌道を計画する前に検証して、通らない候補を安く落とす。
         _, joint_list, q_start, base_start, _, _ = build_start_and_goal(
-            robot, robot_arm, handshake, base_start)
+            robot, robot_arm, handshake, base_start, orbit=orbit)
         first_waypoint = trajectory_waypoints(
             robot, joint_list, [np.concatenate([q_start, base_start])])[0]
         joint_names = [j.name for j in robot.joint_list]
@@ -824,7 +1038,7 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     if zero_lead_in[2]:
         zero_motion = _plan_from_start(
             robot, robot_arm, handshake, joint_positions, zero[1], args,
-            verification_pairs, solver, obstacle_cache)
+            verification_pairs, solver, obstacle_cache, orbit=orbit)
     best = None
     n_tried = 1
     if zero_motion is not None and zero_motion['verified']:
@@ -846,7 +1060,7 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
             motion = _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
                 args, verification_pairs, solver, obstacle_cache,
-                optimize=False)
+                optimize=False, orbit=orbit)
             if motion['verified']:
                 best = (candidate, lead_in_check, motion)
                 break
@@ -857,13 +1071,13 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
             candidate, lead_in_check = first_lead_in_ok
             best = (candidate, lead_in_check, _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
-                args, verification_pairs, solver, obstacle_cache))
+                args, verification_pairs, solver, obstacle_cache, orbit=orbit))
         if best is None:
             # どの候補も通らなかった: 従来通り角度 0 の結果を返す。
             if zero_motion is None:
                 zero_motion = _plan_from_start(
                     robot, robot_arm, handshake, joint_positions, zero[1],
-                    args, verification_pairs, solver, obstacle_cache)
+                    args, verification_pairs, solver, obstacle_cache, orbit=orbit)
             best = (zero, zero_lead_in, zero_motion)
 
     (angle, _), (lead_in, lead_in_distances, lead_in_verified), motion = best
@@ -879,13 +1093,16 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
 
 def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
                      args, verification_pairs, solver, obstacle_cache,
-                     optimize=True):
+                     optimize=True, orbit=None):
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する
     (``plan_person_motion`` の docstring 参照)。``compute_time`` は呼び出し
     側が入れる。``optimize`` が偽なら jaxls の最適化は行わず、最適化なしの
-    候補 (pre-touch/線形補間) のうち最も貫通が浅いものを返す。"""
+    候補 (pre-touch/線形補間) のうち最も貫通が浅いものを返す。``orbit``
+    (``(公転の中心, 避ける位置)``) を渡すと、台車の初期軌道を公転+自転の
+    経路にする (``base_interpolation`` 参照)。"""
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
-        build_start_and_goal(robot, robot_arm, handshake, base_start)
+        build_start_and_goal(robot, robot_arm, handshake, base_start,
+                             orbit=orbit)
     n_joints = len(q_start)
 
     def make_candidate(trajectory, kind, attempt=None, cost=None,
@@ -912,7 +1129,8 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         )
 
     initial_traj = build_initial_trajectory(
-        q_start, base_start, q_goal, base_goal, args.n_waypoints)
+        q_start, base_start, q_goal, base_goal, args.n_waypoints,
+        orbit=orbit)
     candidates = []
     normal = palm_normal_direction(handshake, joint_positions)
     if normal is not None:
@@ -922,7 +1140,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         if q_pre is not None:
             candidates.append(('pretouch', build_pretouch_trajectory(
                 q_start, base_start, q_pre, q_goal, base_goal,
-                args.n_waypoints, DEFAULT_PRETOUCH_SPLIT)))
+                args.n_waypoints, DEFAULT_PRETOUCH_SPLIT, orbit=orbit)))
     candidates.append(('linear', initial_traj))
 
     force_optimize = getattr(args, 'force_optimize', False)
@@ -1073,12 +1291,12 @@ def main():
         help='軌道 JSON の保存先ディレクトリ (既定 random_motion_poses/。'
             '入力と同じファイル名で保存する)。')
     parser.add_argument(
-        '--approach-distance', type=float, default=DEFAULT_APPROACH_DISTANCE,
-        help='接近開始位置 (途中目標) を最終台車位置から人間の反対方向へ '
-            '下げる距離の上限 [m] (既定 {})。小さいほど、ロボットがその '
-            '向きからずれているときの横へのふくらみが小さくなる '
-            '(approach_base_start 参照)。'.format(
-                DEFAULT_APPROACH_DISTANCE))
+        '--approach-distance', type=float,
+        default=DEFAULT_APPROACH_DISTANCE,
+        help='接近開始位置 (途中目標) を置く、公転を始める円の半径 (手から '
+            '最終台車位置までの距離) への上乗せ分 [m] (既定 {})。小さい '
+            'ほど、経路の膨らみが小さくなる (orbit_base_start/orbit_'
+            'base_path 参照)。'.format(DEFAULT_APPROACH_DISTANCE))
     parser.add_argument(
         '--initial-base-pose', type=float, nargs=3,
         default=list(INITIAL_BASE_POSE), metavar=('X', 'Y', 'YAW'),

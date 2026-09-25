@@ -214,6 +214,10 @@ def main():
             '--initial-base-pose として渡すロボットの初期台車姿勢 '
             '(既定は指定なし = 原点。人物は (3, 0) 付近に置かれるので、'
             '例えば 5 0 3.14 で人の向こう側から回り込む経路を試せる)。')
+    parser.add_argument(
+        '--approach-distance', type=float, default=None,
+        help='--plan-motion 指定時、plan_handshake_motion.py に '
+            '--approach-distance として渡す (既定は指定なし)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -274,6 +278,8 @@ def main():
         if args.initial_base_pose is not None:
             motion_args += ['--initial-base-pose'] + [
                 str(v) for v in args.initial_base_pose]
+        if args.approach_distance is not None:
+            motion_args += ['--approach-distance', str(args.approach_distance)]
         motion_elapsed, motion_stdout = run_step(
             '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
