@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 .claude/
 scripts/random*
-scripts/grid_search_handshake_motion_results*.csv
+tools/grid_search_handshake_motion_results*.csv
 src/aero_demo.egg-info/
 data/
 firmware/atoms3_estop/include/wifi_secrets.h

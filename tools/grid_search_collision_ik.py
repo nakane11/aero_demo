@@ -83,7 +83,7 @@ rthre``、視線タスクの閾値は変わらない) の全組み合わせに�
 
 Usage
 -----
-    python3 grid_search_collision_ik.py \\
+    python3 tools/grid_search_collision_ik.py \\
         --attempts-per-pose 16 64 \\
         --collision-ik-stop 100 500 \\
         --collision-pairs none-gd collision_pairs.json
@@ -106,8 +106,9 @@ import tempfile
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+_SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 import numpy as np  # noqa: E402
 
@@ -130,7 +131,7 @@ def generate_dataset(python, human_dir, palm_dir, num_samples, seed):
         print('[grid] {} 人分の人物を生成します -> {}'.format(
             num_samples, human_dir))
         cmd = [python,
-              os.path.join(_THIS_DIR, 'generate_random_human_poses.py'),
+              os.path.join(_SCRIPTS_DIR, 'generate_random_human_poses.py'),
               '--num-samples', str(num_samples), '--output-dir', human_dir]
         if seed is not None:
             cmd += ['--seed', str(seed)]
@@ -138,7 +139,7 @@ def generate_dataset(python, human_dir, palm_dir, num_samples, seed):
     if not glob.glob(os.path.join(palm_dir, '*.json')):
         print('[grid] 掌の位置姿勢を推定します -> {}'.format(palm_dir))
         subprocess.run([
-            python, os.path.join(_THIS_DIR, 'estimate_palm_poses.py'),
+            python, os.path.join(_SCRIPTS_DIR, 'estimate_palm_poses.py'),
             '--input-dir', human_dir, '--output-dir', palm_dir], check=True)
 
 

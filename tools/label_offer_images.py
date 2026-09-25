@@ -17,7 +17,7 @@ py``) が保存した骨格重畳画像を 1 枚ずつブラウザ (viser の GU
 
 Usage
 -----
-    python3 scripts/label_offer_images.py \
+    python3 tools/label_offer_images.py \
         --image-dir /tmp/offer_dataset/images \
         --palm-dir /tmp/offer_dataset/palms
 

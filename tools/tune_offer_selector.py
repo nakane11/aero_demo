@@ -39,7 +39,7 @@
 
 Usage
 -----
-    python3 tune_offer_selector.py \
+    python3 tools/tune_offer_selector.py \
         --skeleton-dir /path/to/skeletons --palm-dir /path/to/palms
 """
 
@@ -53,11 +53,12 @@ import sys
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 from aero_demo import json_io  # noqa: E402
 
@@ -229,10 +230,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--skeleton-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_human_poses'))
+        default=os.path.join(_SCRIPTS_DIR, 'random_human_poses'))
     parser.add_argument(
         '--palm-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_palm_poses'))
+        default=os.path.join(_SCRIPTS_DIR, 'random_palm_poses'))
     parser.add_argument('--label-key', type=str, default='human_label')
     parser.add_argument(
         '--n-random', type=int, default=200,

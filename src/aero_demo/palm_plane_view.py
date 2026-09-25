@@ -3,7 +3,7 @@
 
 """人物骨格を skrobot の viewer 向けの線分 (``LineString``) にする部品.
 
-``scripts/draw_random_human_poses.py`` 等が使う。
+``tools/draw_random_human_poses.py`` 等が使う。
 
 rospy は import しない。描けなかったことは例外ではなく戻り値で返すので、
 ログをどう出すかは呼び出し側が決める。

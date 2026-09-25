@@ -46,8 +46,8 @@ OFFSET`` だけ浮かせてあり、``batch_inverse_kinematics`` の収束判定
 
 人体だけでなく、ロボット自身のリンク同士の干渉 (自己干渉) も既定で回避
 する (``--no-self-collision`` で無効化できる)。チェックする組み合わせは
-常に ``--collision-pairs`` (JSON、``build_collision_pairs.py`` が生成)
-で明示的に指定した組み合わせだけに限る。このファイルが既定のパスに
+常に ``--collision-pairs`` (JSON、``tools/build_collision_pairs.py`` が
+生成) で明示的に指定した組み合わせだけに限る。このファイルが既定のパスに
 無ければ、干渉回避を丸ごと無効にして通常のヤコビアン法の IK に
 フォールバックする。
 
@@ -105,7 +105,7 @@ from skrobot.models import Aero  # noqa: E402
 from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
     create_self_collision_pairs)
 
-from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
+from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 
 # 掌のローカル +Y (甲->掌方向) まわりにこの角度ずつ向きをずらした候補を
 # 順に試し、IK が解けた最初のものを採用する。差し出している手 (offered_
@@ -161,7 +161,7 @@ def turn_candidates_deg(hand, palm):
 
 # ``turn_candidates_deg`` が返す候補数 (常に 3: 親指側/0 度/小指側)。実際の
 # 角度・順序は ``hand``/``palm`` に応じて変わるため、候補数だけを外部
-# (``grid_search_collision_ik.py`` の ``--turn-candidates`` 既定値等) から
+# (``tools/grid_search_collision_ik.py`` の ``--turn-candidates`` 既定値等) から
 # 参照したい場合はこちらを使う。
 NUM_TURN_CANDIDATES = 3
 
@@ -470,8 +470,7 @@ HAND_FINGER_LANDMARKS = (
     (17, 20),  # 小指: MCP -> 指先
 )
 # HAND_FINGER_LANDMARKS の各指に対応する名前 (--collision-pairs JSON で
-# 人体側のオブジェクトを指すのに使う。analyze_collision_pairs.py の
-# _FINGER_LABELS と同じ順序)。
+# 人体側のオブジェクトを指すのに使う)。
 HAND_FINGER_LABELS = ('thumb', 'index', 'middle', 'ring', 'pinky')
 HAND_PALM_RADIUS = 0.05  # [m] 掌の円柱の半径
 HAND_PALM_HEIGHT = 0.02  # [m] 掌の円柱の厚み (平たくする)
@@ -1015,9 +1014,7 @@ def human_obstacle_names():
     リストを返す (``joint_positions`` の中身に依存しない構造だけの情報)。
 
     ``--collision-pairs`` (JSON) で人体側のオブジェクトを指定するときの
-    名前、および ``analyze_collision_pairs.py`` が書き出す
-    ``collision_pair_analysis.json`` の ``human_collision_min_dist`` の
-    キーの後半と対応する。``load_collision_pairs`` がこのリストを使い、
+    名前と対応する。``load_collision_pairs`` がこのリストを使い、
     JSON 中の名前がロボットのリンク名でなければ人体セグメント名とみなして
     ``human_body_obstacles`` の出力中の対応するインデックスに解決する。
     """
@@ -1052,8 +1049,8 @@ def human_capsules(joint_positions):
     だけ離れた点に潰す。ただし親関節が検出できていれば
     ``_fill_missing_joints_straight_down`` により、子関節は鉛直方向に
     伸ばした推定位置で埋める (``human_body_obstacles`` と同じ)。
-    ``analyze_collision_pairs.py`` と ``collision_pairs_min_distance`` が、
-    ``Cylinder`` の代わりに素の (線分, 半径) を使いたいときに使う。"""
+    ``tools/build_collision_pairs.py`` と ``collision_pairs_min_distance``
+    が、``Cylinder`` の代わりに素の (線分, 半径) を使いたいときに使う。"""
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     caps = []
     names = []
@@ -1230,8 +1227,8 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
     [m] を返す。負の値は貫通していることを意味する。``collision_pairs`` が
     空/``None`` のときは ``float('inf')`` を返す (検証対象なし)。
 
-    ``analyze_collision_pairs.py`` が干渉ペア候補を洗い出すのに使ったのと
-    同じ厳密な形状 (``apply_collision_model`` が差し替えた
+    ``tools/build_collision_pairs.py`` が干渉ペア候補を洗い出すのに使った
+    のと同じ厳密な形状 (``apply_collision_model`` が差し替えた
     ``collision_mesh`` の頂点そのもの) を使って距離を計算する。
 
     人体側は ``human_capsules`` の解析的な (線分, 半径) ではなく
@@ -1369,9 +1366,10 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
 def apply_collision_model(robot, primitive_type=None, force_convert=False,
                           collision_urdf_path=None):
     """``robot`` (実メッシュの Aero) の各リンクの ``collision_mesh`` を、
-    ``view_aero_collision_model.py`` と同じ方法 (``skrobot.urdf.
-    convert_meshes_to_primitives``) で生成したプリミティブ近似形状に
-    差し替える。
+    ``aero_demo.collision_model.build_collision_model_urdf`` (``skrobot.
+    urdf.convert_meshes_to_primitives`` を使う。プリミティブ近似モデルを
+    そのまま見るだけの CLI ツールは ``tools/view_aero_collision_model.py``
+    参照) で生成したプリミティブ近似形状に差し替える。
 
     ``build_collision_model_urdf`` がプリミティブ近似 URDF をファイルと
     してキャッシュする (既に生成済みならそれを再利用し、``force_convert``
@@ -1453,7 +1451,7 @@ def collision_link_list_for_arm(robot, robot_arm):
     ``collision_mesh`` を持たないリンクは除外する。``batch_inverse_
     kinematics`` 自体はこの関数を使わない (最適化でチェックする組み合わせ
     は常に ``collision_pairs`` だけで決まる)。``build_collision_
-    verification_pairs`` (事後検証用) と ``analyze_collision_pairs.py``
+    verification_pairs`` (事後検証用) と ``tools/build_collision_pairs.py``
     が、この関数で全リンクを集めてから総当たりの組み合わせを作る。
     """
     return [link for link in robot.link_list
@@ -1473,10 +1471,10 @@ def load_collision_pairs(path, robot):
       との干渉ペア (``(Link, int)``、int はそのセグメントの
       ``collision_obstacles`` 中のインデックス) として扱う。
 
-    ``build_collision_pairs.py`` が ``analyze_collision_pairs.py`` の出力
-    からこの形式で生成する。``robot`` (``apply_collision_model`` 適用済み
-    を想定) のリンク名と突き合わせ、どちらの解釈にも当てはまらない名前が
-    含まれていた場合は ``ValueError`` にする。
+    ``tools/build_collision_pairs.py`` がこの形式で生成する。``robot``
+    (``apply_collision_model`` 適用済みを想定) のリンク名と突き合わせ、
+    どちらの解釈にも当てはまらない名前が含まれていた場合は ``ValueError``
+    にする。
     """
     with open(path) as f:
         pair_names = json.load(f)
@@ -2147,7 +2145,8 @@ def main():
         help='干渉回避で実際にチェックする組み合わせ (自己干渉のロボット '
             'リンク同士、および人体との干渉のロボットリンク×人体セグメント) '
             'を指定する JSON (2 要素の名前のリストのリスト。既定 '
-            'collision_pairs.json。build_collision_pairs.py が生成する)。 '
+            'collision_pairs.json。tools/build_collision_pairs.py が '
+            '生成する)。 '
             '既定のパスにファイルが無ければ、自己干渉・人体との干渉の両方 '
             'を無効にして通常のヤコビアン法の IK を解く。')
     parser.add_argument(

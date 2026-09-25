@@ -16,9 +16,9 @@ obstacles`` の Cylinder) は、SMPL メッシュに重ねて半透明
 姿勢が体のどの部位のせいか目で見て確認できるようにするため。同様に、
 ``solve_palm_ik.py`` が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
 (box/cylinder/sphere のプリミティブ形状。``solve_palm_ik.apply_collision_
-model`` / ``view_aero_collision_model.py`` と同じ ``skrobot.urdf.
-convert_meshes_to_primitives`` で生成・キャッシュした URDF) も、
-``view_aero_collision_model.py`` と全く同じ方法でもう一体の
+model`` / ``tools/view_aero_collision_model.py`` と同じ ``aero_demo.
+collision_model.build_collision_model_urdf`` で生成・キャッシュした URDF)
+も、``tools/view_aero_collision_model.py`` と全く同じ方法でもう一体の
 ``skrobot.model.RobotModel`` として読み込み、通常のロボットモデル (不透明)
 に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、``aero_demo.palm_plane_
 view.set_color`` を使い、viser でも alpha が effective になるように
@@ -578,7 +578,7 @@ def main():
 
     viewer.add(robot)
     # solve_palm_ik.py の IK が干渉回避に使ったのと同じプリミティブ近似
-    # ジオメトリ (view_aero_collision_model.py と同じもの) を、人物を
+    # ジオメトリ (tools/view_aero_collision_model.py と同じもの) を、人物を
     # またいで一度だけ作って重ねて表示する (毎フレーム作り直す必要はなく、
     # sync_robot_collision_overlay で robot の姿勢に追従させるだけでよい)。
     robot_collision_overlay = build_robot_collision_overlay(robot)

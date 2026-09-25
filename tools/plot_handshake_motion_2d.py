@@ -22,12 +22,13 @@ Usage
 -----
     # パイプラインを実行してから描く (位置引数とオプションは
     # run_pipeline_test.py にそのまま渡す)
-    python3 plot_handshake_motion_2d.py 20 --seed 3 \
+    python3 tools/plot_handshake_motion_2d.py 20 --seed 3 \
         --initial-base-pose 5 0 3.14
 
     # 既存の作業ディレクトリ (run_pipeline_test.py が表示する
     # 「作業ディレクトリ: ...」) の結果を描き直すだけ
-    python3 plot_handshake_motion_2d.py --work-dir /tmp/aero_demo_pipeline_xxx
+    python3 tools/plot_handshake_motion_2d.py \
+        --work-dir /tmp/aero_demo_pipeline_xxx
 """
 
 import argparse
@@ -43,8 +44,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+_SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 _PKG_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -84,13 +86,14 @@ def sample_by_arc_length(points, n):
 def run_pipeline(pipeline_args):
     """``run_pipeline_test.py --plan-motion`` を実行し、出力をそのまま流し
     ながら作業ディレクトリのパスを返す。"""
-    command = [sys.executable, os.path.join(_THIS_DIR, 'run_pipeline_test.py')]
+    command = [sys.executable,
+              os.path.join(_SCRIPTS_DIR, 'run_pipeline_test.py')]
     command += pipeline_args
     if '--plan-motion' not in pipeline_args:
         command.append('--plan-motion')
     work_dir = None
     process = subprocess.Popen(
-        command, cwd=_THIS_DIR, stdout=subprocess.PIPE,
+        command, cwd=_SCRIPTS_DIR, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
         sys.stdout.write(line)

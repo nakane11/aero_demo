@@ -3,8 +3,8 @@
 
 """MediaPipe 形式の骨格 (``{関節名: 座標}`` / ``PeoplePoseEstimator`` の
 2D ランドマーク) を viser の線分、または OpenCV 画像への重ね描きにする
-共通処理。``draw_random_human_poses.py``/``scripts/ros/
-run_camera_pipeline_test.py``/``scripts/ros/record_palm_offer_clips.py``
+共通処理。``tools/draw_random_human_poses.py``/``scripts/ros/
+run_camera_pipeline_test.py``/``tools/ros/record_palm_offer_clips.py``
 で共有する。rospy には依存しない。
 """
 

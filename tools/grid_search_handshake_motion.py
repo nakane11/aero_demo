@@ -66,21 +66,22 @@ JIT 再コンパイルが発生する。``grid_search_collision_ik.py`` と同�
 Usage
 -----
     # 予行運転: 少人数・ベースライン1点だけを計測して1人あたりの所要時間を見る
-    python3 grid_search_handshake_motion.py --num-samples 10 --force-optimize \\
-        --motion-attempts-values 3 --n-waypoints-values 20 \\
+    python3 tools/grid_search_handshake_motion.py --num-samples 10 \\
+        --force-optimize --motion-attempts-values 3 --n-waypoints-values 20 \\
         --max-iterations-values 60
 
     # 本番: 既定の OFAT グリッド (7通り) を、pre-touch/線形補間の早期採用を
     # 無効にして (--force-optimize) 全対象人物で必ず最適化させる
-    python3 grid_search_handshake_motion.py --num-samples 100 --force-optimize
+    python3 tools/grid_search_handshake_motion.py --num-samples 100 \\
+        --force-optimize
 
     # 参考: --force-optimize なしの自然なパイプライン成功率・所要時間
     # (最適化が必要なケースが少ないと分かっているので大きめのサンプル数で)
-    python3 grid_search_handshake_motion.py --num-samples 300
+    python3 tools/grid_search_handshake_motion.py --num-samples 300
 
     # 2軸だけ総当たり (残り1軸は固定) にしたい場合
-    python3 grid_search_handshake_motion.py --mode full --force-optimize \\
-        --n-waypoints-values 12 20 30 \\
+    python3 tools/grid_search_handshake_motion.py --mode full \\
+        --force-optimize --n-waypoints-values 12 20 30 \\
         --motion-attempts-values 1 3 6 --max-iterations-values 60
 """
 
@@ -98,8 +99,9 @@ import time
 from collections import Counter
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+_SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 _PKG_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -128,7 +130,7 @@ def generate_dataset(python, human_dir, palm_dir, handshake_dir,
         print('[grid] {} 人分の人物を生成します -> {}'.format(
             num_samples, human_dir))
         cmd = [python,
-              os.path.join(_THIS_DIR, 'generate_random_human_poses.py'),
+              os.path.join(_SCRIPTS_DIR, 'generate_random_human_poses.py'),
               '--num-samples', str(num_samples), '--output-dir', human_dir]
         if seed is not None:
             cmd += ['--seed', str(seed)]
@@ -136,11 +138,11 @@ def generate_dataset(python, human_dir, palm_dir, handshake_dir,
     if not glob.glob(os.path.join(palm_dir, '*.json')):
         print('[grid] 掌の位置姿勢を推定します -> {}'.format(palm_dir))
         subprocess.run([
-            python, os.path.join(_THIS_DIR, 'estimate_palm_poses.py'),
+            python, os.path.join(_SCRIPTS_DIR, 'estimate_palm_poses.py'),
             '--input-dir', human_dir, '--output-dir', palm_dir], check=True)
     if not glob.glob(os.path.join(handshake_dir, '*.json')):
         print('[grid] 握手姿勢 (掌IK) を解きます -> {}'.format(handshake_dir))
-        cmd = [python, os.path.join(_THIS_DIR, 'solve_palm_ik.py'),
+        cmd = [python, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
               '--input-dir', palm_dir, '--output-dir', handshake_dir,
               '--skeleton-dir', human_dir]
         if seed is not None:

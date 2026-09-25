@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``collision_pairs.json`` (``solve_palm_ik.py --collision-pairs`` に
-渡す、干渉回避で実際にチェックするリンクの組み合わせの JSON) を、以下の
-手順で自動的に作る。
+"""``scripts/collision_pairs.json`` (``solve_palm_ik.py --collision-pairs``
+に渡す、干渉回避で実際にチェックするリンクの組み合わせの JSON。本番の
+``scripts/`` 側が読む既定ファイルそのものを更新する、開発用ツール) を、
+以下の手順で自動的に作る。
 
 1. ``generate_random_human_poses.py`` で人物 (既定 100 人) を生成する。
 2. ``estimate_palm_poses.py`` で各人物の掌の位置姿勢を推定する。
 3. 干渉回避無し (``solve_palm_ik.py --collision-pairs`` に存在しない
    パスを渡すことで自己干渉・人体との干渉の両方と、事後の干渉検証を
    まとめて無効にする) で全員の IK を 1 回だけ解く。
-4. 3. の結果 (``analyze_collision_pairs.analyze_handshake_dir``) を
-   集計し、実際に (指定した距離未満まで) 近づいた -- 干渉した --
-   リンクの組み合わせを、干渉した人数が多い順に並べたランキングを作る。
+4. 3. の結果 (このファイル内の ``analyze_handshake_dir``、旧
+   ``analyze_collision_pairs.py`` から移植したもの) を集計し、実際に
+   (指定した距離未満まで) 近づいた -- 干渉した -- リンクの組み合わせを、
+   干渉した人数が多い順に並べたランキングを作る。
 5. このランキングの上位 ``--num-pairs`` 組をそのまま ``collision_pairs.
    json`` として書き出す。``--max-ik-seconds-per-person`` を指定した
    場合は、代わりにランキングの先頭から 1・2・3... 組と増やしながら
@@ -39,11 +41,12 @@
 
 Usage
 -----
-    python3 build_collision_pairs.py --num-pairs 8
+    python3 tools/build_collision_pairs.py --num-pairs 8
 
 既存の (README 記載の) パイプラインと同じ既定ディレクトリ
-(``random_human_poses/``/``random_palm_poses/``) を使い、``solve_palm_
-ik.py`` の入出力には ``random_handshake_poses/`` を使う。
+(``scripts/random_human_poses/``/``scripts/random_palm_poses/``) を使い、
+``solve_palm_ik.py`` の入出力には ``scripts/random_handshake_poses/`` を
+使う。
 """
 
 import argparse
@@ -56,13 +59,137 @@ import sys
 import tempfile
 import time
 
+import numpy as np
+
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+_SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
-from solve_palm_ik import HUMAN_FRONT_DISTANCE  # noqa: E402
+from solve_palm_ik import (  # noqa: E402
+    HUMAN_FRONT_DISTANCE, apply_collision_model, collision_link_list_for_arm,
+    human_capsules, human_translation_offset, load_skeleton_json,
+    segment_points_distance, translate_joint_positions)
 
-from analyze_collision_pairs import analyze_handshake_dir  # noqa: E402
+from skrobot.coordinates import Coordinates  # noqa: E402
+from skrobot.models import Aero  # noqa: E402
+from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
+    create_self_collision_pairs)
+
+
+def analyze_handshake_dir(handshake_dir, skeleton_dir,
+                          human_front_distance=HUMAN_FRONT_DISTANCE,
+                          dist_threshold=0.0):
+    """``handshake_dir`` (``solve_palm_ik.py`` の出力) と ``skeleton_dir``
+    (骨格 JSON) を読み、自己干渉・人体との干渉それぞれの組み合わせごとの
+    「全サンプル中の最小距離」と「``dist_threshold`` [m] 未満まで近づいた
+    (干渉した) サンプル数」を集計する (旧 ``analyze_collision_pairs.
+    analyze_handshake_dir`` を移植したもの。干渉ペアの自動抽出以外の用途
+    (単独でのレポート表示、``collision_pair_analysis.json`` への書き出し)
+    は使われなくなったため削除し、この関数だけを残してある)。
+
+    各リンクは ``apply_collision_model`` が差し替えた ``collision_mesh``
+    (``trimesh.Trimesh``、box/cylinder/sphere のプリミティブ近似形状) の
+    頂点をそのまま (半径 0 の点群として) 使う -- 干渉回避付きバッチ IK の
+    勾配降下法が最適化のために使う球への近似 (``extract_collision_
+    spheres``) は行わない。自己干渉の距離はリンク間の頂点対の最短距離、
+    人体との干渉の距離は頂点と人体セグメント (線分 + 半径) との最短距離
+    (``segment_points_distance``) からその半径を引いたもの。
+
+    Returns
+    -------
+    dict
+        ``self_min_dist``/``human_min_dist`` (キーは ``(名前A, 名前B)`` の
+        タプル、値は距離 [m])、``self_collision_count``/``human_
+        collision_count`` (同じキーで、``dist_threshold`` 未満まで
+        近づいたサンプル数)、``self_pairs`` (組み合わせのリスト)、
+        ``link_names``/``cap_names``、``n_samples`` を持つ dict。
+        ``n_samples`` が 0 のときは他の値も空。
+    """
+    robot = Aero(use_hand=False)
+    apply_collision_model(robot)
+    collision_link_list = collision_link_list_for_arm(robot, 'r')
+    link_names = [link.name for link in collision_link_list]
+    n_links = len(collision_link_list)
+
+    vertices_local_by_link = [
+        np.asarray(link.collision_mesh.vertices, dtype=np.float64)
+        for link in collision_link_list]
+
+    self_pairs = create_self_collision_pairs(
+        collision_link_list, ignore_adjacent=True)
+
+    self_min_dist = {}
+    self_collision_count = {}
+    human_min_dist = {}
+    human_collision_count = {}
+    n_samples = 0
+    cap_names = []
+
+    files = sorted(glob.glob(os.path.join(handshake_dir, '*.json')))
+    for path in files:
+        with open(path) as f:
+            result = json.load(f)
+        if not result.get('solved'):
+            continue
+        base_name = os.path.basename(path)
+        skeleton_path = os.path.join(skeleton_dir, base_name)
+        if not os.path.exists(skeleton_path):
+            continue
+        n_samples += 1
+
+        joint_positions = load_skeleton_json(skeleton_path)
+        offset = human_translation_offset(
+            joint_positions, front_distance=human_front_distance)
+        joint_positions = translate_joint_positions(joint_positions, offset)
+        caps, cap_names = human_capsules(joint_positions)
+
+        robot.reset_pose()
+        robot.newcoords(Coordinates())
+        robot.base_link.newcoords(Coordinates())
+        robot.angle_vector(np.asarray(result['joint_angle_vector']))
+        base_coords = Coordinates(
+            pos=result['base_position']).rotate(result['base_yaw'], 'z')
+        robot.newcoords(base_coords)
+
+        world_vertices_by_link = []
+        for link, verts_local in zip(collision_link_list,
+                                     vertices_local_by_link):
+            world_vertices_by_link.append(
+                verts_local @ link.worldrot().T + link.worldpos())
+
+        for li, lj in self_pairs:
+            verts_i = world_vertices_by_link[li]
+            verts_j = world_vertices_by_link[lj]
+            dists = np.linalg.norm(
+                verts_i[:, np.newaxis, :] - verts_j[np.newaxis, :, :],
+                axis=-1)
+            best = float(dists.min())
+            key = tuple(sorted((link_names[li], link_names[lj])))
+            if key not in self_min_dist or best < self_min_dist[key]:
+                self_min_dist[key] = best
+            if best < dist_threshold:
+                self_collision_count[key] = (
+                    self_collision_count.get(key, 0) + 1)
+
+        for li in range(n_links):
+            verts_i = world_vertices_by_link[li]
+            for ci, (p0, p1, cap_r) in enumerate(caps):
+                best = float(
+                    segment_points_distance(p0, p1, verts_i).min()) - cap_r
+                key = (link_names[li], cap_names[ci])
+                if key not in human_min_dist or best < human_min_dist[key]:
+                    human_min_dist[key] = best
+                if best < dist_threshold:
+                    human_collision_count[key] = (
+                        human_collision_count.get(key, 0) + 1)
+
+    return dict(
+        self_min_dist=self_min_dist, human_min_dist=human_min_dist,
+        self_collision_count=self_collision_count,
+        human_collision_count=human_collision_count,
+        self_pairs=self_pairs, link_names=link_names, cap_names=cap_names,
+        n_samples=n_samples)
 
 
 def load_pairs(path):
@@ -139,7 +266,7 @@ def run(cmd):
 
 def solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
             collision_pairs_path, robot_arm, seed, extra_args):
-    cmd = [python, os.path.join(_THIS_DIR, 'solve_palm_ik.py'),
+    cmd = [python, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
           '--input-dir', palm_poses_dir,
           '--output-dir', handshake_dir,
           '--skeleton-dir', human_poses_dir,
@@ -193,9 +320,10 @@ def main():
             '場合は終了時に削除されない)。')
     parser.add_argument(
         '--output', type=str,
-        default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
-        help='書き出す干渉ペア JSON のパス (既定 collision_pairs.json。'
-            'solve_palm_ik.py --collision-pairs の既定パスと同じ)。')
+        default=os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'),
+        help='書き出す干渉ペア JSON のパス (既定 scripts/collision_pairs.'
+            'json。solve_palm_ik.py --collision-pairs の既定パスと同じ、'
+            '本番が読む実体そのものを更新する)。')
     parser.add_argument(
         '--skip-generate', action='store_true',
         help='手順 1・2 (人物生成・掌推定) を省略し、既存の --human-poses-'
@@ -256,11 +384,11 @@ def main():
 
         if not args.skip_generate:
             run([args.python,
-                os.path.join(_THIS_DIR, 'generate_random_human_poses.py'),
+                os.path.join(_SCRIPTS_DIR, 'generate_random_human_poses.py'),
                 '--num-samples', str(args.num_samples),
                 '--output-dir', args.human_poses_dir])
             run([args.python,
-                os.path.join(_THIS_DIR, 'estimate_palm_poses.py'),
+                os.path.join(_SCRIPTS_DIR, 'estimate_palm_poses.py'),
                 '--input-dir', args.human_poses_dir,
                 '--output-dir', args.palm_poses_dir])
 

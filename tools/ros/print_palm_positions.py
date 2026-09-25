@@ -18,9 +18,25 @@ viser 画面には ``run_camera_pipeline_test.py`` と同じ骨格線に加え�
 ロボットモデル (両腕を下ろした初期姿勢, IK では動かさない) と、検出できた
 左右の掌の位置に矢印 (Axis) を重ねて表示する。
 
+あわせて骨格 (関節点・ボーン線) を ``visualization_msgs/MarkerArray``
+として ``skeleton_markers`` トピック (ノードを名前空間なしで動かす通常
+の使い方では ``/skeleton_markers``) に publish するので、rviz からも
+確認できる。骨格の座標は ``--base-frame`` (既定 ``base_link``) 座標系
+なので、Marker の ``header.frame_id`` は必ず ``--base-frame`` にする
+(カメラ座標系のままではない)。``header.stamp`` は骨格推定に使った
+カラー画像の timestamp を使う -- これは camera->base の TF 変換に
+実際に使った時刻と同じなので、rviz 側の TF 表示ともずれない。
+
+rviz でロボットモデル・``launch/decompress.launch`` が作る点群と一緒に
+見るための rviz 設定・launch ファイルは ``rviz/skeleton_demo.rviz``/
+``launch/view_skeleton.launch`` を参照 (ロボット本体の bringup
+(``robot_description``/``robot_state_publisher``/joint_states の TF) は
+aero-ros-pkg 側の ``aero_startup/aero_bringup.launch`` が担っており、実機
+操作を伴うためこの launch には含めていない -- 別途起動しておくこと)。
+
 Usage
 -----
-    python3 scripts/ros/print_palm_positions.py
+    python3 tools/ros/print_palm_positions.py
 """
 
 import argparse
@@ -34,16 +50,22 @@ import numpy as np
 import rospy
 import message_filters
 import tf2_ros
+from geometry_msgs.msg import Point
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_SCRIPTS_DIR = os.path.dirname(_THIS_DIR)
-_PKG_SRC_DIR = os.path.join(_SCRIPTS_DIR, '..', 'src')
+_TOOLS_DIR = os.path.dirname(_THIS_DIR)
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+_SCRIPTS_DIR = os.path.join(_REPO_ROOT, 'scripts')
+_PKG_SRC_DIR = os.path.join(_REPO_ROOT, 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
@@ -128,6 +150,12 @@ class PrintPalmPositionsNode(object):
                          else args.max_person_distance))
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
+        # rviz で見られるように骨格を publish するトピック
+        # (座標系は self.args.base_frame -- 下の _publish_skeleton_markers
+        # 参照)。
+        self.skeleton_marker_pub = rospy.Publisher(
+            'skeleton_markers', MarkerArray, queue_size=1)
+
         self._viewer_lock = threading.Lock()
         self._skeleton_links = []
         self._palm_axes = {'R': None, 'L': None}
@@ -205,6 +233,7 @@ class PrintPalmPositionsNode(object):
             display_joint_positions = None
 
         self._update_skeleton_view(display_joint_positions)
+        self._publish_skeleton_markers(display_joint_positions, color_msg.header)
 
         if joint_positions is None:
             return
@@ -227,6 +256,75 @@ class PrintPalmPositionsNode(object):
             for link in self._skeleton_links:
                 self.viewer.add(link)
             self.viewer.redraw()
+
+    def _publish_skeleton_markers(self, joint_positions, header):
+        """骨格 (関節点・ボーン線) を ``MarkerArray`` として rviz 向けに
+        publish する。
+
+        骨格の座標はカメラ座標系ではなく ``self.args.base_frame``
+        (camera_to_base で変換済み) なので、Marker の ``header.frame_id``
+        は必ず ``self.args.base_frame`` にする (カメラの frame_id をそ
+        のまま使うと rviz 側で位置がずれる)。``header.stamp`` は
+        ``camera_to_base`` の TF 変換に実際に使った時刻 (このフレームの
+        カラー画像の timestamp) をそのまま使う。
+
+        検出が途切れた (``joint_positions is None``) フレームでは
+        ``DELETEALL`` だけを publish して、rviz 側に古い骨格を残さない。
+        """
+        marker_array = MarkerArray()
+
+        delete_marker = Marker()
+        delete_marker.header.frame_id = self.args.base_frame
+        delete_marker.header.stamp = header.stamp
+        delete_marker.ns = 'skeleton'
+        delete_marker.action = Marker.DELETEALL
+        marker_array.markers.append(delete_marker)
+
+        if joint_positions:
+            positions = skeleton_drawing.fill_missing_wrist_from_hand(
+                joint_positions)
+
+            bone_marker = Marker()
+            bone_marker.header.frame_id = self.args.base_frame
+            bone_marker.header.stamp = header.stamp
+            bone_marker.ns = 'skeleton'
+            bone_marker.id = 1
+            bone_marker.type = Marker.LINE_LIST
+            bone_marker.action = Marker.ADD
+            bone_marker.pose.orientation.w = 1.0
+            bone_marker.scale.x = 0.01
+            for start_name, end_name in skeleton_drawing.BONE_NAME_PAIRS:
+                if start_name not in positions or end_name not in positions:
+                    continue
+                rgba_255 = palm_plane_view.bone_color(
+                    '{}->{}'.format(start_name, end_name))
+                rgba = ColorRGBA(r=rgba_255[0] / 255.0, g=rgba_255[1] / 255.0,
+                                 b=rgba_255[2] / 255.0, a=rgba_255[3] / 255.0)
+                for name in (start_name, end_name):
+                    p = positions[name]
+                    bone_marker.points.append(
+                        Point(x=float(p[0]), y=float(p[1]), z=float(p[2])))
+                    bone_marker.colors.append(rgba)
+            marker_array.markers.append(bone_marker)
+
+            joint_marker = Marker()
+            joint_marker.header.frame_id = self.args.base_frame
+            joint_marker.header.stamp = header.stamp
+            joint_marker.ns = 'skeleton'
+            joint_marker.id = 2
+            joint_marker.type = Marker.SPHERE_LIST
+            joint_marker.action = Marker.ADD
+            joint_marker.pose.orientation.w = 1.0
+            joint_marker.scale.x = 0.02
+            joint_marker.scale.y = 0.02
+            joint_marker.scale.z = 0.02
+            joint_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+            for p in positions.values():
+                joint_marker.points.append(
+                    Point(x=float(p[0]), y=float(p[1]), z=float(p[2])))
+            marker_array.markers.append(joint_marker)
+
+        self.skeleton_marker_pub.publish(marker_array)
 
     def _update_palm_axes(self, palms):
         with self._viewer_lock:
@@ -285,9 +383,11 @@ class PrintPalmPositionsNode(object):
 
     def spin(self):
         print('viser のブラウザ画面で骨格・ロボット・掌の位置を確認しつつ、'
-              'ターミナルに base_link 座標系での掌位置が print され続けます '
+              'rviz では ~skeleton_markers (MarkerArray, frame_id={}) '
+              'で骨格を確認できます。ターミナルには base_link 座標系での'
+              '掌位置が print され続けます '
               '(--print-interval={:.1f} 秒間隔)。'.format(
-                  self.args.print_interval))
+                  self.args.base_frame, self.args.print_interval))
         rospy.spin()
 
 

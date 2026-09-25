@@ -17,9 +17,9 @@ MediaPipe 形式の骨格・掌の
    が判定し、`offered_hand` (`"R"` / `"L"` / `null`) として同じ JSON
    に入れる。
 
-3. **`scripts/draw_random_human_poses.py`**
-   手順 1・2 で生成した JSON を読み込み、SMPLの人体メッシュ・骨格・左右
-   の掌の座標系をビューアで表示する。手繋ぎに使うと判定された手を赤で描く。
+3. (開発用、本番パイプラインの一部ではない) 手順 1・2 の JSON を目視確認
+   したい場合は `tools/draw_random_human_poses.py` が使える。詳細は
+   [`docs/dev_tools.md`](docs/dev_tools.md) 参照。
 
 4. **`scripts/solve_palm_ik.py`**
    手順 2 の JSONを入力とし、人間の手にロボットが触れる干渉回避付き全身 
@@ -107,8 +107,7 @@ generate_random_human_poses.py  (既定の出力先: random_human_poses/)
         ▼
 estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: random_palm_poses/)
         │  (左右の掌の position/rot (または None) + offered_hand)
-        ├──▶ draw_random_human_poses.py  (既定の入力先: random_human_poses/, 掌: random_palm_poses/)
-        │        (viserで表示)
+        ├──▶ (開発用) tools/draw_random_human_poses.py で viser 表示して確認できる
         ▼
 solve_palm_ik.py  (既定の入力先: random_palm_poses/, skeleton: random_human_poses/, 出力先: random_handshake_poses/)
         │  (IK 後の台車位置/全関節角/手先姿勢)
@@ -119,14 +118,14 @@ view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handsha
          (SMPL メッシュ + ロボットモデルを viserで表示)
 ```
 
-`generate_random_human_poses.py`/`estimate_palm_poses.py`/`draw_random_
-human_poses.py`/`solve_palm_ik.py`/`plan_handshake_motion.py`/
-`view_handshake_poses.py` の
-`--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
+`generate_random_human_poses.py`/`estimate_palm_poses.py`/
+`solve_palm_ik.py`/`plan_handshake_motion.py`/`view_handshake_poses.py`
+の `--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
 `--handshake-dir` は、いずれも `scripts/` 直下の
 `random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/`/
 `random_motion_poses/` が既定値になっているため、指定を省略すれば 1〜5
-はそのままつながる。
+はそのままつながる ([`docs/dev_tools.md`](docs/dev_tools.md) の開発用
+ツール群も、既定ではこれらと同じディレクトリを読み書きする)。
 
 ## 環境構築
 
@@ -194,7 +193,7 @@ GPU 版 jax は起動時にデバイスメモリの確保を試み、大きい�
 
 `view_handshake_poses.py` が既定で使う`aero_with_feetech_hand.urdf` 
 は`feetech_hand` パッケージから持ってくる必要がある。`aero_demo.
-aero_urdf_setup.load_aero` (`view_handshake_poses.py`/`view_aero_
+aero_urdf_setup.load_aero` (`view_handshake_poses.py`/`tools/view_aero_
 collision_model.py` が `Aero(...)` の代わりに使う) が初回呼び出し時に
 自動で URDF・メッシュを `~/.skrobot/` 以下に配置するので、**catkin
 ワークスペースの source や `ROS_PACKAGE_PATH` は不要**。`feetech_hand`
@@ -218,8 +217,8 @@ python3 generate_random_human_poses.py --num-samples 100
 # 2. 骨格から左右の掌の位置姿勢を推定 (既定で 1. の出力を読み、scripts/random_palm_poses/ に保存)
 python3 estimate_palm_poses.py
 
-# 3. viser で表示 (既定で 1./2. の出力を読む)
-python3 draw_random_human_poses.py
+# 3. (開発用) viser で表示して 1./2. の結果を目視確認したい場合
+python3 ../tools/draw_random_human_poses.py
 
 # 4. 人が差し出していると判定された手 (2. の offered_hand) に、その反対側の
 #    ロボットの腕で触れる全身 IK を解く (offered_hand が null の人物は対象外)
@@ -245,27 +244,30 @@ python3 view_handshake_poses.py
 使うロボットの腕は `--robot-arm` で変更できる (既定のは人間の手の
 反対側)。
 
-`draw_random_human_poses.py` は加えて
-`--advance-mode auto` にすると `--pause` 秒ごとに自動で次の人物へ進み、
-`--output-dir` を指定すると表示した各姿勢の画像をその都度保存する
+上記の 3. を含め、grid search・データ収集・ラベル付けなど本番パイプライン
+に必須ではない開発・デバッグ用のプログラムは `tools/` (ROS 依存のものは
+`tools/ros/`) にまとめてある。一覧・使い方は
+[`docs/dev_tools.md`](docs/dev_tools.md) を参照。
 
 ## 実カメラ入力: 掌差し出しクリップの収集とカメラ無しでのテスト
 
 実カメラで動かすパイプライン (`scripts/ros/run_camera_pipeline_test.py`)
-に加えて、`scripts/ros/record_palm_offer_clips.py` を常時起動しておくと、
-掌の差し出しを検出するたびにその前後を rosbag クリップとして自動で
-切り出して保存できる。保存したクリップは `run_camera_pipeline_test.py`
-に `--bag` で渡せば、実カメラ・実ロボットの TF 配信なしにパイプライン
-全体をそのままテストできる。
+に加えて、(開発用) `tools/ros/record_palm_offer_clips.py` を常時起動して
+おくと、掌の差し出しを検出するたびにその前後を rosbag クリップとして
+自動で切り出して保存できる。保存したクリップは `run_camera_pipeline_
+test.py` に `--bag` で渡せば、実カメラ・実ロボットの TF 配信なしに
+パイプライン全体をそのままテストできる (このデータ収集・ラベル付け系の
+開発用ツール一式は [`docs/dev_tools.md`](docs/dev_tools.md) にまとめて
+ある)。
 
 ### 1. `record_palm_offer_clips.py`: クリップの録画
 
 実カメラ・実ロボットが動いている状態で実行する:
 
 ```bash
-python3 scripts/ros/record_palm_offer_clips.py
+python3 tools/ros/record_palm_offer_clips.py
 # 保存先を変えたい場合
-python3 scripts/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
+python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 ```
 
 `Ctrl-C` などで止めるまで無期限に動き続け、その間に検出した掌の差し出しを連番のファイル名

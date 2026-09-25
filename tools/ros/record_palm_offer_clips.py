@@ -30,8 +30,8 @@ lookup_frame_position``) -- はすべて ``run_camera_pipeline_test.py`` と
 
 Usage
 -----
-    python3 scripts/ros/record_palm_offer_clips.py
-    python3 scripts/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
+    python3 tools/ros/record_palm_offer_clips.py
+    python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 """
 
 import argparse
@@ -52,8 +52,10 @@ from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_SCRIPTS_DIR = os.path.dirname(_THIS_DIR)
-_PKG_SRC_DIR = os.path.join(_SCRIPTS_DIR, '..', 'src')
+_TOOLS_DIR = os.path.dirname(_THIS_DIR)
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+_SCRIPTS_DIR = os.path.join(_REPO_ROOT, 'scripts')
+_PKG_SRC_DIR = os.path.join(_REPO_ROOT, 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 if _SCRIPTS_DIR not in sys.path:

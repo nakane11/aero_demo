@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Aeroの干渉(コリジョン)モデルをviser viewerで可視化する.
+"""Aeroの干渉(コリジョン)モデルをviser viewerで可視化する (デバッグ用).
 
-scikit-robotに付属する `skr convert-urdf-to-primitives`
-(skrobot.urdf.convert_meshes_to_primitives) を使い、Aeroのメッシュ形状を
-box/cylinder/sphereなどのプリミティブ形状に近似変換したURDFを生成する。
-生成したURDFをもう一体のロボットとして読み込み、元のAero(不透明)に重ねて
-半透明で表示することで、干渉モデルの形状を確認できる。
+``aero_demo.collision_model.build_collision_model_urdf`` (本番の
+``solve_palm_ik.py``/``handshake_viewer_common.py`` も使う、プリミティブ
+近似 URDF を作る処理そのもの) が生成したURDFをもう一体のロボットとして
+読み込み、元のAero(不透明)に重ねて半透明で表示することで、干渉モデルの
+形状を確認できる。この可視化そのものは本番パイプラインでは使わない
+デバッグ用ツール。
 """
 import argparse
 import os
 import sys
-from pathlib import Path
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
@@ -18,46 +18,9 @@ if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402  (パス追加後に import)
+from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
-from skrobot.urdf import convert_meshes_to_primitives  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
-
-
-def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
-    """Aero URDFのvisual/collisionメッシュをプリミティブ形状に変換する.
-
-    Parameters
-    ----------
-    urdf_path : str
-        変換元のURDFファイルパス。
-    primitive_type : str or None
-        'box' / 'cylinder' / 'sphere' を指定すると全リンクをその形状に強制する。
-        Noneの場合はリンクごとに最も近い形状を自動選択する。
-    force : bool
-        既に生成済みのURDFがあっても作り直すかどうか。
-
-    Returns
-    -------
-    output_path : Path
-        生成されたプリミティブ近似URDFのパス。
-    """
-    urdf_path = Path(urdf_path)
-    output_path = urdf_path.parent / f"{urdf_path.stem}_primitives.urdf"
-
-    if output_path.exists() and not force:
-        print(f"[skip] 既存の干渉モデルURDFを再利用します: {output_path}")
-        return output_path
-
-    print(f"[convert] {urdf_path} -> {output_path}")
-    modified = convert_meshes_to_primitives(
-        str(urdf_path),
-        str(output_path),
-        convert_visual=True,
-        convert_collision=True,
-        primitive_type=primitive_type,
-    )
-    print(f"[convert] {modified} 個のジオメトリをプリミティブに変換しました")
-    return output_path
 
 
 def main():

@@ -40,11 +40,11 @@ clips.py``/``run_camera_pipeline_test.py`` のようにライブ購読はしな�
 Usage
 -----
     # 判定器なしで連続録画した bag から、2.5 秒おきにサンプリング (既定)
-    python3 scripts/ros/extract_skeletons_from_bag.py \
+    python3 tools/ros/extract_skeletons_from_bag.py \
         --bag session1.bag --output-dir /tmp/offer_dataset
 
     # record_palm_offer_clips.py が切り出した bag から 1 本 1 サンプル
-    python3 scripts/ros/extract_skeletons_from_bag.py \
+    python3 tools/ros/extract_skeletons_from_bag.py \
         --bag palm_offer_clips/*.bag --output-dir /tmp/offer_dataset \
         --single-sample
 """
@@ -63,8 +63,10 @@ import rosbag
 import tf2_ros
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_SCRIPTS_DIR = os.path.dirname(_THIS_DIR)
-_PKG_SRC_DIR = os.path.join(_SCRIPTS_DIR, '..', 'src')
+_TOOLS_DIR = os.path.dirname(_THIS_DIR)
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+_SCRIPTS_DIR = os.path.join(_REPO_ROOT, 'scripts')
+_PKG_SRC_DIR = os.path.join(_REPO_ROOT, 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 if _SCRIPTS_DIR not in sys.path:

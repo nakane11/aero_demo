@@ -45,12 +45,12 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 import solve_palm_ik as spik  # noqa: E402
-from view_aero_collision_model import build_collision_model_urdf  # noqa: E402
 
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 
+from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 
@@ -141,12 +141,13 @@ def remove_obstacles_gui(viewer):
 def build_robot_collision_overlay(robot, primitive_type=None,
                                   force_convert=False):
     """``solve_palm_ik.py``/``plan_handshake_motion.py`` が干渉回避に
-    使ったのと同じロボット自身の近似ジオメトリを、``view_aero_collision_
-    model.py`` と全く同じ方法でもう一体の ``skrobot.model.RobotModel``
-    として読み込む。
+    使ったのと同じロボット自身の近似ジオメトリを、``tools/view_aero_
+    collision_model.py`` と全く同じ方法でもう一体の ``skrobot.model.
+    RobotModel`` として読み込む。
 
-    ``build_collision_model_urdf`` (``view_aero_collision_model.py``/
-    ``solve_palm_ik.apply_collision_model`` と共通) が ``robot.urdf_path``
+    ``build_collision_model_urdf`` (``aero_demo.collision_model``、
+    ``solve_palm_ik.apply_collision_model``/``tools/view_aero_collision_
+    model.py`` と共通) が ``robot.urdf_path``
     から生成した box/cylinder/sphere のプリミティブ近似 URDF をキャッシュ
     する (既に生成済みならそれを再利用し、``force_convert`` を指定した
     ときだけ作り直す) ので、``skr convert-urdf-to-primitives`` で見えるの
