@@ -146,6 +146,7 @@ from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr  # noqa: E402
 from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
+from skrobot.model import LinearJoint  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 from skrobot.planner.trajectory_optimization.solvers import (  # noqa: E402
     create_solver)
@@ -233,6 +234,18 @@ TIME_LIMIT_MAX_ITERATIONS = 100
 BASE_CORRECTION_MAX_ATTEMPTS = 3
 BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
 BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
+# hover 目標・押し込み終了時に、腕が指令に追いつくのを待つときの
+# パラメータ (_wait_joint_settle 参照)。実機の腕は制御周期 15Hz + サーボ
+# への到達時間 (overlap 約 133ms) の分、指令から約 0.2 秒遅れて追従し、
+# wait_interpolation はその遅れが解消する前に返る (2026-09-25 実機ログ:
+# 上限速度で動いていた l_shoulder_r が約 7 度遅れ、hover 時点で手先が
+# 関節由来だけで約 67mm (実際の手が約 5cm 高い)、押し込み終了直後 64mm
+# -> 1 秒後 14.5mm)。関節角だけから FK で求めた手先のずれ (台車のずれは
+# 含まない) が TOLERANCE 以下になるまで、最大 TIMEOUT 秒待つ (押し込み
+# 終了時は接触の負荷で届かないこともあるため、時間切れでも止めない)。
+JOINT_SETTLE_HAND_TOLERANCE = 0.01  # [m]
+JOINT_SETTLE_TIMEOUT = 1.5  # [s]
+JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -1466,13 +1479,123 @@ class HandshakePipelineNode(object):
 
         self._correct_base_residual(start_odom_coords, final_traj_point)
 
+        # 腕は実機側の遅延で指令から約 0.2 秒遅れて追従し、
+        # wait_interpolation はその遅れが解消する前に返る (JOINT_SETTLE_
+        # HAND_TOLERANCE 参照)。遅れたまま押し込みを始めると hover を経由
+        # しない (手が高い位置から押し付ける) 動きになるため、hover 目標に
+        # 腕が追いつくのを待ってから押し込む。
+        robot_arm = result['robot_arm']
+        self._wait_joint_settle(
+            'hover', display_waypoints[reach_boundary - 1], joint_names,
+            robot_arm)
+
         if reach_boundary < len(display_waypoints):
             self._execute_waypoint_segment(
                 display_waypoints[reach_boundary - 1:], joint_names)
+            # 押し込み自体も遅れて完了するので、押し付け終わってから
+            # 「どうぞ」と発話する。
+            self._wait_joint_settle(
+                '押し込み終了', display_waypoints[-1], joint_names,
+                robot_arm)
 
         self._say(self.args.speech_done_text)
 
         print('[execute] 実行を終了しました。')
+
+    def _wait_joint_settle(self, label, waypoint, joint_names, robot_arm,
+                           tolerance=JOINT_SETTLE_HAND_TOLERANCE,
+                           timeout=JOINT_SETTLE_TIMEOUT):
+        """実機の腕が ``waypoint`` の関節角に追いつく (関節角だけから求めた
+        手先のずれが ``tolerance`` 以下になる) まで、最大 ``timeout`` 秒
+        待つ。到達直後と、待った場合は待機後の状態を ``[debug][joint]``
+        ログに出す。時間切れでも (接触の負荷等で届かない場合があるため)
+        止めずにそのまま戻る。
+        """
+        start = time.time()
+        hand_err, over = self._joint_tracking_error(
+            waypoint, joint_names, robot_arm)
+        self._print_joint_tracking(
+            '{} 到達直後'.format(label), hand_err, over)
+        if np.linalg.norm(hand_err) <= tolerance:
+            return
+        while not rospy.is_shutdown():
+            if time.time() - start >= timeout:
+                print('[execute][WARN] {}: {:.1f} 秒待っても腕が指令に'
+                      '追いつきませんでした (手先のずれ {:.1f}mm > {:.1f}mm)。'
+                      'このまま進みます。'.format(
+                          label, timeout, np.linalg.norm(hand_err) * 1e3,
+                          tolerance * 1e3))
+                break
+            rospy.sleep(JOINT_SETTLE_POLL_PERIOD)
+            hand_err, over = self._joint_tracking_error(
+                waypoint, joint_names, robot_arm)
+            if np.linalg.norm(hand_err) <= tolerance:
+                break
+        self._print_joint_tracking(
+            '{} 待機後 ({:.2f}s)'.format(label, time.time() - start),
+            hand_err, over)
+
+    @staticmethod
+    def _print_joint_tracking(label, hand_err, over):
+        """``_joint_tracking_error`` の結果を ``[debug][joint]`` ログに出す。"""
+        print('[debug][joint] {}: 手先のずれ(関節角のみ由来)={:.1f}mm '
+              '(dx={:+.1f} dy={:+.1f} dz={:+.1f}mm, world系), '
+              '1deg/5mm超の関節 {}個: {}'.format(
+                  label, np.linalg.norm(hand_err) * 1e3,
+                  hand_err[0] * 1e3, hand_err[1] * 1e3, hand_err[2] * 1e3,
+                  len(over), ', '.join(over) if over else 'なし'))
+
+    def _joint_tracking_error(self, waypoint, joint_names, robot_arm):
+        """``waypoint`` の指令関節角と実機の現在の関節角の差を求める。
+
+        Returns
+        -------
+        (hand_err, over)
+            ``hand_err`` はその差による手先位置のずれ (指令 - 実機、world
+            系 [m]、台車の位置ずれは含まない、関節角だけから FK で求めた
+            ``{robot_arm}arm_end_coords`` の差)。``over`` は差が 1deg
+            (直動関節は 5mm) を超えた関節の表示文字列 (大きい順)。
+
+        ``self.ri.angle_vector()`` は ``self.real_robot`` を実機の関節角で
+        上書きするので、呼び出し前の ``self.real_robot`` の姿勢は最後に
+        戻す (以後の区間の waypoint 組み立てに影響させないため)。
+        """
+        saved_av = self.real_robot.angle_vector().copy()
+        try:
+            actual_av = self.ri.angle_vector().copy()
+            name_to_angle = dict(zip(joint_names,
+                                     waypoint['joint_angle_vector']))
+            for joint in self.real_robot.joint_list:
+                if joint.name in name_to_angle:
+                    joint.joint_angle(name_to_angle[joint.name])
+            target_av = self.real_robot.angle_vector().copy()
+            end_coords = getattr(self.real_robot,
+                                 '{}arm_end_coords'.format(robot_arm))
+            target_hand = end_coords.worldpos().copy()
+            self.real_robot.angle_vector(actual_av)
+            actual_hand = end_coords.worldpos().copy()
+        finally:
+            self.real_robot.angle_vector(saved_av)
+
+        controller_joint_names = {
+            name for param in self.ri.controller_param_table[
+                self.ri.controller_type]
+            for name in param['joint_names']}
+        diffs = self.ri.sub_angle_vector(target_av, actual_av)
+        entries = []  # (閾値で正規化した大きさ, 表示文字列)
+        for joint, diff in zip(self.real_robot.joint_list, diffs):
+            if joint.name not in controller_joint_names:
+                continue
+            if isinstance(joint, LinearJoint):
+                entries.append((abs(diff) / 0.005,
+                                '{}={:+.1f}mm'.format(joint.name, diff * 1e3)))
+            else:
+                entries.append((abs(diff) / math.radians(1.0),
+                                '{}={:+.1f}deg'.format(
+                                    joint.name, math.degrees(diff))))
+        entries.sort(reverse=True)
+        over = [text for score, text in entries if score > 1.0]
+        return target_hand - actual_hand, over
 
     def _say(self, text):
         """``text`` をロボットに発話させる (非ブロッキング)。
