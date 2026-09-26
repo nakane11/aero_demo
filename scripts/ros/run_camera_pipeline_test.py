@@ -175,90 +175,64 @@ ARM_HEAD_NOD_PITCH_DEG = 25.0
 # ゆっくりめにしてある。
 ARM_HEAD_NOD_MOVE_TIME = 5
 
-# 実機で軌道を再生するときの速度倍率。waypoint 間の既定所要時間
-# (motion['dt'] = --dt) をこの値で割って実行する (_execute_on_robot
-# 参照)。--dt は軌道最適化の速度/加速度コストの正規化にも使われるため、
-# 実行速度だけを変えたいときは --dt ではなくこちらを変える。台車の
-# 最大速度で間に合わない区間は _scaled_time_list で別途延ばされ、この
-# 場合は EXECUTION_SPEED_SCALE を上げても実際の所要時間は変わらない
-# (2026-09-25 実機検証、腕の関節可動速度制限で move_time が自動的に
-# 引き延ばされる場合も同様)。台車の回頭・並進もこの倍率の恩恵を受ける
-# ようにするには、BASE_CORRECTION_MAX_VEL/ANGVEL を実機の
-# base_controller (aero_base_link.yaml、ロボット本体側にあり、この
-# リポジトリの jsk_aero_startup/config/aero_base_link.yaml は単なる
-# 参考コピーで自動反映されない) の実際の設定に必ず合わせること。
-# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため、下記の
-# EXECUTION_TARGET_MAX_VEL/ANGVEL・JOINT_VEL_RATIO と揃えて 1.5 -> 1.2。
-EXECUTION_SPEED_SCALE = 1.2
+# 実機で軌道を再生するときの waypoint 間の所要時間の下限 [秒]。所要時間
+# は固定の dt (motion['dt']、軌道最適化のコスト正規化用) ではなく、区間
+# ごとに律速する軸が上限 × VEL_LIMIT_RATIO になるよう _limited_time_list
+# で決める (2026-09-26 ユーザー要望、それまでは dt / EXECUTION_SPEED_SCALE
+# が下限だった)。この下限はほとんど動かない区間の時間が 0 に潰れない
+# ためだけのもので、腕のコントローラの制御周期 (15Hz) 1 周期分にしてある。
+MIN_SEGMENT_TIME = 1.0 / 15.0
 
-# 通常再生 (_scaled_time_list、waypoint 間の所要時間計算) で "実機が
-# 出せる速度としてこれ以上は使わない" という再生速度の目標上限。
-# BASE_CORRECTION_MAX_VEL/ANGVEL (実機の真の上限、下記) とは別物にして
-# あるのは、ロボット本体側 (aero_base_link.yaml) の上限を余裕を持って
-# 上げても、その分自動的にモーションが速くならないようにするため
-# (2026-09-25 ユーザー要望: 合計移動時間を約4秒程度に保ちたい)。
-# _scaled_time_list はこの値と実機の真の上限の小さい方を使う (実機の
-# 上限がこれより低ければ、無理に速い前提で時間を見積もったりしない)。
-# 現在の値は接近 (waypoint20個) + 押し込み (6個) の実測例で合計約4秒に
-# なるよう逆算したもの (詳細は run_camera_pipeline_test.py の会話ログ
-# 2026-09-25 参照)。押し込み前の残差補正 (_correct_base_residual) は
-# ここでは頭打ちにせず、引き続き実機の真の上限をそのまま使う (残差の
-# 補正はできるだけ速く収束させたいため)。
-# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため 0.3/1.0 ->
-# 0.24/0.8 (EXECUTION_SPEED_SCALE・JOINT_VEL_RATIO も同じ割合で変更)。
-EXECUTION_TARGET_MAX_VEL = 0.24    # [m/s]
-EXECUTION_TARGET_MAX_ANGVEL = 0.8  # [rad/s]
-
-# 押し込み (post_process) 動作の直前で行う台車の位置補正
-# (_correct_base_residual 参照) のパラメータ。maxvel/maxrad は実機の
-# base_controller (pr2_base_trajectory_action) が実際に使っている上限
-# (aero_base_link.yaml の base_link_x/y/pan の max_velocity) に合わせて
-# あるが、この yaml は台車自身 (ロボット本体) の中にあり、
+# 台車の速度上限。実機の base_controller (pr2_base_trajectory_action) が
+# 使っている aero_base_link.yaml の base_link_x/y/pan の max_velocity と
+# 必ず一致させること。この yaml は台車自身 (ロボット本体) の中にあり、
 # jsk_aero_startup/config/aero_base_link.yaml (このリポジトリのコピー、
 # 単なる参考用でロボット実機には自動反映されない) とは値が一致すると
-# は限らない。この値を超える指令は pr2_base_trajectory_action 内で
-# 頭打ちにされるため、変更するときは必ずロボット実機側の設定を確認
-# すること。2026-09-25 時点でロボット実機側は base_link_x/y=0.3,
+# は限らない。2026-09-25 時点でロボット実機側は base_link_x/y=0.3,
 # base_link_pan=1.0 (ssh 先で rosparam get /base_controller/
-# joint_trajectory_action/base_link_{x,y,pan}/max_velocity で確認済み)
-# で運用されている。ロボット側でこれをさらに上げても、通常再生の
-# 速度は上記 EXECUTION_TARGET_
-# MAX_VEL/ANGVEL で頭打ちになる (_scaled_time_list 参照)。当初 skrobot
-# (ROSRobotMoveBaseInterface.go_pos_unsafe_wait) の値 (0.295/0.495、
-# Aero の実際の設定とは無関係の値) をそのまま流用していたところ、実機
-# ログで sec (残差解消にかける時間) を実際の 2.5 倍速く見積もってしまい、
-# 時間切れで毎回残差の 3-5 割程度しか補正できず 3 回で収束しなかった
-# (2026-09-24 実機検証、回頭残差 68.2 度に対し sec=3.0s で実移動 31.9
-# 度 = 0.2rad/s 換算の 34.4 度とほぼ一致)。
+# joint_trajectory_action/base_link_{x,y,pan}/max_velocity で確認済み)。
+# pr2_base_trajectory_action はこれを超える指令速度を odom 系の軸ごとに
+# 頭打ちにする。当初 skrobot (ROSRobotMoveBaseInterface.go_pos_unsafe_
+# wait) の値 (0.295/0.495、Aero の実際の設定とは無関係の値) をそのまま
+# 流用していたところ、sec (残差解消にかける時間) を実際の 2.5 倍速く
+# 見積もってしまい、時間切れで毎回残差の 3-5 割程度しか補正できなかった
+# (2026-09-24 実機検証)。
+BASE_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
+BASE_MAX_ANGVEL = 1.0  # [rad/s] 実機の base_link_pan の max_velocity
+
+# 台車 (BASE_MAX_VEL/ANGVEL) と腕・首・腰・リフター (URDF の velocity) の
+# 速度上限のうち、指令で使ってよい割合 (2026-09-26 ユーザー要望で両方
+# 0.6 に統一、同日 0.8 -> 0.9 に変更)。上限を超えた指令を実機側で頭打ち
+# にされて遅れ、後から補正するのではなく、初めから超えない指令を送る
+# ため、_limited_time_list で実機側が補間に使う 3 次スプラインの瞬間
+# 速度の最大値がちょうどこの割合になるよう区間の所要時間を決める (区間の
+# 平均速度だけを見ると、速度 0 の境界を持つ区間では瞬間速度が平均の最大
+# 1.5 倍になる)。実機の
+# aero_ros_controller も PositionJointSaturationInterface で URDF の
+# velocity を超える指令を制御周期ごとに頭打ちにする (実機の
+# robot_description と skrobot の URDF の velocity は一致、2026-09-25
+# 確認、2026-09-25 実機ログでは頭打ちによる押し込み区間先頭の約 6 度の
+# 追従ずれを確認)。上限との差は、pr2_base_trajectory_action の位置誤差の
+# P 補正が指令速度に上乗せされる分の余裕も兼ねる。
+VEL_LIMIT_RATIO = 0.9
+# 加速度の上限を、上記の速度の上限 (× VEL_LIMIT_RATIO) まで何秒かけて
+# 加速するかで表したもの [秒]。台車・関節とも同じ値を使う (台車・関節の
+# 加速度の仕様値が無いため、2026-09-26 ユーザー要望「ゆるやかに加減速
+# してほしい」に対し仮に 0.5 秒とし、同日ユーザー指示で 0.3 秒に変更したが、
+# 最後の手先位置がずれるようになった気がするとの報告 (odom・関節角の
+# ログ上はずれ無し、台車のスリップの疑い、未確認) で 0.4 秒に変更)。
+# 大きくするほどゆるやかになるが、動き出し・止まり際の区間が延びて全体の
+# 所要時間も延びる。
+ACCEL_TIME = 0.4
+# 上記を満たす区間の所要時間を求める反復の上限回数 (これで収まらなければ
+# 全区間を一律に延ばして必ず上限内にする)。
+TIME_LIMIT_MAX_ITERATIONS = 100
+
+# 押し込み (post_process) 動作の直前で行う台車の位置補正
+# (_correct_base_residual 参照) のパラメータ。
 BASE_CORRECTION_MAX_ATTEMPTS = 3
-BASE_CORRECTION_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
-BASE_CORRECTION_MAX_ANGVEL = 1.0  # [rad/s] 実機の base_link_pan の max_velocity
-# 実機の上限のうちどこまで使うかの安全率。上げるほど速くなるが、実機が
-# 追従しきれず残差が残るリスクも上がる (2026-09-24 実機検証で 0.8 から
-# 変えずに運用してきた実績あり)。2026-09-25 ユーザー要望によりさらに
-# 少し速くするため 0.8 -> 0.9 に変更。実機で追従できているか (直後の
-# [debug][segment] の「差」ログ) を確認しながら調整すること。
-BASE_CORRECTION_VEL_RATIO = 0.9
 BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
 BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
-
-# 腕・首・腰・リフターの関節速度上限 (URDF の velocity) のうち、通常再生で
-# どこまで使うかの安全率 (台車の BASE_CORRECTION_VEL_RATIO の関節版、
-# _joint_limited_time_list 参照)。実機の aero_ros_controller は
-# PositionJointSaturationInterface で URDF の velocity を超える指令を
-# 制御周期ごとに頭打ちにする (実機の robot_description と skrobot の URDF
-# の velocity は一致、2026-09-25 確認)。skrobot の angle_vector_sequence は
-# 区間の平均速度が上限ちょうどになるまでしか時間を延ばさないため、速度 0
-# の境界を持つ区間では 3 次スプラインの瞬間速度が上限を超え、実機側で
-# 頭打ちにされて指令より遅れていた (2026-09-25 実機ログ、押し込み区間の
-# 先頭で約 6 度の追従ずれ)。そこで、スプラインの瞬間速度の最大値がこの
-# 割合以下になるまで、区間の所要時間を送信前に延ばす。
-# 2026-09-25 ユーザー要望で再生速度全体を 0.8 倍にするため 0.9 -> 0.72
-# (= 0.9 × 0.8、EXECUTION_SPEED_SCALE・EXECUTION_TARGET_MAX_VEL/ANGVEL も
-# 同じ割合で変更)。
-JOINT_VEL_RATIO = 0.72
-# 上記を満たすまで区間の所要時間を延ばす反復の上限回数。
-JOINT_TIME_MAX_ITERATIONS = 20
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -1403,8 +1377,12 @@ class HandshakePipelineNode(object):
                 joint.joint_angle(name_to_initial_angle[joint.name])
         self.real_robot.neck_p_joint.joint_angle(
             np.deg2rad(ARM_HEAD_NOD_PITCH_DEG))
-        self.ri.angle_vector(self.real_robot.angle_vector(),
-                             ARM_HEAD_NOD_MOVE_TIME)
+        target_av = self.real_robot.angle_vector()
+        # 静止 -> 静止の 1 区間でも、瞬間速度のピークは平均の 1.5 倍になる
+        # ので、関節速度上限 (VEL_LIMIT_RATIO) を超えない時間まで延ばす。
+        move_time, = self._limited_time_list(
+            [target_av], None, [ARM_HEAD_NOD_MOVE_TIME])
+        self.ri.angle_vector(target_av, move_time)
         print('[ARM] 腕を初期姿勢まで下ろし、首を {:.0f} 度まで下げました。'
               .format(ARM_HEAD_NOD_PITCH_DEG))
 
@@ -1470,7 +1448,6 @@ class HandshakePipelineNode(object):
             return
 
         joint_names = motion['joint_names']
-        move_time = max(motion['dt'] / EXECUTION_SPEED_SCALE, 0.01)
         # 接近区間 (display_waypoints[:reach_boundary]) は hover 目標
         # (waypoint index reach_boundary - 1) で終わり、押し込み区間
         # (display_waypoints[reach_boundary - 1:]、先頭に hover 目標を含む)
@@ -1485,14 +1462,13 @@ class HandshakePipelineNode(object):
         self._say(self.args.speech_start_text)
 
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
-            display_waypoints[:reach_boundary], joint_names, move_time)
+            display_waypoints[:reach_boundary], joint_names)
 
         self._correct_base_residual(start_odom_coords, final_traj_point)
 
         if reach_boundary < len(display_waypoints):
             self._execute_waypoint_segment(
-                display_waypoints[reach_boundary - 1:], joint_names,
-                move_time)
+                display_waypoints[reach_boundary - 1:], joint_names)
 
         self._say(self.args.speech_done_text)
 
@@ -1510,7 +1486,7 @@ class HandshakePipelineNode(object):
         except Exception as exc:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             print('[speech] 発話に失敗しました ({})。'.format(exc))
 
-    def _execute_waypoint_segment(self, waypoints, joint_names, move_time):
+    def _execute_waypoint_segment(self, waypoints, joint_names):
         """``waypoints`` (先頭要素を基準にした 1 区間分) を、waypoint の
         境界で止まらない滑らかな軌道として実機で実行する (台車・腕は並行
         して動く、``_execute_on_robot`` が分割前に行っていたのと同じ処理)。
@@ -1566,24 +1542,17 @@ class HandshakePipelineNode(object):
         # ここまでで区間分の関節角・移動量を集め終えたので、それぞれ 1 回の
         # ゴールとしてまとめて送る (どちらも非ブロッキング)。
         #
-        # waypoint 間の所要時間は一律 move_time (=motion['dt']) ではなく、
-        # 実機の base_controller の最大速度で物理的に間に合う時間まで
-        # 必要に応じて延ばす (_scaled_time_list 参照)。特に初期位置から
-        # 接近開始位置までの直進 (lead-in) は、以前は大きな回頭を少ない
-        # waypoint 数に均等割りしていたため
-        # motion['dt'] のままでは実機が追従できないことが実機検証
-        # (2026-09-24) で判明した。同様に、腕・首・腰・リフターの関節速度
-        # 上限で間に合わない区間も延ばす (_joint_limited_time_list 参照)。
-        # 台車と腕には同じ time_list を渡し、どちらか遅い方に合わせて
-        # その区間だけもう片方もゆっくり動かす (skrobot の angle_vector_
-        # sequence に腕側の時間だけを延ばさせると、台車とのタイミングが
-        # ずれて干渉検証済みの経路から外れるため)。
-        time_list = (
-            self._scaled_time_list(base_trajectory_points, move_time)
-            if base_trajectory_points else [move_time] * len(waypoints))
-        if arm_angle_vectors:
-            time_list = self._joint_limited_time_list(
-                arm_angle_vectors, time_list)
+        # waypoint 間の所要時間は固定の dt (motion['dt']) ではなく、区間
+        # ごとに台車と腕・首・腰・リフターのうち律速する軸の指令の瞬間
+        # 速度がちょうど上限 × VEL_LIMIT_RATIO になるよう決める
+        # (_limited_time_list 参照、下限は MIN_SEGMENT_TIME)。台車と腕には
+        # 同じ time_list を渡し、律速しない側はその区間だけ上限より遅く
+        # 動かす (skrobot の angle_vector_sequence に腕側の時間だけを
+        # 延ばさせると、台車とのタイミングがずれて干渉検証済みの経路から
+        # 外れるため)。
+        time_list = self._limited_time_list(
+            arm_angle_vectors, base_trajectory_points,
+            [MIN_SEGMENT_TIME] * len(waypoints))
         start_odom_coords = None
         if arm_angle_vectors:
             self.ri.angle_vector_sequence(arm_angle_vectors, time_list)
@@ -1607,10 +1576,8 @@ class HandshakePipelineNode(object):
                       math.degrees(matrix2ypr(start_odom_coords.rotation)[0]),
                       sum(time_list),
                       ', '.join('{:.2f}'.format(t) for t in time_list)))
-            self.ri.move_trajectory_sequence(
-                base_trajectory_points,
-                time_list,
-                stop=True, send_action=True, wait=False)
+            self._send_base_trajectory(
+                base_trajectory_points, time_list, wait=False)
 
         # 送信は上でまとめて 1 回だけ行っているので、完了待ちも最後に
         # まとめて 1 回だけ行う (台車・腕は並行して動く)。
@@ -1638,134 +1605,220 @@ class HandshakePipelineNode(object):
             base_trajectory_points[-1] if base_trajectory_points else None)
         return start_odom_coords, final_traj_point
 
-    @staticmethod
-    def _scaled_time_list(base_trajectory_points, default_time):
-        """``base_trajectory_points`` (区間先頭からの累積 ``[dx, dy,
-        dyaw]`` 列) から、waypoint 間の所要時間 (``move_trajectory_
-        sequence``/``angle_vector_sequence`` の time_list) を求める。
+    def _send_base_trajectory(self, base_trajectory_points, time_list,
+                              wait):
+        """``base_trajectory_points`` (区間先頭の台車姿勢を基準にした累積
+        ``[dx, dy, dyaw]`` 列) を ``time_list`` で台車に送る。
 
-        既定は ``default_time`` (通常 ``motion['dt'] / EXECUTION_SPEED_
-        SCALE``) だが、想定速度 (``EXECUTION_TARGET_MAX_VEL``/
-        ``ANGVEL`` と実機の真の上限 ``BASE_CORRECTION_MAX_VEL``/
-        ``ANGVEL`` の小さい方、安全率 ``BASE_CORRECTION_VEL_RATIO``)
-        で物理的に間に合わない区間だけ、間に合うだけの時間まで個別に
-        延ばす (間に合う区間は ``default_time`` のまま、全体を一律に
-        遅くしたりはしない)。実機の真の上限の方が優先されるので、
-        ロボット本体側の上限が目標より低いうちは目標通りには速くなら
-        ないし、逆に本体側の上限を目標より上げても再生速度は目標で
-        頭打ちになる (2026-09-25 ユーザー要望)。
-
-        初期位置から接近開始位置までの直進 (lead-in、当時は大きな回頭を
-        固定の 10 個の waypoint に均等割りしていた) で ``motion['dt']`` を
-        一律に使うと大きな回頭が必要な人物では実機が追従しきれない
-        (実機検証 2026-09-24: 141.9 度の回頭に 2.0 秒しか割り当てられて
-        おらず、実機の最大回頭速度 0.2 rad/s では本来 12.4 秒程度必要
-        だったため waypoint 完了時点で 77.5 度もの残差が残った)。
+        ゴールの組み立て (odom 系への変換) は skrobot の
+        ``move_trajectory_sequence`` に任せるが、各点の速度は
+        ``_point_velocities`` (始点・終点 0、途中は前後区間の平均速度の
+        平均) で付け直してから送る。skrobot のままだと各点の速度が
+        「その点から始まる区間の平均速度」になり、静止状態から最初の
+        区間の速度へいきなり跳ぶため (2026-09-26 ユーザー要望: ゆるやかに
+        加減速させる)。``_limited_time_list`` もこの速度で判定している。
         """
-        time_list = []
-        prev = (0.0, 0.0, 0.0)
-        # 実機の真の上限より速い前提で時間を見積もると (=それだけ短い
-        # 時間しか割り当てないと) 実機が追従できず残差が残る
-        # (2026-09-24 実機検証で発生した不具合、詳細は
-        # BASE_CORRECTION_MAX_VEL のコメント参照) ため、目標速度が
-        # 実機の真の上限を上回っている場合は必ず実機の上限を優先する。
-        target_vel = min(EXECUTION_TARGET_MAX_VEL, BASE_CORRECTION_MAX_VEL)
-        target_angvel = min(EXECUTION_TARGET_MAX_ANGVEL,
-                             BASE_CORRECTION_MAX_ANGVEL)
-        for point in base_trajectory_points:
-            distance = math.hypot(point[0] - prev[0], point[1] - prev[1])
-            d_yaw = abs(point[2] - prev[2])
-            required = max(
-                distance / (target_vel * BASE_CORRECTION_VEL_RATIO),
-                d_yaw / (target_angvel * BASE_CORRECTION_VEL_RATIO))
-            time_list.append(max(default_time, required))
-            prev = point
-        return time_list
+        goal = self.ri.move_trajectory_sequence(
+            base_trajectory_points, time_list, stop=True, send_action=False)
+        points = goal.goal.trajectory.points
+        deltas = np.diff(np.vstack([
+            np.zeros(3),
+            np.asarray(base_trajectory_points, dtype=np.float64)]), axis=0)
+        point_vel = self._point_velocities(
+            deltas, np.asarray(time_list, dtype=np.float64))
+        # point_vel の x/y は区間先頭の台車の向き基準なので、ゴールの位置
+        # (odom 系) に合わせて、先頭の点の yaw (= 送信時の odom の yaw) で
+        # 回す。
+        yaw0 = points[0].positions[2]
+        cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
+        for point, (vx, vy, vyaw) in zip(points, point_vel):
+            point.velocities = [cos_yaw * vx - sin_yaw * vy,
+                                sin_yaw * vx + cos_yaw * vy,
+                                vyaw]
+        self.ri.move_base_trajectory_action.send_goal(goal.goal)
+        if wait:
+            self.ri.move_base_trajectory_action.wait_for_result()
 
-    def _joint_limited_time_list(self, arm_angle_vectors, time_list):
-        """``time_list`` (``_scaled_time_list`` で台車の速度上限まで考慮
-        済みの区間ごとの所要時間) を、腕・首・腰・リフターの関節速度上限
-        (URDF の velocity × ``JOINT_VEL_RATIO``) でも間に合うよう、必要な
-        区間だけ延ばして返す。
+    def _limited_time_list(self, arm_angle_vectors, base_trajectory_points,
+                           time_list):
+        """区間ごとの所要時間を、実機に送る指令の速度・加速度の最大値が、
+        その区間で律速する軸 (台車の並進・回頭、腕・首・腰・リフターの
+        各関節) でちょうど上限になるよう決めて返す (2026-09-26 ユーザー
+        要望、固定の dt は使わない)。速度の上限は台車が ``BASE_MAX_VEL``/
+        ``BASE_MAX_ANGVEL``、関節が URDF の velocity に ``VEL_LIMIT_RATIO``
+        を掛けたもの、加速度の上限はその速度まで ``ACCEL_TIME`` 秒かけて
+        加速する値。``time_list`` は区間ごとの所要時間の下限 (動きが小さい
+        区間でもこれより短くはしない)。
 
-        区間 i は ``avs[i] -> avs[i + 1]`` (``avs[0]`` は送信直前の実機の
-        関節角、``angle_vector_sequence`` も同じ点から補間を始める)。まず
-        台車と同じく区間の平均速度で延ばし、続けて実機の JointTrajectory
-        Controller が補間に使う 3 次スプラインの瞬間速度の最大値
-        (``_hermite_peak_speeds``) が上限以下になるまで反復して延ばす
-        (平均速度だけ見ると、速度 0 の境界を持つ区間で瞬間速度が平均の
-        最大 1.5 倍になり実機側で頭打ちにされる、``JOINT_VEL_RATIO``
-        参照)。延ばすのは上限を超える区間だけで、他の区間はそのまま。
+        ``arm_angle_vectors`` は ``angle_vector_sequence`` に渡す関節角列
+        (区間 i は ``avs[i] -> avs[i + 1]``、``avs[0]`` は送信直前の実機の
+        関節角)、``base_trajectory_points`` は ``_send_base_trajectory``
+        に渡す区間先頭からの累積 ``[dx, dy, dyaw]`` 列。どちらも None/空
+        なら判定から外す。
+
+        どちらのコントローラ (腕は JointTrajectoryController、台車は
+        pr2_base_trajectory_action) も、各点の位置・速度から 3 次エルミート
+        で補間するので、その速度・加速度の最大値で判定する (点の速度は
+        どちらも ``_point_velocities``)。区間の時間を変えると前後の点の
+        速度も変わり隣の区間の最大値も変わるため反復し、わずかでも上限を
+        超えて終わった場合は全区間を一律に延ばす (全区間を k 倍すると速度
+        は 1/k 倍、加速度は 1/k^2 倍になるので必ず収まる)。
         """
-        ri = self.ri
-        controller_joint_names = {
-            name for param in ri.controller_param_table[ri.controller_type]
-            for name in param['joint_names']}
-        # コントローラで動かさない関節 (指など) は上限なし (inf) として
-        # 判定から外す。
-        max_vel = np.array([
-            joint.max_joint_velocity * JOINT_VEL_RATIO
-            if (joint.name in controller_joint_names
-                and joint.max_joint_velocity > 0)
-            else np.inf
-            for joint in self.real_robot.joint_list])
-        avs = [ri.angle_vector()] + list(arm_angle_vectors)
-        deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
-                           for i in range(len(arm_angle_vectors))])
-        times = np.array(time_list, dtype=np.float64)
-        times = np.maximum(times, np.max(np.abs(deltas) / max_vel, axis=1))
-        for _ in range(JOINT_TIME_MAX_ITERATIONS):
-            ratio = np.max(self._hermite_peak_speeds(deltas, times) / max_vel,
-                           axis=1)
-            over = ratio > 1.0 + 1e-6
-            if not np.any(over):
+        axis_names = []
+        arm_deltas = None
+        base_deltas = None
+        if arm_angle_vectors:
+            ri = self.ri
+            controller_joint_names = {
+                name for param in ri.controller_param_table[ri.controller_type]
+                for name in param['joint_names']}
+            # コントローラで動かさない関節 (指など) は上限なし (inf) として
+            # 判定から外す。
+            arm_max_vel = np.array([
+                joint.max_joint_velocity * VEL_LIMIT_RATIO
+                if (joint.name in controller_joint_names
+                    and joint.max_joint_velocity > 0)
+                else np.inf
+                for joint in self.real_robot.joint_list])
+            avs = [ri.angle_vector()] + list(arm_angle_vectors)
+            arm_deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
+                                   for i in range(len(arm_angle_vectors))])
+            axis_names += [joint.name for joint in self.real_robot.joint_list]
+        if base_trajectory_points:
+            points = np.vstack([np.zeros(3),
+                                np.asarray(base_trajectory_points, dtype=np.float64)])
+            base_deltas = np.diff(points, axis=0)
+            axis_names += ['base_xy', 'base_yaw']
+        if not axis_names:
+            return [float(t) for t in time_list]
+        axis_names += ['{}の加速度'.format(name) for name in axis_names]
+
+        def peak_ratios(times):
+            # 区間ごと・軸ごとの (速度の最大値 / 上限) と
+            # sqrt(加速度の最大値 / 上限) (時間に対してどちらも反比例する
+            # 形にそろえる)。列は axis_names の順。
+            vel_ratios = []
+            acc_ratios = []
+            if arm_deltas is not None:
+                point_vel = self._point_velocities(arm_deltas, times)
+                vel, acc = self._hermite_peaks(arm_deltas, times, point_vel)
+                vel_ratios.append(vel / arm_max_vel)
+                acc_ratios.append(acc / (arm_max_vel / ACCEL_TIME))
+            if base_deltas is not None:
+                point_vel = self._point_velocities(base_deltas, times)
+                # pr2_base_trajectory_action は odom 系の x/y 軸ごとに頭打ちに
+                # するが、ここでの dx/dy は区間先頭の台車の向き基準なので、
+                # どの向きの軸成分でも超えないよう並進は x/y のベクトルの
+                # 大きさの最大値で判定する (回頭中のロボット座標系の成分も
+                # これ以下になる)。
+                vel_xy, acc_xy = self._hermite_peaks(
+                    base_deltas[:, :2], times, point_vel[:, :2], norm=True)
+                vel_yaw, acc_yaw = self._hermite_peaks(
+                    base_deltas[:, 2:], times, point_vel[:, 2:])
+                vel_limit = np.array([BASE_MAX_VEL, BASE_MAX_ANGVEL]) \
+                    * VEL_LIMIT_RATIO
+                vel_ratios.append(
+                    np.stack([vel_xy, vel_yaw[:, 0]], axis=1) / vel_limit)
+                acc_ratios.append(
+                    np.stack([acc_xy, acc_yaw[:, 0]], axis=1)
+                    / (vel_limit / ACCEL_TIME))
+            return np.concatenate(
+                vel_ratios + [np.sqrt(r) for r in acc_ratios], axis=1)
+
+        min_times = np.array(time_list, dtype=np.float64)
+        times = min_times.copy()
+        for _ in range(TIME_LIMIT_MAX_ITERATIONS):
+            # 区間ごとに、律速する軸がちょうど上限になる時間へ伸縮する
+            # (速度の最大値は時間にほぼ反比例、加速度は 2 乗に反比例する
+            # ので平方根をとってある)。加速度は隣の区間の時間にも強く
+            # 依存し、ratio 倍そのままだと振動して収束しない (台車の滑らかな
+            # 20 区間の例で ±8% の振動が続いた) ため、平方根で半分だけ
+            # 動かす (同じ例で 14 回で収束)。
+            ratio = np.max(peak_ratios(times), axis=1)
+            new_times = np.maximum(min_times, times * np.sqrt(ratio))
+            if np.allclose(new_times, times, rtol=1e-4, atol=0.0):
+                times = new_times
                 break
-            times[over] *= ratio[over]
+            times = new_times
+        # 反復がわずかな超過を残して終わっても必ず上限内にする。
+        worst = float(np.max(peak_ratios(times)))
+        if worst > 1.0:
+            if worst > 1.01:
+                print('[debug][segment] 速度上限の反復で収まらなかったため '
+                      '全区間を {:.3f} 倍に延ばします。'.format(worst))
+            times *= worst
 
-        # 延ばした区間と、その区間で上限に最も近い関節 (実機ログで
-        # どの関節が律速したかを切り分けるため)。
-        peak_ratio = self._hermite_peak_speeds(deltas, times) / max_vel
-        extended = [
-            '{}:{:.2f}->{:.2f}s({})'.format(
-                i, time_list[i], times[i],
-                self.real_robot.joint_list[int(np.argmax(peak_ratio[i]))].name)
-            for i in range(len(times)) if times[i] > time_list[i] + 1e-6]
-        if extended:
-            print('[debug][segment] 関節速度上限 (×{}) により延ばした区間: {}'
-                  .format(JOINT_VEL_RATIO, ', '.join(extended)))
+        # 区間ごとの所要時間と律速した軸 (下限で決まった区間は "下限"、
+        # 実機ログで何が律速したかを切り分けるため)。
+        final_ratio = peak_ratios(times)
+        entries = [
+            '{}:{:.2f}s({})'.format(
+                i, times[i],
+                '下限' if times[i] <= min_times[i] * (1.0 + 1e-3)
+                else axis_names[int(np.argmax(final_ratio[i]))])
+            for i in range(len(times))]
+        print('[debug][segment] 速度上限 (×{}, 加速 {}s) で決めた所要時間 '
+              '(合計 {:.2f}s): {}'.format(
+                  VEL_LIMIT_RATIO, ACCEL_TIME, float(np.sum(times)),
+                  ', '.join(entries)))
         return [float(t) for t in times]
 
     @staticmethod
-    def _hermite_peak_speeds(deltas, times):
-        """各区間 (``deltas[i]`` = 区間 i の関節角変化量、``times[i]`` =
-        所要時間) を skrobot の ``angle_vector_sequence`` と同じ規則で
-        作った点速度の 3 次エルミート補間で動かしたときの、関節ごとの
-        瞬間速度の最大値 (絶対値、形状は ``deltas`` と同じ) を返す。
-
-        点速度は前後区間の平均速度の平均で、前後で符号が逆の関節と最後の
-        点は 0 (``angle_vector_sequence`` 参照)。始点 (送信直前の実機) は
-        静止しているものとみなす。
+    def _point_velocities(deltas, times):
+        """各点に付ける速度 (形状は ``(区間数 + 1, 軸数)``)。skrobot の
+        ``angle_vector_sequence`` と同じ規則で、途中の点は前後区間の平均
+        速度の平均、前後で符号が逆の軸と最後の点は 0。始点 (送信直前の
+        実機) も静止しているものとして 0。腕は skrobot がこの規則で送り、
+        台車は ``_send_base_trajectory`` がこの規則で付け直して送る。
         """
         n_segments = len(times)
-        seg_times = times[:, None]
-        seg_vel = deltas / seg_times
+        seg_vel = deltas / times[:, None]
         point_vel = np.zeros((n_segments + 1, deltas.shape[1]))
         if n_segments > 1:
             same_sign = deltas[:-1] * deltas[1:] >= 0.0
             point_vel[1:n_segments] = np.where(
                 same_sign, 0.5 * (seg_vel[:-1] + seg_vel[1:]), 0.0)
+        return point_vel
+
+    @staticmethod
+    def _hermite_peaks(deltas, times, point_vel, norm=False, n_samples=101):
+        """各区間 (``deltas[i]`` = 区間 i の変化量、``times[i]`` = 所要時間)
+        を、点の速度 ``point_vel`` (区間 i の両端は ``point_vel[i]``/
+        ``point_vel[i + 1]``) の 3 次エルミート補間で動かしたときの、速度と
+        加速度の最大値 (絶対値) の組を返す。形状は軸ごと (``deltas`` と
+        同じ)、``norm=True`` なら全軸をまとめたベクトルの大きさで
+        ``(区間数,)``。
+
+        p(t) = a t^3 + b t^2 + v0 t (p(0) = 0, p(T) = delta, p'(0) = v0,
+        p'(T) = v1)。加速度 p''(t) は 1 次式なので最大値は両端 (ベクトルの
+        大きさでも同じ)。速度 p'(t) は 2 次式で、軸ごとなら最大値は両端か
+        頂点。ベクトルの大きさは軸ごとの最大値が別々の時刻に出ることが
+        あり合成すると過大になるため、区間内を ``n_samples`` 点で評価する
+        (速度は 2 次式で滑らかなので誤差は上限の 0.1% 未満)。
+        """
+        seg_times = times[:, None]
         v0 = point_vel[:-1]
         v1 = point_vel[1:]
-        # p(t) = a t^3 + b t^2 + v0 t (p(0) = 0, p(T) = delta, p'(0) = v0,
-        # p'(T) = v1)。p'(t) は 2 次式なので、最大値は両端か頂点。
         a = (v0 + v1) / seg_times ** 2 - 2.0 * deltas / seg_times ** 3
         b = 3.0 * deltas / seg_times ** 2 - (2.0 * v0 + v1) / seg_times
+        acc0 = 2.0 * b
+        acc1 = 6.0 * a * seg_times + 2.0 * b
+        if norm:
+            # t: (区間数, n_samples, 1)、速度: (区間数, n_samples, 軸数)
+            t = (np.linspace(0.0, 1.0, n_samples)[None, :]
+                 * seg_times)[:, :, None]
+            vel = (3.0 * a[:, None] * t ** 2 + 2.0 * b[:, None] * t
+                   + v0[:, None])
+            return (np.max(np.linalg.norm(vel, axis=2), axis=1),
+                    np.maximum(np.linalg.norm(acc0, axis=1),
+                               np.linalg.norm(acc1, axis=1)))
         peak = np.maximum(np.abs(v0), np.abs(v1))
         with np.errstate(divide='ignore', invalid='ignore'):
             t_star = -b / (3.0 * a)
             v_star = v0 - b ** 2 / (3.0 * a)
         inside = (a != 0.0) & (t_star > 0.0) & (t_star < seg_times)
-        return np.where(inside, np.maximum(peak, np.abs(v_star)), peak)
+        return (np.where(inside, np.maximum(peak, np.abs(v_star)), peak),
+                np.maximum(np.abs(acc0), np.abs(acc1)))
 
     def _correct_base_residual(
             self, start_odom_coords, final_traj_point,
@@ -1786,10 +1839,10 @@ class HandshakePipelineNode(object):
         絶対姿勢 (odom 系) を求め、実行後の実際の odom との残差を
         ロボット正面基準に回転させて相対移動として送り返す。収束閾値は
         skrobot の ``go_pos_unsafe_wait`` と同じ (位置2.5cm/角度2.5度)。
-        sec (所要時間) の換算に使う最大速度は実機の base_controller
-        の設定 (並進 0.3/回頭 1.0) に安全率 (``BASE_CORRECTION_VEL_
-        RATIO``、現在0.9) を掛けたもの
-        (``BASE_CORRECTION_MAX_VEL``/``BASE_CORRECTION_MAX_ANGVEL`` 参照)。
+        sec (所要時間) は、静止 -> 静止の 1 区間として指令の速度・加速度
+        が上限 (``BASE_MAX_VEL``/``BASE_MAX_ANGVEL`` × ``VEL_LIMIT_RATIO``、
+        加速度は ``ACCEL_TIME``) を超えない時間 (``_limited_time_list``
+        参照)。
 
         接近区間に台車移動が無かった場合は何もしない。
         """
@@ -1845,17 +1898,13 @@ class HandshakePipelineNode(object):
                   '({}/{})。'.format(
                       err_norm, math.degrees(abs(err_yaw)), attempt + 1,
                       max_attempts))
-            sec = max(
-                err_norm / (BASE_CORRECTION_MAX_VEL * BASE_CORRECTION_VEL_RATIO),
-                abs(err_yaw) / (BASE_CORRECTION_MAX_ANGVEL
-                                * BASE_CORRECTION_VEL_RATIO),
-                1.0)
-            # move_trajectory は send_action=True かつ wait 省略 (既定
-            # True) のとき move_trajectory_sequence を通じて完了まで
-            # ブロックするので、ここでは改めて wait_for_result を呼ぶ
-            # 必要はない。
-            self.ri.move_trajectory(err_x, err_y, err_yaw, sec, stop=True,
-                                    send_action=True)
+            # 静止 -> 静止の 1 区間として、速度・加速度が上限を超えない
+            # 時間を _limited_time_list で求める (最低 1 秒は skrobot の
+            # go_pos_unsafe_wait と同じ)。
+            sec, = self._limited_time_list(
+                None, [[err_x, err_y, err_yaw]], [1.0])
+            self._send_base_trajectory(
+                [[err_x, err_y, err_yaw]], [sec], wait=True)
 
         print('[execute][WARN] 押し込み前の台車の位置ずれ補正が {} 回で '
               '収束しませんでした (残差 {:.3f}m / {:.1f}deg)。このまま '
@@ -2270,9 +2319,6 @@ def main():
         '--n-waypoints', type=int, default=phm.DEFAULT_N_WAYPOINTS,
         help='軌道の waypoint 数 (始点・終点を含む。既定 {})。'.format(
             phm.DEFAULT_N_WAYPOINTS))
-    parser.add_argument('--dt', type=float, default=phm.DEFAULT_DT,
-                        help='waypoint 間の時間刻み [秒] (既定 {})。'.format(
-                            phm.DEFAULT_DT))
     parser.add_argument(
         '--max-iterations', type=int, default=phm.DEFAULT_MAX_ITERATIONS,
         help='軌道最適化 (jaxls) の最大反復回数 (既定 {})。'.format(
