@@ -1022,7 +1022,8 @@ class HandshakePipelineNode(object):
             # _resolve_robot_position 参照)。
             self.offered_hand_selector.robot_position = \
                 self._resolve_robot_position()
-            self._try_handshake(armed_joint_positions)
+            self._try_handshake(armed_joint_positions,
+                                color_msg.header.stamp.to_sec())
 
         if (self.state == 'armed' and self.armed_deadline is not None
                and time.time() > self.armed_deadline):
@@ -1031,16 +1032,19 @@ class HandshakePipelineNode(object):
             print('[ARMED] タイムアウトしました。差し出し手が決まりません '
                   'でした。')
 
-    def _try_handshake(self, joint_positions):
+    def _try_handshake(self, joint_positions, stamp):
         handshake_t0 = time.time()
-        palms = self.palm_estimator.estimate(joint_positions)
+        # stamp (カメラ画像の時刻) を渡して、掌が一定時間静止していることも
+        # 差し出し手の条件に含める (OfferedHandSelector.select の t 参照)。
+        palms = self.palm_estimator.estimate(joint_positions, t=stamp)
         # ARMED なのに offered_hand が決まらないとき、viser 画面にスコア/
         # veto 理由の内訳を出す。「手のランドマークがそもそも取れていない
         # (veto=no_palm)」のか「取れているがスコアが --offer-score-min に
         # 届いていない」のかを見分けられるようにするため (PalmPoseEstimator.
         # estimate は offered_hand しか返さないので、同じ入力で select() を
         # 呼び直す)。
-        selection = self.offered_hand_selector.select(joint_positions, palms)
+        selection = self.offered_hand_selector.select(
+            joint_positions, palms, t=stamp)
         with self._lock:
             self._latest_offer_selection = selection
 

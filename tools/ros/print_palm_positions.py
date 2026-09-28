@@ -242,7 +242,8 @@ class PrintPalmPositionsNode(object):
         # (run_camera_pipeline_test.py の _resolve_robot_position と同じ)。
         robot_hand_position = self._resolve_robot_hand_position()
         self.offered_hand_selector.robot_position = robot_hand_position
-        palms = self.palm_estimator.estimate(joint_positions)
+        palms = self.palm_estimator.estimate(
+            joint_positions, t=color_msg.header.stamp.to_sec())
         self._update_palm_axes(palms)
         self._print_palms(palms, robot_hand_position)
 

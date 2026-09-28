@@ -385,7 +385,8 @@ class PalmOfferClipRecorder(object):
                     joint_positions, t=color_msg.header.stamp.to_sec())
                 self.palm_estimator.offered_hand_selector.robot_position = \
                     self._resolve_robot_position()
-                palms = self.palm_estimator.estimate(joint_positions)
+                palms = self.palm_estimator.estimate(
+                    joint_positions, t=color_msg.header.stamp.to_sec())
                 offered_hand = palms['offered_hand']
                 # run_camera_pipeline_test.py の ARMED 中と同じスコア内訳を
                 # スロットルして標準出力に出す (このノードには viser 画面が
@@ -394,7 +395,7 @@ class PalmOfferClipRecorder(object):
                 # estimate は offered_hand しか返さないので、同じ入力で
                 # select() を呼び直す)。
                 selection = self.palm_estimator.offered_hand_selector.select(
-                    joint_positions, palms)
+                    joint_positions, palms, t=color_msg.header.stamp.to_sec())
                 rospy.loginfo_throttle(
                     1.0, '[record-palm-offer-clips] %s',
                     epp.format_offer_scores(

@@ -155,6 +155,22 @@ OFFER_SCORE_MIN = 0.86
 # 到達性など、この判定器が知らない事情を持つ側) が覆せる。
 AMBIGUOUS_MARGIN = 0.08
 
+# 掌の静止判定。スコアが閾値を超えていても、その掌が直近
+# STILLNESS_WINDOW 秒のあいだ現在位置から STILLNESS_MAX_DISPLACEMENT [m]
+# 以内に留まっていなければ、まだ差し出している途中 (腕を動かしている
+# 最中) とみなして ``side`` を ``None`` にする。動いている手を目標にして
+# IK・軌道計画を始めると、ロボットが着く頃には手が別の場所にあるため。
+# 時刻 ``t`` を渡された呼び出し (実カメラの連続フレーム) でだけ効き、
+# 単発の骨格 (合成データ) には効かない (``OfferedHandSelector.select``)。
+STILLNESS_WINDOW = 0.5
+# 実カメラの深度ノイズ (One Euro Filter 通過後でも 1-2 cm 程度残る) と
+# 手の自然な揺れで静止を取りこぼさない程度に緩めに取る。
+STILLNESS_MAX_DISPLACEMENT = 0.05
+# 履歴のサンプル間隔がこれを超えたら (手をロストした、ARMED の区切りを
+# またいだ等) 履歴を捨てて測り直す。間が空いた区間の静止は保証できない
+# ため。
+STILLNESS_MAX_GAP = 0.4
+
 # 関節が欠測した入力 (実カメラで下半身がフレーム外、など) で胴長・腕長を
 # 補うための人体比。身長 1.7 m の成人で 肩幅 ~0.40 m, 腰->肩 ~0.50 m,
 # 上腕+前腕 ~0.58 m 程度。
@@ -389,6 +405,13 @@ class OfferedHandSelector(object):
     外す。それ以外の足切りは持たず、``score_min`` だけで「差し出して
     いない」を決める。
 
+    ``select`` に時刻 ``t`` を渡した場合 (実カメラの連続フレーム) は、
+    これに加えて「掌が ``stillness_window`` 秒以上静止しているか」も
+    判定に含める (:data:`STILLNESS_WINDOW`)。スコアが閾値を超えた側でも
+    静止していなければ ``side`` は ``None`` になる。そのため左右の掌位置の
+    履歴をインスタンスに持つので、人物 (カメラ入力) ごとに別のインスタンス
+    を使うこと。
+
     Examples
     --------
     >>> selector = OfferedHandSelector()
@@ -407,7 +430,10 @@ class OfferedHandSelector(object):
                  finger_to_robot_axis_blend=0.0,
                  finger_to_robot_ramp=FINGER_TO_ROBOT_RAMP,
                  approach_ramp=APPROACH_RAMP,
-                 approach_height_scale=1.0):
+                 approach_height_scale=1.0,
+                 stillness_window=STILLNESS_WINDOW,
+                 stillness_max_displacement=STILLNESS_MAX_DISPLACEMENT,
+                 stillness_max_gap=STILLNESS_MAX_GAP):
         """
         Parameters
         ----------
@@ -460,6 +486,16 @@ class OfferedHandSelector(object):
             既定 1.0 (従来通り 3 次元距離)。0.0 にすると水平面 (xy) の
             接近だけを見るようになり、「ロボットの手の高さまで上げないと
             近づいたと評価されない」問題を弱められる。
+        stillness_window : float
+            掌がこの秒数以上静止していなければ差し出しと認めない
+            (``select`` に ``t`` を渡したときだけ効く)。既定は
+            :data:`STILLNESS_WINDOW`。0.0 以下なら静止判定をしない。
+        stillness_max_displacement : float
+            静止とみなす、現在位置からの最大のずれ [m]。既定は
+            :data:`STILLNESS_MAX_DISPLACEMENT`。
+        stillness_max_gap : float
+            履歴のサンプル間隔がこれを超えたら履歴を捨てる [s]。既定は
+            :data:`STILLNESS_MAX_GAP`。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -475,8 +511,17 @@ class OfferedHandSelector(object):
         self.finger_to_robot_ramp = tuple(finger_to_robot_ramp)
         self.approach_ramp = tuple(approach_ramp)
         self.approach_height_scale = float(approach_height_scale)
+        self.stillness_window = float(stillness_window)
+        self.stillness_max_displacement = float(stillness_max_displacement)
+        self.stillness_max_gap = float(stillness_max_gap)
+        # 左右の掌位置の履歴 [(t, position), ...] (t 昇順、_update_stillness)。
+        self._palm_history = {'R': [], 'L': []}
 
-    def select(self, joint_positions, palms):
+    def reset_stillness(self):
+        """掌の静止判定の履歴を捨てる (人物が入れ替わったとき等)."""
+        self._palm_history = {'R': [], 'L': []}
+
+    def select(self, joint_positions, palms, t=None):
         """どちらの手を繋ぐべきかを判定する.
 
         Parameters
@@ -487,6 +532,13 @@ class OfferedHandSelector(object):
         palms : dict
             ``PalmPoseEstimator.estimate`` の戻り値 (``{'R': palm, 'L':
             palm}``、推定できなかった側は ``None``)。
+        t : float or None
+            このフレームの時刻 [s] (カメラ画像のタイムスタンプ)。渡すと
+            掌の位置を履歴に積み、``stillness_window`` 秒以上静止して
+            いる掌だけを差し出しと認める。同じ ``t`` で何度呼んでも履歴は
+            1 サンプルぶんしか増えない (``estimate`` の後に内訳を見るため
+            ``select`` を呼び直す使い方ができる)。``None`` (既定) なら
+            静止判定をしない (単発の骨格向け、従来の挙動)。
 
         Returns
         -------
@@ -508,10 +560,20 @@ class OfferedHandSelector(object):
                 人物 (``body.hip_center``) からロボットまでの距離 [m]
                 (``body`` が作れなければ ``None``)。``max_distance`` の
                 調整・デバッグ用。
+            ``still``
+                左右の掌が静止しているか (``True`` / ``False``)。静止判定を
+                していない (``t`` が ``None``、``stillness_window`` が 0 以下、
+                掌が無い) 側は ``None``。
+            ``still_duration``
+                左右の掌が現在位置から ``stillness_max_displacement`` 以内に
+                留まり続けている時間 [s] (``still`` が ``None`` の側は
+                ``None``)。履歴は窓の長さぶんしか持たないので、
+                ``stillness_window`` + 1 フレーム程度で頭打ちになる。
         """
         joints = {name: np.asarray(p, dtype=np.float64)
                   for name, p in joint_positions.items()}
         body = _body_frame(joints)
+        still, still_duration = self._update_stillness(palms, t)
 
         distance = None
         too_far = False
@@ -554,13 +616,69 @@ class OfferedHandSelector(object):
         side = None
         if candidates:
             best = max(candidates, key=lambda s: candidates[s])
-            if candidates[best] >= self.score_min:
+            # 静止していない掌は (スコアが足りていても) 差し出している途中と
+            # みなして見送る。反対側の手に切り替えはしない -- argmax 側が
+            # 差し出そうとしている手なので、止まるのを待つ。
+            if (candidates[best] >= self.score_min
+                    and still[best] is not False):
                 side = best
         ambiguous = bool(side is not None and margin is not None
                          and margin < self.ambiguous_margin)
         return dict(side=side, scores=scores, features=features,
                     margin=margin, ambiguous=ambiguous, veto=veto,
-                    distance=distance)
+                    distance=distance, still=still,
+                    still_duration=still_duration)
+
+    def _update_stillness(self, palms, t):
+        """掌の位置を履歴に積み、左右の静止判定を返す.
+
+        Returns
+        -------
+        (still, still_duration)
+            どちらも ``{'R': ..., 'L': ...}``。``select`` の戻り値の同名
+            キーを参照。
+        """
+        still = {'R': None, 'L': None}
+        still_duration = {'R': None, 'L': None}
+        if t is None or self.stillness_window <= 0.0:
+            return still, still_duration
+        t = float(t)
+        for side in ('R', 'L'):
+            history = self._palm_history[side]
+            palm = palms.get(side)
+            if palm is None:
+                # 掌をロストしたら静止は測り直し。
+                del history[:]
+                continue
+            position = np.asarray(palm['position'], dtype=np.float64)
+            if history and t < history[-1][0]:
+                # 時刻が巻き戻った (rosbag のループ再生等)。
+                del history[:]
+            if history and t - history[-1][0] > self.stillness_max_gap:
+                del history[:]
+            if history and t == history[-1][0]:
+                history[-1] = (t, position)
+            else:
+                history.append((t, position))
+            # 窓の始点以前のサンプルは 1 つ (窓を覆っているかの判定用) だけ
+            # 残す。
+            window_start = t - self.stillness_window
+            while len(history) >= 2 and history[1][0] <= window_start:
+                del history[0]
+
+            # 最新から遡って、現在位置からのずれが閾値以内に収まり続けて
+            # いる最も古いサンプルまでの時間を静止時間とする。
+            since = t
+            for sample_t, sample_position in reversed(history):
+                if (np.linalg.norm(sample_position - position)
+                        > self.stillness_max_displacement):
+                    break
+                since = sample_t
+            still_duration[side] = t - since
+            # 1e-6 はタイムスタンプの浮動小数点誤差ぶん。
+            still[side] = (still_duration[side]
+                           >= self.stillness_window - 1e-6)
+        return still, still_duration
 
     def _robot_position(self, body):
         """ロボットの手先のワールド座標.
@@ -697,20 +815,25 @@ def format_offer_scores(selection, score_min):
     取れていない (``veto``: ``no_palm``)」のか「人物が遠すぎる
     (``veto``: ``too_far``、``OfferedHandSelector(max_distance=...)``
     参照)」のか「取れているがスコアが閾値 ``score_min`` に届いていない」
-    のかを見分けられるようにする。``run_camera_pipeline_test.py`` (viser
+    のか「スコアは足りているが掌がまだ静止していない」のかを見分けられる
+    ようにする。``run_camera_pipeline_test.py`` (viser
     画面・標準出力) と ``record_palm_offer_clips.py`` (標準出力) の両方が
     使う共通の整形処理。
     """
     parts = ['差し出し手判定 (閾値 {:.2f})'.format(score_min)]
     if selection['distance'] is not None:
         parts.append('距離={:.2f}m'.format(selection['distance']))
+    still_duration = selection.get('still_duration') or {}
     for side in ('R', 'L'):
         veto = selection['veto'][side]
         score = selection['scores'][side]
         if veto is not None:
             parts.append('{}=判定不可({})'.format(side, veto))
         else:
-            parts.append('{}={:.2f}'.format(side, score))
+            text = '{}={:.2f}'.format(side, score)
+            if still_duration.get(side) is not None:
+                text += '(静止{:.2f}s)'.format(still_duration[side])
+            parts.append(text)
     return ', '.join(parts)
 
 
@@ -741,7 +864,7 @@ class PalmPoseEstimator(object):
         self.offered_hand_selector = \
             offered_hand_selector or OfferedHandSelector()
 
-    def estimate(self, joint_positions):
+    def estimate(self, joint_positions, t=None):
         """左右の掌の位置姿勢と、手繋ぎに使うべき手を推定する.
 
         Parameters
@@ -750,6 +873,9 @@ class PalmPoseEstimator(object):
             関節名 (MediaPipe 形式) -> [x, y, z] (ロボット座標系)。骨格の
             生成元 (``RandomSkeletonGenerator`` / 実カメラの推定など) は
             問わない。
+        t : float or None
+            このフレームの時刻 [s]。渡すと掌の静止判定も差し出し手の判定
+            に含める (:meth:`OfferedHandSelector.select` 参照)。
 
         Returns
         -------
@@ -771,12 +897,12 @@ class PalmPoseEstimator(object):
             どちらの手も差し出していなければ ``None``
             (:class:`OfferedHandSelector`)。スコアや特徴量の内訳は JSON
             には出さないので、必要なら ``self.offered_hand_selector.
-            select(joint_positions, palms)`` を直接呼ぶ。
+            select(joint_positions, palms, t)`` を直接呼ぶ。
         """
         joints = {name: np.asarray(p, dtype=np.float64)
                  for name, p in joint_positions.items()}
         palms = {side: self._estimate_one(joints, side) for side in ('R', 'L')}
-        selection = self.offered_hand_selector.select(joints, palms)
+        selection = self.offered_hand_selector.select(joints, palms, t)
         result = dict(palms)
         result['offered_hand'] = selection['side']
         return result
