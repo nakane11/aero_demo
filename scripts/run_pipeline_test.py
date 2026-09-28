@@ -132,6 +132,41 @@ def summarize_handshakes(handshake_dir):
     )
 
 
+def summarize_final_corrections(handshake_dir):
+    """``solve_palm_ik.py --final-correction-trials`` が記録した
+    ``final_correction`` (押し込み直前の最終補正の試行結果) を集計する。
+
+    比較用に、計画時の押し込み姿勢 (``post_process``) を解いたときの
+    ``compute_time`` の平均も返す (最終補正は同じ IK を hover 姿勢から
+    もう 1 回解くだけなので、これと同程度になるはず)。
+    """
+    times = []
+    reasons = {}
+    position_changes = []
+    planned_times = []
+    n_people = 0
+    for _, data in load_json_files(handshake_dir):
+        records = data.get('final_correction')
+        if not records:
+            continue
+        n_people += 1
+        planned_times.append(data['post_process']['compute_time'])
+        for record in records:
+            times.append(record['compute_time'])
+            reasons[record['reason']] = reasons.get(record['reason'], 0) + 1
+            position_changes.append(record['position_change'])
+    if not times:
+        return None
+    times_sorted = sorted(times)
+    return dict(
+        n_people=n_people, n_trials=len(times), reasons=reasons,
+        avg_time=sum(times) / len(times),
+        median_time=times_sorted[len(times_sorted) // 2],
+        max_time=times_sorted[-1],
+        avg_planned_time=sum(planned_times) / len(planned_times),
+        avg_position_change=sum(position_changes) / len(position_changes))
+
+
 def summarize_motions(motion_dir):
     """``plan_handshake_motion.py`` の出力 JSON を集計する。
 
@@ -218,6 +253,17 @@ def main():
         '--approach-distance', type=float, default=None,
         help='--plan-motion 指定時、plan_handshake_motion.py に '
             '--approach-distance として渡す (既定は指定なし)。')
+    parser.add_argument(
+        '--final-correction-trials', type=int, default=0,
+        help='solve_palm_ik.py に --final-correction-trials として渡し、'
+            '押し込み直前の最終補正 (hover 到達後に掌を検出し直して押し込み '
+            '姿勢を解き直す) の計算時間を、台車のスリップを乱数で与えて '
+            '1 人あたりこの回数ずつ見積もる (既定 0 = 行わない)。')
+    parser.add_argument(
+        '--final-correction-slip', type=float, nargs=2, default=None,
+        metavar=('XY', 'YAW_DEG'),
+        help='solve_palm_ik.py に --final-correction-slip として渡す '
+            'スリップの範囲 (既定は指定なし = ±0.03m/±3度)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -248,9 +294,16 @@ def main():
               offered.get(None, 0)))
 
     # 4. solve_palm_ik.py
-    solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py', [
-        '--input-dir', palm_dir, '--output-dir', handshake_dir,
-        '--skeleton-dir', skeleton_dir])
+    solve_args = ['--input-dir', palm_dir, '--output-dir', handshake_dir,
+                  '--skeleton-dir', skeleton_dir]
+    if args.final_correction_trials > 0:
+        solve_args += ['--final-correction-trials',
+                       str(args.final_correction_trials)]
+        if args.final_correction_slip is not None:
+            solve_args += ['--final-correction-slip'] + [
+                str(v) for v in args.final_correction_slip]
+    solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
+                                           solve_args)
     warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)
     summary = summarize_handshakes(handshake_dir)
     print('[4/5] solve_palm_ik.py: IK 対象 {} 人中 {} 人 solved '
@@ -356,6 +409,25 @@ def main():
           '[4/5] 実行直後の行を参照。IK 1段階目が warmup 後も長い場合は '
           'warmup 漏れではなく、人物ごとに再コンパイルが起きている '
           '(docs/jax_compilation_cache.md 参照) 可能性を疑うこと。)')
+
+    if args.final_correction_trials > 0:
+        fc = summarize_final_corrections(handshake_dir)
+        print()
+        if fc is None:
+            print('=== 押し込み直前の最終補正 === 対象 (後処理まで解けた人物) '
+                  'がいませんでした。')
+        else:
+            print('=== 押し込み直前の最終補正 ({} 人 x {} 回 = {} 試行) ==='
+                  .format(fc['n_people'], args.final_correction_trials,
+                          fc['n_trials']))
+            print('  補正 IK の計算時間: 平均 {:.3f} 秒 / 中央値 {:.3f} 秒 / '
+                  '最大 {:.3f} 秒 (計画時の押し込み IK は平均 {:.3f} 秒)'
+                  .format(fc['avg_time'], fc['median_time'], fc['max_time'],
+                          fc['avg_planned_time']))
+            print('  結果の内訳: {} (押し込み目標の変化 平均 {:.1f}mm)'.format(
+                ', '.join('{}={}'.format(k, v)
+                          for k, v in sorted(fc['reasons'].items())),
+                fc['avg_position_change'] * 1e3))
 
     # 5. view_handshake_poses.py / view_handshake_motion.py
     #    (--viewer のときだけ実際に起動する。--plan-motion も指定されて

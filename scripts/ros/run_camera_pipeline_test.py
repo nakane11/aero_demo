@@ -71,6 +71,7 @@ ARMED) と組み合わせると、ブラウザを一切触らずに「手を差�
 """
 
 import argparse
+import collections
 import copy
 import json
 import math
@@ -135,6 +136,7 @@ from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
 from handshake_viewer_common import apply_robot_pose as apply_result_pose  # noqa: E402,E501
 from handshake_viewer_common import apply_waypoint_pose  # noqa: E402
 from handshake_viewer_common import build_display_waypoints  # noqa: E402
+from handshake_viewer_common import build_press_in_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
 from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
@@ -246,6 +248,13 @@ BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
 JOINT_SETTLE_HAND_TOLERANCE = 0.01  # [m]
 JOINT_SETTLE_TIMEOUT = 1.5  # [s]
 JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
+
+# --press-in-refine (hover 到達後に人の手を検出し直して押し込み姿勢を解き
+# 直す、_refine_press_in 参照) で使う、停止後に新しく受け取るカメラ
+# フレーム数と、その待ち時間の上限。骨格は複数フレームの中央値を使う
+# (One Euro Filter の平滑化値は台車移動中の履歴を引きずるため使わない)。
+PRESS_IN_REFINE_FRAMES = 3
+PRESS_IN_REFINE_TIMEOUT = 1.0  # [s]
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -411,6 +420,12 @@ class HandshakePipelineNode(object):
         self._viewer_lock = threading.Lock()
         self._latest_joint_positions = None  # 最新フレームの joint_positions (dict) or None
         self._latest_is_base_frame = False   # 上記が base_link 座標系かどうか (TF 解決済みか)
+        # base_link 座標系に変換できたフレームの通し番号と、平滑化前の骨格
+        # (未検出なら None)。_refine_press_in が「停止後に届いたフレーム」
+        # だけを集めるのに使う。
+        self._raw_frame_seq = 0
+        self._raw_base_frames = collections.deque(maxlen=10)
+        self._current_palm = None         # 直近の IK に使った掌 (base_link 座標系、平行移動前) or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 (offered_hand_selector.select の戻り値) or None
         # 'idle' (ARM 待ち) -> 'armed' (差し出し手待ち) -> 'solving'
         # (offered_hand が決まって IK 計算中) -> 'result' (IK 完了、結果
@@ -907,6 +922,10 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._latest_joint_positions = preview_joint_positions
             self._latest_is_base_frame = is_base_frame
+            if is_base_frame:
+                self._raw_frame_seq += 1
+                self._raw_base_frames.append(
+                    (self._raw_frame_seq, raw_joint_positions))
 
         if self.state == 'armed' and armed_joint_positions is not None:
             # robot_position (差し出し手判定の基準にするロボット手先位置)
@@ -1141,6 +1160,7 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._current_result = result
             self._current_motion = motion
+            self._current_palm = palm
             self._display_waypoints = display_waypoints
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
@@ -1490,17 +1510,112 @@ class HandshakePipelineNode(object):
             robot_arm)
 
         if reach_boundary < len(display_waypoints):
-            self._execute_waypoint_segment(
-                display_waypoints[reach_boundary - 1:], joint_names)
+            press_waypoints = display_waypoints[reach_boundary - 1:]
+            if self.args.press_in_refine:
+                refined = self._refine_press_in(
+                    press_waypoints[0], joint_names, result)
+                if refined is not None:
+                    press_waypoints = [press_waypoints[0]] + refined
+            self._execute_waypoint_segment(press_waypoints, joint_names)
             # 押し込み自体も遅れて完了するので、押し付け終わってから
             # 「どうぞ」と発話する。
             self._wait_joint_settle(
-                '押し込み終了', display_waypoints[-1], joint_names,
+                '押し込み終了', press_waypoints[-1], joint_names,
                 robot_arm)
 
         self._say(self.args.speech_done_text)
 
         print('[execute] 実行を終了しました。')
+
+    def _collect_fresh_joint_positions(self, n_frames, timeout):
+        """呼び出し以降に届いた (base_link 座標系に変換できた) カメラ
+        フレームを ``n_frames`` 枚待ち、平滑化前の骨格の関節ごとの中央値を
+        返す。骨格が検出できたフレームが半数未満、または ``timeout`` 秒で
+        ``n_frames`` 枚届かなければ、その時点までのフレームで判断する
+        (1 枚も無ければ ``None``)。"""
+        with self._lock:
+            start_seq = self._raw_frame_seq
+        deadline = time.time() + timeout
+        while not rospy.is_shutdown() and time.time() < deadline:
+            with self._lock:
+                if self._raw_frame_seq - start_seq >= n_frames:
+                    break
+            rospy.sleep(0.01)
+        with self._lock:
+            frames = [joints for seq, joints in self._raw_base_frames
+                      if seq > start_seq]
+        detected = [joints for joints in frames if joints is not None]
+        if not detected or len(detected) * 2 < len(frames):
+            return None
+        names = [name for name in detected[0]
+                 if sum(name in joints for joints in detected) * 2
+                 >= len(detected)]
+        return {name: np.median([joints[name] for joints in detected
+                                 if name in joints], axis=0).tolist()
+                for name in names}
+
+    def _refine_press_in(self, hover_wp, joint_names, result):
+        """hover 目標に到達した後、カメラで人の手を検出し直して押し込み
+        姿勢を解き直し (``spik.refine_post_process``)、押し込み区間の
+        waypoint (``hover_wp`` の次から最後まで) を返す。
+
+        検出し直した掌は、実機が実際にいる台車位置 (スリップ込み) から
+        見た ``base_link`` 座標系で得られる。これを「台車が hover 目標
+        (``hover_wp``) にいる」前提で計画時と同じ座標系に移して解き直す
+        ので、台車のスリップと人の手の動きの両方が腕の動きで吸収される
+        (台車自体は動かさない)。手が検出できない・変化が大きすぎる・IK が
+        解けない場合は ``None`` を返し、計画どおりの押し込みを使う。
+        """
+        t0 = time.time()
+        with self._lock:
+            planned_palm = self._current_palm
+        offered_hand = result['offered_hand']
+        planned_post = result.get('post_process')
+        if planned_post is None or planned_palm is None:
+            return None
+        joint_positions = self._collect_fresh_joint_positions(
+            PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+        wait_time = time.time() - t0
+        palm = None
+        if joint_positions is not None:
+            palm = self.palm_estimator.estimate(joint_positions).get(
+                offered_hand)
+        if palm is None:
+            print('[execute][refine] hover 到達後に {}手を検出できなかった '
+                  'ため、計画どおりに押し込みます ({:.2f}s 待機)。'.format(
+                      offered_hand, wait_time))
+            return None
+
+        t1 = time.time()
+        apply_waypoint_pose(self.robot, joint_names, [hover_wp], 0)
+        base = self.robot.base_link
+        observed = spik.transform_palm(palm, base.worldrot(), base.worldpos())
+        info = spik.refine_post_process(
+            self.robot, result['robot_arm'], observed, result['turn_deg'],
+            planned_post)
+        ik_time = time.time() - t1
+        palm_shift = np.asarray(observed['position']) - np.asarray(
+            planned_palm['position'])
+        self._log_debug(dict(
+            event='press_in_refine', reason=info['reason'],
+            wait_time=wait_time, ik_time=ik_time,
+            palm_shift=[float(v) for v in palm_shift],
+            position_change=info['position_change'],
+            rotation_change_deg=math.degrees(info['rotation_change'])))
+        if info['post_process'] is None:
+            print('[execute][refine] 押し込み姿勢を解き直せなかったため '
+                  '({}、目標の変化 {:.1f}mm/{:.1f}deg)、計画どおりに押し込み '
+                  'ます。'.format(info['reason'],
+                                 info['position_change'] * 1e3,
+                                 math.degrees(info['rotation_change'])))
+            return None
+        print('[execute][refine] 検出し直した手に合わせて押し込み姿勢を '
+              '補正しました ({}、目標の変化 {:.1f}mm/{:.1f}deg、待機 {:.2f}s '
+              '+ IK {:.3f}s)。'.format(
+                  info['reason'], info['position_change'] * 1e3,
+                  math.degrees(info['rotation_change']), wait_time, ik_time))
+        return build_press_in_waypoints(
+            hover_wp, joint_names, info['post_process'])
 
     def _wait_joint_settle(self, label, waypoint, joint_names, robot_arm,
                            tolerance=JOINT_SETTLE_HAND_TOLERANCE,
@@ -2504,6 +2619,12 @@ def main():
         '--speech-start-text', type=str, default='今から行きますね',
         help='--auto-execute で実機が動き出すときに発話する文 '
             '(空文字列で発話しない)。')
+    parser.add_argument(
+        '--press-in-refine', action='store_true',
+        help='--auto-execute で hover 目標に到達した後、カメラで人の手を '
+            '検出し直し、台車のスリップや人の手の動きでずれた分を押し込み '
+            '姿勢 (腕・首の IK、台車は動かさない) を解き直して吸収する '
+            '(_refine_press_in 参照、既定オフ)。')
     parser.add_argument(
         '--speech-done-text', type=str, default='どうぞ、手を握ってください',
         help='--auto-execute で掌を差し出し終えたときに発話する文 '

@@ -225,6 +225,12 @@ DEFAULT_POST_PROCESS_IK_STOP = 40
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
+# 押し込み直前の最終補正 (refine_post_process) で、検出し直した掌による
+# 押し込み目標の変化がこれを超えたら補正せず計画どおりの押し込みを使う
+# (掌の誤検出で腕が大きく振られるのを防ぐ安全弁)。
+REFINE_MAX_POSITION_CHANGE = 0.10  # [m]
+REFINE_MAX_ROTATION_CHANGE = math.radians(30.0)  # [rad]
+
 # pick_verified_candidate が曲げ量コスト昇順に干渉の事後検証
 # (collision_pairs_min_distance) + solve_post_process を試す候補数の上限。
 # どちらも 1 回あたりのコストが軽くない処理で、収束した候補
@@ -534,13 +540,20 @@ def palm_to_target_rots(palm, hand, robot_arm):
     優先して寄せる順序を ``hand`` ごとに変えて返すため、ここでもそれを
     そのまま使う。
     """
+    return [palm_target_rot(palm, deg, robot_arm)
+           for deg in turn_candidates_deg(hand, palm)]
+
+
+def palm_target_rot(palm, turn_deg, robot_arm):
+    """``palm_to_target_rots`` の候補のうち、向き ``turn_deg`` [度] の
+    1 つだけを返す (``solved_result`` が記録する ``turn_deg`` から、掌を
+    検出し直したときに同じ向きの目標姿勢を作り直すのに使う)。"""
     x_axis = np.asarray(palm['x_axis'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
     y_axis = -normal
     z_axis = np.cross(x_axis, y_axis)
     base_rot = np.column_stack([x_axis, y_axis, z_axis])
-    return [_correct_grasp_frame(_turn_about_y(base_rot, deg), robot_arm)
-           for deg in turn_candidates_deg(hand, palm)]
+    return _correct_grasp_frame(_turn_about_y(base_rot, turn_deg), robot_arm)
 
 
 def palm_target_position(palm):
@@ -617,6 +630,25 @@ def translate_palm(palm, offset):
     position[1] += dy
     translated['position'] = position
     return translated
+
+
+def transform_palm(palm, rot, pos):
+    """掌の位置姿勢 JSON の 1 手分 (``palm``) を剛体変換 ``x -> rot @ x +
+    pos`` で別の座標系へ移したコピーを返す (``position`` と各軸・``rot``
+    を変換する)。"""
+    rot = np.asarray(rot, dtype=np.float64)
+    pos = np.asarray(pos, dtype=np.float64)
+    transformed = dict(palm)
+    transformed['position'] = (
+        rot @ np.asarray(palm['position'], dtype=np.float64) + pos).tolist()
+    for key in ('x_axis', 'y_axis', 'z_axis'):
+        if palm.get(key) is not None:
+            transformed[key] = (
+                rot @ np.asarray(palm[key], dtype=np.float64)).tolist()
+    if palm.get('rot') is not None:
+        transformed['rot'] = (
+            rot @ np.asarray(palm['rot'], dtype=np.float64)).tolist()
+    return transformed
 
 
 def human_facing_direction(joint_positions):
@@ -1537,7 +1569,8 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
                        thre=DEFAULT_POST_PROCESS_IK_THRE,
                        rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                        gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
-                       gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE):
+                       gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
+                       gaze=True):
     """``pick_verified_candidate`` が干渉検証まで通した候補について、
     人間にロボットが実際に掌を押し付けられることを確認する後処理判定を
     行う (``POST_PROCESS_TARGET_HOVER_OFFSET`` 参照)。
@@ -1554,7 +1587,8 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 
     視線の目標は人間自身の掌の位置 (IK を解く前から分かっている固定点)
     なので、腕・視線を逐次に分けず 1 回の呼び出しで同時に解ける。両タスク
-    とも収束して初めて後処理判定は成功とする。
+    とも収束して初めて後処理判定は成功とする。``gaze=False`` のときは 2 を
+    解かず、1 (腕) だけで判定する (首は呼び出し前の角度のまま)。
 
     ``robot`` は呼び出し前の姿勢 (``pick_verified_candidate`` が反映した
     候補の姿勢) を初期値として直接書き換えて解く。``revert_if_fail=True``
@@ -1581,18 +1615,25 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
             position - head_move_target.worldpos())
 
     try:
-        # position_mask/rotation_mask はタスクごと (腕/首) に別のマスクを
-        # 使うため、normalize_mask で 3 要素配列に解決済みのリストにして
-        # から渡す (そうしないと 1 つのマスク指定として誤解釈される)。
-        result = robot.inverse_kinematics(
-            target_coords=[target_coords, head_target],
-            move_target=[move_target, head_move_target],
-            link_list=[whole_body.link_list, robot.head.link_list],
-            position_mask=[normalize_mask(True), normalize_mask(False)],
-            rotation_mask=[normalize_mask(True), normalize_mask('xy')],
-            stop=max(stop, gaze_ik_stop),
-            thre=[thre, thre], rthre=[rthre, gaze_ik_rthre],
-            revert_if_fail=True)
+        if gaze:
+            # position_mask/rotation_mask はタスクごと (腕/首) に別のマスク
+            # を使うため、normalize_mask で 3 要素配列に解決済みのリストに
+            # してから渡す (そうしないと 1 つのマスク指定として誤解釈
+            # される)。
+            result = robot.inverse_kinematics(
+                target_coords=[target_coords, head_target],
+                move_target=[move_target, head_move_target],
+                link_list=[whole_body.link_list, robot.head.link_list],
+                position_mask=[normalize_mask(True), normalize_mask(False)],
+                rotation_mask=[normalize_mask(True), normalize_mask('xy')],
+                stop=max(stop, gaze_ik_stop),
+                thre=[thre, thre], rthre=[rthre, gaze_ik_rthre],
+                revert_if_fail=True)
+        else:
+            result = robot.inverse_kinematics(
+                target_coords, move_target=move_target,
+                link_list=whole_body.link_list,
+                stop=stop, thre=thre, rthre=rthre, revert_if_fail=True)
     except Exception as e:
         print('  [post-process] 押し付け/視線 IK で例外が発生したため '
               '棄却します: {}'.format(e))
@@ -1612,6 +1653,107 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
         compute_time=time.time() - start_time,
     )
+
+
+def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
+                        max_position_change=REFINE_MAX_POSITION_CHANGE,
+                        max_rotation_change=REFINE_MAX_ROTATION_CHANGE):
+    """hover 目標に到達した後、検出し直した掌 ``palm`` に合わせて押し込み
+    姿勢 (``solve_post_process``) を解き直す (台車のスリップや人の手の
+    動きで、計画時の掌と実際の掌がずれた分を腕だけで吸収する最終補正)。
+
+    ``robot`` は呼び出し前に hover 目標の姿勢 (関節角・台車) にしておく
+    (これを初期値に、台車は動かさず腕・首だけで解く)。``palm`` は
+    ``robot`` と同じ座標系 (hover 目標にいる前提のワールド系) で表した
+    掌。目標の向きは計画時と同じ ``turn_deg`` (``solved_result`` の
+    ``turn_deg``) で作り直す。``planned_post`` は計画時の
+    ``result['post_process']`` で、押し込み目標の変化量の計算と上限判定
+    (``max_position_change``/``max_rotation_change``) に使う。
+
+    Returns
+    -------
+    dict
+        ``post_process`` (解き直した結果 dict、失敗・上限超えなら
+        ``None``)、``position_change`` [m]/``rotation_change`` [rad]
+        (計画時の押し込み目標からの変化)、``reason`` (``'ok'``/
+        ``'ok_arm_only'`` (視線は収束せず腕だけ解けた)/``'too_large'``/
+        ``'ik_failed'``)、``compute_time`` [秒]。
+    """
+    start_time = time.time()
+    target_rot = palm_target_rot(palm, turn_deg, robot_arm)
+    position = np.asarray(palm['position'], dtype=np.float64)
+    normal = np.asarray(palm['y_axis'], dtype=np.float64)
+    target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+    position_change = float(np.linalg.norm(
+        target_pos - np.asarray(planned_post['target_position'])))
+    rel_rot = np.asarray(planned_post['target_rot']).T @ target_rot
+    rotation_change = float(math.acos(
+        np.clip((np.trace(rel_rot) - 1.0) / 2.0, -1.0, 1.0)))
+    info = dict(post_process=None, position_change=position_change,
+                rotation_change=rotation_change)
+    if (position_change > max_position_change
+            or rotation_change > max_rotation_change):
+        info.update(reason='too_large', compute_time=time.time() - start_time)
+        return info
+    post = solve_post_process(robot, robot_arm, palm, target_rot)
+    reason = 'ok'
+    if post is None:
+        # 計画時の押し込み姿勢は首が可動域の端で視線がぎりぎり収束している
+        # ことが多く、掌が少しずれただけで視線 IK が収束しなくなる (腕は
+        # 収束している)。押し込みで要るのは腕なので、首は計画時の押し込み
+        # 姿勢の角度にして腕だけで解き直す。
+        planned_angles = dict(zip(planned_post['joint_names'],
+                                  planned_post['joint_angle_vector']))
+        for link in robot.head.link_list:
+            if link.joint.name in planned_angles:
+                link.joint.joint_angle(planned_angles[link.joint.name])
+        post = solve_post_process(robot, robot_arm, palm, target_rot,
+                                  gaze=False)
+        reason = 'ok_arm_only' if post is not None else 'ik_failed'
+    info.update(post_process=post, reason=reason,
+                compute_time=time.time() - start_time)
+    return info
+
+
+def simulate_final_correction(robot, robot_arm, result, palm, angle_vector,
+                              base_pose, trials, slip_xy, slip_yaw, rng):
+    """``refine_post_process`` の計算時間・成功率を見積もるため、hover
+    目標 (``angle_vector``/``base_pose``) で台車が一様乱数 (x/y は
+    ±``slip_xy`` [m]、yaw は ±``slip_yaw`` [rad]) だけスリップしたと
+    仮定し、そのときロボットから見える掌 (ロボットを hover 目標に置いた
+    ワールド系に直したもの) で押し込み姿勢を ``trials`` 回解き直す。
+
+    Returns
+    -------
+    dict
+        ``refine_post_process`` の戻り値から ``post_process`` を除いた
+        ``trials`` 回分のリスト (``slip`` [dx, dy, dyaw] を付けたもの)。
+    """
+    robot.angle_vector(angle_vector)
+    robot.newcoords(base_pose)
+    base_rot = robot.base_link.worldrot().copy()
+    base_pos = robot.base_link.worldpos().copy()
+    records = []
+    for _ in range(trials):
+        dx, dy = rng.uniform(-slip_xy, slip_xy, size=2)
+        dyaw = rng.uniform(-slip_yaw, slip_yaw)
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        slip_rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        # 実際の台車 = hover 目標 * スリップ。そこから見た掌を、hover 目標に
+        # いると仮定したワールド系に戻す変換 (B S^-1 B^-1)。
+        rot = base_rot @ slip_rot.T @ base_rot.T
+        pos = (base_pos - rot @ base_pos
+               - base_rot @ slip_rot.T @ np.array([dx, dy, 0.0]))
+        observed = transform_palm(palm, rot, pos)
+        robot.angle_vector(angle_vector)
+        robot.newcoords(base_pose)
+        info = refine_post_process(
+            robot, robot_arm, observed, result['turn_deg'],
+            result['post_process'])
+        info.pop('post_process')
+        info['slip'] = [float(dx), float(dy), float(dyaw)]
+        records.append(info)
+    return records
 
 
 def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
@@ -2155,6 +2297,18 @@ def main():
         help='pick_verified_candidate が関節の曲げ量コスト昇順に '
             '干渉の事後検証 + solve_post_process を試す候補数の上限 '
             '(既定は無制限)。0 以下を指定すると無制限に試す。')
+    parser.add_argument(
+        '--final-correction-trials', type=int, default=0,
+        help='押し込み直前の最終補正 (refine_post_process、hover 到達後に '
+            '掌を検出し直して押し込み姿勢を解き直す) の計算時間を見積もる '
+            'ため、後処理まで解けた人物ごとに台車のスリップを乱数で与えて '
+            'この回数だけ解き直し、結果 JSON の final_correction に記録する '
+            '(既定 0 = 行わない)。')
+    parser.add_argument(
+        '--final-correction-slip', type=float, nargs=2, default=[0.03, 3.0],
+        metavar=('XY', 'YAW_DEG'),
+        help='--final-correction-trials で与える台車のスリップの範囲 '
+            '(x/y は ±XY [m]、yaw は ±YAW_DEG [度] の一様乱数、既定 0.03 3.0)。')
     args = parser.parse_args()
 
     files = iter_palm_files(args.input_dir)
@@ -2323,6 +2477,16 @@ def main():
                 turn_index, angle_vector, base_pose,
                 person_base_limits, post_process_result, collision_ik_time,
                 candidate_selection_time, human_hand, palm)
+            if (args.final_correction_trials > 0
+                    and post_process_result is not None):
+                # 人物ごとに固定のシードにする (共有の np.random を進めると
+                # 以降の人物の IK の初期値まで変わってしまうため)。
+                result['final_correction'] = simulate_final_correction(
+                    robot, robot_arm, result, palm, angle_vector, base_pose,
+                    args.final_correction_trials,
+                    args.final_correction_slip[0],
+                    math.radians(args.final_correction_slip[1]),
+                    np.random.RandomState(i))
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         n_total += 1

@@ -433,9 +433,19 @@ def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINT
     post = result.get('post_process')
     if post is None:
         return waypoints, n_approach
+    waypoints += build_press_in_waypoints(
+        waypoints[-1], motion['joint_names'], post, n_press_in)
+    return waypoints, n_approach
 
-    joint_names = motion['joint_names']
-    last_wp = waypoints[-1]
+
+def build_press_in_waypoints(last_wp, joint_names, post,
+                             n_press_in=PRESS_IN_DISPLAY_WAYPOINTS):
+    """hover 目標の waypoint ``last_wp`` (関節角は ``joint_names`` の並び)
+    から押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict) までを
+    ``n_press_in`` 等分した補間 waypoint のリスト (``last_wp`` 自身は含ま
+    ない) を返す (``build_display_waypoints`` と、実機で押し込み直前に
+    押し込み姿勢を解き直したときの差し替えに使う)。"""
+    waypoints = []
     start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
     post_name_to_angle = dict(zip(post['joint_names'],
                                   post['joint_angle_vector']))
@@ -454,4 +464,4 @@ def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINT
             base_yaw=float(base_vec[2]),
             joint_angle_vector=[float(v) for v in angle_vec],
         ))
-    return waypoints, n_approach
+    return waypoints
