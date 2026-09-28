@@ -1132,15 +1132,23 @@ class HandshakePipelineNode(object):
                     person_base_limits[2], human_yaw,
                     margin=math.radians(
                         spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
+        # 台車の前後位置を人の立ち位置付近に絞り、人と横並びにする。解け
+        # なければ窓を広げて解き直す (spik.solve_person_ik_side_by_side
+        # 参照)。
+        standing_xy = spik.human_standing_xy(translated_joints)
+        standing_x = None if standing_xy is None else float(standing_xy[0])
 
         target_pos = spik.palm_target_position(translated_palm)
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
-        picked, collision_ik_time, candidate_selection_time = \
-            spik.solve_person_ik(
+        (picked, collision_ik_time, candidate_selection_time,
+         person_base_limits, x_margin) = \
+            spik.solve_person_ik_side_by_side(
                 self.robot, translated_palm, offered_hand, robot_arm,
-                collision_obstacles,
+                collision_obstacles, person_base_limits, standing_x,
+                x_margins=args.base_x_standing_margins,
+                front_offset_weight=args.front_offset_weight,
+                facing_yaw_weight=args.facing_yaw_weight,
                 attempts_per_pose=args.attempts_per_pose,
-                base_limits=person_base_limits,
                 self_collision=(not args.no_self_collision
                                 and self.collision_pairs is not None),
                 collision_pairs=self.collision_pairs,
@@ -1161,6 +1169,7 @@ class HandshakePipelineNode(object):
                 candidate_selection_time, offered_hand, translated_palm)
         result['offered_hand'] = offered_hand
         result['robot_arm'] = robot_arm
+        result['base_x_standing_margin'] = x_margin
 
         # IK が解けたら続けて軌道計画を行う (plan_handshake_motion.py の
         # main と同じ、target かつ solved の人物だけが対象)。IK は
@@ -1202,6 +1211,13 @@ class HandshakePipelineNode(object):
                 kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                 compute_time=motion['compute_time']))
 
+        # 最終の台車位置と人の位置関係 (方位・前方ずれ・向きのずれ、
+        # docs/handshake_base_placement.md)。IK と同じ仮想座標系で計算する
+        # ので untranslate の前に求める。
+        placement = (spik.base_placement_metrics(
+            translated_joints, result['base_position'], result['base_yaw'])
+            if result['solved'] else None)
+
         self._untranslate_result(result, offset)
         if motion is not None:
             self._untranslate_motion(motion, offset)
@@ -1211,6 +1227,8 @@ class HandshakePipelineNode(object):
             robot_arm=robot_arm, solved=result['solved'],
             base_position=[result['base_position'][0],
                           result['base_position'][1]],
+            base_x_standing_margin=x_margin,
+            placement=placement,
             collision_ik_time=collision_ik_time,
             candidate_selection_time=candidate_selection_time))
 
@@ -2915,6 +2933,28 @@ def main():
     parser.add_argument(
         '--base-yaw-range', type=float, nargs=2,
         default=list(spik.DEFAULT_BASE_YAW_RANGE))
+    parser.add_argument(
+        '--base-x-standing-margins', type=float, nargs='+',
+        default=list(spik.DEFAULT_BASE_X_STANDING_MARGINS),
+        help='台車の x (前後) の可動範囲を人の立ち位置 ±この幅 [m] に絞る '
+            '(人と横並びにするため、solve_palm_ik.py と同じ)。先頭から順に '
+            '試し、解けなければ次の幅で解き直す。負の値は絞らない (既定 {})。'
+            .format(' '.join(
+                str(m) for m in spik.DEFAULT_BASE_X_STANDING_MARGINS)))
+    parser.add_argument(
+        '--front-offset-weight', type=float,
+        default=spik.DEFAULT_FRONT_OFFSET_WEIGHT,
+        help='IK 候補の並べ替えで、関節の曲げ量コストに「台車が人の立ち位置 '
+            'から人の正面方向にずれた距離 [m] の絶対値 × この重み」を足す '
+            '(solve_palm_ik.py と同じ。既定 {}、0 で足さない)。'.format(
+                spik.DEFAULT_FRONT_OFFSET_WEIGHT))
+    parser.add_argument(
+        '--facing-yaw-weight', type=float,
+        default=spik.DEFAULT_FACING_YAW_WEIGHT,
+        help='IK 候補の並べ替えで、関節の曲げ量コストに「台車の向きが人の '
+            '正面方向からずれた角度 [rad] の絶対値 × この重み」を足す '
+            '(solve_palm_ik.py と同じ。既定 {}、0 で足さない)。'.format(
+                spik.DEFAULT_FACING_YAW_WEIGHT))
     parser.add_argument(
         '--save-dir', type=str, default=None,
         help='指定すると、IK まで解いた試行ごとに骨格/掌/IK結果/軌道の '

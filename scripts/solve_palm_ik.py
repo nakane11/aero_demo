@@ -765,6 +765,52 @@ def restrict_base_y_range_to_hand_side(base_y_range, side_sign):
     return (lo, restricted_hi) if lo <= restricted_hi else base_y_range
 
 
+# 台車の x (前後) を人間の立ち位置からどれだけずらしてよいかの許容幅
+# [m]。solve_person_ik_side_by_side が狭い方から順に試し、解けなければ
+# 広げる (負の値は絞らない)。
+DEFAULT_BASE_X_STANDING_MARGINS = (0.15, 0.3, -1.0)
+
+# pick_verified_candidate の並べ替えで、関節の曲げ量コストに足す「台車が
+# 人の立ち位置から人の正面方向にずれた距離 [m] の絶対値」の重み。窓
+# (DEFAULT_BASE_X_STANDING_MARGINS) の中でも曲げ量コスト最小の解は窓の
+# 前端に張り付くため、横並びに近い候補を優先させる
+# (docs/handshake_base_placement.md 参照)。
+DEFAULT_FRONT_OFFSET_WEIGHT = 30.0
+
+# 同じく、台車の向きが人の正面方向からずれた角度 [rad] の絶対値の重み。
+# yaw は人の正面方向 ±30° の窓 (restrict_base_yaw_range_to_human_facing)
+# の中では縛るものが無く、窓の端 (人の方へ斜めに向く等) に張り付きやすい
+# (docs/handshake_base_placement.md 参照)。
+DEFAULT_FACING_YAW_WEIGHT = 30.0
+
+
+def restrict_base_x_range_to_human_standing(base_x_range, standing_x,
+                                            margin):
+    """台車の x 可動範囲 ``base_x_range`` (下限, 上限) を、人間の立ち位置
+    の x 座標 ``standing_x`` (``human_standing_xy`` の x) を中心とした
+    ``±margin`` の窓との積集合に絞ったものを返す。
+
+    x の制限が無いと、差し出した手 (体の 0.4〜0.5m 前) の真横まで台車が
+    前に出て腕を体の横に下ろしたまま繋ぐ解が関節の曲げ量コスト最小に
+    なり、最終位置が人より前にずれて、終点で人がロボットの斜め後ろに
+    来てしまう。人と横並びにするため前後位置を立ち位置付近に縛る。
+
+    人間がほぼ ±x を向いていることを前提にする
+    (``restrict_base_y_range_to_hand_side`` が world の y で左右を判定
+    しているのと同じ前提)。``standing_x``/``margin`` が ``None`` または
+    ``margin`` が負のときは制限せずそのまま返す。積集合が空になる場合も
+    IK が解けなくなってしまうため ``base_x_range`` をそのまま返す。
+    """
+    if standing_x is None or margin is None or margin < 0.0:
+        return base_x_range
+    lo, hi = base_x_range
+    restricted_lo = max(lo, standing_x - margin)
+    restricted_hi = min(hi, standing_x + margin)
+    if restricted_lo > restricted_hi:
+        return base_x_range
+    return (restricted_lo, restricted_hi)
+
+
 # 台車の向きを人間の正面方向にどれだけ揃えるかの許容幅 (既定 ±30度)。
 DEFAULT_BASE_YAW_FACING_MARGIN_DEG = 30.0
 
@@ -1872,6 +1918,54 @@ def simulate_final_correction(robot, robot_arm, result, palm, angle_vector,
     return records
 
 
+def _base_front_offset(base_pose, standing_xy, facing):
+    """台車の位置 (``base_pose``、``batch_inverse_kinematics`` が返す
+    Coordinates) が、人の立ち位置 ``standing_xy`` から人の正面方向
+    ``facing`` (単位ベクトル) にどれだけ前 [m] にあるか (後ろなら負)。"""
+    base_xy = np.asarray(base_pose.worldpos(), dtype=np.float64)[:2]
+    return float(np.dot(base_xy - standing_xy, facing))
+
+
+def _base_yaw_offset(base_pose, facing):
+    """台車の向き (``base_pose`` の +x 軸) の、人の正面方向 ``facing``
+    (単位ベクトル) からのずれ [rad] (-pi〜pi、左回りが正)。"""
+    x_axis = np.asarray(base_pose.worldrot(), dtype=np.float64)[:2, 0]
+    return float(math.atan2(
+        facing[0] * x_axis[1] - facing[1] * x_axis[0],
+        facing[0] * x_axis[0] + facing[1] * x_axis[1]))
+
+
+def base_placement_metrics(joint_positions, base_position, base_yaw):
+    """最終の台車位置と人の位置関係を返す (docs/handshake_base_placement.md
+    の指標)。``joint_positions`` と ``base_position``/``base_yaw`` は同じ
+    座標系のもの。人の立ち位置・向きが求まらなければ ``None``。
+
+    Returns
+    -------
+    dict or None
+        ``bearing_deg``: 台車の中心から人の立ち位置を見た方向 (ロボットの
+        正面が 0 度、左回りが正、±90 度が真横)。``front_offset``: 台車が
+        人の立ち位置から人の正面方向にどれだけ前にあるか [m]。
+        ``yaw_offset_deg``: 台車の向きの人の正面方向からのずれ (人のいる
+        側へ回っている向きが正)。
+    """
+    standing_xy = human_standing_xy(joint_positions)
+    facing = human_facing_direction(joint_positions)
+    if standing_xy is None or facing is None:
+        return None
+    base_xy = np.asarray(base_position, dtype=np.float64)[:2]
+    d = standing_xy - base_xy
+    c, s = math.cos(-base_yaw), math.sin(-base_yaw)
+    bearing = math.atan2(s * d[0] + c * d[1], c * d[0] - s * d[1])
+    yaw_offset = base_yaw - math.atan2(facing[1], facing[0])
+    yaw_offset = math.atan2(math.sin(yaw_offset), math.cos(yaw_offset))
+    return dict(
+        bearing_deg=math.degrees(bearing),
+        front_offset=float(np.dot(base_xy - standing_xy, facing)),
+        yaw_offset_deg=math.degrees(yaw_offset) * (
+            1.0 if bearing > 0.0 else -1.0))
+
+
 def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             verification_pairs, joint_positions,
                             collision_verify_tolerance,
@@ -1881,7 +1975,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
                             post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                             post_process_max_candidates=(
-                                DEFAULT_POST_PROCESS_MAX_CANDIDATES)):
+                                DEFAULT_POST_PROCESS_MAX_CANDIDATES),
+                            front_offset_weight=0.0,
+                            facing_yaw_weight=0.0):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、**関節の曲げ量コスト (``joint_bend_cost``)
@@ -1900,6 +1996,14 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     ``verification_pairs`` には最適化で使った (絞り込み済みの)
     ``collision_pairs`` ではなく、``build_collision_verification_pairs``
     が作る総当たりの組み合わせを渡す想定。
+
+    ``front_offset_weight`` > 0 (かつ ``joint_positions`` あり) のときは、
+    曲げ量コストに「台車が人の立ち位置から人の正面方向にずれた距離 [m]
+    の絶対値 × ``front_offset_weight``」を足したコストで並べる
+    (``DEFAULT_FRONT_OFFSET_WEIGHT`` 参照)。``facing_yaw_weight`` > 0
+    のときは、同様に「台車の向きが人の正面方向からずれた角度 [rad] の
+    絶対値 × ``facing_yaw_weight``」も足す (``DEFAULT_FACING_YAW_WEIGHT``
+    参照)。以下の「曲げ量コスト」はこの合計を指す。
 
     まず 1 を満たす候補全てについて、``angle_vectors`` の値から直接
     (``robot`` の状態を書き換えずに) 曲げ量コストだけを計算し、昇順に
@@ -1939,14 +2043,36 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     turn_degs = turn_candidates_deg(hand, palm)
     bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
 
+    # front_offset_weight > 0 のときは、台車が人の立ち位置から人の正面
+    # 方向にずれた距離 [m] の絶対値にこの重みを掛けてコストに足す
+    # (_base_front_offset 参照、人と横並びの候補を優先する)。
+    # facing_yaw_weight > 0 のときは、台車の向きが人の正面方向からずれた
+    # 角度 [rad] の絶対値にこの重みを掛けて足す (人と同じ向きに揃える)。
+    standing_xy = facing = None
+    if (front_offset_weight > 0.0 or facing_yaw_weight > 0.0) \
+            and joint_positions:
+        standing_xy = human_standing_xy(joint_positions)
+        facing = human_facing_direction(joint_positions)
+
+    def candidate_cost(candidate_index):
+        cost = _joint_bend_cost_from_vector(
+            angle_vectors[candidate_index], bend_cost_indices)
+        if standing_xy is not None and facing is not None:
+            base_pose = base_poses[candidate_index]
+            if front_offset_weight > 0.0:
+                cost += front_offset_weight * abs(_base_front_offset(
+                    base_pose, standing_xy, facing))
+            if facing_yaw_weight > 0.0:
+                cost += facing_yaw_weight * abs(_base_yaw_offset(
+                    base_pose, facing))
+        return cost
+
     # 第1パス (安価): 収束した候補全てについて、angle_vectors から直接
     # 曲げ量コストだけを計算し (robot の状態は書き換えない)、昇順に
     # 並べ替える。同着コストのタイブレークは添字順 (向き優先 -> 初期値順)
     # にする。
     candidates = sorted(
-        ((_joint_bend_cost_from_vector(
-            angle_vectors[candidate_index], bend_cost_indices),
-          candidate_index)
+        ((candidate_cost(candidate_index), candidate_index)
          for candidate_index, ok in enumerate(success_flags) if ok),
         key=lambda item: (item[0], item[1]))
 
@@ -2030,7 +2156,9 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     post_process_thre=DEFAULT_POST_PROCESS_IK_THRE,
                     post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                     post_process_max_candidates=(
-                        DEFAULT_POST_PROCESS_MAX_CANDIDATES)):
+                        DEFAULT_POST_PROCESS_MAX_CANDIDATES),
+                    front_offset_weight=0.0,
+                    facing_yaw_weight=0.0):
     """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
     初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
@@ -2162,9 +2290,65 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         attempts_per_pose=attempts_per_pose,
         post_process_thre=post_process_thre,
         post_process_rthre=post_process_rthre,
-        post_process_max_candidates=post_process_max_candidates)
+        post_process_max_candidates=post_process_max_candidates,
+        front_offset_weight=front_offset_weight,
+        facing_yaw_weight=facing_yaw_weight)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
+
+
+def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
+                                 collision_obstacles, base_limits,
+                                 standing_x,
+                                 x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
+                                 **kwargs):
+    """台車の x 可動範囲を人間の立ち位置 ``standing_x`` ± ``x_margins``
+    の各幅に絞って、狭い方から順に ``solve_person_ik`` を解き、最初に
+    解けた結果を返す (``restrict_base_x_range_to_human_standing`` 参照)。
+
+    狭い窓だけでは解けない人 (手を体のかなり前に差し出している等) が
+    いるため、解けなければ窓を広げて解き直す。``x_margins`` の負の値は
+    「x を絞らない」を表し、最後に置けば従来と同じ範囲で解いたときの
+    成功率を下回らない。``base_limits`` はバッチ IK に trace 対象の引数
+    として渡るため (docs/jax_compilation_cache.md 9節)、解き直しても
+    再コンパイルは起きない。``standing_x`` が ``None`` のときは絞らずに
+    1 回だけ解く。``kwargs`` はそのまま ``solve_person_ik`` に渡す。
+
+    Returns
+    -------
+    tuple
+        ``(picked, collision_ik_time, candidate_selection_time,
+        base_limits, x_margin)``。時間は全試行の合計、``base_limits``/
+        ``x_margin`` は最後に試した (解けたならその) 窓。
+    """
+    if standing_x is None or not x_margins:
+        x_margins = (-1.0,)
+    collision_ik_time = candidate_selection_time = 0.0
+    # 干渉検証は通ったが後処理判定 (押し込み・視線) に通らなかった解は、
+    # 窓を広げれば後処理まで通る解が見つかることがあるので解き直す。
+    # どの窓でも後処理まで通らなければ、最初に見つかったこの解を返す。
+    fallback = None
+    for x_margin in x_margins:
+        person_base_limits = [
+            restrict_base_x_range_to_human_standing(
+                base_limits[0], standing_x, margin=x_margin),
+            base_limits[1], base_limits[2]]
+        picked, ik_time, selection_time = solve_person_ik(
+            robot, palm, hand, robot_arm, collision_obstacles,
+            base_limits=person_base_limits, **kwargs)
+        collision_ik_time += ik_time
+        candidate_selection_time += selection_time
+        if picked is not None and picked[3] is not None:
+            break
+        if picked is not None and fallback is None:
+            fallback = (picked, person_base_limits, x_margin)
+        print('  [base-x] 立ち位置 ±{} m では後処理まで解けませんでした。'
+              .format(x_margin if x_margin >= 0.0 else 'inf'))
+    else:
+        if fallback is not None:
+            picked, person_base_limits, x_margin = fallback
+    return (picked, collision_ik_time, candidate_selection_time,
+            person_base_limits, x_margin)
 
 
 def base_movable_region(base_limits):
@@ -2425,6 +2609,25 @@ def main():
         metavar=('XY', 'YAW_DEG'),
         help='--final-correction-trials で与える台車のスリップの範囲 '
             '(x/y は ±XY [m]、yaw は ±YAW_DEG [度] の一様乱数、既定 0.03 3.0)。')
+    parser.add_argument(
+        '--base-x-standing-margins', type=float, nargs='+',
+        default=list(DEFAULT_BASE_X_STANDING_MARGINS),
+        help='台車の x (前後) の可動範囲を人間の立ち位置 ±この幅 [m] に絞る '
+            '(人と横並びにするため)。複数指定すると先頭から順に試し、解け '
+            'なければ次の幅で解き直す。負の値は絞らない (既定 {})。'
+            .format(' '.join(str(m) for m in DEFAULT_BASE_X_STANDING_MARGINS)))
+    parser.add_argument(
+        '--front-offset-weight', type=float,
+        default=DEFAULT_FRONT_OFFSET_WEIGHT,
+        help='候補の並べ替えで、関節の曲げ量コストに「台車が人の立ち位置から '
+            '人の正面方向にずれた距離 [m] の絶対値 × この重み」を足す '
+            '(既定 {}、0 で足さない)。'.format(DEFAULT_FRONT_OFFSET_WEIGHT))
+    parser.add_argument(
+        '--facing-yaw-weight', type=float,
+        default=DEFAULT_FACING_YAW_WEIGHT,
+        help='候補の並べ替えで、関節の曲げ量コストに「台車の向きが人の正面 '
+            '方向からずれた角度 [rad] の絶対値 × この重み」を足す '
+            '(既定 {}、0 で足さない)。'.format(DEFAULT_FACING_YAW_WEIGHT))
     args = parser.parse_args()
 
     files = iter_palm_files(args.input_dir)
@@ -2554,12 +2757,23 @@ def main():
                         person_base_limits[2], human_yaw,
                         margin=math.radians(DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
 
+        # 台車の前後位置を人間の立ち位置付近に絞り、人と横並びにする。
+        # 解けなければ窓を広げて解き直す (solve_person_ik_side_by_side
+        # 参照)。
+        standing_xy = (None if joint_positions is None
+                       else human_standing_xy(joint_positions))
+        standing_x = None if standing_xy is None else float(standing_xy[0])
+
         target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, human_hand, robot_arm)
-        picked, collision_ik_time, candidate_selection_time = solve_person_ik(
+        (picked, collision_ik_time, candidate_selection_time,
+         person_base_limits, x_margin) = solve_person_ik_side_by_side(
             robot, palm, human_hand, robot_arm, collision_obstacles,
+            person_base_limits, standing_x,
+            x_margins=args.base_x_standing_margins,
+            front_offset_weight=args.front_offset_weight,
+            facing_yaw_weight=args.facing_yaw_weight,
             attempts_per_pose=args.attempts_per_pose,
-            base_limits=person_base_limits,
             collision_weight=DEFAULT_COLLISION_WEIGHT,
             collision_margin=DEFAULT_COLLISION_MARGIN,
             self_collision=(collision_pairs is not None),
@@ -2605,6 +2819,8 @@ def main():
                     np.random.RandomState(i))
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
+        # 最後に試した x の窓の幅 (負なら絞っていない)。
+        result['base_x_standing_margin'] = x_margin
         n_total += 1
         n_solved += int(result['solved'])
         save_json(result, out_path)

@@ -40,6 +40,17 @@ MediaPipe 形式の骨格・掌の
    (`--base-yaw-facing-margin` で変更可) にそれぞれ人物ごとに制限される
    (`--no-hand-side-base-constraint`/`--no-facing-base-constraint` で
    無効化可)。
+   終点で人と横並びになるよう、台車の x (前後) も人の立ち位置 ±0.15 m に
+   絞って解き、後処理まで通る解が無ければ ±0.3 m → 無制限と窓を広げて
+   解き直す (`--base-x-standing-margins`、負の値は無制限。結果 JSON の
+   `base_x_standing_margin` に解けた窓を記録)。さらに候補の採用順は、関節の
+   曲げ量コストに「台車が人の立ち位置から人の正面方向にずれた距離 [m] ×
+   `--front-offset-weight` (既定 30)」と「台車の向きが人の正面方向から
+   ずれた角度 [rad] × `--facing-yaw-weight` (既定 30)」を足したコストの
+   昇順にする。背景と
+   合成データでの比較は
+   [`docs/handshake_base_placement.md`](docs/handshake_base_placement.md)
+   参照 (`run_camera_pipeline_test.py` にも同名のオプション)。
    人体側の干渉回避ジオメトリはIK 最適化中の干渉コスト・候補採用前の事後検証
    ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。事後検証
    (候補ごとの `collision_pairs_min_distance` 呼び出し)はこの人体ジオメトリ
@@ -236,6 +247,10 @@ python3 view_handshake_poses.py
 「経路上の干渉も含めて検証できた人数 (verified)」を集計に加える。この
 とき `--viewer` も指定すると、5 は `view_handshake_poses.py` の代わりに
 軌道を再生できる `view_handshake_motion.py` を開く。
+`--base-x-standing-margins`/`--front-offset-weight`/`--facing-yaw-weight` はそのまま
+`solve_palm_ik.py` に渡される (最終台車位置の比較に使う、
+[`docs/handshake_base_placement.md`](docs/handshake_base_placement.md)
+参照)。
 
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
 `--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる

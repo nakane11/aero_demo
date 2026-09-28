@@ -110,6 +110,18 @@ python3 tools/plot_handshake_motion_2d.py 20 --seed 3 \
     --initial-base-pose 5 0 3.14
 ```
 
+### `tools/summarize_final_base_placement.py`
+
+`run_pipeline_test.py` の作業ディレクトリ (複数可) を読み、IK が決めた
+最終の台車位置と人の位置関係 (方位・人の正面方向に沿った前方ずれ)・
+成功率・IK の計算時間を集計する。指標の定義と、これを使った比較は
+[`handshake_base_placement.md`](handshake_base_placement.md) 参照。
+
+```bash
+python3 tools/summarize_final_base_placement.py \
+    /tmp/aero_demo_pipeline_xxxx /tmp/aero_demo_pipeline_yyyy
+```
+
 ### `tools/view_aero_collision_model.py`
 
 Aero の干渉 (コリジョン) モデル (`aero_demo.collision_model.

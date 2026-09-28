@@ -267,6 +267,20 @@ def main():
         metavar=('XY', 'YAW_DEG'),
         help='solve_palm_ik.py に --final-correction-slip として渡す '
             'スリップの範囲 (既定は指定なし = ±0.03m/±3度)。')
+    parser.add_argument(
+        '--base-x-standing-margins', type=float, nargs='+', default=None,
+        help='solve_palm_ik.py に --base-x-standing-margins として渡す '
+            '(台車の前後位置を人の立ち位置 ± この幅 [m] に絞り、解けなければ '
+            '次の幅で解き直す。負の値で絞らない。既定は指定なし = '
+            'solve_palm_ik.py の既定値)。')
+    parser.add_argument(
+        '--front-offset-weight', type=float, default=None,
+        help='solve_palm_ik.py に --front-offset-weight として渡す (既定は '
+            '指定なし = solve_palm_ik.py の既定値)。')
+    parser.add_argument(
+        '--facing-yaw-weight', type=float, default=None,
+        help='solve_palm_ik.py に --facing-yaw-weight として渡す (既定は '
+            '指定なし = solve_palm_ik.py の既定値)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -305,6 +319,13 @@ def main():
         if args.final_correction_slip is not None:
             solve_args += ['--final-correction-slip'] + [
                 str(v) for v in args.final_correction_slip]
+    if args.base_x_standing_margins is not None:
+        solve_args += ['--base-x-standing-margins'] + [
+            str(v) for v in args.base_x_standing_margins]
+    if args.front_offset_weight is not None:
+        solve_args += ['--front-offset-weight', str(args.front_offset_weight)]
+    if args.facing_yaw_weight is not None:
+        solve_args += ['--facing-yaw-weight', str(args.facing_yaw_weight)]
     solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
                                            solve_args)
     warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)
