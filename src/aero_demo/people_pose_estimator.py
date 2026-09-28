@@ -416,7 +416,8 @@ class PeoplePoseEstimator(object):
             を人物自身の左右に直したもの。見た目だけで決まるため誤りうる)、
             ``score`` (handedness の確信度)、``positions`` (``{side}Hand0``..
             ``{side}Hand20`` -> [x, y, z]、深度が取れた点だけ。
-            ``estimate_3d`` と同じ除去処理を通したもの)。
+            ``estimate_3d`` と同じ除去処理を通したもの)、``pixels``
+            (同じ名前 -> 画像上の [u, v]、深度に関係なく全 21 点)。
         """
         if self.hands is None:
             self.hands = mp.solutions.hands.Hands(
@@ -454,7 +455,10 @@ class PeoplePoseEstimator(object):
             hands.append(dict(
                 side=side, score=float(classification.score),
                 positions={name: [float(v) for v in p]
-                           for name, p in positions.items()}))
+                           for name, p in positions.items()},
+                pixels={joint_pos['limb']: [float(joint_pos['x']),
+                                            float(joint_pos['y'])]
+                        for joint_pos in joints_2d}))
         return hands
 
     def _sample_depth(self, depth_img, u, v):

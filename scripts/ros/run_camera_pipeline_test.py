@@ -81,12 +81,13 @@ import sys
 import threading
 import time
 
+import cv2
 import numpy as np
 
 import rospy
 import message_filters
 import tf2_ros
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
 
 # このファイルは ROS 依存プログラムをまとめた scripts/ros/ の下にあるので、
 # ROS 非依存の scripts/ (estimate_palm_poses.py/solve_palm_ik.py がある) は
@@ -123,6 +124,7 @@ from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
 from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
+from aero_demo import scan_matching  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo.ros_camera_utils import (  # noqa: E402
     imgmsg_to_ndarray, lookup_camera_to_base, lookup_frame_position,
@@ -144,6 +146,7 @@ from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
+from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr  # noqa: E402
 from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
@@ -235,6 +238,29 @@ TIME_LIMIT_MAX_ITERATIONS = 100
 BASE_CORRECTION_MAX_ATTEMPTS = 3
 BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
 BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
+# 上記の補正で、実際に動いた量を移動前後の /scan の照合
+# (aero_demo.scan_matching.icp_2d) で求めるときのパラメータ
+# (--base-correction scan)。/odom は指令の積分なのでスリップが表れない。
+SCAN_CAPTURE_TIMEOUT = 0.5  # [s] 呼び出し後に新しいスキャンが届くまで待つ上限
+SCAN_MAX_RANGE = 10.0  # [m] これより遠い点は使わない
+# 人の骨格の各関節 (xy) からこの半径以内の点は照合に使わない (脚などが
+# 移動の前後で動くため)。
+SCAN_HUMAN_EXCLUDE_RADIUS = 0.5  # [m]
+# 照合結果を採用する品質の下限/上限 (満たさなければ odom で代用)。合成
+# スキャン (160 度旋回+スリップ) では対応率 0.7 前後・rms 8mm 前後。
+SCAN_MIN_INLIER_RATIO = 0.3
+SCAN_MIN_INLIERS = 100
+SCAN_MAX_RMS = 0.03  # [m]
+# 台車のゴール終了後に odom が止まるのを待つとき (_wait_odom_settle) の
+# 判定。この時間の間の移動がこれ未満なら止まったとみなす。
+ODOM_SETTLE_WINDOW = 0.05  # [s]
+ODOM_SETTLE_POSITION = 0.001  # [m]
+ODOM_SETTLE_ANGLE = math.radians(0.1)  # [rad]
+ODOM_SETTLE_TIMEOUT = 1.0  # [s]
+# actionlib のゴール状態の表示名 (actionlib_msgs/GoalStatus)。
+GOAL_STATUS_NAMES = {
+    0: 'PENDING', 1: 'ACTIVE', 2: 'PREEMPTED', 3: 'SUCCEEDED', 4: 'ABORTED',
+    5: 'REJECTED', 6: 'PREEMPTING', 7: 'RECALLING', 8: 'RECALLED', 9: 'LOST'}
 # hover 目標・押し込み終了時に、腕が指令に追いつくのを待つときの
 # パラメータ (_wait_joint_settle 参照)。実機の腕は制御周期 15Hz + サーボ
 # への到達時間 (overlap 約 133ms) の分、指令から約 0.2 秒遅れて追従し、
@@ -543,6 +569,12 @@ class HandshakePipelineNode(object):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub, info_sub], queue_size=5, slop=0.1)
         self.sync.registerCallback(self._on_frame)
+        # 台車位置補正 (--base-correction scan) で使う LiDAR。最新の 1 つ
+        # (PC で受信した時刻, msg) だけ保持する (_capture_scan 参照)。
+        self._latest_scan = None
+        if args.base_correction == 'scan':
+            self.scan_sub = rospy.Subscriber(
+                args.scan_topic, LaserScan, self._on_scan, queue_size=1)
 
         self._setup_viewer(args)
 
@@ -940,7 +972,12 @@ class HandshakePipelineNode(object):
                 color, depth_m, intrinsics, output_transform=camera_to_base)
             with self._lock:
                 if self._hand_frames_requested:
-                    self._hand_frames.append(hands)
+                    # 失敗時に画像として保存できるよう、画像・カメラの
+                    # 姿勢・内部パラメータも一緒に持つ (_save_refine_failure)。
+                    self._hand_frames.append(dict(
+                        hands=hands, color=color,
+                        camera_to_base=camera_to_base, intrinsics=intrinsics,
+                        stamp=color_msg.header.stamp.to_sec()))
 
         if self.state == 'armed' and armed_joint_positions is not None:
             # robot_position (差し出し手判定の基準にするロボット手先位置)
@@ -1458,8 +1495,10 @@ class HandshakePipelineNode(object):
         止まらない滑らかな軌道にするため、まとめて 1 つのゴールとして送り
         台車・腕を並行に動かす (従来通り)。ただし押し込みは台車が hover
         目標姿勢にいる前提の動きなので、接近区間の完了後・押し込み区間の
-        開始前に、台車のスリップ等による位置ずれを odom 基準で検出・補正し
-        (``_correct_base_residual``)、補正が収束してから押し込みへ進む。
+        開始前に、台車のスリップ等による位置ずれを検出・補正し
+        (``_correct_base_residual``、既定では移動前後の /scan の照合で
+        実際の移動量を求める。``--base-correction``)、補正が収束してから
+        押し込みへ進む。
         腕はこの補正の間、待たされない (接近区間の腕動作は既に完了して
         いる)。
 
@@ -1509,10 +1548,26 @@ class HandshakePipelineNode(object):
 
         self._say(self.args.speech_start_text)
 
+        # 台車位置補正の基準にするスキャン (まだ静止している接近区間の開始
+        # 前に取る) と、照合から除く人の骨格の位置 (骨格はこの時点の
+        # base_link 系 = 接近区間の先頭の台車座標系で表されている)。
+        ref_scan = None
+        exclude_centers = None
+        if self.args.base_correction == 'scan':
+            ref_scan = self._capture_scan()
+            with self._lock:
+                frozen = self._frozen_joint_positions
+            if frozen:
+                exclude_centers = np.array(
+                    [p[:2] for p in frozen.values()], dtype=np.float64)
+
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
             display_waypoints[:reach_boundary], joint_names)
 
-        self._correct_base_residual(start_odom_coords, final_traj_point)
+        if self.args.base_correction != 'none':
+            self._correct_base_residual(
+                start_odom_coords, final_traj_point, ref_scan=ref_scan,
+                exclude_centers=exclude_centers)
 
         # 腕は実機側の遅延で指令から約 0.2 秒遅れて追従し、
         # wait_interpolation はその遅れが解消する前に返る (JOINT_SETTLE_
@@ -1574,36 +1629,127 @@ class HandshakePipelineNode(object):
 
         Returns
         -------
-        (joint_positions or None, distances)
+        (joint_positions or None, distances, candidates)
             ``distances`` は採用したフレームごとの、選んだ手の掌中心と
-            ``expected_position`` の距離 [m]。
+            ``expected_position`` の距離 [m]。``candidates`` はフレームごと
+            の検出した全ての手の内訳 (ログ・失敗時の保存用。``side``/
+            ``score``/深度が取れた点数 ``n_points``/掌の中心 ``palm_position``
+            (掌が求まらなければ None)/``distance`` [m])。
         """
         chosen = []
         distances = []
-        for hands in hand_frames:
+        candidates = []
+        for frame in hand_frames:
             best = None
-            for hand in hands:
+            frame_candidates = []
+            for hand in frame['hands']:
                 prefix = '{}Hand'.format(hand['side'])
                 joints = {'{}Hand{}'.format(side, name[len(prefix):]): p
                           for name, p in hand['positions'].items()}
                 palm = self.palm_estimator.estimate_palm(joints, side)
-                if palm is None:
-                    continue
-                dist = float(np.linalg.norm(
+                dist = None if palm is None else float(np.linalg.norm(
                     np.asarray(palm['position']) - expected_position))
-                if best is None or dist < best[0]:
+                frame_candidates.append(dict(
+                    side=hand['side'], score=hand['score'],
+                    n_points=len(hand['positions']),
+                    palm_position=(None if palm is None
+                                   else [float(v) for v in palm['position']]),
+                    distance=dist))
+                if dist is not None and (best is None or dist < best[0]):
                     best = (dist, joints)
+            candidates.append(frame_candidates)
             if best is not None and best[0] <= PRESS_IN_REFINE_MAX_HAND_DISTANCE:
                 distances.append(best[0])
                 chosen.append(best[1])
         if not chosen:
-            return None, distances
+            return None, distances, candidates
         names = [name for name in chosen[0]
                  if sum(name in joints for joints in chosen) * 2
                  >= len(chosen)]
         return ({name: np.median([joints[name] for joints in chosen
                                   if name in joints], axis=0).tolist()
-                 for name in names}, distances)
+                 for name in names}, distances, candidates)
+
+    def _save_refine_failure(self, hand_frames, expected_position, candidates,
+                             record):
+        """押し込み直前の手の再検出に失敗したときのカメラ画像を保存する
+        (``--save-dir`` があればその下の ``refine_failures/``、無ければ
+        ``/tmp/aero_demo_refine_failures/``)。
+
+        フレームごとに元画像 (``frame{i}_raw.png``) と、検出した手の
+        ランドマーク・左右・計画時の掌からの距離、計画時の掌の位置
+        (hover 目標にいる前提、赤の十字と許容範囲
+        ``PRESS_IN_REFINE_MAX_HAND_DISTANCE`` の円) を描いた画像
+        (``frame{i}.png``) を保存し、``record`` (ログと同じ内容) を
+        ``record.json`` に書く。
+        """
+        root = (os.path.join(self.args.save_dir, 'refine_failures')
+                if self.args.save_dir else '/tmp/aero_demo_refine_failures')
+        out_dir = os.path.join(root, time.strftime('%Y%m%d_%H%M%S'))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            for i, (frame, frame_candidates) in enumerate(
+                    zip(hand_frames, candidates)):
+                color = frame['color']
+                cv2.imwrite(os.path.join(out_dir, 'frame{}_raw.png'.format(i)),
+                            color)
+                image = color.copy()
+                intr = frame['intrinsics']
+                base_to_camera = np.linalg.inv(frame['camera_to_base'])
+
+                def project(point):
+                    p = base_to_camera @ np.append(point, 1.0)
+                    if p[2] <= 0:
+                        return None, None
+                    return ((int(intr.fx * p[0] / p[2] + intr.cx),
+                             int(intr.fy * p[1] / p[2] + intr.cy)), p[2])
+
+                uv, depth = project(expected_position)
+                if uv is not None:
+                    radius = int(intr.fx * PRESS_IN_REFINE_MAX_HAND_DISTANCE
+                                 / depth)
+                    cv2.drawMarker(image, uv, (0, 0, 255), cv2.MARKER_CROSS,
+                                   30, 3)
+                    cv2.circle(image, uv, radius, (0, 0, 255), 2)
+                    cv2.putText(image, 'expected palm', (uv[0] + 10, uv[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                for hand, cand in zip(frame['hands'], frame_candidates):
+                    pixels = list(hand['pixels'].values())
+                    for u, v in pixels:
+                        cv2.circle(image, (int(u), int(v)), 3, (0, 255, 0), -1)
+                    if cand['palm_position'] is not None:
+                        palm_uv, _ = project(np.asarray(cand['palm_position']))
+                        if palm_uv is not None:
+                            cv2.drawMarker(image, palm_uv, (255, 0, 0),
+                                           cv2.MARKER_SQUARE, 16, 2)
+                    label = '{} {:.2f} {}'.format(
+                        cand['side'], cand['score'],
+                        'no palm' if cand['distance'] is None
+                        else '{:.0f}mm'.format(cand['distance'] * 1e3))
+                    u0, v0 = pixels[0]
+                    cv2.putText(image, label, (int(u0), int(v0) + 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imwrite(os.path.join(out_dir, 'frame{}.png'.format(i)),
+                            image)
+            json_io.save_json(os.path.join(out_dir, 'record.json'), dict(
+                record, stamps=[frame['stamp'] for frame in hand_frames]))
+            print('[execute][refine] 手の再検出に失敗したときの画像を {} に '
+                  '保存しました。'.format(out_dir))
+        except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
+            print('[execute][refine][WARN] 画像の保存に失敗しました ({})。'
+                  .format(exc))
+
+    def _place_robot_at_waypoint(self, joint_names, waypoint):
+        """``self.robot`` (IK 用) を ``waypoint`` の関節角・台車姿勢にする。
+
+        ``apply_waypoint_pose`` は ``base_link`` をロボットモデル本体からの
+        相対で置くが、``self.robot`` の本体は IK・軌道計画
+        (``robot.newcoords``) で動かされたままになっているため、先に本体を
+        原点に戻す (戻さないと ``base_link`` のワールド姿勢が waypoint と
+        食い違う)。
+        """
+        self.robot.newcoords(Coordinates())
+        apply_waypoint_pose(self.robot, joint_names, [waypoint], 0)
 
     def _refine_press_in(self, hover_wp, joint_names, result):
         """hover 目標に到達した後、カメラで人の手を検出し直して押し込み
@@ -1627,7 +1773,7 @@ class HandshakePipelineNode(object):
         # 計画時の掌 (初期位置基準) を、hover 目標にいる前提で今の
         # base_link 系に直した位置。検出した手のうちどれが人の手かを
         # 選ぶ基準にする。
-        apply_waypoint_pose(self.robot, joint_names, [hover_wp], 0)
+        self._place_robot_at_waypoint(joint_names, hover_wp)
         base = self.robot.base_link
         base_rot = base.worldrot().copy()
         base_pos = base.worldpos().copy()
@@ -1635,7 +1781,7 @@ class HandshakePipelineNode(object):
             np.asarray(planned_palm['position']) - base_pos)
         hand_frames = self._collect_hand_frames(
             PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
-        joint_positions, distances = self._select_offered_hand(
+        joint_positions, distances, candidates = self._select_offered_hand(
             hand_frames, offered_hand, expected_position)
         wait_time = time.time() - t0
         palm = None
@@ -1643,20 +1789,32 @@ class HandshakePipelineNode(object):
             palm = self.palm_estimator.estimate_palm(
                 joint_positions, offered_hand)
         if palm is None:
+            nearest = [c['distance'] for frame in candidates for c in frame
+                       if c['distance'] is not None]
             print('[execute][refine] hover 到達後に {}手を検出できなかった '
                   'ため、計画どおりに押し込みます ({:.2f}s 待機、{} フレーム'
                   '中 手を検出 {} フレーム、計画時の掌から {:.0f}mm 以内 {} '
-                  'フレーム)。'.format(
+                  'フレーム、最も近い手 {})。'.format(
                       offered_hand, wait_time, len(hand_frames),
-                      sum(1 for hands in hand_frames if hands),
+                      sum(1 for frame in hand_frames if frame['hands']),
                       PRESS_IN_REFINE_MAX_HAND_DISTANCE * 1e3,
-                      len(distances)))
+                      len(distances),
+                      '{:.0f}mm'.format(min(nearest) * 1e3) if nearest
+                      else 'なし'))
+            record = dict(
+                event='press_in_refine', reason='no_hand',
+                wait_time=wait_time, n_frames=len(hand_frames),
+                expected_position=[float(v) for v in expected_position],
+                candidates=candidates)
+            self._log_debug(record)
+            self._save_refine_failure(hand_frames, expected_position,
+                                      candidates, record)
             return None
 
         t1 = time.time()
         # _select_offered_hand の中で self.robot は触っていないが、念のため
         # hover 目標の姿勢に戻してから解く。
-        apply_waypoint_pose(self.robot, joint_names, [hover_wp], 0)
+        self._place_robot_at_waypoint(joint_names, hover_wp)
         observed = spik.transform_palm(palm, base_rot, base_pos)
         info = spik.refine_post_process(
             self.robot, result['robot_arm'], observed, result['turn_deg'],
@@ -1668,6 +1826,8 @@ class HandshakePipelineNode(object):
             event='press_in_refine', reason=info['reason'],
             wait_time=wait_time, ik_time=ik_time,
             n_frames=len(hand_frames), hand_distances=distances,
+            expected_position=[float(v) for v in expected_position],
+            candidates=candidates,
             palm_shift=[float(v) for v in palm_shift],
             position_change=info['position_change'],
             rotation_change_deg=math.degrees(info['rotation_change'])))
@@ -1901,8 +2061,10 @@ class HandshakePipelineNode(object):
             expected_yaw = (matrix2ypr(start_odom_coords.rotation)[0]
                             + base_trajectory_points[-1][2])
             actual_yaw = matrix2ypr(odom_after.rotation)[0]
-            print('[debug][segment] wait_for_result 直後 odom_yaw={:.1f}deg '
-                  '(期待値={:.1f}deg, 差={:.1f}deg)'.format(
+            state = self.ri.move_base_trajectory_action.get_state()
+            print('[debug][segment] wait_for_result 直後 (ゴール終了状態 {}) '
+                  'odom_yaw={:.1f}deg (期待値={:.1f}deg, 差={:.1f}deg)'.format(
+                      GOAL_STATUS_NAMES.get(state, state),
                       math.degrees(actual_yaw), math.degrees(expected_yaw),
                       math.degrees(
                           (expected_yaw - actual_yaw + math.pi)
@@ -2112,24 +2274,131 @@ class HandshakePipelineNode(object):
         return (np.where(inside, np.maximum(peak, np.abs(v_star)), peak),
                 np.maximum(np.abs(acc0), np.abs(acc1)))
 
+    def _wait_odom_settle(self, timeout=ODOM_SETTLE_TIMEOUT):
+        """odom が ``ODOM_SETTLE_WINDOW`` 秒の間に ``ODOM_SETTLE_POSITION``/
+        ``ODOM_SETTLE_ANGLE`` 以上動かなくなるまで、最大 ``timeout`` 秒
+        待つ。``(待った時間 [s], (その間の移動距離 [m], 回転 [rad]))``
+        を返す。"""
+        start = time.time()
+        first = self._odom_pose(self.ri.odom)
+        prev = first
+        while not rospy.is_shutdown() and time.time() - start < timeout:
+            rospy.sleep(ODOM_SETTLE_WINDOW)
+            cur = self._odom_pose(self.ri.odom)
+            step = scan_matching.relative(prev, cur)
+            prev = cur
+            if (math.hypot(step[0], step[1]) < ODOM_SETTLE_POSITION
+                    and abs(step[2]) < ODOM_SETTLE_ANGLE):
+                break
+        total = scan_matching.relative(first, prev)
+        return time.time() - start, (math.hypot(total[0], total[1]),
+                                     abs(total[2]))
+
+    @staticmethod
+    def _odom_pose(coords):
+        """odom の ``Coordinates`` を ``[x, y, yaw]`` にする。"""
+        return np.array([coords.translation[0], coords.translation[1],
+                         matrix2ypr(coords.rotation)[0]])
+
+    def _on_scan(self, msg):
+        # 受信した時刻は PC の時計で持つ (ロボットと PC の時計がずれて
+        # いても「この時刻以降に届いたスキャン」を判定できるように)。
+        with self._lock:
+            self._latest_scan = (time.time(), msg)
+
+    def _capture_scan(self, timeout=SCAN_CAPTURE_TIMEOUT):
+        """呼び出し以降に届いた /scan を 1 つ待ち、台車座標系
+        (``args.base_frame``) の点群 ``(N, 2)`` にして返す。届かない・
+        センサの TF が引けなければ ``None``。"""
+        after = time.time()
+        deadline = after + timeout
+        msg = None
+        while not rospy.is_shutdown() and time.time() < deadline:
+            with self._lock:
+                latest = self._latest_scan
+            if latest is not None and latest[0] > after:
+                msg = latest[1]
+                break
+            rospy.sleep(0.005)
+        if msg is None:
+            print('[execute][scan][WARN] {} 秒以内に {} が届きませんでした。'
+                  .format(timeout, self.args.scan_topic))
+            return None
+        transform = lookup_camera_to_base(
+            self.tf_buffer, self.args.base_frame, msg.header)
+        if transform is None:
+            return None
+        matrix = transform_to_matrix(transform.transform)
+        sensor_pose = (matrix[0, 3], matrix[1, 3],
+                       math.atan2(matrix[1, 0], matrix[0, 0]))
+        return scan_matching.scan_to_points(
+            msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min,
+            msg.range_max, sensor_pose=sensor_pose, max_range=SCAN_MAX_RANGE)
+
+    def _match_scan(self, ref_scan, odom_delta, exclude_centers, attempt,
+                    plan):
+        """今のスキャンを ``ref_scan`` と照合して区間先頭から実際に動いた量
+        ``[x, y, yaw]`` を返し、結果をログに出す。照合の品質が悪ければ
+        (``SCAN_MIN_INLIER_RATIO``/``SCAN_MIN_INLIERS``/``SCAN_MAX_RMS``)
+        ``None``。"""
+        cur_scan = self._capture_scan()
+        if cur_scan is None:
+            return None
+        t0 = time.time()
+        match = scan_matching.icp_2d(
+            ref_scan, cur_scan, odom_delta, exclude_centers=exclude_centers,
+            exclude_radius=SCAN_HUMAN_EXCLUDE_RADIUS)
+        match_time = time.time() - t0
+        scan_delta = np.asarray(match['pose'])
+        ok = (match['inlier_ratio'] >= SCAN_MIN_INLIER_RATIO
+              and match['n_inliers'] >= SCAN_MIN_INLIERS
+              and match['rms'] <= SCAN_MAX_RMS)
+        # odom (指令の積分) から見た実際の位置のずれ = スリップ量。
+        slip = scan_matching.relative(odom_delta, scan_delta)
+        self._log_debug(dict(
+            event='scan_correction', attempt=attempt, ok=bool(ok),
+            plan=[float(v) for v in plan],
+            odom_delta=[float(v) for v in odom_delta],
+            scan_delta=[float(v) for v in scan_delta],
+            slip=[float(v) for v in slip],
+            rms=match['rms'], inlier_ratio=match['inlier_ratio'],
+            n_inliers=match['n_inliers'], iterations=match['iterations'],
+            n_points=[len(ref_scan), len(cur_scan)], match_time=match_time))
+        print('[execute][scan] attempt={} スキャン照合{}: 実際の移動 '
+              '({:+.3f}m, {:+.3f}m, {:+.1f}deg) / odom ({:+.3f}m, {:+.3f}m, '
+              '{:+.1f}deg) -> スリップ ({:+.3f}m, {:+.3f}m, {:+.1f}deg) '
+              '[rms={:.1f}mm, 対応率={:.2f}, {:.3f}s]'.format(
+                  attempt, '' if ok else ' (品質不足のため odom を使用)',
+                  scan_delta[0], scan_delta[1], math.degrees(scan_delta[2]),
+                  odom_delta[0], odom_delta[1], math.degrees(odom_delta[2]),
+                  slip[0], slip[1], math.degrees(slip[2]),
+                  match['rms'] * 1e3, match['inlier_ratio'], match_time))
+        return scan_delta if ok else None
+
     def _correct_base_residual(
-            self, start_odom_coords, final_traj_point,
+            self, start_odom_coords, final_traj_point, ref_scan=None,
+            exclude_centers=None,
             max_attempts=BASE_CORRECTION_MAX_ATTEMPTS,
             position_tolerance=BASE_CORRECTION_POSITION_TOLERANCE,
             angle_tolerance=BASE_CORRECTION_ANGLE_TOLERANCE):
         """接近区間の完了直後、押し込み (post_process) に進む前に台車の
         位置ずれ (スリップ等による ``move_trajectory_sequence`` のオープン
-        ループ指令と実際の到達姿勢との差) を odom 基準で検出し、収束する
-        まで相対移動で補正する。
+        ループ指令と実際の到達姿勢との差) を検出し、収束するまで相対移動で
+        補正する。
 
         ``start_odom_coords``/``final_traj_point`` は接近区間を実行した
         ``_execute_waypoint_segment`` の戻り値そのもの --
         ``start_odom_coords`` は軌道送信時に基準として使われた odom、
         ``final_traj_point`` はその区間の最終 waypoint (= hover 目標) を
-        区間先頭からの相対量 ``[dx, dy, dyaw]`` で表したもの。両者から
-        ``move_trajectory_sequence`` が内部で行うのと同じ変換で目標の
-        絶対姿勢 (odom 系) を求め、実行後の実際の odom との残差を
-        ロボット正面基準に回転させて相対移動として送り返す。収束閾値は
+        区間先頭からの相対量 ``[dx, dy, dyaw]`` で表したもの。
+
+        区間先頭から実際に動いた量は、``ref_scan`` (区間の開始前に
+        ``_capture_scan`` で取った台車座標系の点群) があれば今のスキャンと
+        の照合 (``_match_scan``、``exclude_centers`` (区間先頭の台車座標系)
+        の近く = 人の点は使わない) で求め、無い・照合できなかったときは
+        odom の差分で代用する (odom は指令の積分なのでスリップは検出でき
+        ない)。hover 目標との残差をロボット正面基準の相対移動として送り
+        返す。収束閾値は
         skrobot の ``go_pos_unsafe_wait`` と同じ (位置2.5cm/角度2.5度)。
         sec (所要時間) は、静止 -> 静止の 1 区間として指令の速度・加速度
         が上限 (``BASE_MAX_VEL``/``BASE_MAX_ANGVEL`` × ``VEL_LIMIT_RATIO``、
@@ -2140,43 +2409,34 @@ class HandshakePipelineNode(object):
         """
         if start_odom_coords is None or final_traj_point is None:
             return
-        dx, dy, dyaw = final_traj_point
-        start_yaw = matrix2ypr(start_odom_coords.rotation)[0]
-        start_x, start_y = start_odom_coords.translation[:2]
-        target_x = start_x + math.cos(start_yaw) * dx - math.sin(start_yaw) * dy
-        target_y = start_y + math.sin(start_yaw) * dx + math.cos(start_yaw) * dy
-        target_yaw = start_yaw + dyaw
-        # [debug] 79 度規模の大きな残差の原因調査用。ここで求めた
-        # target_yaw が「意図した hover 目標の向き」と一致しているかを
-        # 見るためのログ (_execute_waypoint_segment の [debug][segment]
-        # ログの start_odom_yaw/dyaw と同じ値になっているはず)。
-        print('[debug][correct] start_odom(x={:.3f} y={:.3f} yaw={:.1f}deg) '
-              'final_traj_point(dx={:.3f} dy={:.3f} dyaw={:.1f}deg) '
-              '-> target(x={:.3f} y={:.3f} yaw={:.1f}deg)'.format(
-                  start_x, start_y, math.degrees(start_yaw),
-                  dx, dy, math.degrees(dyaw),
-                  target_x, target_y, math.degrees(target_yaw)))
+        plan = np.asarray(final_traj_point, dtype=np.float64)
+        start_odom = self._odom_pose(start_odom_coords)
 
+        settle_time, drift = self._wait_odom_settle()
+        print('[execute][correct] 接近区間の終了後に odom が止まるまで {:.2f}s '
+              '(その間の移動 {:.1f}mm/{:.2f}deg)'.format(
+                  settle_time, drift[0] * 1e3, math.degrees(drift[1])))
         err_norm = 0.0
         err_yaw = 0.0
         for attempt in range(max_attempts):
-            odom = self.ri.odom
-            cur_x, cur_y = odom.translation[:2]
-            cur_yaw = matrix2ypr(odom.rotation)[0]
-            err_x_world = target_x - cur_x
-            err_y_world = target_y - cur_y
-            err_yaw = (target_yaw - cur_yaw + math.pi) % (2 * math.pi) - math.pi
-            # world 系の残差を、ロボットの現在の向き基準 (前後左右) に
-            # 回転させる (move_trajectory に渡す相対移動量はこの基準)。
-            err_x = math.cos(cur_yaw) * err_x_world + math.sin(cur_yaw) * err_y_world
-            err_y = -math.sin(cur_yaw) * err_x_world + math.cos(cur_yaw) * err_y_world
+            # 区間先頭から実際に動いた量。odom は指令の積分でスリップが
+            # 表れないので、基準スキャン (ref_scan、区間の開始前に取得) が
+            # あれば、今のスキャンとの照合で求める。
+            odom_delta = scan_matching.relative(
+                start_odom, self._odom_pose(self.ri.odom))
+            actual, source = odom_delta, 'odom'
+            if ref_scan is not None:
+                scan_delta = self._match_scan(
+                    ref_scan, odom_delta, exclude_centers, attempt, plan)
+                if scan_delta is not None:
+                    actual, source = scan_delta, 'scan'
+            # hover 目標の、今の台車から見た姿勢 (= 補正で動かす量。
+            # move_trajectory に渡す相対移動量は今の台車の前後左右基準)。
+            err_x, err_y, err_yaw = scan_matching.relative(actual, plan)
             err_norm = math.hypot(err_x, err_y)
-            # [debug] 生の odom 値そのもの (回転方向の符号が想定通りかも
-            # ここで確認できる)。
-            print('[debug][correct] attempt={} odom(x={:.3f} y={:.3f} '
-                  'yaw={:.1f}deg) err_yaw={:.1f}deg'.format(
-                      attempt, cur_x, cur_y, math.degrees(cur_yaw),
-                      math.degrees(err_yaw)))
+            print('[execute][correct] attempt={} ({}基準) 目標までの残差 '
+                  '{:+.3f}m {:+.3f}m {:+.1f}deg'.format(
+                      attempt, source, err_x, err_y, math.degrees(err_yaw)))
 
             if err_norm <= position_tolerance and abs(err_yaw) <= angle_tolerance:
                 if attempt > 0:
@@ -2195,8 +2455,24 @@ class HandshakePipelineNode(object):
             # go_pos_unsafe_wait と同じ)。
             sec, = self._limited_time_list(
                 None, [[err_x, err_y, err_yaw]], [1.0])
+            before = self._odom_pose(self.ri.odom)
             self._send_base_trajectory(
                 [[err_x, err_y, err_yaw]], [sec], wait=True)
+            state = self.ri.move_base_trajectory_action.get_state()
+            # ゴールが終わった扱いになった後も台車が動き続けていることが
+            # ある (終端で速度が残ると即 ABORTED になる)。次のスキャンを
+            # 動いている途中に取らないよう、odom が止まるまで待つ。
+            settle_time, drift = self._wait_odom_settle()
+            moved = scan_matching.relative(
+                before, self._odom_pose(self.ri.odom))
+            print('[execute][correct] 補正の移動: 指令 ({:+.3f}m, {:+.3f}m, '
+                  '{:+.1f}deg) {:.2f}s -> odom 上の移動 ({:+.3f}m, {:+.3f}m, '
+                  '{:+.1f}deg)、ゴール終了状態 {}、終了後に odom が止まるまで '
+                  '{:.2f}s (その間の移動 {:.1f}mm/{:.2f}deg)'.format(
+                      err_x, err_y, math.degrees(err_yaw), sec,
+                      moved[0], moved[1], math.degrees(moved[2]),
+                      GOAL_STATUS_NAMES.get(state, state), settle_time,
+                      drift[0] * 1e3, math.degrees(drift[1])))
 
         print('[execute][WARN] 押し込み前の台車の位置ずれ補正が {} 回で '
               '収束しませんでした (残差 {:.3f}m / {:.1f}deg)。このまま '
@@ -2437,6 +2713,15 @@ def main():
     parser.add_argument('--camera-info-topic', type=str,
                         default='/camera/color/camera_info')
     parser.add_argument('--base-frame', type=str, default='base_link')
+    parser.add_argument(
+        '--base-correction', choices=['scan', 'odom', 'none'],
+        default='scan',
+        help='--auto-execute で接近区間の後 (押し込み前) に行う台車の位置 '
+            '補正で、実際に動いた量を何で求めるか。scan (既定) は移動前後の '
+            '--scan-topic を照合する (照合できなければ odom で代用)。odom は '
+            '/odom の差分 (指令の積分なのでスリップは検出できない)。none は '
+            '補正しない。')
+    parser.add_argument('--scan-topic', type=str, default='/scan')
     parser.add_argument(
         '--tf-cache-time', type=float, default=30.0,
         help='tf2 バッファの保持時間 [秒] (既定 30.0)。カメラ側と '
