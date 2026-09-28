@@ -524,10 +524,10 @@ def main():
             '概算値 ({}) にフォールバックする。'.format(
                 _FALLBACK_ROBOT_HAND_POSITION))
     parser.add_argument(
-        '--max-person-distance', type=float, default=4.2,
+        '--max-person-distance', type=float, default=3.0,
         help='人物 (腰の中点) からロボット手先までの距離 [m] がこれを '
             '超えたら、スコアを見るまでもなく両手とも差し出し候補から '
-            '外す (既定 4.2、run_camera_pipeline_test.py の既定値と揃えて '
+            '外す (既定 3.0、run_camera_pipeline_test.py の既定値と揃えて '
             'ある)。奥や画面の端に映り込んだだけの、手を差し出す気の無い '
             '通行人を拾わないための足切り (estimate_palm_poses.'
             'OfferedHandSelector の max_distance 引数、veto 理由は '

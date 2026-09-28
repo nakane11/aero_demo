@@ -429,7 +429,7 @@ def main():
     parser.add_argument('--joint-smoothing-beta', type=float, default=0.3)
     parser.add_argument('--joint-smoothing-dcutoff', type=float, default=1.0)
     parser.add_argument('--offer-score-min', type=float, default=0.65)
-    parser.add_argument('--max-person-distance', type=float, default=4.2)
+    parser.add_argument('--max-person-distance', type=float, default=3.0)
     parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
         help='ロボットの現在の手先位置として TF を引くフレーム (既定 '

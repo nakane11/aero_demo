@@ -367,7 +367,7 @@ def main():
         metavar=('X', 'Y', 'Z'))
     parser.add_argument('--robot-hand-frame', type=str,
                         default='r_eef_grasp_link')
-    parser.add_argument('--max-person-distance', type=float, default=4.2)
+    parser.add_argument('--max-person-distance', type=float, default=3.0)
     args = parser.parse_args()
 
     bag_paths = []
