@@ -71,7 +71,6 @@ ARMED) と組み合わせると、ブラウザを一切触らずに「手を差�
 """
 
 import argparse
-import collections
 import copy
 import json
 import math
@@ -250,11 +249,17 @@ JOINT_SETTLE_TIMEOUT = 1.5  # [s]
 JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
 
 # hover 到達後に人の手を検出し直して押し込み姿勢を解き直す補正
-# (_refine_press_in 参照、--no-press-in-refine で無効) で使う、停止後に新しく受け取るカメラ
-# フレーム数と、その待ち時間の上限。骨格は複数フレームの中央値を使う
-# (One Euro Filter の平滑化値は台車移動中の履歴を引きずるため使わない)。
+# (_refine_press_in 参照、--no-press-in-refine で無効) で使う、停止後に
+# 新しく受け取るカメラフレーム数と、その待ち時間の上限。hover ではロボット
+# が人に近く体が画角に入らないことが多い (Holistic は体を検出できないと
+# 手も返さない) ため、手だけの検出 (MediaPipe Hands) を使い、手の
+# ランドマークは複数フレームの中央値にする。
 PRESS_IN_REFINE_FRAMES = 3
-PRESS_IN_REFINE_TIMEOUT = 1.0  # [s]
+PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
+# 検出した手のうち、計画時の掌の位置 (hover 目標にいる前提で今の
+# base_link 系に直したもの) に最も近いものを人の手とみなす。これより
+# 遠ければ (別の手・ロボット自身の手の誤検出など) 使わない。
+PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.15  # [m]
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -324,6 +329,13 @@ class HandshakePipelineNode(object):
             max_hand_segment_length=args.max_hand_segment_length,
             max_hand_reach=args.max_hand_reach,
             depth_patch_size=args.depth_patch_size)
+        # 押し込み直前の補正 (_refine_press_in) で使う手だけの検出
+        # (MediaPipe Hands) は初回呼び出し時にモデルを読み込むため、その
+        # 待ち時間が補正に乗らないよう、ここでダミー画像で 1 回呼んでおく。
+        self.pose_estimator.estimate_hands_3d(
+            np.zeros((240, 320, 3), dtype=np.uint8),
+            np.zeros((240, 320), dtype=np.float32),
+            CameraIntrinsics(fx=300.0, fy=300.0, cx=160.0, cy=120.0))
 
         # IK 自体は指なしロボットで解く (solve_palm_ik.py と同じ、指関節が
         # あると自己干渉ペアの組み合わせが無駄に増える)。画面には別に
@@ -420,11 +432,11 @@ class HandshakePipelineNode(object):
         self._viewer_lock = threading.Lock()
         self._latest_joint_positions = None  # 最新フレームの joint_positions (dict) or None
         self._latest_is_base_frame = False   # 上記が base_link 座標系かどうか (TF 解決済みか)
-        # base_link 座標系に変換できたフレームの通し番号と、平滑化前の骨格
-        # (未検出なら None)。_refine_press_in が「停止後に届いたフレーム」
-        # だけを集めるのに使う。
-        self._raw_frame_seq = 0
-        self._raw_base_frames = collections.deque(maxlen=10)
+        # _refine_press_in が要求している間だけ、base_link 座標系に変換
+        # できたフレームごとに手だけの検出 (estimate_hands_3d) も行い、
+        # その結果 (検出した手のリスト) をここに溜める。
+        self._hand_frames_requested = False
+        self._hand_frames = []
         self._current_palm = None         # 直近の IK に使った掌 (base_link 座標系、平行移動前) or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 (offered_hand_selector.select の戻り値) or None
         # 'idle' (ARM 待ち) -> 'armed' (差し出し手待ち) -> 'solving'
@@ -922,10 +934,13 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._latest_joint_positions = preview_joint_positions
             self._latest_is_base_frame = is_base_frame
-            if is_base_frame:
-                self._raw_frame_seq += 1
-                self._raw_base_frames.append(
-                    (self._raw_frame_seq, raw_joint_positions))
+            hand_frames_requested = self._hand_frames_requested
+        if hand_frames_requested and is_base_frame:
+            hands = self.pose_estimator.estimate_hands_3d(
+                color, depth_m, intrinsics, output_transform=camera_to_base)
+            with self._lock:
+                if self._hand_frames_requested:
+                    self._hand_frames.append(hands)
 
         if self.state == 'armed' and armed_joint_positions is not None:
             # robot_position (差し出し手判定の基準にするロボット手先位置)
@@ -1527,32 +1542,68 @@ class HandshakePipelineNode(object):
 
         print('[execute] 実行を終了しました。')
 
-    def _collect_fresh_joint_positions(self, n_frames, timeout):
+    def _collect_hand_frames(self, n_frames, timeout):
         """呼び出し以降に届いた (base_link 座標系に変換できた) カメラ
-        フレームを ``n_frames`` 枚待ち、平滑化前の骨格の関節ごとの中央値を
-        返す。骨格が検出できたフレームが半数未満、または ``timeout`` 秒で
-        ``n_frames`` 枚届かなければ、その時点までのフレームで判断する
-        (1 枚も無ければ ``None``)。"""
+        フレームについて手だけの検出 (``estimate_hands_3d``) を行わせ、
+        ``n_frames`` 枚分 (``timeout`` 秒で届かなければそれまでの分) の
+        結果 (フレームごとの検出した手のリスト) を返す。"""
         with self._lock:
-            start_seq = self._raw_frame_seq
+            self._hand_frames = []
+            self._hand_frames_requested = True
         deadline = time.time() + timeout
-        while not rospy.is_shutdown() and time.time() < deadline:
+        try:
+            while not rospy.is_shutdown() and time.time() < deadline:
+                with self._lock:
+                    if len(self._hand_frames) >= n_frames:
+                        break
+                rospy.sleep(0.01)
+        finally:
             with self._lock:
-                if self._raw_frame_seq - start_seq >= n_frames:
-                    break
-            rospy.sleep(0.01)
-        with self._lock:
-            frames = [joints for seq, joints in self._raw_base_frames
-                      if seq > start_seq]
-        detected = [joints for joints in frames if joints is not None]
-        if not detected or len(detected) * 2 < len(frames):
-            return None
-        names = [name for name in detected[0]
-                 if sum(name in joints for joints in detected) * 2
-                 >= len(detected)]
-        return {name: np.median([joints[name] for joints in detected
-                                 if name in joints], axis=0).tolist()
-                for name in names}
+                self._hand_frames_requested = False
+                frames = self._hand_frames
+                self._hand_frames = []
+        return frames
+
+    def _select_offered_hand(self, hand_frames, side, expected_position):
+        """``_collect_hand_frames`` の各フレームから、掌の中心が
+        ``expected_position`` (今の base_link 系) に最も近い手を 1 つずつ
+        選び (``PRESS_IN_REFINE_MAX_HAND_DISTANCE`` より遠ければそのフレーム
+        は使わない)、そのランドマークのフレーム間の中央値を
+        ``{side}Hand*`` の名前で返す。Hands の左右判定は誤りうるため左右
+        ラベルは使わず、位置だけで選ぶ。
+
+        Returns
+        -------
+        (joint_positions or None, distances)
+            ``distances`` は採用したフレームごとの、選んだ手の掌中心と
+            ``expected_position`` の距離 [m]。
+        """
+        chosen = []
+        distances = []
+        for hands in hand_frames:
+            best = None
+            for hand in hands:
+                prefix = '{}Hand'.format(hand['side'])
+                joints = {'{}Hand{}'.format(side, name[len(prefix):]): p
+                          for name, p in hand['positions'].items()}
+                palm = self.palm_estimator.estimate_palm(joints, side)
+                if palm is None:
+                    continue
+                dist = float(np.linalg.norm(
+                    np.asarray(palm['position']) - expected_position))
+                if best is None or dist < best[0]:
+                    best = (dist, joints)
+            if best is not None and best[0] <= PRESS_IN_REFINE_MAX_HAND_DISTANCE:
+                distances.append(best[0])
+                chosen.append(best[1])
+        if not chosen:
+            return None, distances
+        names = [name for name in chosen[0]
+                 if sum(name in joints for joints in chosen) * 2
+                 >= len(chosen)]
+        return ({name: np.median([joints[name] for joints in chosen
+                                  if name in joints], axis=0).tolist()
+                 for name in names}, distances)
 
     def _refine_press_in(self, hover_wp, joint_names, result):
         """hover 目標に到達した後、カメラで人の手を検出し直して押し込み
@@ -1573,23 +1624,40 @@ class HandshakePipelineNode(object):
         planned_post = result.get('post_process')
         if planned_post is None or planned_palm is None:
             return None
-        joint_positions = self._collect_fresh_joint_positions(
+        # 計画時の掌 (初期位置基準) を、hover 目標にいる前提で今の
+        # base_link 系に直した位置。検出した手のうちどれが人の手かを
+        # 選ぶ基準にする。
+        apply_waypoint_pose(self.robot, joint_names, [hover_wp], 0)
+        base = self.robot.base_link
+        base_rot = base.worldrot().copy()
+        base_pos = base.worldpos().copy()
+        expected_position = base_rot.T @ (
+            np.asarray(planned_palm['position']) - base_pos)
+        hand_frames = self._collect_hand_frames(
             PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+        joint_positions, distances = self._select_offered_hand(
+            hand_frames, offered_hand, expected_position)
         wait_time = time.time() - t0
         palm = None
         if joint_positions is not None:
-            palm = self.palm_estimator.estimate(joint_positions).get(
-                offered_hand)
+            palm = self.palm_estimator.estimate_palm(
+                joint_positions, offered_hand)
         if palm is None:
             print('[execute][refine] hover 到達後に {}手を検出できなかった '
-                  'ため、計画どおりに押し込みます ({:.2f}s 待機)。'.format(
-                      offered_hand, wait_time))
+                  'ため、計画どおりに押し込みます ({:.2f}s 待機、{} フレーム'
+                  '中 手を検出 {} フレーム、計画時の掌から {:.0f}mm 以内 {} '
+                  'フレーム)。'.format(
+                      offered_hand, wait_time, len(hand_frames),
+                      sum(1 for hands in hand_frames if hands),
+                      PRESS_IN_REFINE_MAX_HAND_DISTANCE * 1e3,
+                      len(distances)))
             return None
 
         t1 = time.time()
+        # _select_offered_hand の中で self.robot は触っていないが、念のため
+        # hover 目標の姿勢に戻してから解く。
         apply_waypoint_pose(self.robot, joint_names, [hover_wp], 0)
-        base = self.robot.base_link
-        observed = spik.transform_palm(palm, base.worldrot(), base.worldpos())
+        observed = spik.transform_palm(palm, base_rot, base_pos)
         info = spik.refine_post_process(
             self.robot, result['robot_arm'], observed, result['turn_deg'],
             planned_post)
@@ -1599,6 +1667,7 @@ class HandshakePipelineNode(object):
         self._log_debug(dict(
             event='press_in_refine', reason=info['reason'],
             wait_time=wait_time, ik_time=ik_time,
+            n_frames=len(hand_frames), hand_distances=distances,
             palm_shift=[float(v) for v in palm_shift],
             position_change=info['position_change'],
             rotation_change_deg=math.degrees(info['rotation_change'])))
@@ -1929,7 +1998,6 @@ class HandshakePipelineNode(object):
             axis_names += ['base_xy', 'base_yaw']
         if not axis_names:
             return [float(t) for t in time_list]
-        axis_names += ['{}の加速度'.format(name) for name in axis_names]
 
         def peak_ratios(times):
             # 区間ごと・軸ごとの (速度の最大値 / 上限) と
@@ -1985,20 +2053,6 @@ class HandshakePipelineNode(object):
                 print('[debug][segment] 速度上限の反復で収まらなかったため '
                       '全区間を {:.3f} 倍に延ばします。'.format(worst))
             times *= worst
-
-        # 区間ごとの所要時間と律速した軸 (下限で決まった区間は "下限"、
-        # 実機ログで何が律速したかを切り分けるため)。
-        final_ratio = peak_ratios(times)
-        entries = [
-            '{}:{:.2f}s({})'.format(
-                i, times[i],
-                '下限' if times[i] <= min_times[i] * (1.0 + 1e-3)
-                else axis_names[int(np.argmax(final_ratio[i]))])
-            for i in range(len(times))]
-        print('[debug][segment] 速度上限 (×{}, 加速 {}s) で決めた所要時間 '
-              '(合計 {:.2f}s): {}'.format(
-                  VEL_LIMIT_RATIO, ACCEL_TIME, float(np.sum(times)),
-                  ', '.join(entries)))
         return [float(t) for t in times]
 
     @staticmethod
@@ -2471,10 +2525,10 @@ def main():
             '場合は、viser 画面に表示されるスコアを見ながらさらに調整する '
             'とよい。'.format(epp.OFFER_SCORE_MIN))
     parser.add_argument(
-        '--max-person-distance', type=float, default=4.2,
+        '--max-person-distance', type=float, default=3.0,
         help='人物 (腰の中点) からロボット手先までの距離 [m] がこれを '
             '超えたら、スコアを見るまでもなく両手とも差し出し候補から '
-            '外す (既定 4.2、record_palm_offer_clips.py の既定値と揃えて '
+            '外す (既定 3.0、record_palm_offer_clips.py の既定値と揃えて '
             'ある)。奥や画面の端に映り込んだだけの、手を差し出す気の無い '
             '通行人を拾わないための足切り (estimate_palm_poses.'
             'OfferedHandSelector の max_distance 引数、veto 理由は '

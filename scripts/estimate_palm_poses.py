@@ -781,6 +781,14 @@ class PalmPoseEstimator(object):
         result['offered_hand'] = selection['side']
         return result
 
+    def estimate_palm(self, joint_positions, side):
+        """``side`` ('R'/'L') の掌 1 つだけを推定する (``estimate`` の
+        ``palms[side]`` と同じ、差し出し手の判定は行わないので手の
+        ランドマークだけの入力にも使える)。"""
+        joints = {name: np.asarray(p, dtype=np.float64)
+                 for name, p in joint_positions.items()}
+        return self._estimate_one(joints, side)
+
     def _estimate_one(self, joints, side):
         points = {}
         for i in palm_plane.PLANE_LANDMARKS:

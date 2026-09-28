@@ -215,6 +215,8 @@ class PeoplePoseEstimator(object):
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence
             )
+        # 手だけの検出 (estimate_hands_3d) は必要になったときに作る。
+        self.hands = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -228,6 +230,9 @@ class PeoplePoseEstimator(object):
             if self.pose is not None:
                 self.pose.close()
                 self.pose = None
+        if self.hands is not None:
+            self.hands.close()
+            self.hands = None
 
     def __enter__(self):
         return self
@@ -394,6 +399,63 @@ class PeoplePoseEstimator(object):
                            for name, p in positions.items()})
 
         return people, people_joint_positions
+
+    def estimate_hands_3d(self, bgr_img, depth_img, intrinsics,
+                          output_transform=None, max_num_hands=2):
+        """体 (pose) を使わず、手だけを検出して 3 次元のランドマークを返す.
+
+        Holistic は体を検出してからその結果で手の領域を切り出すため、体が
+        画角に入らない距離 (ロボットが人の手の目の前まで近づいたとき等)
+        では手も返さない。MediaPipe Hands は画像から直接手を検出するので
+        その場合にも使える。
+
+        Returns
+        -------
+        list of dict
+            検出した手ごとに ``side`` ('R'/'L'、MediaPipe の handedness
+            を人物自身の左右に直したもの。見た目だけで決まるため誤りうる)、
+            ``score`` (handedness の確信度)、``positions`` (``{side}Hand0``..
+            ``{side}Hand20`` -> [x, y, z]、深度が取れた点だけ。
+            ``estimate_3d`` と同じ除去処理を通したもの)。
+        """
+        if self.hands is None:
+            self.hands = mp.solutions.hands.Hands(
+                max_num_hands=max_num_hands,
+                min_detection_confidence=self.min_detection_confidence,
+                min_tracking_confidence=self.min_tracking_confidence)
+        h, w, _ = bgr_img.shape
+        results = self.hands.process(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
+        if not results.multi_hand_landmarks:
+            return []
+        hands = []
+        for landmarks, handedness in zip(results.multi_hand_landmarks,
+                                         results.multi_handedness):
+            classification = handedness.classification[0]
+            # Hands の handedness は左右反転した (自撮り) 画像を前提にして
+            # いるため、反転していないカメラ画像では人物自身の左右と逆になる。
+            side = 'R' if classification.label == 'Left' else 'L'
+            joints_2d = self._hand_joint_positions(
+                '{}Hand'.format(side), landmarks, w, h)
+            positions = {}
+            for joint_pos in joints_2d:
+                if not (0 <= joint_pos['y'] < depth_img.shape[0]
+                        and 0 <= joint_pos['x'] < depth_img.shape[1]):
+                    continue
+                z = self._sample_depth(
+                    depth_img, int(joint_pos['x']), int(joint_pos['y']))
+                if z is None:
+                    continue
+                x = (joint_pos['x'] - intrinsics.cx) * z / intrinsics.fx
+                y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
+                positions[joint_pos['limb']] = np.array([x, y, z])
+            positions = self._prune_implausible_hand_landmarks(positions)
+            if output_transform is not None:
+                positions = self._apply_transform(positions, output_transform)
+            hands.append(dict(
+                side=side, score=float(classification.score),
+                positions={name: [float(v) for v in p]
+                           for name, p in positions.items()}))
+        return hands
 
     def _sample_depth(self, depth_img, u, v):
         """(u, v) の近傍から有効な深度の中央値を返す (無ければ None).
