@@ -371,6 +371,7 @@ class HandshakePipelineNode(object):
         spik.restrict_elbow_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
+        self._attach_camera_optical_coords()
         # self.robot の関節角ベクトル (motion['joint_names'] と同じ並び) での
         # 「初期姿勢」(両腕を体の横に下ろした姿勢, plan_handshake_motion.
         # arms_down_angles と同じ -- plan_handshake_motion.py の始点
@@ -876,6 +877,41 @@ class HandshakePipelineNode(object):
 
     def _set_link_visible(self, link, visible):
         common_set_link_visible(self.viewer, link, visible)
+
+    def _attach_camera_optical_coords(self, timeout=3.0):
+        """視線 IK (``spik.solve_post_process``、``spik.solve_person_ik``/
+        ``spik.refine_post_process`` から呼ばれる) で掌に向けるカメラ光軸を、
+        実機の TF (head_link -> ``--camera-optical-frame``) で
+        ``self.robot`` に取り付ける。TF が引けなければ
+        ``spik.attach_camera_optical_coords`` の既定値 (launch/
+        decompress.launch の head_to_camera_link) のまま使い、警告を出す。"""
+        head_frame = self.robot.head_link.name
+        optical_frame = self.args.camera_optical_frame
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                head_frame, optical_frame, rospy.Time(0),
+                rospy.Duration(timeout))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            spik.attach_camera_optical_coords(self.robot)
+            print('[camera-optical][WARN] TF ({} -> {}) が {:.1f} 秒以内に '
+                  '引けなかったため、視線 IK のカメラ光軸は既定値 '
+                  '(launch/decompress.launch の head_to_camera_link) を '
+                  '使います: {}'.format(head_frame, optical_frame, timeout, e))
+            return
+        # 既定値の光軸 (head_link 系) と比べてずれを表示する。
+        default_coords = spik.attach_camera_optical_coords(self.robot)
+        default_axis = self.robot.head_link.worldrot().T.dot(
+            default_coords.worldrot()[:, 2])
+        matrix = transform_to_matrix(transform.transform)
+        spik.attach_camera_optical_coords(
+            self.robot, pos=matrix[:3, 3], rot=matrix[:3, :3])
+        diff_deg = math.degrees(math.acos(float(np.clip(
+            np.dot(default_axis, matrix[:3, 2]), -1.0, 1.0))))
+        print('[camera-optical] 視線 IK のカメラ光軸を TF ({} -> {}) から '
+              '設定しました (pos=[{:.4f}, {:.4f}, {:.4f}]、既定値との光軸の '
+              'ずれ {:.2f} 度)。'.format(head_frame, optical_frame,
+                                     *(list(matrix[:3, 3]) + [diff_deg])))
 
     def _resolve_robot_position(self):
         """差し出し手判定の基準にするロボット手先の base_link 座標を返す.
@@ -2713,6 +2749,13 @@ def main():
     parser.add_argument('--camera-info-topic', type=str,
                         default='/camera/color/camera_info')
     parser.add_argument('--base-frame', type=str, default='base_link')
+    parser.add_argument(
+        '--camera-optical-frame', type=str,
+        default='camera_color_optical_frame',
+        help='押し込み姿勢の視線 IK で掌に向けるカメラ光軸のフレーム (既定 '
+            'camera_color_optical_frame)。起動時に head_link からの TF を '
+            '1 回引いて使い、引けなければ launch/decompress.launch の値から '
+            '作った既定値を使う。')
     parser.add_argument(
         '--base-correction', choices=['scan', 'odom', 'none'],
         default='scan',

@@ -97,8 +97,10 @@ os.environ.setdefault(
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS', '0')
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 
+from skrobot.coordinates import CascadedCoords  # noqa: E402
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr, normalize_mask  # noqa: E402
+from skrobot.coordinates.math import quaternion2matrix  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
@@ -247,6 +249,20 @@ DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
 # (姿勢のみ, rotation_mask='xy' で視線軸まわりの回転は見ない)。
 DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
+
+# 視線 IK で掌に向けるカメラの光軸座標 (attach_camera_optical_coords 参照)
+# の既定値。head_link -> camera_link は launch/decompress.launch の
+# head_to_camera_link と同じ値 (四元数は ROS と同じ (x, y, z, w) の並び)。
+# ``robot.head_end_coords`` の +Z は head_link から約 10 度下を向いており、
+# 実機カメラの光軸 (head_link の +X にほぼ平行) と 11.3 度ずれているため、
+# そちらを掌に向けるとカメラが掌より上を向いて手が画角から外れる。
+HEAD_TO_CAMERA_LINK_POS = (0.06700, 0.01038, 0.18521)  # [m]
+HEAD_TO_CAMERA_LINK_QUAT_XYZW = (0.032565, -0.0105949, -0.012757, 0.999332)
+# camera_link -> optical frame の回転 (REP 103: optical の +X/+Y/+Z が
+# camera_link の -Y/-Z/+X。列が optical の各軸を camera_link で表したもの)。
+CAMERA_LINK_TO_OPTICAL_ROT = np.array([[0.0, 0.0, 1.0],
+                                       [-1.0, 0.0, 0.0],
+                                       [0.0, -1.0, 0.0]])
 
 # 肘関節 ({r,l}_elbow_joint) の可動域制限 [deg]。0 度が腕をまっすぐ伸ばした
 # 状態、負方向が肘を曲げる方向。可動域いっぱいまで曲げた IK 解は前腕と
@@ -1563,6 +1579,102 @@ def build_collision_verification_pairs(robot, robot_arm):
     return pairs
 
 
+def attach_camera_optical_coords(robot, pos=None, rot=None):
+    """``robot.head_link`` に、実機カメラの光軸を +Z とする座標
+    (``robot.camera_optical_coords``, ``CascadedCoords``) を取り付ける。
+    視線 IK (``solve_post_process``) はこの +Z を掌に向ける。
+
+    ``pos``/``rot`` は head_link から見た光軸座標の位置 [m]・回転行列。
+    省略時は ``HEAD_TO_CAMERA_LINK_POS``/``HEAD_TO_CAMERA_LINK_QUAT_XYZW``
+    (launch の head_link -> camera_link) に ``CAMERA_LINK_TO_OPTICAL_ROT``
+    を組み合わせた既定値を使う (camera_link -> カラーカメラの並進は含まな
+    い)。実機ノードは TF の head_link -> camera_color_optical_frame を渡して
+    既定値を上書きする。既に取り付けてあれば位置姿勢だけ置き換える。
+
+    Returns
+    -------
+    skrobot.coordinates.CascadedCoords
+        ``robot.camera_optical_coords``。
+    """
+    if pos is None:
+        pos = HEAD_TO_CAMERA_LINK_POS
+    if rot is None:
+        qx, qy, qz, qw = HEAD_TO_CAMERA_LINK_QUAT_XYZW
+        rot = quaternion2matrix([qw, qx, qy, qz], normalize=True).dot(
+            CAMERA_LINK_TO_OPTICAL_ROT)
+    coords = getattr(robot, 'camera_optical_coords', None)
+    if coords is None:
+        coords = CascadedCoords(parent=robot.head_link,
+                                name='camera_optical_coords')
+        robot.camera_optical_coords = coords
+    coords.newcoords(Coordinates(pos=list(pos), rot=np.asarray(rot)))
+    return coords
+
+
+def camera_optical_coords(robot):
+    """``robot.camera_optical_coords`` を返す (未取り付けなら既定値で
+    ``attach_camera_optical_coords`` してから返す)。"""
+    coords = getattr(robot, 'camera_optical_coords', None)
+    if coords is None:
+        coords = attach_camera_optical_coords(robot)
+    return coords
+
+
+def _gaze_target(gaze_coords, position):
+    """``gaze_coords`` の +Z を ``position`` へ向ける視線 IK の目標座標。
+
+    rotation_mask='xy' は姿勢差の軸角ベクトルの z 成分を捨てるだけなので、
+    目標の視線軸まわりのひねりが大きいと収束しない。現在の ``gaze_coords``
+    の向きから最小回転で +Z を向けた姿勢にして、ひねりを 0 に揃える
+    (optical frame は x/y が head_end_coords と約 90 度違い、単位姿勢から
+    作ると首が収束しない)。"""
+    return Coordinates(
+        pos=list(position), rot=gaze_coords.worldrot()).align_axis_to_direction(
+            np.asarray(position) - gaze_coords.worldpos())
+
+
+def _gaze_error(gaze_coords, position):
+    """``gaze_coords`` の +Z と ``position`` への方向のなす角 [rad]。"""
+    direction = np.asarray(position) - gaze_coords.worldpos()
+    direction = direction / np.linalg.norm(direction)
+    return float(math.acos(np.clip(
+        np.dot(gaze_coords.worldrot()[:, 2], direction), -1.0, 1.0)))
+
+
+# _reaim_gaze で首だけの視線 IK を目標を作り直しながら繰り返す最大回数。
+POST_PROCESS_GAZE_REAIM_ROUNDS = 3
+
+
+def _reaim_gaze(robot, gaze_coords, position, stop, rthre,
+                rounds=POST_PROCESS_GAZE_REAIM_ROUNDS):
+    """腕・首の同時 IK の後、首 (``robot.head.link_list``) だけで視線を
+    ``position`` へ向け直す。
+
+    同時 IK の視線目標は解く前のカメラ位置から見た掌の方向で固定される
+    が、押し込みの腕 IK は腰・膝も動かすため解いている間に頭が 0.1〜0.2m
+    動き、収束しても実際の視線は掌から 10〜30 度ずれる。首は腕・胴より
+    先端側なので、ここで首を動かしても腕の解は変わらない。首を動かすと
+    カメラの位置も少し変わるので、目標を作り直して最大 ``rounds`` 回
+    繰り返す。首の可動域で向ききれなくても、ずれが小さくなった分は残す
+    (悪化したら元の首の角度に戻す)。
+    """
+    head_joints = [link.joint for link in robot.head.link_list]
+    for _ in range(rounds):
+        error = _gaze_error(gaze_coords, position)
+        if error < rthre:
+            return
+        before = [joint.joint_angle() for joint in head_joints]
+        robot.inverse_kinematics(
+            _gaze_target(gaze_coords, position), move_target=gaze_coords,
+            link_list=robot.head.link_list, position_mask=False,
+            rotation_mask='xy', stop=stop, rthre=rthre,
+            revert_if_fail=False)
+        if _gaze_error(gaze_coords, position) >= error:
+            for joint, angle in zip(head_joints, before):
+                joint.joint_angle(angle)
+            return
+
+
 def solve_post_process(robot, robot_arm, palm, target_rot,
                        offset=POST_PROCESS_TARGET_HOVER_OFFSET,
                        stop=DEFAULT_POST_PROCESS_IK_STOP,
@@ -1581,14 +1693,17 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     1. 腕: 掌の目標位置を ``offset`` (既定 ``POST_PROCESS_TARGET_HOVER_
        OFFSET``、掌へわずかにめり込む位置) にした位置・姿勢
        (``target_rot`` を厳密に使う)。
-    2. 首 (``robot.head.link_list``, 3 関節): ロボットの頭部エンド
-       エフェクタの +Z が人間の掌 (``palm['position']``) を向くように
+    2. 首 (``robot.head.link_list``, 3 関節): カメラの光軸
+       (``camera_optical_coords`` の +Z、``robot.head_end_coords`` では
+       ない) が人間の掌 (``palm['position']``) を向くように
        (``rotation_mask='xy'``, 位置は制約しない)。
 
     視線の目標は人間自身の掌の位置 (IK を解く前から分かっている固定点)
     なので、腕・視線を逐次に分けず 1 回の呼び出しで同時に解ける。両タスク
-    とも収束して初めて後処理判定は成功とする。``gaze=False`` のときは 2 を
-    解かず、1 (腕) だけで判定する (首は呼び出し前の角度のまま)。
+    とも収束して初めて後処理判定は成功とする。成功したら、解いている間に
+    頭が動いた分の視線のずれを首だけで向け直す (``_reaim_gaze``、判定の
+    成否には影響しない)。``gaze=False`` のときは 2 を解かず、1 (腕) だけで
+    判定する (首は呼び出し前の角度のまま)。
 
     ``robot`` は呼び出し前の姿勢 (``pick_verified_candidate`` が反映した
     候補の姿勢) を初期値として直接書き換えて解く。``revert_if_fail=True``
@@ -1609,10 +1724,8 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
-    head_move_target = robot.head_end_coords
-    head_target = Coordinates(
-        pos=position.tolist()).align_axis_to_direction(
-            position - head_move_target.worldpos())
+    head_move_target = camera_optical_coords(robot)
+    head_target = _gaze_target(head_move_target, position)
 
     try:
         if gaze:
@@ -1640,6 +1753,9 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         return None
     if result is False:
         return None
+    if gaze:
+        _reaim_gaze(robot, head_move_target, position,
+                    gaze_ik_stop, gaze_ik_rthre)
 
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
     return dict(
