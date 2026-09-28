@@ -175,6 +175,7 @@ def summarize_motions(motion_dir):
     ``optimized``、``plan_handshake_motion.KIND_LABELS`` 参照)。
     """
     n_planned = n_verified = n_lead_in_verified = n_both_verified = 0
+    n_head_blended = 0
     kinds = {}
     approach_angles = {}
     compute_times = []
@@ -187,6 +188,7 @@ def summarize_motions(motion_dir):
         n_verified += int(verified)
         n_lead_in_verified += int(lead_in_verified)
         n_both_verified += int(verified and lead_in_verified)
+        n_head_blended += int(bool(data.get('head_gaze_blended')))
         kind = data.get('kind')
         kinds[kind] = kinds.get(kind, 0) + 1
         if data.get('approach_angle') is not None:
@@ -205,7 +207,8 @@ def summarize_motions(motion_dir):
                         if compute_times else None)
     return dict(n_planned=n_planned, n_verified=n_verified,
                n_lead_in_verified=n_lead_in_verified,
-               n_both_verified=n_both_verified, kinds=kinds,
+               n_both_verified=n_both_verified,
+               n_head_blended=n_head_blended, kinds=kinds,
                approach_angles=approach_angles,
                avg_compute_time=avg_compute_time)
 
@@ -350,6 +353,10 @@ def main():
                   motion_summary['n_lead_in_verified'],
                   ', '.join('{}={}'.format(k, v) for k, v in sorted(
                       motion_summary['approach_angles'].items()))))
+        print('[4.5/5] 接近区間の後半で首を押し込み姿勢 (掌を向く視線) へ '
+              '補間した人数: {} / {}'.format(
+                  motion_summary['n_head_blended'],
+                  motion_summary['n_planned']))
         if motion_warmup_lines:
             for line in motion_warmup_lines:
                 print('[4.5/5] {}'.format(line))

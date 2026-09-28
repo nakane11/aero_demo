@@ -206,6 +206,10 @@ DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 # 経路上の通過点はそこまで厳密でなくてよいとして 1 cm まで許容する。
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = 0.01  # [m]
 
+# 接近区間のこの割合以降で、首を押し込み姿勢 (掌を向く視線) の角度へ
+# 補間する (blend_head_to_post_process 参照)。
+HEAD_GAZE_BLEND_START = 0.5
+
 
 def human_body_cylinder_obstacles(joint_positions):
     """``solve_palm_ik.human_body_obstacles`` が返す全 ``Cylinder`` (体幹・
@@ -1081,6 +1085,8 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
             best = (zero, zero_lead_in, zero_motion)
 
     (angle, _), (lead_in, lead_in_distances, lead_in_verified), motion = best
+    motion['head_gaze_blended'] = blend_head_to_post_process(
+        robot, motion, handshake)
     motion['approach_distance'] = approach_distance
     motion['approach_angle'] = float(angle)
     motion['approach_candidates_tried'] = n_tried
@@ -1089,6 +1095,58 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     motion['lead_in_verified'] = lead_in_verified
     motion['compute_time'] = time.time() - start_time
     return motion
+
+
+def blend_head_to_post_process(robot, motion, handshake,
+                               start_fraction=HEAD_GAZE_BLEND_START):
+    """接近区間 (``motion['waypoints']``) の後半 (``start_fraction`` 以降)
+    で、首の関節角を押し込み姿勢 (``handshake['post_process']``、首が
+    人の掌を向いている) の値へ線形に補間する (破壊的に書き換える)。
+
+    軌道計画では首を IK 結果 (hover 目標) の角度に固定しているが、
+    視線は押し込み姿勢でしか解いていないため、hover の時点では掌が
+    カメラの画角から外れていることが多い (押し込み直前に掌を検出し直す
+    補正で見つけられない)。hover に着いた時点で掌を向いているように
+    する。
+
+    書き換えた waypoint の干渉検証はし直さない (``waypoint_min_distances``
+    は書き換え前の首の角度で測ったまま)。首の動きは、元々は押し込み区間
+    (検証しない) で同じ角度まで動いていたものを前倒ししているだけで、
+    検証し直すと軌道計画が 1 人あたり約 0.05 秒 (約2割) 増えるため
+    (2026-09-28 計測、8 人全員で検証を通過していた)。
+
+    Returns
+    -------
+    bool
+        書き換えたら True (``post_process`` が無い、首の角度が変わらない
+        場合は False)。
+    """
+    post = handshake.get('post_process')
+    waypoints = motion.get('waypoints')
+    if post is None or not waypoints:
+        return False
+    joint_names = motion['joint_names']
+    post_angles = dict(zip(post['joint_names'], post['joint_angle_vector']))
+    head_indices = [joint_names.index(link.joint.name)
+                    for link in robot.head.link_list
+                    if link.joint.name in post_angles
+                    and link.joint.name in joint_names]
+    if not head_indices:
+        return False
+    target = np.array([post_angles[joint_names[i]] for i in head_indices])
+    hover = np.array([waypoints[-1]['joint_angle_vector'][i]
+                      for i in head_indices])
+    if np.allclose(target, hover):
+        return False
+
+    n = len(waypoints)
+    start = min(int(n * start_fraction), n - 1)
+    for k in range(start, n):
+        t = (k - start + 1) / float(n - start)
+        vec = waypoints[k]['joint_angle_vector']
+        for i, goal in zip(head_indices, target):
+            vec[i] = float(vec[i] + (goal - vec[i]) * t)
+    return True
 
 
 def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
