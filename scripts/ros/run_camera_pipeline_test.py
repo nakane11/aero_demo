@@ -249,8 +249,8 @@ JOINT_SETTLE_HAND_TOLERANCE = 0.01  # [m]
 JOINT_SETTLE_TIMEOUT = 1.5  # [s]
 JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
 
-# --press-in-refine (hover 到達後に人の手を検出し直して押し込み姿勢を解き
-# 直す、_refine_press_in 参照) で使う、停止後に新しく受け取るカメラ
+# hover 到達後に人の手を検出し直して押し込み姿勢を解き直す補正
+# (_refine_press_in 参照、--no-press-in-refine で無効) で使う、停止後に新しく受け取るカメラ
 # フレーム数と、その待ち時間の上限。骨格は複数フレームの中央値を使う
 # (One Euro Filter の平滑化値は台車移動中の履歴を引きずるため使わない)。
 PRESS_IN_REFINE_FRAMES = 3
@@ -2620,11 +2620,12 @@ def main():
         help='--auto-execute で実機が動き出すときに発話する文 '
             '(空文字列で発話しない)。')
     parser.add_argument(
-        '--press-in-refine', action='store_true',
-        help='--auto-execute で hover 目標に到達した後、カメラで人の手を '
-            '検出し直し、台車のスリップや人の手の動きでずれた分を押し込み '
-            '姿勢 (腕・首の IK、台車は動かさない) を解き直して吸収する '
-            '(_refine_press_in 参照、既定オフ)。')
+        '--no-press-in-refine', dest='press_in_refine', action='store_false',
+        help='--auto-execute で hover 目標に到達した後に行う押し込み姿勢の '
+            '補正 (カメラで人の手を検出し直し、台車のスリップや人の手の動き '
+            'でずれた分を腕・首の IK で吸収する、台車は動かさない。'
+            '_refine_press_in 参照) を無効にし、計画どおりに押し込む '
+            '(既定では補正する)。')
     parser.add_argument(
         '--speech-done-text', type=str, default='どうぞ、手を握ってください',
         help='--auto-execute で掌を差し出し終えたときに発話する文 '
