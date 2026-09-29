@@ -342,6 +342,104 @@ def collision_pairs_text(colliding):
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
+# ログの出し分け (2026-09-29 ユーザー要望)。成功/失敗などの状態遷移に
+# 当たる重要なログは従来どおり print で画面に出し、[debug] などの詳細な
+# 数値ログは log_debug で LOG_DIR 以下のログファイルにだけ書く。画面に
+# 出すログも前後関係を追えるよう同じファイルに書く (setup_log_dir が
+# sys.stdout を画面とファイルの両方へ書く _TeeStream に差し替える)。
+# ファイルは起動から最初の試行までが LOG_STARTUP_NAME、以後は試行 (差し
+# 出し手が決まって IK を解いた人) ごとに LOG_PERSON_TEMPLATE
+# (switch_log_file 参照)。起動し直すと前回のファイルは全て削除する。
+# ファイルの各行には PC の時刻を付ける。
+LOG_DIR = '/tmp/run_camera_pipeline_test_logs'
+LOG_STARTUP_NAME = 'startup.log'
+LOG_PERSON_TEMPLATE = 'person_{:02d}.log'
+
+
+class _TeeStream(object):
+    """``stream`` (元の標準出力) と ``log_file`` の両方に書くストリーム。
+    ファイルには行頭に時刻を付ける。"""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+        self._lock = threading.Lock()
+        self._at_line_start = True
+
+    def set_log_file(self, log_file):
+        """書き込み先のファイルを ``log_file`` に切り替え、前のファイルを
+        閉じる。"""
+        with self._lock:
+            old = self._log_file
+            if not self._at_line_start:
+                old.write('\n')
+            old.close()
+            self._log_file = log_file
+            self._at_line_start = True
+
+    def write(self, text):
+        with self._lock:
+            self._stream.write(text)
+            self._write_file(text)
+        return len(text)
+
+    def write_file_only(self, text):
+        with self._lock:
+            self._write_file(text)
+
+    def _write_file(self, text):
+        for line in text.splitlines(True):
+            if self._at_line_start:
+                now = time.time()
+                self._log_file.write('{}.{:03d} '.format(
+                    time.strftime('%H:%M:%S', time.localtime(now)),
+                    int(now * 1000) % 1000))
+            self._log_file.write(line)
+            self._at_line_start = line.endswith('\n')
+        self._log_file.flush()
+
+    def flush(self):
+        with self._lock:
+            self._stream.flush()
+            self._log_file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+_tee_stream = None
+
+
+def setup_log_dir():
+    """前回起動時のログ (``LOG_DIR``) を削除して作り直し、
+    ``LOG_STARTUP_NAME`` を開いて標準出力を画面とファイルの両方へ書く
+    ようにする。そのファイルのパスを返す。"""
+    global _tee_stream
+    shutil.rmtree(LOG_DIR, ignore_errors=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, LOG_STARTUP_NAME)
+    _tee_stream = _TeeStream(sys.stdout, open(path, 'w', encoding='utf-8'))
+    sys.stdout = _tee_stream
+    return path
+
+
+def switch_log_file(person):
+    """以後のログの書き込み先を ``person`` 人目 (試行番号) のファイルに
+    切り替え、そのパスを返す (``setup_log_dir`` 前なら何もせず None)。"""
+    if _tee_stream is None:
+        return None
+    path = os.path.join(LOG_DIR, LOG_PERSON_TEMPLATE.format(person))
+    _tee_stream.set_log_file(open(path, 'w', encoding='utf-8'))
+    return path
+
+
+def log_debug(text):
+    """画面には出さずログファイルにだけ 1 行書く (``setup_log_file`` 前
+    なら何もしない)。"""
+    if _tee_stream is not None:
+        _tee_stream.write_file_only(text + '\n')
+
+
 
 class HandshakePipelineNode(object):
     """カメラ入力 -> 骨格推定 -> (ARM ボタン押下時) 掌推定・IK を行うノード."""
@@ -422,7 +520,7 @@ class HandshakePipelineNode(object):
         if os.path.exists(args.collision_pairs):
             self.collision_pairs = spik.load_collision_pairs(
                 args.collision_pairs, self.robot)
-            print('[collision-pairs] {} 組を読み込みました。'.format(
+            log_debug('[collision-pairs] {} 組を読み込みました。'.format(
                 len(self.collision_pairs)))
         else:
             print('[collision-pairs] {} が見つからないため、干渉回避なしで '
@@ -437,7 +535,7 @@ class HandshakePipelineNode(object):
         self._robot_hand_position_fallback = \
             self._compute_robot_hand_position_fallback()
         self.robot_position = self._resolve_robot_position()
-        print('[robot-hand-position] {} (base_link)'.format(
+        log_debug('[robot-hand-position] {} (base_link)'.format(
             self.robot_position.tolist()))
 
         # 掌推定・差し出し手判定器は毎フレーム作り直さず使い回す (以前は
@@ -511,12 +609,6 @@ class HandshakePipelineNode(object):
         # どの行がどの試行のものかを人手で追えるようにするため各ログ行に
         # 付ける (_solve_handshake 参照)。
         self._attempt_count = 0
-        # デバッグログファイルパス (JSON Lines 形式)。--save-dir があれば
-        # そこに debug_log.jsonl を作り、各試行の進捗を追記する。
-        self._debug_log_path = None
-        if args.save_dir:
-            self._debug_log_path = os.path.join(args.save_dir, 'debug_log.jsonl')
-            os.makedirs(args.save_dir, exist_ok=True)
 
         self._warmup_ik()
 
@@ -662,6 +754,7 @@ class HandshakePipelineNode(object):
         args = self.args
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
+        warmup_t0 = time.time()
         collision_obstacles = (
             [] if (args.no_human_collision or self.collision_pairs is None)
             else spik.human_body_obstacles({}))
@@ -691,7 +784,7 @@ class HandshakePipelineNode(object):
                 collision_pairs=self.collision_pairs,
                 joint_positions={},
                 verification_pairs=self.verification_pairs)
-            print('[warmup] {}腕: IK {:.1f} 秒'.format(
+            log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
                 label, time.time() - t0))
             if picked is None:
                 print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
@@ -707,8 +800,10 @@ class HandshakePipelineNode(object):
             phm.plan_person_motion(
                 self.robot, robot_arm, handshake, {}, warmup_human_xy,
                 motion_args, self.verification_pairs, self.solver)
-            print('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
+            log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
                 label, time.time() - t0))
+        print('[warmup] 完了しました ({:.1f} 秒)。'.format(
+            time.time() - warmup_t0))
 
     def _setup_viewer(self, args):
         """viser ビューアと ``ARM``/``RESET`` ボタン・状態表示パネル・
@@ -932,7 +1027,7 @@ class HandshakePipelineNode(object):
             self.robot, pos=matrix[:3, 3], rot=matrix[:3, :3])
         diff_deg = math.degrees(math.acos(float(np.clip(
             np.dot(default_axis, matrix[:3, 2]), -1.0, 1.0))))
-        print('[camera-optical] 視線 IK のカメラ光軸を TF ({} -> {}) から '
+        log_debug('[camera-optical] 視線 IK のカメラ光軸を TF ({} -> {}) から '
               '設定しました (pos=[{:.4f}, {:.4f}, {:.4f}]、既定値との光軸の '
               'ずれ {:.2f} 度)。'.format(head_frame, optical_frame,
                                      *(list(matrix[:3, 3]) + [diff_deg])))
@@ -1099,25 +1194,23 @@ class HandshakePipelineNode(object):
                 self._handshake_total_time = time.time() - handshake_t0
 
     def _log_debug(self, record):
-        """デバッグ用ログを JSON 1 行として標準出力・ファイルに書く.
+        """デバッグ用ログを JSON 1 行としてログファイルにだけ書く
+        (``log_debug`` 参照、画面には出さない).
 
         テキストの整形ログだと ``grep``/後からの機械的な集計がしづらいため、
         ``_solve_handshake`` が offered_hand を検出してから結果が出るまでの
         各段階の情報を、すべて ``{"event": ...}`` の JSON 1 行にまとめて出す
-        (``[debug]`` 接頭辞で ``grep '^\\[debug\\]'`` すれば debug ログだけ
-        抜き出せる)。``--save-dir`` が指定されていれば、
-        ``save_dir/debug_log.jsonl`` に追記される (JSONL 形式)。
+        (``grep '\\[debug\\] {'`` すれば JSON のログだけ抜き出せる)。
         """
-        log_line = '[debug] ' + json.dumps(record, ensure_ascii=False)
-        print(log_line)
-        if self._debug_log_path is not None:
-            with open(self._debug_log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
 
     def _solve_handshake(self, joint_positions, palms, offered_hand):
         args = self.args
         self._attempt_count += 1
         attempt = self._attempt_count
+        log_path = switch_log_file(attempt)
+        print('[ARMED] 試行{}: {}手を差し出しました。IK・軌道計画を始めます '
+              '(ログ: {})。'.format(attempt, offered_hand, log_path))
         self._log_debug(dict(event='armed', person=attempt,
                              offered_hand=offered_hand))
         robot_arm = (spik.DEFAULT_ROBOT_ARM[offered_hand]
@@ -1260,6 +1353,22 @@ class HandshakePipelineNode(object):
             placement=placement,
             collision_ik_time=collision_ik_time,
             candidate_selection_time=candidate_selection_time))
+        if not result['solved']:
+            print('[result] 試行{} ({}手/{}腕): IK 失敗 ({:.1f} 秒)。'.format(
+                attempt, offered_hand, robot_arm,
+                collision_ik_time + candidate_selection_time))
+        elif motion is None:
+            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし。'.format(
+                attempt, offered_hand, robot_arm))
+        else:
+            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画{} '
+                  '({}、IK {:.1f} 秒 + 軌道 {:.1f} 秒)。'.format(
+                      attempt, offered_hand, robot_arm,
+                      '成功' if self._motion_verified(motion)
+                      else '失敗 (干渉検証 NG)',
+                      phm.KIND_LABELS.get(motion['kind'], motion['kind']),
+                      collision_ik_time + candidate_selection_time,
+                      motion['compute_time']))
 
         # solve_palm_ik.py が実際に干渉判定へ使ったのと同じ人体の近似
         # ジオメトリ (Cylinder) は、この joint_positions (frozen 表示中の
@@ -1585,7 +1694,7 @@ class HandshakePipelineNode(object):
             self.ri.angle_vector_sequence(
                 [down_av, up_av], time_list, controller_type='head_controller')
             self.ri.wait_interpolation(controller_type='head_controller')
-            print('[nod] 首を {:.0f} 度まで下げて {:.0f} 度に戻しました '
+            log_debug('[nod] 首を {:.0f} 度まで下げて {:.0f} 度に戻しました '
                   '({:.2f} 秒)。'.format(HEAD_NOD_PITCH_DEG,
                                         np.rad2deg(initial_angle),
                                         sum(time_list)))
@@ -1882,7 +1991,7 @@ class HandshakePipelineNode(object):
                             image)
             json_io.save_json(os.path.join(out_dir, 'record.json'), dict(
                 record, stamps=[frame['stamp'] for frame in hand_frames]))
-            print('[execute][refine] 手の再検出に失敗したときの画像を {} に '
+            log_debug('[execute][refine] 手の再検出に失敗したときの画像を {} に '
                   '保存しました。'.format(out_dir))
         except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
             print('[execute][refine][WARN] 画像の保存に失敗しました ({})。'
@@ -2042,7 +2151,7 @@ class HandshakePipelineNode(object):
     @staticmethod
     def _print_joint_tracking(label, hand_err, over):
         """``_joint_tracking_error`` の結果を ``[debug][joint]`` ログに出す。"""
-        print('[debug][joint] {}: 手先のずれ(関節角のみ由来)={:.1f}mm '
+        log_debug('[debug][joint] {}: 手先のずれ(関節角のみ由来)={:.1f}mm '
               '(dx={:+.1f} dy={:+.1f} dz={:+.1f}mm, world系), '
               '1deg/5mm超の関節 {}個: {}'.format(
                   label, np.linalg.norm(hand_err) * 1e3,
@@ -2116,9 +2225,8 @@ class HandshakePipelineNode(object):
             return
         try:
             self.sound_client.say(text, voice=self.args.speech_voice)
-            print('[speech] 「{}」'.format(text))
-        except Exception as exc:  # noqa: BLE001  (発話失敗で実機動作を止めない)
-            print('[speech] 発話に失敗しました ({})。'.format(exc))
+        except Exception:  # noqa: BLE001  (発話失敗で実機動作を止めない)
+            pass
 
     def _execute_waypoint_segment(self, waypoints, joint_names):
         """``waypoints`` (先頭要素を基準にした 1 区間分) を、waypoint の
@@ -2199,7 +2307,7 @@ class HandshakePipelineNode(object):
             # waypoint 数・送信直前の odom yaw を記録しておき、
             # _correct_base_residual 側のログと突き合わせて、どの区間の
             # 送信が追従できていないかを切り分ける。
-            print('[debug][segment] waypoint数={} 計画上のdyaw={:.1f}deg '
+            log_debug('[debug][segment] waypoint数={} 計画上のdyaw={:.1f}deg '
                   '(=[{}]) 送信直前odom_yaw={:.1f}deg '
                   'time_list合計={:.3f}s (=[{}])'
                   .format(
@@ -2229,7 +2337,7 @@ class HandshakePipelineNode(object):
                             + base_trajectory_points[-1][2])
             actual_yaw = matrix2ypr(odom_after.rotation)[0]
             state = self.ri.move_base_trajectory_action.get_state()
-            print('[debug][segment] wait_for_result 直後 (ゴール終了状態 {}) '
+            log_debug('[debug][segment] wait_for_result 直後 (ゴール終了状態 {}) '
                   'odom_yaw={:.1f}deg (期待値={:.1f}deg, 差={:.1f}deg)'.format(
                       GOAL_STATUS_NAMES.get(state, state),
                       math.degrees(actual_yaw), math.degrees(expected_yaw),
@@ -2379,7 +2487,7 @@ class HandshakePipelineNode(object):
         worst = float(np.max(peak_ratios(times)))
         if worst > 1.0:
             if worst > 1.01:
-                print('[debug][segment] 速度上限の反復で収まらなかったため '
+                log_debug('[debug][segment] 速度上限の反復で収まらなかったため '
                       '全区間を {:.3f} 倍に延ばします。'.format(worst))
             times *= worst
         return [float(t) for t in times]
@@ -2531,7 +2639,7 @@ class HandshakePipelineNode(object):
             rms=match['rms'], inlier_ratio=match['inlier_ratio'],
             n_inliers=match['n_inliers'], iterations=match['iterations'],
             n_points=[len(ref_scan), len(cur_scan)], match_time=match_time))
-        print('[execute][scan] attempt={} スキャン照合{}: 実際の移動 '
+        log_debug('[execute][scan] attempt={} スキャン照合{}: 実際の移動 '
               '({:+.3f}m, {:+.3f}m, {:+.1f}deg) / odom ({:+.3f}m, {:+.3f}m, '
               '{:+.1f}deg) -> スリップ ({:+.3f}m, {:+.3f}m, {:+.1f}deg) '
               '[rms={:.1f}mm, 対応率={:.2f}, {:.3f}s]'.format(
@@ -2580,7 +2688,7 @@ class HandshakePipelineNode(object):
         start_odom = self._odom_pose(start_odom_coords)
 
         settle_time, drift = self._wait_odom_settle()
-        print('[execute][correct] 接近区間の終了後に odom が止まるまで {:.2f}s '
+        log_debug('[execute][correct] 接近区間の終了後に odom が止まるまで {:.2f}s '
               '(その間の移動 {:.1f}mm/{:.2f}deg)'.format(
                   settle_time, drift[0] * 1e3, math.degrees(drift[1])))
         err_norm = 0.0
@@ -2601,7 +2709,7 @@ class HandshakePipelineNode(object):
             # move_trajectory に渡す相対移動量は今の台車の前後左右基準)。
             err_x, err_y, err_yaw = scan_matching.relative(actual, plan)
             err_norm = math.hypot(err_x, err_y)
-            print('[execute][correct] attempt={} ({}基準) 目標までの残差 '
+            log_debug('[execute][correct] attempt={} ({}基準) 目標までの残差 '
                   '{:+.3f}m {:+.3f}m {:+.1f}deg'.format(
                       attempt, source, err_x, err_y, math.degrees(err_yaw)))
 
@@ -2632,7 +2740,7 @@ class HandshakePipelineNode(object):
             settle_time, drift = self._wait_odom_settle()
             moved = scan_matching.relative(
                 before, self._odom_pose(self.ri.odom))
-            print('[execute][correct] 補正の移動: 指令 ({:+.3f}m, {:+.3f}m, '
+            log_debug('[execute][correct] 補正の移動: 指令 ({:+.3f}m, {:+.3f}m, '
                   '{:+.1f}deg) {:.2f}s -> odom 上の移動 ({:+.3f}m, {:+.3f}m, '
                   '{:+.1f}deg)、ゴール終了状態 {}、終了後に odom が止まるまで '
                   '{:.2f}s (その間の移動 {:.1f}mm/{:.2f}deg)'.format(
@@ -3202,6 +3310,10 @@ def main():
             'で rosbag のみを使って動作確認する際に指定する。')
     # argparse は roslaunch が付ける残りの引数 (__name/__log 等) を無視する
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
+
+    log_path = setup_log_dir()
+    print('[log] 詳細なログ ([debug] など) は画面に出さず {} 以下に試行 (人) '
+          'ごとのファイルで保存します (起動時: {})。'.format(LOG_DIR, log_path))
 
     bag_process = None
     if args.bag:

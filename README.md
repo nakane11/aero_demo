@@ -324,7 +324,12 @@ python3 scripts/ros/run_camera_pipeline_test.py \
   `move_trajectory_sequence` のままだと、静止状態から最初の区間の速度へ
   いきなり跳ぶため。
 
-実行時は区間ごとの所要時間と律速した軸が次のようにログに出る
+`[debug]` などの詳細なログは画面には出さず、
+`/tmp/run_camera_pipeline_test_logs/` 以下に起動時 (`startup.log`) と
+試行 (人) ごと (`person_01.log`, ...) のファイルで保存する (画面に出る
+成功/失敗などのログも同じファイルに時刻付きで入る。起動し直すと前回の
+ファイルは削除される)。
+区間ごとの所要時間と律速した軸は次のようにログに出る
 (`〜の加速度` は加速度で、`下限` は `MIN_SEGMENT_TIME` で決まった区間):
 
 ```
