@@ -54,7 +54,7 @@
 
 | 対象 | 形状 |
 |---|---|
-| ロボット | 指なしモデル (`Aero(use_hand=False)`)。各リンクを box/cylinder/sphere のプリミティブで近似したもの (`apply_collision_model`)。実メッシュではない |
+| ロボット | 指なしモデル (`Aero(use_hand=False)`)。各リンクを box/cylinder/sphere のプリミティブで近似したもの (`apply_collision_model`)。実メッシュではない。台車は元 URDF の box (`wheel_base_link`、地面から 0.038〜0.187 m) に加え、前方の高い部分を干渉専用のリンク `wheel_base_front_link` の box (前端から前後 0.25 m、左右 0.52 m、地面から 0.038〜0.32 m) として足す (`aero_demo.collision_model.EXTRA_COLLISION_BOXES`) |
 | 人体 | 骨格から作る 26 本の `Cylinder` (`human_body_obstacles`)。詳細は下 |
 
 人体の 26 本の内訳:

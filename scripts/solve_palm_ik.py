@@ -101,6 +101,7 @@ from skrobot.coordinates import CascadedCoords  # noqa: E402
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr, normalize_mask  # noqa: E402
 from skrobot.coordinates.math import quaternion2matrix  # noqa: E402
+from skrobot.model import Link  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
@@ -1564,11 +1565,52 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False,
             link.collision_mesh = None
             link.collision_primitive = None
             n_excluded += 1
+
+    # 干渉モデル URDF にだけあるリンク (aero_demo.collision_model.EXTRA_
+    # COLLISION_BOXES: 台車前方の高い部分など) は、robot に干渉専用の
+    # リンクとして付ける (robot.link_list/joint_list には入れず、親リンクに
+    # assoc して追従させる)。parent_link を設定し、軌道最適化
+    # (TrajectoryProblem._compute_collision_link_offsets) からは固定関節の
+    # 先にある wheel_base_link と同じ扱いになるようにする (ただし現状の
+    # scikit-robot は、鎖に届かない台車固定のリンクを chain[0] の座標系・
+    # オフセット 0 に置いてしまう既知の不具合がある)。
+    robot_links_by_name = {link.name: link for link in robot.link_list}
+    extra_links = [link for link in getattr(robot, 'extra_collision_links',
+                                            [])]
+    extra_names = {link.name for link in extra_links}
+    for collision_link in collision_robot.link_list:
+        mesh = getattr(collision_link, 'collision_mesh', None)
+        if (collision_link.name in robot_links_by_name
+                or collision_link.name in extra_names or mesh is None):
+            continue
+        src_parent = collision_link.parent_link
+        parent = (robot_links_by_name.get(src_parent.name)
+                  if src_parent is not None else None)
+        if parent is None:
+            raise ValueError(
+                '{} のリンク {!r} の親リンクがロボットに見つかりません。'
+                .format(collision_urdf_path, collision_link.name))
+        relative = src_parent.copy_worldcoords().inverse_transformation() \
+            .transform(collision_link.copy_worldcoords())
+        link = Link(name=collision_link.name)
+        link.newcoords(parent.copy_worldcoords().transform(relative))
+        parent.assoc(link)
+        link.add_parent_link(parent)
+        link.collision_mesh = mesh
+        link.collision_primitive = getattr(
+            collision_link, 'collision_primitive', None)
+        extra_links.append(link)
+        extra_names.add(link.name)
+    robot.extra_collision_links = extra_links
+
     print('[collision-model] {} 個のリンクの干渉ジオメトリを ({}) から '
-          '差し替えました{}。'.format(
+          '差し替えました{}{}。'.format(
               n_replaced, collision_urdf_path,
               ' ({} 個のリンクを干渉回避の対象から除外)'.format(n_excluded)
-              if explicit_exclude else ''))
+              if explicit_exclude else '',
+              ' (干渉専用のリンク {} を追加)'.format(
+                  ', '.join(link.name for link in extra_links))
+              if extra_links else ''))
 
 
 def collision_link_list_for_arm(robot, robot_arm):
@@ -1581,9 +1623,22 @@ def collision_link_list_for_arm(robot, robot_arm):
     は常に ``collision_pairs`` だけで決まる)。``build_collision_
     verification_pairs`` (事後検証用) と ``tools/build_collision_pairs.py``
     が、この関数で全リンクを集めてから総当たりの組み合わせを作る。
+
+    ``apply_collision_model`` が付けた干渉専用のリンク (``robot.extra_
+    collision_links``) も含め、それぞれ親リンクの直後に並べる。
+    ``create_self_collision_pairs(ignore_adjacent=True)`` はリスト上で
+    隣り合う組を除くので、常に重なっている親子 (台車の箱同士) の組が
+    自己干渉の対象から外れる。
     """
-    return [link for link in robot.link_list
-           if getattr(link, 'collision_mesh', None) is not None]
+    extras_by_parent = {}
+    for link in getattr(robot, 'extra_collision_links', []):
+        extras_by_parent.setdefault(link.parent_link, []).append(link)
+    links = []
+    for link in robot.link_list:
+        if getattr(link, 'collision_mesh', None) is not None:
+            links.append(link)
+        links.extend(extras_by_parent.get(link, []))
+    return links
 
 
 def load_collision_pairs(path, robot):
@@ -1606,7 +1661,9 @@ def load_collision_pairs(path, robot):
     """
     with open(path) as f:
         pair_names = json.load(f)
-    links_by_name = {link.name: link for link in robot.link_list}
+    links_by_name = {link.name: link for link in
+                     list(robot.link_list)
+                     + list(getattr(robot, 'extra_collision_links', []))}
     obstacle_index_by_name = {
         name: idx for idx, name in enumerate(human_obstacle_names())}
     pairs = []
