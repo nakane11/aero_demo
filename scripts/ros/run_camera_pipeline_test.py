@@ -482,7 +482,7 @@ class HandshakePipelineNode(object):
         # (view_handshake_poses.py と同じ見た目にするため)。
         self.robot = Aero(use_hand=False)
         spik.restrict_elbow_range(self.robot)
-        spik.restrict_ankle_range(self.robot)
+        spik.restrict_leg_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
         self._attach_camera_optical_coords()

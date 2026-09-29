@@ -33,7 +33,8 @@
 | 関節 | 制限 | 理由 |
 |---|---|---|
 | `{r,l}_elbow_joint` | 下限を -120° に (`ELBOW_MIN_ANGLE_DEG`) | 曲げきると前腕と上腕が平行に近い不自然な姿勢になる |
-| `ankle_joint` | 上限 90° → 81° (低くなる側を全域の 10% 削る, `ANKLE_LOW_SIDE_MARGIN_RATIO`) | 腰が低いと実機の押し込みで指令に追従できない |
+| `ankle_joint` | 上限 90° → 81° (低くなる側を全域の 10% 削る, `LEG_LOW_SIDE_MARGIN_RATIO`) | 腰が低いと実機の押し込みで指令に追従できない |
+| `knee_joint` | 下限 -90° → -81° (同上, `restrict_leg_range`) | 同上 (曲げすぎない) |
 | `{r,l}_hand_y_joint` | 0 に固定 (`lock_fixed_joints`) | 実機にモータが無い。動かすと左手の向きが 180° 前後ずれる |
 
 第1段のバッチ IK だけは、この上からさらに各関節の上下を全域幅の 10% ずつ
