@@ -57,8 +57,9 @@ IK・軌道計画 (state 'result') まで進むと、``--auto-execute`` を付�
 実機 (``AeroROSRobotInterface``) への接続自体は ``--auto-execute`` の
 指定に関わらず起動時に常に試みるため、接続に成功していれば
 (``--auto-execute`` を指定していなくても) ``ARM`` ボタンを押した瞬間に
-実機の首を少し下げると同時に腕を初期姿勢 (体の横に下ろした姿勢) まで
-戻し、人間が手を差し出しやすい姿勢にする (``_nod_head_for_arm`` 参照):
+実機を初期姿勢 (腕を体の横に下ろした姿勢) まで戻し (``_move_to_initial_
+pose`` 参照)、差し出し手が決まった瞬間にうなずく (``_nod_head``
+参照):
 
     python3 scripts/ros/run_camera_pipeline_test.py
 
@@ -167,18 +168,20 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 DEFAULT_PLAYBACK_FPS = 40.0
 
 # ARM ボタンを押した瞬間 (実機 self.ri への接続に成功している状態のとき
-# に、--auto-execute の指定有無に関わらず、_nod_head_for_arm 参照) に
-# 実機の首を下げる目標角度 [deg]。``Aero.reset_pose`` の既定
-# (neck_p_joint = 25 度、以後このパイプライン全体の「見ている」基準姿勢)
-# からさらに下げ、まっすぐ人の顔の高さを見続けるより控えめにうつむかせる
-# ことで、人間が手 (ロボットの手先の高さ) を差し出しやすい・近づきやすい
-# 印象にする。実機の首の可動方向 (どちらが「下」か) は個体差の可能性が
-# あるため、実機で確認して向きが逆なら符号を反転させること。
-ARM_HEAD_NOD_PITCH_DEG = 25.0
-# 上記の首下げ・腕を初期姿勢まで下ろす動作 (_nod_head_for_arm) にかける
-# 時間 [秒]。あまり速いと会釈というより首を振っただけに見えるため、
-# ゆっくりめにしてある。
-ARM_HEAD_NOD_MOVE_TIME = 5
+# に、--auto-execute の指定有無に関わらず、_move_to_initial_pose 参照)
+# に腕を初期姿勢まで下ろす動作にかける時間 [秒]。
+ARM_INITIAL_POSE_MOVE_TIME = 5
+# 差し出し手が決まった瞬間 (_try_handshake -> _nod_head) に、首を
+# ``Aero.reset_pose`` の既定 (neck_p_joint = 25 度、軌道の初期姿勢と
+# 同じ) からこの角度 [deg] まで下げて 25 度に戻す (うなずく)。実機の首の
+# 可動方向 (どちらが「下」か) は個体差の可能性があるため、実機で確認して
+# 向きが逆なら符号を反転させること。URDF の neck_p_joint の上限は
+# 0.96 rad (約 55 度)。
+HEAD_NOD_PITCH_DEG = 40.0
+# うなずきの下げる・戻すそれぞれにかける時間の下限 [秒]。あまり速いと
+# うなずきというより首を振っただけに見える。軌道計画はうなずきと並行に
+# 進み、実機の移動はうなずき終わるまで待つ (_execute_on_robot 参照)。
+HEAD_NOD_MOVE_TIME = 0.5
 
 # 実機で軌道を再生するときの waypoint 間の所要時間の下限 [秒]。所要時間
 # は固定の dt (motion['dt']、軌道最適化のコスト正規化用) ではなく、区間
@@ -473,6 +476,10 @@ class HandshakePipelineNode(object):
         self.state = 'idle'
         self.armed_deadline = None
         self._busy = False                # IK 計算中は次フレームの処理を止める
+        # うなずき (_nod_head) が終わっていれば set。_execute_on_robot は
+        # これを待ってから実機を動かす。
+        self._nod_done = threading.Event()
+        self._nod_done.set()
         self._frozen_joint_positions = None  # offered_hand が決まった瞬間の骨格 (以後この骨格を固定表示する) or None
         self._current_result = None       # 直近の solve_palm_ik の結果 dict (ボタン用) or None
         self._current_motion = None       # 直近の plan_handshake_motion の結果 dict or None
@@ -502,7 +509,9 @@ class HandshakePipelineNode(object):
         self._warmup_ik()
 
         # 実機接続 (--auto-execute の指定に関わらず常に AeroROSRobotInterface
-        # への接続を試みる)。ARM ボタン押下時の首下げ (_nod_head_for_arm) は
+        # への接続を試みる)。ARM ボタン押下時の初期姿勢への復帰
+        # (_move_to_initial_pose)・差し出し手が決まったときのうなずき
+        # (_nod_head) は
         # 台車・腕を実際に動かすフラグとは独立に、self.ri さえ使えれば行い
         # たいため。台車・腕を実際に動かす実行は引き続き --auto-execute で
         # 制御する (_execute_on_robot 参照)。skrobot の
@@ -521,7 +530,8 @@ class HandshakePipelineNode(object):
         if args.no_robot_interface:
             # rosbag での実機なし動作確認用 (--no-robot-interface)。接続を
             # 試みること自体をやめる (self.ri は None のままになり、ARM 時の
-            # 首下げ/--auto-execute による実機操作は無効のままになる)。
+            # 初期姿勢への復帰・うなずき/--auto-execute による実機操作は
+            # 無効のままになる)。
             print('[execute] --no-robot-interface が指定されたため、実機 '
                   '(AeroROSRobotInterface) への接続を試みません。')
         else:
@@ -539,7 +549,8 @@ class HandshakePipelineNode(object):
                 self.real_robot = None
                 self.ri = None
                 print('[execute] 実機 (AeroROSRobotInterface) への接続に失敗した '
-                      'ため、ARM 時の首下げ/--auto-execute による実機操作は無効の '
+                      'ため、ARM 時の初期姿勢への復帰・うなずき/--auto-execute '
+                      'による実機操作は無効の '
                       'ままになります ({})。'.format(exc))
 
         # --auto-execute で実機を動かすときの発話 (動き出す直前と掌を
@@ -753,7 +764,7 @@ class HandshakePipelineNode(object):
             with self._lock:
                 self._handshake_total_time = None
             if self.ri is not None:
-                # 首下げ・腕を初期姿勢まで下ろす動作 (_nod_head_for_arm)。
+                # 腕を初期姿勢まで下ろす動作 (_move_to_initial_pose)。
                 # self.ri は --auto-execute の指定に関わらず接続を試みて
                 # いるため (__init__ 参照)、接続さえ成功していれば
                 # --auto-execute を指定していない場合でも実行する。
@@ -761,7 +772,7 @@ class HandshakePipelineNode(object):
                 # コールバックのスレッドで直接行うとブロックするため、
                 # _execute_on_robot と同様に別スレッドに逃がす。
                 threading.Thread(
-                    target=self._nod_head_for_arm, daemon=True).start()
+                    target=self._move_to_initial_pose, daemon=True).start()
             print('[ARM] ARMED になりました。{:.0f} 秒以内に手を差し出して'
                   'ください。'.format(self.args.armed_timeout))
 
@@ -1054,6 +1065,11 @@ class HandshakePipelineNode(object):
             return
         self.armed_deadline = None
         self._busy = True
+        if self.ri is not None:
+            # 差し出し手が決まったことを伝えるうなずき。軌道計画と並行に
+            # 行う (この関数はカメラのコールバックスレッドで動くため)。
+            self._nod_done.clear()
+            threading.Thread(target=self._nod_head, daemon=True).start()
         # 差し出し手が決まった瞬間の骨格を固定表示にする (以後 ARMED を
         # 抜けるので、この骨格はもうカメラの最新フレームで上書きされない)。
         # 同時に IK 計算に入るので ARM ボタンを RESET ボタンに切り替える。
@@ -1480,18 +1496,19 @@ class HandshakePipelineNode(object):
         self._collision_pairs_text = collision_pairs_text(colliding)
 
     # ------------------------------------------------------------------
-    # 実機動作 (ARM ボタン押下時の首下げ・初期姿勢への復帰、--auto-execute)
+    # 実機動作 (ARM ボタン押下時の初期姿勢への復帰、うなずき、
+    # --auto-execute)
     # ------------------------------------------------------------------
-    def _nod_head_for_arm(self):
+    def _move_to_initial_pose(self):
         """ARM ボタン押下時 (``--auto-execute`` の指定有無に関わらず、
         実機 ``self.ri`` への接続に成功している状態のときのみ
-        ``_on_arm`` から別スレッドで呼ばれる) に、実機の首を
-        ``ARM_HEAD_NOD_PITCH_DEG`` まで下げると同時に、腕を含む全身を
+        ``_on_arm`` から別スレッドで呼ばれる) に、腕・首を含む全身を
         ``self._initial_joint_names``/``self._initial_joint_angle_vector``
         (``__init__`` 参照、``phm.arms_down_angles`` による「両腕を体の横に
-        下ろした」初期姿勢 -- ARM 前/RESET 後に画面へ表示しているのと同じ
-        姿勢) まで動かす。まっすぐ顔を見続け腕を構えたままより威圧感の
-        少ない、人間が手を差し出しやすい姿勢にする。
+        下ろした」初期姿勢 (首は neck_p = 25 度) -- ARM 前/RESET 後に画面へ
+        表示しているのと同じ姿勢で、軌道の先頭もこの姿勢から始まる) まで
+        動かす。腕を構えたままより威圧感の少ない、人間が手を差し出しやすい
+        姿勢にする。
 
         ``controller_type`` を指定せずに送ることで既定の
         ``'default_controller'`` (``larm_controller``/``rarm_controller``/
@@ -1519,16 +1536,51 @@ class HandshakePipelineNode(object):
         for joint in self.real_robot.joint_list:
             if joint.name in name_to_initial_angle:
                 joint.joint_angle(name_to_initial_angle[joint.name])
-        self.real_robot.neck_p_joint.joint_angle(
-            np.deg2rad(ARM_HEAD_NOD_PITCH_DEG))
         target_av = self.real_robot.angle_vector()
         # 静止 -> 静止の 1 区間でも、瞬間速度のピークは平均の 1.5 倍になる
         # ので、関節速度上限 (VEL_LIMIT_RATIO) を超えない時間まで延ばす。
         move_time, = self._limited_time_list(
-            [target_av], None, [ARM_HEAD_NOD_MOVE_TIME])
+            [target_av], None, [ARM_INITIAL_POSE_MOVE_TIME])
         self.ri.angle_vector(target_av, move_time)
-        print('[ARM] 腕を初期姿勢まで下ろし、首を {:.0f} 度まで下げました。'
-              .format(ARM_HEAD_NOD_PITCH_DEG))
+        print('[ARM] 腕・首を初期姿勢に戻しました。')
+
+    def _nod_head(self):
+        """差し出し手が決まった瞬間 (``_try_handshake`` から別スレッドで
+        呼ばれる) に、首 (neck_p) を ``HEAD_NOD_PITCH_DEG`` まで下げてから
+        初期姿勢の角度 (``self._initial_joint_angle_vector``、25 度) に
+        戻す (うなずく)。終わったら (失敗しても) ``self._nod_done`` を
+        set する。
+
+        ``head_controller`` だけに送るので、ARM 時の初期姿勢への動作が
+        まだ続いていても腕のゴールは打ち切らない (送るベクトルは実機の
+        現在の関節角の neck_p だけを置き換えたもの)。
+        """
+        try:
+            current_av = np.asarray(self.ri.angle_vector(), dtype=np.float64)
+            joint_list = self.real_robot.joint_list
+            neck_index = joint_list.index(self.real_robot.neck_p_joint)
+            initial_angle = dict(zip(
+                self._initial_joint_names,
+                self._initial_joint_angle_vector))[
+                    self.real_robot.neck_p_joint.name]
+            down_av = current_av.copy()
+            down_av[neck_index] = np.deg2rad(HEAD_NOD_PITCH_DEG)
+            up_av = current_av.copy()
+            up_av[neck_index] = initial_angle
+            time_list = self._limited_time_list(
+                [down_av, up_av], None,
+                [HEAD_NOD_MOVE_TIME, HEAD_NOD_MOVE_TIME])
+            self.ri.angle_vector_sequence(
+                [down_av, up_av], time_list, controller_type='head_controller')
+            self.ri.wait_interpolation(controller_type='head_controller')
+            print('[nod] 首を {:.0f} 度まで下げて {:.0f} 度に戻しました '
+                  '({:.2f} 秒)。'.format(HEAD_NOD_PITCH_DEG,
+                                        np.rad2deg(initial_angle),
+                                        sum(time_list)))
+        except Exception as exc:  # noqa: BLE001  (うなずけなくても握手の実行は止めない)
+            print('[nod] うなずきに失敗しました ({})。'.format(exc))
+        finally:
+            self._nod_done.set()
 
     def _execute_on_robot(self):
         """``--auto-execute`` が指定されていて実行条件を満たしたとき
@@ -1592,6 +1644,12 @@ class HandshakePipelineNode(object):
                   'ません (verified={}, lead_in_verified={})。'.format(
                       motion['verified'], motion['lead_in_verified']))
             return
+
+        # 軌道計画がうなずき (_nod_head) より先に終わったら、うなずき
+        # 終わるまで待つ (軌道の先頭の首の角度はうなずき後の 25 度)。
+        if not self._nod_done.wait(timeout=10.0):
+            print('[execute] うなずきが 10 秒以内に終わらなかったため、'
+                  '待たずに実行します。')
 
         joint_names = motion['joint_names']
         # 接近区間 (display_waypoints[:reach_boundary]) は hover 目標
