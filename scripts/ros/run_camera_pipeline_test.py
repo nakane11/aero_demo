@@ -289,6 +289,18 @@ PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 # base_link 系に直したもの) に最も近いものを人の手とみなす。これより
 # 遠ければ (別の手・ロボット自身の手の誤検出など) 使わない。
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.15  # [m]
+# 上に加えて、次の手も使わない (tools/ros/compare_hand_detectors.py で
+# 同じフレームの Holistic と比べた 2026-09-29 の計測では、Hands の掌は
+# 普段は数 mm で一致するが、handedness の score が低いときに 3〜6cm
+# ずれたり、掌と甲を取り違えて法線が反転 (146〜180 度) したりした)。
+# * handedness の score がこれ未満の手 (score 0.52〜0.79 の手で外れが
+#   多かった。一致していた手はほぼ 0.84 以上)。
+# * 掌の法線が計画時の掌の法線からこれより大きく傾いた手 (掌と甲の取り
+#   違え。反転は score 0.99 でも起きたので score だけでは弾けない)。
+#   押し込み姿勢の解き直しは目標の向きの変化が REFINE_MAX_ROTATION_CHANGE
+#   (30 度) を超えると棄却されるので、それより少し緩くしてある。
+PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
+PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 45.0
 
 # ロボット自身/人体側の干渉回避ジオメトリを重ねて表示する色、経路の後処理
 # 補間フレーム数は view_handshake_poses.py/view_handshake_motion.py と共通
@@ -1736,13 +1748,18 @@ class HandshakePipelineNode(object):
                 self._hand_frames = []
         return frames
 
-    def _select_offered_hand(self, hand_frames, side, expected_position):
+    def _select_offered_hand(self, hand_frames, side, expected_position,
+                             expected_normal):
         """``_collect_hand_frames`` の各フレームから、掌の中心が
         ``expected_position`` (今の base_link 系) に最も近い手を 1 つずつ
         選び (``PRESS_IN_REFINE_MAX_HAND_DISTANCE`` より遠ければそのフレーム
         は使わない)、そのランドマークのフレーム間の中央値を
         ``{side}Hand*`` の名前で返す。Hands の左右判定は誤りうるため左右
-        ラベルは使わず、位置だけで選ぶ。
+        ラベルは使わず、位置で選ぶ。ただし handedness の score が
+        ``PRESS_IN_REFINE_MIN_HAND_SCORE`` 未満の手と、掌の法線が
+        ``expected_normal`` (計画時の掌の法線、今の base_link 系) から
+        ``PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG`` より傾いた手 (掌と甲の
+        取り違え) は候補から除く。
 
         Returns
         -------
@@ -1751,7 +1768,9 @@ class HandshakePipelineNode(object):
             ``expected_position`` の距離 [m]。``candidates`` はフレームごと
             の検出した全ての手の内訳 (ログ・失敗時の保存用。``side``/
             ``score``/深度が取れた点数 ``n_points``/掌の中心 ``palm_position``
-            (掌が求まらなければ None)/``distance`` [m])。
+            (掌が求まらなければ None)/``distance`` [m]/``normal_angle_deg``
+            (計画時の掌の法線とのなす角)/``rejected`` (除いた理由
+            ``'low_score'``/``'normal'``、使える候補なら None))。
         """
         chosen = []
         distances = []
@@ -1764,15 +1783,25 @@ class HandshakePipelineNode(object):
                 joints = {'{}Hand{}'.format(side, name[len(prefix):]): p
                           for name, p in hand['positions'].items()}
                 palm = self.palm_estimator.estimate_palm(joints, side)
-                dist = None if palm is None else float(np.linalg.norm(
-                    np.asarray(palm['position']) - expected_position))
+                dist = normal_angle = rejected = None
+                if palm is not None:
+                    dist = float(np.linalg.norm(
+                        np.asarray(palm['position']) - expected_position))
+                    normal_angle = math.degrees(math.acos(np.clip(np.dot(
+                        palm['y_axis'], expected_normal), -1.0, 1.0)))
+                    if hand['score'] < PRESS_IN_REFINE_MIN_HAND_SCORE:
+                        rejected = 'low_score'
+                    elif normal_angle > PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG:
+                        rejected = 'normal'
                 frame_candidates.append(dict(
                     side=hand['side'], score=hand['score'],
                     n_points=len(hand['positions']),
                     palm_position=(None if palm is None
                                    else [float(v) for v in palm['position']]),
-                    distance=dist))
-                if dist is not None and (best is None or dist < best[0]):
+                    distance=dist, normal_angle_deg=normal_angle,
+                    rejected=rejected))
+                if (dist is not None and rejected is None
+                        and (best is None or dist < best[0])):
                     best = (dist, joints)
             candidates.append(frame_candidates)
             if best is not None and best[0] <= PRESS_IN_REFINE_MAX_HAND_DISTANCE:
@@ -1842,7 +1871,10 @@ class HandshakePipelineNode(object):
                     label = '{} {:.2f} {}'.format(
                         cand['side'], cand['score'],
                         'no palm' if cand['distance'] is None
-                        else '{:.0f}mm'.format(cand['distance'] * 1e3))
+                        else '{:.0f}mm {:.0f}deg'.format(
+                            cand['distance'] * 1e3, cand['normal_angle_deg']))
+                    if cand.get('rejected'):
+                        label += ' x' + cand['rejected']
                     u0, v0 = pixels[0]
                     cv2.putText(image, label, (int(u0), int(v0) + 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -1896,10 +1928,12 @@ class HandshakePipelineNode(object):
         base_pos = base.worldpos().copy()
         expected_position = base_rot.T @ (
             np.asarray(planned_palm['position']) - base_pos)
+        # 計画時の掌の法線も同じ系に直す (掌と甲を取り違えた手を除くため)。
+        expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
         hand_frames = self._collect_hand_frames(
             PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
         joint_positions, distances, candidates = self._select_offered_hand(
-            hand_frames, offered_hand, expected_position)
+            hand_frames, offered_hand, expected_position, expected_normal)
         wait_time = time.time() - t0
         palm = None
         if joint_positions is not None:
@@ -1907,21 +1941,30 @@ class HandshakePipelineNode(object):
                 joint_positions, offered_hand)
         if palm is None:
             nearest = [c['distance'] for frame in candidates for c in frame
-                       if c['distance'] is not None]
+                       if c['distance'] is not None and c['rejected'] is None]
+            n_rejected = {reason: sum(
+                1 for frame in candidates for c in frame
+                if c['rejected'] == reason)
+                for reason in ('low_score', 'normal')}
             print('[execute][refine] hover 到達後に {}手を検出できなかった '
                   'ため、計画どおりに押し込みます ({:.2f}s 待機、{} フレーム'
                   '中 手を検出 {} フレーム、計画時の掌から {:.0f}mm 以内 {} '
-                  'フレーム、最も近い手 {})。'.format(
+                  'フレーム、最も近い手 {}、除外した手 score<{:.2f}: {} / '
+                  '法線>{:.0f}deg: {})。'.format(
                       offered_hand, wait_time, len(hand_frames),
                       sum(1 for frame in hand_frames if frame['hands']),
                       PRESS_IN_REFINE_MAX_HAND_DISTANCE * 1e3,
                       len(distances),
                       '{:.0f}mm'.format(min(nearest) * 1e3) if nearest
-                      else 'なし'))
+                      else 'なし', PRESS_IN_REFINE_MIN_HAND_SCORE,
+                      n_rejected['low_score'],
+                      PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG,
+                      n_rejected['normal']))
             record = dict(
                 event='press_in_refine', reason='no_hand',
                 wait_time=wait_time, n_frames=len(hand_frames),
                 expected_position=[float(v) for v in expected_position],
+                expected_normal=[float(v) for v in expected_normal],
                 candidates=candidates)
             self._log_debug(record)
             self._save_refine_failure(hand_frames, expected_position,
