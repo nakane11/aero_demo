@@ -270,6 +270,12 @@ CAMERA_LINK_TO_OPTICAL_ROT = np.array([[0.0, 0.0, 1.0],
 # 緩める (restrict_elbow_range 参照)。上限 (0 度) は変更しない。
 ELBOW_MIN_ANGLE_DEG = -120.0
 
+# 足首 (ankle_joint, URDF 上 0〜90 度) のうち使わない範囲の、全域幅に対する
+# 比率。曲げるほど (90 度側ほど) 腰が低くなり、実機の押し込みで指令値に
+# 追従できない (+10 度前後ずれる) ことがあったため、低くなる側の端から
+# この比率 (9 度) を削る (restrict_ankle_range 参照)。
+ANKLE_LOW_SIDE_MARGIN_RATIO = 0.1
+
 # 干渉回避付きバッチ IK (solve_person_ik) だけに適用する、関節可動域の
 # 上下マージン比率 (restrict_joint_range_margin 参照)。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
@@ -890,6 +896,27 @@ def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
     min_angle = math.radians(min_angle_deg)
     for arm in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
+
+
+def restrict_ankle_range(robot, margin_ratio=ANKLE_LOW_SIDE_MARGIN_RATIO):
+    """``ankle_joint`` の上限 (曲げて腰が一番低くなる側の端) を、全域幅の
+    ``margin_ratio`` だけ内側に狭める (``ANKLE_LOW_SIDE_MARGIN_RATIO``
+    参照)。URDF の 0〜90 度に対し既定では上限を 81 度にする。
+
+    ``restrict_elbow_range`` と同様、``robot`` 側を書き換えれば
+    ``*_whole_body``・バッチ IK・軌道計画・押し込み IK のすべてに効く。
+    干渉回避付き IK の ``restrict_joint_range_margin`` はこの制限の上に
+    さらにマージンを掛ける。
+    同じ ``robot`` に 2 回呼んでも狭め直さないよう、URDF の上限を
+    ``_urdf_max_angle`` に覚えておきそこから計算する。
+    """
+    joint = robot.ankle_joint
+    if not hasattr(joint, '_urdf_max_angle'):
+        joint._urdf_max_angle = joint.max_angle
+    joint.max_angle = joint._urdf_max_angle - margin_ratio * (
+        joint._urdf_max_angle - joint.min_angle)
+    if joint.joint_angle() > joint.max_angle:
+        joint.joint_angle(joint.max_angle)
 
 
 def lock_fixed_joints(robot):
@@ -2643,6 +2670,7 @@ def main():
     # あるので、指の関節が要らないこのスクリプトでは手なしモデルを使う。
     robot = Aero(use_hand=False)
     restrict_elbow_range(robot)
+    restrict_ankle_range(robot)
     lock_fixed_joints(robot)
     apply_collision_model(robot)
 

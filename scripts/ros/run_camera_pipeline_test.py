@@ -369,6 +369,7 @@ class HandshakePipelineNode(object):
         # (view_handshake_poses.py と同じ見た目にするため)。
         self.robot = Aero(use_hand=False)
         spik.restrict_elbow_range(self.robot)
+        spik.restrict_ankle_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
         self._attach_camera_optical_coords()
@@ -1985,16 +1986,23 @@ class HandshakePipelineNode(object):
             for name in param['joint_names']}
         diffs = self.ri.sub_angle_vector(target_av, actual_av)
         entries = []  # (閾値で正規化した大きさ, 表示文字列)
-        for joint, diff in zip(self.real_robot.joint_list, diffs):
+        # 差 (指令 - 実測) に加えて指令値と実測値も出す (可動域の端に
+        # 近い指令で追従できていないのかを切り分けるため)。
+        for joint, diff, target, actual in zip(
+                self.real_robot.joint_list, diffs, target_av, actual_av):
             if joint.name not in controller_joint_names:
                 continue
             if isinstance(joint, LinearJoint):
                 entries.append((abs(diff) / 0.005,
-                                '{}={:+.1f}mm'.format(joint.name, diff * 1e3)))
+                                '{}={:+.1f}mm (指令{:.1f}/実測{:.1f})'.format(
+                                    joint.name, diff * 1e3, target * 1e3,
+                                    actual * 1e3)))
             else:
                 entries.append((abs(diff) / math.radians(1.0),
-                                '{}={:+.1f}deg'.format(
-                                    joint.name, math.degrees(diff))))
+                                '{}={:+.1f}deg (指令{:.1f}/実測{:.1f})'.format(
+                                    joint.name, math.degrees(diff),
+                                    math.degrees(target),
+                                    math.degrees(actual))))
         entries.sort(reverse=True)
         over = [text for score, text in entries if score > 1.0]
         return target_hand - actual_hand, over
