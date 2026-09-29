@@ -1,0 +1,352 @@
+# IK・事後検証・軌道計画の制約一覧
+
+握手姿勢を求める二段階の IK (干渉回避付きバッチ IK → 後処理 IK)、
+その間に挟む干渉の事後検証、接近軌道の計画で、それぞれ何を制約・コストに
+入れているかをまとめる。値はすべて 2026-09-28 時点のコードの既定値。
+定数名は `solve_palm_ik.py` (`spik`) と `plan_handshake_motion.py`
+(`phm`) のもの。
+
+全体の流れ:
+
+```
+人物ごと (solve_palm_ik.main / run_camera_pipeline_test._solve_handshake)
+  └ 台車 x の窓ごと (0.15 m → 0.3 m → 無制限, solve_person_ik_side_by_side)
+      ├ 第1段: 干渉回避付きバッチ IK (向き 3 × 初期値 512 を 1 バッチ)
+      └ 候補選択 (pick_verified_candidate): コスト昇順に
+          ├ 干渉の事後検証 (collision_pairs_min_distance)
+          └ 第2段: 後処理 IK (solve_post_process, 掌へ押し込む姿勢 + 視線)
+軌道計画 (plan_person_motion)
+  └ 接近開始位置の候補ごと
+      ├ lead-in の干渉検証
+      └ pre-touch 経由 → 線形補間 → jaxls 最適化 の順に作って全 waypoint を検証
+実機 (--auto-execute)
+  └ hover 到達後、押し込み直前の最終補正 (refine_post_process)
+```
+
+## 0. 共通の前提
+
+### 関節可動域 (全段階共通)
+
+`main` 起動時に `robot` の関節自体を書き換えるので、以降のすべての IK・
+軌道計画に効く。
+
+| 関節 | 制限 | 理由 |
+|---|---|---|
+| `{r,l}_elbow_joint` | 下限を -120° に (`ELBOW_MIN_ANGLE_DEG`) | 曲げきると前腕と上腕が平行に近い不自然な姿勢になる |
+| `ankle_joint` | 上限 90° → 81° (低くなる側を全域の 10% 削る, `ANKLE_LOW_SIDE_MARGIN_RATIO`) | 腰が低いと実機の押し込みで指令に追従できない |
+| `{r,l}_hand_y_joint` | 0 に固定 (`lock_fixed_joints`) | 実機にモータが無い。動かすと左手の向きが 180° 前後ずれる |
+
+第1段のバッチ IK だけは、この上からさらに各関節の上下を全域幅の 10% ずつ
+狭める (`restrict_joint_range_margin`, `DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO`)。
+バッチ IK の呼び出し前後だけ適用して戻すので、後処理 IK・軌道計画は本来の
+(上表適用後の) 可動域で解く。
+
+### 動かす関節
+
+- IK・軌道計画とも `{arm}arm_whole_body` (脚のリフター機構 + 片腕) を動かす。
+  使わない方の腕は肘を伸ばして下ろした姿勢で固定 (`seed_arm_pose`)。
+- 台車 (x, y, yaw) を動かすのは第1段のバッチ IK と軌道計画だけ。
+  後処理 IK・pre-touch IK・最終補正は台車を動かさない。
+- 首 (`robot.head`, 3 関節) を解くのは後処理 IK と最終補正だけ。
+
+### 干渉ジオメトリ
+
+| 対象 | 形状 |
+|---|---|
+| ロボット | 指なしモデル (`Aero(use_hand=False)`)。各リンクを box/cylinder/sphere のプリミティブで近似したもの (`apply_collision_model`)。実メッシュではない |
+| 人体 | 骨格から作る 26 本の `Cylinder` (`human_body_obstacles`)。詳細は下 |
+
+人体の 26 本の内訳:
+
+- 骨 14 本 (`HUMAN_COLLISION_SEGMENTS`)。半径は頭–首 0.10、首–肩 0.09、
+  上腕 0.06、前腕 0.04、大腿 0.09、下腿 0.06 m。
+- 胴体 3 本 (左右の肩–腰、腰–腰) の半径だけは、実測の肩幅・腰幅 × 0.5 ×
+  0.55 + 0.03 m を 0.08〜0.20 m にクリップした値 (`_torso_segment_radius`)。
+- 左右の手それぞれに、掌 1 本 (半径 0.05 m・厚み 0.02 m) と指 5 本 (半径 0.008 m)。
+- 検出できなかった関節は、親関節があれば鉛直下向きに伸ばした位置で補う
+  (`_fill_missing_joints_straight_down`、例: 上腕 -0.30 m)。前腕の手首端は
+  掌の円柱の表面まで延長する。
+- 親も無い部位は 100 m 先のダミーで埋める (JIT の再コンパイルを避けるため、
+  本数は常に 26 本)。
+
+**差し出している手も含めて全身を障害物にする。** 目標位置は掌から浮かせてあり
+(第1段 +0.08 m)、掌へ触れる姿勢 (第2段 -0.01 m) は干渉判定の対象外なので、
+これで成り立っている (第2段の節を参照)。
+
+### 干渉の組み合わせ (ペア)
+
+| 用途 | ペア |
+|---|---|
+| 第1段バッチ IK の最適化 | `scripts/collision_pairs.json` (`tools/build_collision_pairs.py` が事前に絞り込んだもの。自己干渉とロボット×人体の両方を含む)。**ファイルが無いと自己干渉・人体の干渉回避の両方を無効にして解く** |
+| 事後検証 (IK・軌道共通) | 総当たり (`build_collision_verification_pairs`): 隣接リンクを除く全リンク同士と、全リンク × 人体 26 本 |
+| 軌道最適化 (jaxls) | 干渉ジオメトリを持つ全リンク (`collision_link_list_for_arm`) × 人体、および自己干渉 (`collision_pairs.json` は使わない) |
+
+## 1. 第1段: 干渉回避付きバッチ IK
+
+`solve_person_ik` → `robot.batch_inverse_kinematics(backend='jax', use_base='planar')`
+
+### 目標
+
+- 位置: 掌の位置 + 掌の法線 × **0.08 m** (`TARGET_HOVER_OFFSET`、掌の少し手前 = hover)。
+- 姿勢: ロボットの手先 (`{arm}_eef_grasp_link`) の +X を人の指方向に、
+  +Y を掌の法線の逆向きにそろえた姿勢を、+Y 軸まわりに 3 通り回したもの
+  (親指側 ±90° / 0° / 小指側 ∓90°, `turn_candidates_deg`)。左腕は
+  `_correct_grasp_frame` で補正する。
+- 位置・姿勢ともに 6 自由度すべてを拘束する (`position_mask=True, rotation_mask=True`)。
+
+### 台車の可動域 (`base_limits`)
+
+人物は常に Aero の前方 3.0 m (`HUMAN_FRONT_DISTANCE`) に平行移動してから
+解くので、以下はその座標系での値。
+
+| 軸 | 既定範囲 | 人物ごとの絞り込み |
+|---|---|---|
+| x | 0〜6 m | 人の立ち位置 x ± 0.15 m → ± 0.3 m → 無制限 の順に試す (`DEFAULT_BASE_X_STANDING_MARGINS`)。人と横並びにするため |
+| y | -3〜3 m | 差し出している手の側 (人の中心から見て) だけに絞る (`restrict_base_y_range_to_hand_side`)。空になるなら絞らない |
+| yaw | ±90° | 人の正面方向 ± 30° に**置き換える** (`restrict_base_yaw_range_to_human_facing`) |
+
+x の窓は `solve_person_ik_side_by_side` が狭い方から順に試し、後処理まで
+通る解が見つかった窓で止める (下の「解の優先順位」を参照)。
+
+既定範囲 (`DEFAULT_BASE_X_RANGE`/`_Y_RANGE`/`_YAW_RANGE`) は、
+`run_camera_pipeline_test.py` では `--base-x-range`/`--base-y-range`/
+`--base-yaw-range` で変えられる。`solve_palm_ik.py` にはこのオプションが
+無く、定数のまま。y・yaw の絞り込みを無効にするオプションはどちらにも無い。
+これは最終台車位置の範囲であり、そこへ至る経路の範囲ではない
+(4 節の「台車の移動範囲」を参照)。
+
+### コスト (ソフト制約)
+
+| 項 | 重み | マージン (効き始める距離) |
+|---|---|---|
+| 目標位置・姿勢の誤差 | skrobot の既定 | — |
+| ロボット×人体の干渉 | 10.0 (`DEFAULT_COLLISION_WEIGHT`) | 0.05 m (`DEFAULT_COLLISION_MARGIN`) |
+| 自己干渉 | 10.0 (`self_collision_weight=None` → 人体と同じ重み) | 0.02 m (`DEFAULT_SELF_COLLISION_MARGIN`) |
+| 関節可動域・台車可動域 | ハード (範囲内にクリップ) | — |
+
+干渉はペナルティなので、干渉が解消していなくても収束判定は通る。そのため必ず
+事後検証を挟む。
+
+### 収束判定
+
+- 最大 80 反復 (`DEFAULT_COLLISION_IK_STOP`)。jax の勾配降下法は収束に
+  関係なく毎回この回数だけ回すので、実質的なタイムアウトとして働く。
+- 位置誤差 0.03 m 以下 かつ 姿勢誤差 8° 以下 (`DEFAULT_COLLISION_IK_THRE`/`_RTHRE`)。
+  干渉の残差は見ない。
+- 初期値は 1 目標あたり 512 個 (`DEFAULT_ATTEMPTS_PER_POSE`)。0 番は種の姿勢
+  (`seed_arm_pose`)、残りは関節・台車の可動域内の一様乱数。
+- `return_all_attempts=True` で、誤差最小の 1 つに絞らず、向き 3 × 512 =
+  1536 個すべてを候補として返す。
+
+## 2. 候補選択と干渉の事後検証
+
+`pick_verified_candidate`
+
+### 並べ替えのコスト
+
+収束した候補すべてについて、関節角から直接次のコストを計算し、**昇順**に並べる。
+
+```
+cost = Σ w_j · q_j²                         (関節の曲げ量, 単位 rad)
+     + 30 · |台車が人の立ち位置から人の正面方向にずれた距離 [m]|
+     + 30 · |台車の向きの、人の正面方向からのずれ [rad]|
+```
+
+| 曲げ量の対象関節 (`JOINT_BEND_COST_JOINTS`) | 重み |
+|---|---|
+| `shoulder_p` | 0.3 |
+| `shoulder_r` | 1.5 |
+| `elbow` | 1.0 |
+| `wrist_p` | 1.0 |
+| `wrist_r` (橈屈・尺屈) | 3.0 |
+
+- 台車の移動量・首・ヨー軸 (`shoulder_y`/`wrist_y`)・脚は曲げ量に含めない。
+- 後ろ 2 項の重みは `--front-offset-weight`/`--facing-yaw-weight`
+  (既定 `DEFAULT_FRONT_OFFSET_WEIGHT`/`DEFAULT_FACING_YAW_WEIGHT` = 30)。
+  背景は [handshake_base_placement.md](handshake_base_placement.md)。
+- 同じコストのときだけ添字順 (向きの優先順 → 初期値の番号) で並べる。
+  **向きの優先順位 (`turn_candidates_deg`) はこの同着の並びにしか効かない。**
+  3 通りの向きの候補は 1 つの列にまとめてコストで並べるので、優先順位の
+  低い向きでもコストが小さければ先に採用される。
+
+### 事後検証 (`collision_pairs_min_distance`)
+
+- ペア: 総当たり (0 節の表)。ロボットは指なし。
+- 深さは両方向から求め、大きい方 (より深く貫通している方) を採る:
+  - ロボット側リンクの頂点が人体の円柱に入り込んだ深さ (円柱の半径・高さから解析的に)
+  - 人体の円柱の表面サンプル (周方向 16 × 高さ方向 5 + 上下端面の中心) がリンクの凸形状に入り込んだ深さ
+    (`obstacle_into_link_depth`。箱形リンクの面の途中を細い円柱が貫く場合を拾うため)
+- 自己干渉ペアは頂点同士の最短距離。
+- **棄却条件: 最小距離 < -0.001 m** (1 mm より深く貫通, `DEFAULT_COLLISION_VERIFY_TOLERANCE`)。
+
+### 解の優先順位
+
+1 つの x の窓の中では、コストの小さい候補から順に次を試す:
+
+1. 事後検証で 1 mm より深く貫通していたら**完全に除外**する。
+2. 事後検証を通った最初の候補を「フォールバック」として覚えておく。
+3. 第2段の後処理 IK が成功したら、その候補を**即座に採用**する。
+4. 後処理 IK に失敗したら、次にコストが小さい候補へ進む。
+
+どの候補も後処理 IK に通らなければ、フォールバック (事後検証を通った中で
+コスト最小の候補) を `post_process: null` のまま返す。調べる候補数の上限
+(`--post-process-max-candidates`) は既定では無制限。
+
+x の窓 (`solve_person_ik_side_by_side`) を含めた優先順位:
+
+1. 後処理まで通る解がある最も狭い窓の解。
+2. どの窓でも後処理まで通らなければ、**最初に**フォールバックが得られた窓
+   (最も狭い窓) のフォールバック解 (`post_process: null`)。
+3. それも無ければ解なし (`solved: false`)。
+
+### 対象外・失敗になる条件
+
+| 条件 | 結果 |
+|---|---|
+| 掌 JSON の `offered_hand` が `null` | `target: false` (`no_offered_hand`)。IK を解かない |
+| `offered_hand` はあるがその手の掌が無い | `target: false` (`no_palm`) |
+| 全窓・全候補が未収束か事後検証で棄却 | `solved: false` |
+
+## 3. 第2段: 後処理 IK (押し込み姿勢 + 視線)
+
+`solve_post_process`。事後検証を通った候補の姿勢を初期値に、通常の
+ヤコビアン法 IK (`robot.inverse_kinematics`) を 1 回呼び、腕と首の 2 タスクを
+同時に解く。
+
+| タスク | 目標 | マスク | 収束閾値 |
+|---|---|---|---|
+| 腕 (`{arm}arm_whole_body`) | 掌の位置 + 法線 × **-0.01 m** (掌へ 1 cm めり込む位置, `POST_PROCESS_TARGET_HOVER_OFFSET`)、姿勢は第1段で採用した向きそのもの | 位置・姿勢とも 6 自由度 | 0.01 m / 5° |
+| 首 (`robot.head`) | カメラ光軸 (`camera_optical_coords` の +Z) を掌の位置へ向ける | 位置なし、姿勢 `'xy'` (光軸まわりのひねりは見ない) | 5° |
+
+- 最大 40 反復 (`DEFAULT_POST_PROCESS_IK_STOP`/`_GAZE_IK_STOP`)。
+- 台車は動かさない。**干渉は考慮しない** (干渉回避もしないし、事後検証もしない)。
+  掌に触れる姿勢そのものなので、掌・指とは必ず接触する。
+- **棄却条件: 腕・首のどちらか一方でも収束しない、または IK が例外を出す。**
+  棄却したときは `revert_if_fail=True` で姿勢を元に戻す。
+- 成功したら、IK の間に脚が動いて頭の位置がずれた分を、首だけの視線 IK で
+  最大 3 回向け直す (`_reaim_gaze`)。悪化したら元の角度に戻す。向け直しの
+  成否は後処理の成否に影響しない。
+
+### 押し込み直前の最終補正 (実機のみ)
+
+`refine_post_process`。実機が hover 目標に着いた後、カメラで掌を検出し直し、
+hover 姿勢を初期値にして後処理 IK を解き直す (台車は動かさない)。
+
+| 条件 | 結果 (`reason`) |
+|---|---|
+| 手を検出できない | 計画どおりの押し込み (`no_hand`) |
+| 押し込み目標の変化が 0.10 m を超える、または 30° を超える (`REFINE_MAX_POSITION_CHANGE`/`_ROTATION_CHANGE`) | 計画どおりの押し込み (`too_large`) |
+| 腕・首とも収束 | 補正した押し込み (`ok`) |
+| 首が収束しない | 首を計画時の押し込み姿勢の角度に固定し、腕だけで解き直す (`ok_arm_only`) |
+| 腕だけでも収束しない | 計画どおりの押し込み (`ik_failed`) |
+
+## 4. 軌道計画
+
+`plan_person_motion`。対象は `target: true` かつ `solved: true` の人物だけ。
+終点は第1段の hover 姿勢で、第2段の押し込み姿勢は経路として計画も検証もしない。
+
+### 接近開始位置の候補と優先順位
+
+1. 角度 0 の候補を最初に試す。人の手を中心とする半径 (手から最終台車位置
+   までの距離 + 0.2 m, `DEFAULT_APPROACH_DISTANCE`) の円周上で、初期位置からの
+   直進 (lead-in) が公転+自転の螺旋の接線になる位置 (`orbit_tangent_start`)。
+   向きのずれが 3° 以内にそろう位置が無ければ、手から初期位置の方向
+   (`orbit_base_start`)。
+2. 角度 0 で lead-in か軌道 (最適化込み) が検証を通らなかったときだけ、
+   角度 0 の方向を ±30° 刻みで ±120° まで回した 8 候補を、台車の経路長
+   (初期位置→候補→最終位置) が短い順に試す。候補ごとの jaxls 最適化は
+   遅すぎるので、ここでは**最適化なし**で lead-in と軌道の両方が通った最初の候補を採る。
+3. それも無く、角度 0 の lead-in が通らなかった場合は、lead-in が通った
+   最短の候補で最適化まで行う。
+4. どれも通らなければ角度 0 の結果を返す (`verified: false` のまま)。
+
+公転の向きは、手から見て人の立ち位置の方位を通らない側 (`orbit_sweep`)。
+
+### lead-in (初期位置 → 接近開始位置)
+
+- その場回転 (10° 刻み) → 直進 (0.1 m 刻み)。最適化はしない。
+- 台車が人の立ち位置から **1.0 m 以内** (`LEAD_IN_CHECK_RADIUS`) の
+  waypoint だけを事後検証する。それより遠い waypoint は検証しない (`None`)。
+- 棄却条件: 検証した waypoint のどれかが -0.01 m より深く貫通。
+
+### 軌道の作り方と優先順位 (`_plan_from_start`)
+
+20 waypoint (`DEFAULT_N_WAYPOINTS`)、始点は両腕を下ろした姿勢 (`arms_down_angles`)
++ 接近開始位置、終点は hover 姿勢 + 最終台車位置。次の順に作り、**最初に
+検証を通ったものを採用**する。
+
+| 順 | 種類 (`kind`) | 作り方 | 考慮する制約 |
+|---|---|---|---|
+| 1 | `pretouch` | 前半 75% (`DEFAULT_PRETOUCH_SPLIT`) で台車を螺旋で最終位置へ運びながら腕を pre-touch 姿勢へ、後半 25% は台車を止めて掌の法線方向にまっすぐ hover へ | pre-touch 姿勢 = hover の手先を掌の法線方向へ 0.25 m (`DEFAULT_PRETOUCH_STANDOFF`) 引いた位置・同じ姿勢。台車は最終位置のまま通常の IK で解く (50 反復、0.01 m / 5°、**干渉は考慮しない**)。解けない、または掌のランドマークが 5 点そろわず法線が求まらなければこの候補は作らない |
+| 2 | `linear` | 関節は線形補間、台車は螺旋 (`orbit_base_path`) | なし |
+| 3 | `optimized` | 1・2 のうち最も貫通が浅いものを warm start に jaxls で最適化 | 下表 |
+
+1・2 は最適化しない。最適化中の干渉コストは近似なので、検証を通る軌道を
+無理に最適化すると余裕を削ってしまうことがあるため。
+
+jaxls の軌道最適化 (`build_problem`):
+
+| 項 | 扱い | 重み・パラメータ |
+|---|---|---|
+| 速度 (滑らかさ) | コスト | 1.0 (`DEFAULT_SMOOTHNESS_WEIGHT`) |
+| 加速度 | コスト | 1.0 (`DEFAULT_ACCELERATION_WEIGHT`) |
+| 関節可動域 | 制約 | 0 節の制限のみ (10% のマージンは掛けない) |
+| 台車の位置・向き | 制約なし | jaxls は台車 3 自由度の範囲を ±1e6 にしている |
+| ロボット×人体の干渉 | 制約 (Augmented Lagrangian) | 初期重み 100、効き始め 0.05 m |
+| 自己干渉 | 制約 (Augmented Lagrangian) | 初期重み 100、効き始め 0.02 m |
+| 始点・終点 | 固定 | — |
+
+- 最大 60 反復 (`DEFAULT_MAX_ITERATIONS`)。`dt` = 0.2 秒はコストの正規化に
+  使うだけで、実機の再生速度とは関係ない。
+- 検証を通らなければ、中間 waypoint の腕関節だけに標準偏差 0.3 rad の
+  ガウスノイズを足した warm start で解き直す (合計 3 回, `--motion-attempts`)。
+  台車の経路は揺らさない。
+
+### 事後検証と棄却条件
+
+- 全 waypoint を第2節と同じ `collision_pairs_min_distance` (総当たりペア・指なし) で検証する。
+- **`verified` の条件: 全 waypoint で最小距離 ≥ -0.01 m** (`DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE`)。
+  最終姿勢の 1 mm より緩いのは、経路上の通過点だから。
+- どの作り方でも通らなければ、経路上の最小距離が最も大きい (貫通が最も
+  浅い) 軌道を `verified: false` のまま返す。
+- 実機 (`run_camera_pipeline_test.py --auto-execute`) は `verified` と
+  `lead_in_verified` の両方が真のときだけ動かす (`_motion_verified`)。
+
+### 台車の移動範囲
+
+軌道計画では、台車の経路が通ってよい範囲を**どこにも制限していない**。
+第1段の `base_limits` が縛るのは終点 (最終台車位置) だけ。
+
+| 区間 | 台車の経路の決まり方 | 範囲の制限 |
+|---|---|---|
+| lead-in | 初期位置でその場回転 → 接近開始位置まで直進 | なし |
+| 接近開始位置 | 手を中心とする半径 (手から最終台車位置までの距離 + 0.2 m) の円周上。回り込みの候補は角度 0 から ±120° まで | 円周上という以外なし |
+| 接近開始位置 → 最終位置 | 手を中心に公転+自転する螺旋 (`orbit_base_path`)。pre-touch 経由なら前半 75% で移動し、後半は停止 | 最適化 (jaxls) しても制限なし |
+
+経路の避け方は人体との干渉検証だけで決まり、壁・家具などの環境の障害物は
+考慮しない。実機 (`--auto-execute`) も costmap を使わない相対移動
+(`go_pos_unsafe` 相当) で送る。
+
+### 検証の後で書き換えるもの (再検証しない)
+
+- 接近区間の後半 50% (`HEAD_GAZE_BLEND_START`) で、首の角度を押し込み姿勢の
+  値へ線形補間する (`blend_head_to_post_process`)。首の動きを押し込み区間から
+  前倒ししているだけなので、検証はし直さない。
+
+## 5. 検証していない区間・姿勢
+
+| 区間・姿勢 | 理由 |
+|---|---|
+| 第2段の押し込み姿勢 (`post_process`) | 掌に触れる姿勢そのもの |
+| hover → 押し込みの補間区間 (`build_press_in_waypoints`) と、最終補正で解き直した押し込み | 同上 |
+| pre-touch 姿勢の IK 自体 | 軌道全体を後で検証するので不要 |
+| lead-in のうち人から 1 m より遠い部分 | 人体に届かないとみなす |
+| 首の補間 (`blend_head_to_post_process`) 後の接近区間 | 首の動きを前倒ししているだけとみなす |
+
+## 6. 表示用の検証 (判定には使わない)
+
+`view_handshake_poses.py`・`run_camera_pipeline_test.py` の画面の状態表示は、
+**指ありモデル**の干渉ジオメトリと総当たりペア (指同士・指と他リンクを含む) で
+`colliding_link_pairs` を計算し、1 mm (`--collision-verify-tolerance`) より
+深い貫通を表示する。IK・軌道計画の採否 (指なしで判定) は変えない。
+方針の背景は「最適化は指なし・事後検証は指あり・表示は判定基準に合わせる」。

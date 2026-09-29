@@ -24,80 +24,26 @@ MediaPipe 形式の骨格・掌の
 4. **`scripts/solve_palm_ik.py`**
    手順 2 の JSONを入力とし、人間の手にロボットが触れる干渉回避付き全身 
    IK (台車移動を含む) を解いて、結果を JSON として保存する。
-   ソフトな制約なので、干渉のない解が必ず得られるとは限らない。
    IK に使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
-   1 目標あたりの初期値の数は `--attempts-per-pose` (既定 512)。
-   初期値ごとの解は全て (向き 3 通り × 初期値の数) が干渉検証・後処理判定に
-   回され、最初に通ったものが採用される。向き 3 通り (ロボットの手首側が
-   人間の親指側/回転なし/小指側に来る候補) を試す優先順序は、掌が上を
-   向いていれば親指側、甲が上を向いていれば小指側、どちらとも言えない
-   (掌がほぼ横向き) 場合は回転なしを最優先にする
-   (`solve_palm_ik.turn_candidates_deg` 参照)。干渉回避ペナルティの重み・
-   マージンは `--collision-weight`/`--collision-margin`、台車の移動範囲は
-   `--base-x-range`/`--base-y-range`/`--base-yaw-range`、乱数初期値の
-   再現性は `--seed` で指定する。台車の y 可動範囲は既定で差し出している
-   手の側だけに、台車の向き (yaw) は既定で人間の正面方向 ±30°
-   (`--base-yaw-facing-margin` で変更可) にそれぞれ人物ごとに制限される
-   (`--no-hand-side-base-constraint`/`--no-facing-base-constraint` で
-   無効化可)。
-   終点で人と横並びになるよう、台車の x (前後) も人の立ち位置 ±0.15 m に
-   絞って解き、後処理まで通る解が無ければ ±0.3 m → 無制限と窓を広げて
-   解き直す (`--base-x-standing-margins`、負の値は無制限。結果 JSON の
-   `base_x_standing_margin` に解けた窓を記録)。さらに候補の採用順は、関節の
-   曲げ量コストに「台車が人の立ち位置から人の正面方向にずれた距離 [m] ×
-   `--front-offset-weight` (既定 30)」と「台車の向きが人の正面方向から
-   ずれた角度 [rad] × `--facing-yaw-weight` (既定 30)」を足したコストの
-   昇順にする。背景と
-   合成データでの比較は
+   干渉回避付きバッチ IK → 干渉の事後検証 → 掌へ押し込む後処理 IK の
+   二段階で、制約・重み・解の優先順位・棄却条件は
+   [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)
+   にまとめてある。最終台車位置の決め方の背景と合成データでの比較は
    [`docs/handshake_base_placement.md`](docs/handshake_base_placement.md)
-   参照 (`run_camera_pipeline_test.py` にも同名のオプション)。
-   人体側の干渉回避ジオメトリはIK 最適化中の干渉コスト・候補採用前の事後検証
-   ・ビューアでの半透明表示のすべてで同じ形状(`Cylinder`)を使う。事後検証
-   (候補ごとの `collision_pairs_min_distance` 呼び出し)はこの人体ジオメトリ
-   を候補ループの前に 1 回だけ作って使い回す(人物の姿勢は候補間で変わらない
-   ため)。
+   参照。
 
 4.5. **`scripts/plan_handshake_motion.py`**
    手順 4 の握手姿勢を目標として、そこへ至る接近の軌道 (waypoints) を干渉回避
    付きで生成し JSON として保存する。
 
-   軌道の始点 (腕を下ろした姿勢 + 台車位置姿勢) は「接近開始位置」(途中目標)。
-   人間の手を中心とした円周上 (半径 = 手から最終台車位置までの距離 +
-   `--approach-distance`、既定 0.2 m) に置き、そこから手を中心に公転と自転を
-   同時に行って人の横に並ぶ経路 (半径が方位角に比例して縮むアルキメデス螺旋、
-   終点で減速。公転は人体のある側を通らない向き) を台車の初期軌道にする。円周
-   上の位置は、初期位置からの直進 (lead-in) がこの螺旋の出だしの接線になる
-   ように探索し、向きは進行方向にする。lead-in は、その場回転で進行方向を
-   向いてから直進する (止まらずにそのまま曲がり始める)。手繋ぎの最終姿勢は
-   人と同じ方向を向くため、人と向き合った配置ではほぼ半回転が必要になるが、
-   それを人から遠い lead-in ではなく人の手の周りでの回り込みの中で行う。
-   初期位置から接近開始位置までの lead-in (干渉回避付きの計画・最適化の対象外)
-   は、台車が人間の立ち位置から 1 m 以内に入る waypoint だけ干渉を検証し、
-   結果 JSON の `lead_in_waypoints`/`lead_in_min_distances`/`lead_in_verified`
-   に入れる (1 m より遠い区間は人体に届かないとみなして検証しない)。
-   `verified`/`waypoint_min_distances` は従来通り接近開始位置から先の軌道
-   (`waypoints`) だけの結果で、`lead_in_verified` には影響しない (経路全体の
-   成否は両方を見る必要がある)。
-   ロボットが人の背後・横にいると、この lead-in や接近開始位置からの経路が
-   人体を横切ってしまうため、上記の位置 (角度 0) で干渉検証に通らなかった
-   ときだけ、手を中心に置いた候補 (角度 0 の方向を ±30 度刻みで ±120 度まで
-   回した位置) から、lead-in とその先の軌道の両方が干渉検証を通るもののうち
-   台車の経路が最短のものを選ぶ (結果 JSON の `approach_angle`。角度 0 で
-   通る通常の配置では他の候補は試さず、計算量も従来と同じ)。
-   `--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
+   台車は人の手を中心に公転+自転して人の横に並び、腕は掌の法線方向から
+   pre-touch 姿勢を経由して寄る。幾何的に作った軌道で干渉が残ったときだけ
+   jaxls で最適化し、全 waypoint を事後検証して `verified` に入れる
+   (初期位置から接近開始位置までの直進は `lead_in_verified`、経路全体の
+   成否は両方を見る)。接近開始位置の候補と優先順位・最適化の重み・棄却
+   条件は [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)
+   参照。`--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
    (`run_pipeline_test.py` にも同名のオプション)。
-   終点の手前には掌の法線方向へ `--pretouch-standoff` (既定 0.25 m)
-   引き戻した **pre-touch 姿勢** を挟み、最後の接近を法線方向の直線に
-   することで手先が掌を通り抜けないようにする。この幾何的な構成だけで
-   干渉が無ければ最適化は行わず、干渉が残った場合だけ scikit-robot の
-   `skrobot.planner.trajectory_optimization.TrajectoryProblem`
-   で軌道最適化を行う。
-   採用前には必ず、`solve_palm_ik.py` が最終姿勢の判定に使うのと同じ
-   厳密な形状 (実メッシュ)・同じ人体ジオメトリ (`human_body_obstacles`)
-   で全 waypoint を検証し、結果を `verified` フラグに入れる (経路上の
-   許容貫通量は既定 1 cm)。人体ジオメトリは人物の姿勢が waypoint 間で
-   変わらないため、waypoint ごとに作り直さず検証ループの前に 1 回だけ
-   構築して使い回す。
 
    `--force-optimize` (既定 False) を付けると、pre-touch/線形補間の
    候補が事後検証に通っていても early return せず、必ず jaxls の軌道
