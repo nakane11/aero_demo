@@ -679,12 +679,20 @@ class HandshakePipelineNode(object):
         self.skeleton_image_pub = rospy.Publisher(
             '~skeleton_image', Image, queue_size=1)
 
+        # camera_info は同期に含めず最新の 1 つだけ持つ (_on_camera_info)。
+        # 内部パラメータは変わらないうえ、camera_info は小さく画像より
+        # ずっと早く届くため、同期に含めると画像の転送が遅れたとき
+        # (2026-09-29 の実機で camera_info 0.12 秒に対し画像 0.7〜0.9 秒)
+        # 同じ時刻の camera_info が queue_size 分の履歴から押し出され、
+        # ほとんどのフレームで組ができずに _on_frame が呼ばれなくなる。
+        self._latest_camera_info = None
+        self.info_sub = rospy.Subscriber(
+            args.camera_info_topic, CameraInfo, self._on_camera_info,
+            queue_size=1)
         color_sub = message_filters.Subscriber(args.color_topic, Image)
         depth_sub = message_filters.Subscriber(args.depth_topic, Image)
-        info_sub = message_filters.Subscriber(
-            args.camera_info_topic, CameraInfo)
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub, info_sub], queue_size=5, slop=0.1)
+            [color_sub, depth_sub], queue_size=5, slop=0.1)
         self.sync.registerCallback(self._on_frame)
         # 台車位置補正 (--base-correction scan) で使う LiDAR。最新の 1 つ
         # (PC で受信した時刻, msg) だけ保持する (_capture_scan 参照)。
@@ -1074,8 +1082,17 @@ class HandshakePipelineNode(object):
     # ------------------------------------------------------------------
     # camera callback
     # ------------------------------------------------------------------
-    def _on_frame(self, color_msg, depth_msg, info_msg):
+    def _on_camera_info(self, msg):
+        self._latest_camera_info = msg
+
+    def _on_frame(self, color_msg, depth_msg):
         if self._busy:
+            return
+        info_msg = self._latest_camera_info
+        if info_msg is None:
+            rospy.logwarn_throttle(
+                5.0, '{} をまだ受信していないため、画像を処理しません。'.format(
+                    self.args.camera_info_topic))
             return
         # TF が引けなくてもプレビューは止めない (変換できなければカメラ
         # 座標系のまま推定を続ける)。ARMED での掌推定・IK だけは base_link
