@@ -1,34 +1,34 @@
 [
   [
-    "l_shoulder_center",
-    "Neck-RShoulder"
+    "body_link",
+    "LShoulder-LHip"
+  ],
+  [
+    "body_link",
+    "RShoulder-RHip"
   ],
   [
     "l_shoulder_center",
-    "RShoulder-RElbow"
+    "RShoulder-RHip"
   ],
   [
     "l_upperarm_link",
-    "Neck-RShoulder"
-  ],
-  [
-    "l_upperarm_link",
-    "RShoulder-RElbow"
+    "RShoulder-RHip"
   ],
   [
     "r_shoulder_center",
-    "LShoulder-LElbow"
-  ],
-  [
-    "r_shoulder_center",
-    "Neck-LShoulder"
+    "LShoulder-LHip"
   ],
   [
     "r_upperarm_link",
-    "LShoulder-LElbow"
+    "LShoulder-LHip"
   ],
   [
-    "r_upperarm_link",
-    "Neck-LShoulder"
+    "wheel_base_link",
+    "LKnee-LAnkle"
+  ],
+  [
+    "wheel_base_link",
+    "RKnee-RAnkle"
   ]
 ]
