@@ -35,10 +35,10 @@ import して使う (骨格の入力形式 ``{limb_name: [x, y, z]}`` は合成�
   関節位置に One Euro Filter (Casiez et al. 2012) をかけて時間方向に
   平滑化してから使う (``--joint-smoothing-mincutoff``/
   ``--joint-smoothing-beta`` で調整できる)。
-* ARM を押しても差し出し手が見つからない: ``OfferedHandSelector`` は
-  合成骨格向けにスコア閾値 (``--offer-score-min``, 既定は ``estimate_
-  palm_poses.OFFER_SCORE_MIN``) が調整されているため、実カメラの姿勢では
-  届きにくいことがある。ARMED 中は viser 画面に左右の
+* ARM を押しても差し出し手が見つからない: ``OfferedHandSelector`` の重み
+  は合成骨格と共通だが、スコア閾値だけは実カメラの深度ノイズを見込んで
+  ``--offer-score-min`` (既定 0.65) に下げてある (合成骨格は ``estimate_
+  palm_poses.OFFER_SCORE_MIN``)。それでも届かないときのため、ARMED 中は viser 画面に左右の
   スコア/判定不可の理由 (``no_palm``: 手のランドマークが取れていない、
   等) を表示するので、それを見ながら閾値を調整する。
 

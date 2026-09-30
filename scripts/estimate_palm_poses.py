@@ -81,14 +81,24 @@ ROBOT_FORWARD_DISTANCE = 3.0
 ROBOT_HAND_HEIGHT = 1.2
 
 # 各特徴量 (すべて 0..1 に正規化済み) の重み。合計 1.0 なのでスコアも
-# 0..1 に収まる。``approach`` と ``finger_to_robot`` (ロボットにどれだけ
-# 近づき、どれだけロボットを指しているか) が主な手がかりで、
-# ``separation`` と ``thumb_roll`` は単独での判別力が低いため補助的な
-# 重みにしてある。
+# 0..1 に収まる。合成骨格と実カメラ (run_camera_pipeline_test.py 等) で
+# 共通 (閾値だけは別、OFFER_SCORE_MIN 参照)。``finger_to_robot`` (どれだけ
+# ロボットを指しているか) が主な手がかりで、``approach`` がそれに次ぐ。
+# 実機の人は腰の高さで体の前に軽く差し出すことが多く、approach と
+# separation が低く出るため、2026-09-30 に (0.375, 0.10, 0.375, 0.15) から
+# finger_to_robot 寄りに変えた。差し出し 19 回を含む session1.bag と、一度も
+# 差し出さない session3.bag (いずれも 1 人・1 部屋) で決めた値で、旧重みでは
+# 差し出していない session3 の 1 フレームごとの最高スコア (0.64) が差し出し
+# 区間のスコア中央値 (0.66) とほぼ重なり、誤判定を防いでいたのは静止判定
+# だけだった。この重みでは前者 0.61・後者 0.76 となり、実カメラの閾値 0.65
+# のまま静止判定なしでも session3 で誤判定せず、差し出しの検出は 9/19 回から
+# 15/19 回に増える。合成骨格 (generate_random_human_poses.py --seed 0 の
+# 100 人) では差し出しと判定される人が 18 人から 16 人になるだけで、
+# THUMB_ROLL_RAMP のコメントにある親指が下向きの姿勢は引き続き弾ける。
 OFFER_FEATURE_WEIGHTS = {
-    'approach': 0.375,
-    'separation': 0.10,
-    'finger_to_robot': 0.375,
+    'approach': 0.25,
+    'separation': 0.05,
+    'finger_to_robot': 0.55,
     'thumb_roll': 0.15,
 }
 
@@ -647,8 +657,15 @@ class OfferedHandSelector(object):
             history = self._palm_history[side]
             palm = palms.get(side)
             if palm is None:
-                # 掌をロストしたら静止は測り直し。
-                del history[:]
+                # 掌をロストしても、最後に見えてから stillness_max_gap 以内
+                # なら履歴は残す (この側の静止判定は None)。実カメラでは手の
+                # 深度が欠けて掌が 1 フレームだけ作れないことがよくあり、
+                # そのたびに測り直すと、手を 3 秒出し続けても 0.5 秒の静止に
+                # 届かないことがあった (2026-09-30 の session1.bag)。
+                # 履歴の時刻は最後に見えたフレームのままなので、途切れが
+                # 長引けばここか下の max_gap の判定で捨てる。
+                if history and t - history[-1][0] > self.stillness_max_gap:
+                    del history[:]
                 continue
             position = np.asarray(palm['position'], dtype=np.float64)
             if history and t < history[-1][0]:
