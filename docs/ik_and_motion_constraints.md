@@ -42,6 +42,15 @@
 バッチ IK の呼び出し前後だけ適用して戻すので、後処理 IK・軌道計画は本来の
 (上表適用後の) 可動域で解く。
 
+### IK の手先
+
+`{r,l}arm_end_coords` を `{r,l}_eef_grasp_link` から局所 +X (手首 → 指先) に
+4 cm ずらす (`shift_grasp_point`, `GRASP_POINT_OFFSET_X`、`lock_fixed_joints`
+から呼ぶ)。人の掌に当たる位置が手首寄りだったため。バッチ IK・軌道計画は
+`move_target` の親リンクからの相対位置を読むので、IK・干渉回避・押し込みの
+すべてに効く。実機 TF の `r_eef_grasp_link` (差し出し手の判定の基準) は
+ずらしていない。ずらすと seed 0/1 の 42 人で成功が 40〜41 → 38 人に減る。
+
 ### 動かす関節
 
 - IK・軌道計画とも `{arm}arm_whole_body` (脚のリフター機構 + 片腕) を動かす。
@@ -151,7 +160,7 @@ seed 0/1 で 74 人・0.238 / 0.62 秒。新しい 8 組は平均時間はほぼ
 ### 目標
 
 - 位置: 掌の位置 + 掌の法線 × **0.08 m** (`TARGET_HOVER_OFFSET`、掌の少し手前 = hover)。
-- 姿勢: ロボットの手先 (`{arm}_eef_grasp_link`) の +X を人の指方向に、
+- 姿勢: ロボットの手先 (`{arm}arm_end_coords`、`{arm}_eef_grasp_link` から指先側に 4 cm) の +X を人の指方向に、
   +Y を掌の法線の逆向きにそろえた姿勢を、+Y 軸まわりに 3 通り回したもの
   (親指側 ±90° / 0° / 小指側 ∓90°, `turn_candidates_deg`)。左腕は
   `_correct_grasp_frame` で補正する。

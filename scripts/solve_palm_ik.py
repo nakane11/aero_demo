@@ -1059,7 +1059,8 @@ def lock_fixed_joints(robot):
     ``*_whole_body`` にも反映される。
 
     あわせて ``align_hand_mount_with_hand_model`` で、手の取り付け位置を
-    指ありモデル (実機) に合わせる。
+    指ありモデル (実機) に合わせ、``shift_grasp_point`` で IK の手先
+    (``{r,l}arm_end_coords``) を指先側へずらす。
     """
     for name in robot._FIXED_JOINT_NAMES:
         joint = getattr(robot, name)
@@ -1067,6 +1068,28 @@ def lock_fixed_joints(robot):
         joint.max_angle = 0.0
         joint.joint_angle(0.0)
     align_hand_mount_with_hand_model(robot)
+    shift_grasp_point(robot)
+
+
+# IK の手先 ({r,l}arm_end_coords) を {r,l}_eef_grasp_link から局所 +X
+# (手首 -> 指先) 方向にずらす量 [m]。eef_grasp_link のままだと人の掌に
+# 当たる位置が手首寄りだったため、指先側へ寄せる。
+GRASP_POINT_OFFSET_X = 0.04
+
+
+def shift_grasp_point(robot, offset_x=GRASP_POINT_OFFSET_X):
+    """``{r,l}arm_end_coords`` を親 (``{r,l}_eef_grasp_link``) から局所 +X
+    に ``offset_x`` [m] の位置に置き直す (``GRASP_POINT_OFFSET_X`` 参照)。
+    親からの相対位置を直接設定するので、何度呼んでもずれは重ならない。
+    ``batch_inverse_kinematics``/軌道計画は ``move_target`` の親リンクから
+    の相対位置を読むので、IK・干渉回避・押し込みのすべてに効く。"""
+    for side in ('r', 'l'):
+        end_coords = getattr(robot, '{}arm_end_coords'.format(side), None)
+        if end_coords is None:
+            continue
+        local = end_coords.copy_coords()
+        local.translation = np.array([offset_x, 0.0, 0.0])
+        end_coords.newcoords(local)
 
 
 # {r,l}_hand_y_joint の origin (親 hand_yaw_link から見た hand_link の位置
