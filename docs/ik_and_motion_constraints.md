@@ -54,7 +54,7 @@
 
 | 対象 | 形状 |
 |---|---|
-| ロボット | 指なしモデル (`Aero(use_hand=False)`)。各リンクを box/cylinder/sphere のプリミティブで近似したもの (`apply_collision_model`)。実メッシュではない。台車は元 URDF の box (`wheel_base_link`、地面から 0.038〜0.187 m) に加え、前方の高い部分を干渉専用のリンク `wheel_base_front_link` の box (前端から前後 0.25 m、左右 0.52 m、地面から 0.038〜0.32 m) として足す (`aero_demo.collision_model.EXTRA_COLLISION_BOXES`) |
+| ロボット | 指なしモデル (`Aero(use_hand=False)`)。指なしの URDF は左手の `l_hand_y_joint` の取り付け位置だけが指ありの URDF と 4 cm 違う (z=0、右手と指ありは z=-0.04) ため、`lock_fixed_joints` の中で指ありの値に合わせる (`align_hand_mount_with_hand_model`)。各リンクを box/cylinder/sphere のプリミティブで近似したもの (`apply_collision_model`)。実メッシュではない。台車は元 URDF の box (`wheel_base_link`、地面から 0.038〜0.187 m) に加え、前方の高い部分を干渉専用のリンク `wheel_base_front_link` の box (前端から前後 0.25 m、左右 0.52 m、地面から 0.038〜0.32 m) として足す (`aero_demo.collision_model.EXTRA_COLLISION_BOXES`) |
 | 人体 | 骨格から作る 26 本の `Cylinder` (`human_body_obstacles`)。詳細は下 |
 
 人体の 26 本の内訳:
@@ -78,8 +78,8 @@
 
 | 用途 | ペア |
 |---|---|
-| 第1段バッチ IK の最適化 | `scripts/collision_pairs.json` (`tools/build_collision_pairs.py` が事前に絞り込んだもの。自己干渉とロボット×人体の両方を含む)。**ファイルが無いと自己干渉・人体の干渉回避の両方を無効にして解く** |
-| 事後検証 (IK・軌道共通) | 総当たり (`build_collision_verification_pairs`): 隣接リンクを除く全リンク同士と、全リンク × 人体 26 本 |
+| 第1段バッチ IK の最適化 | `scripts/collision_pairs.json` (`tools/build_collision_pairs.py` が事前に絞り込んだもの。自己干渉とロボット×人体の両方を含められるが、現在の JSON は腕 × 人体の 8 組だけで、自己干渉は入っていない)。**ファイルが無いと自己干渉・人体の干渉回避の両方を無効にして解く** |
+| 事後検証 (IK・軌道共通) | 総当たり (`build_collision_verification_pairs`): 全リンク同士から `self_collision_ignored` の組 (干渉ジオメトリを持つリンクだけでたどった関節のつながりが 3 段以内の組と、既定の姿勢で既に貫通している組) を除いたものと、全リンク × 人体 26 本 |
 | 軌道最適化 (jaxls) | 干渉ジオメトリを持つ全リンク (`collision_link_list_for_arm`) × 人体、および自己干渉 (`collision_pairs.json` は使わない) |
 
 ## 1. 第1段: 干渉回避付きバッチ IK
@@ -172,12 +172,32 @@ cost = Σ w_j · q_j²                         (関節の曲げ量, 単位 rad)
 
 ### 事後検証 (`collision_pairs_min_distance`)
 
-- ペア: 総当たり (0 節の表)。ロボットは指なし。
+- ペア: 総当たり (0 節の表)。ロボットは既定で指なし (`--collision-verify-model nohand`。
+  `hand` にすると、IK を解いた指なしのロボットの関節角・台車位置を指ありモデルに写して
+  指先まで判定する。1 姿勢あたり約 30 ms 遅い)。
+- 差し出さない腕 (IK の最適化対象ではない) は、IK を解かずに関節角を差し替える
+  (`select_other_arm_posture`)。候補ごとに押し込み IK を解いた後、押し込み前と押し込み後
+  のうち腰が低い方の姿勢で、`OTHER_ARM_POSTURES_DEG` (肩 p・肘の組、曲げの小さい順:
+  (-14, 0) = 体の横に下ろした姿勢、(-20, -30)、(-30, -45)、(-40, -60) [deg]) を順に
+  試し、手と指先 (指ありモデルの点群を `hand_yaw_link` 基準で載せたもの) が台車の箱から
+  2 cm (`OTHER_ARM_BASE_CLEARANCE`) 以上離れる最初の姿勢を hover・押し込みの両方に使う。
+  脚と腰を曲げて低くなると、下ろした手の指先が台車の前方の箱に入り込むため
+  (差し替え前は合成データで hover 18/86 人)。
+- 検証の順序: (1) 差し出さない腕に関わらない組で hover を検証 (ここで貫通していれば
+  押し込み IK を解く前に棄却) → (2) 押し込み IK → (3) 腕の差し替え → (4) 差し出さない
+  腕に関わる組で hover を検証 → (5) 押し込み姿勢を自己干渉の組だけで検証 (人の掌に
+  触れる姿勢なので人体は見ない。貫通していれば後処理判定の失敗扱い)。
+- 合成データ 97 人: 後処理まで成功 84 人 (変更前と同じ)、差し出さない手の指先と台車の
+  干渉 0 件 (最小 1.1 cm)、第2段の時間 0.11〜0.12 秒/人 (変更前 0.10)。選ばれた姿勢は
+  (-14, 0) が 61 人、(-20, -30) が 21 人、(-30, -45) が 2 人。
 - 深さは両方向から求め、大きい方 (より深く貫通している方) を採る:
   - ロボット側リンクの頂点が人体の円柱に入り込んだ深さ (円柱の半径・高さから解析的に)
   - 人体の円柱の表面サンプル (周方向 16 × 高さ方向 5 + 上下端面の中心) がリンクの凸形状に入り込んだ深さ
     (`obstacle_into_link_depth`。箱形リンクの面の途中を細い円柱が貫く場合を拾うため)
-- 自己干渉ペアは頂点同士の最短距離。
+- 自己干渉ペアは、一方のリンクの表面サンプル (約 1 cm 間隔) がもう一方の凸形状に
+  入り込んだ深さを両方向で求め、大きい方を採る (`self_collision_depth`)。貫通して
+  いなければ頂点同士の最短距離。以前は常に頂点同士の最短距離 (常に 0 以上) で、
+  自己干渉の貫通は一度も棄却されていなかった。
 - **棄却条件: 最小距離 < -0.001 m** (1 mm より深く貫通, `DEFAULT_COLLISION_VERIFY_TOLERANCE`)。
 
 ### 解の優先順位
@@ -305,7 +325,19 @@ jaxls の軌道最適化 (`build_problem`):
 
 ### 事後検証と棄却条件
 
-- 全 waypoint を第2節と同じ `collision_pairs_min_distance` (総当たりペア・指なし) で検証する。
+- 全 waypoint を第2節と同じ `collision_pairs_min_distance` (総当たりペア) で検証する。
+  ロボットは指なし。差し出さない腕は軌道全体で IK 結果 (差し替え後) の姿勢に固定する
+  (`build_start_and_goal`)。実機ノードは lead-in の間に初期姿勢 (腕を下ろした姿勢) から
+  この姿勢へ補間する。
+- 接近区間の各 waypoint では、差し出さない手の指先と台車の箱の距離
+  (`other_hand_base_clearance`) も最小距離に含める (`verify_waypoints` の `robot_arm`)。
+  IK 結果では hover・押し込み姿勢でしか指先を見ていないため、途中で脚をより深く曲げる
+  軌道では指先が台車に入り込むことがある (追加前は合成データ seed 0 で 33 人中 2 人、
+  最大 5.3 cm)。
+- 軌道が通らず、その原因に指先と台車の干渉が含まれるときは、差し出さない腕を
+  `OTHER_ARM_POSTURES_DEG` の 1 段曲げた姿勢に差し替えて (hover・押し込み姿勢の事後検証を
+  やり直した上で) 計画し直す (`plan_person_motion`)。通れば IK 結果もその姿勢に書き換える
+  (`other_arm_posture_replanned`)。
 - **`verified` の条件: 全 waypoint で最小距離 ≥ -0.01 m** (`DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE`)。
   最終姿勢の 1 mm より緩いのは、経路上の通過点だから。
 - どの作り方でも通らなければ、経路上の最小距離が最も大きい (貫通が最も
@@ -338,7 +370,7 @@ jaxls の軌道最適化 (`build_problem`):
 
 | 区間・姿勢 | 理由 |
 |---|---|
-| 第2段の押し込み姿勢 (`post_process`) | 掌に触れる姿勢そのもの |
+| 第2段の押し込み姿勢 (`post_process`) の人体との干渉 | 掌に触れる姿勢そのもの (自己干渉だけは検証する) |
 | hover → 押し込みの補間区間 (`build_press_in_waypoints`) と、最終補正で解き直した押し込み | 同上 |
 | pre-touch 姿勢の IK 自体 | 軌道全体を後で検証するので不要 |
 | lead-in のうち人から 1 m より遠い部分 | 人体に届かないとみなす |
@@ -349,5 +381,5 @@ jaxls の軌道最適化 (`build_problem`):
 `view_handshake_poses.py`・`run_camera_pipeline_test.py` の画面の状態表示は、
 **指ありモデル**の干渉ジオメトリと総当たりペア (指同士・指と他リンクを含む) で
 `colliding_link_pairs` を計算し、1 mm (`--collision-verify-tolerance`) より
-深い貫通を表示する。IK・軌道計画の採否 (指なしで判定) は変えない。
+深い貫通を表示する。IK・軌道計画の採否は変えない。
 方針の背景は「最適化は指なし・事後検証は指あり・表示は判定基準に合わせる」。

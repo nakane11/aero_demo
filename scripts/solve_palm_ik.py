@@ -71,6 +71,7 @@ random_human_poses/ -> random_palm_poses/ -> random_handshake_poses/ を
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -105,8 +106,6 @@ from skrobot.model import Link  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
-from skrobot.planner.trajectory_optimization.collision import (  # noqa: E402
-    create_self_collision_pairs)
 
 from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 
@@ -862,8 +861,9 @@ def seed_arm_pose(robot, robot_arm):
 
     使わない方の腕 (``robot_arm`` の反対側) は IK の最適化対象に含めない
     (``solve_person_ik``/``solve_post_process`` とも ``link_list`` に
-    含まれない) ため、ここで作った姿勢がそのまま最終結果の
-    ``joint_angle_vector`` にも残る。``reset_pose()`` は肘を目一杯曲げた
+    含まれない)。最終結果では、``pick_verified_candidate`` が押し込み前後で
+    腰の低い方の姿勢に合わせて ``OTHER_ARM_POSTURES_DEG`` の姿勢に差し
+    替える (ここで作る姿勢はその先頭と同じ)。``reset_pose()`` は肘を目一杯曲げた
     (``elbow_joint`` を -135 度にする) 姿勢で、これは前腕を肩の高さまで
     持ち上げた「構え」のような姿勢になってしまう (``plan_handshake_
     motion.arms_down_angles`` 参照) ため、使わない方の腕だけ肘を伸ばして
@@ -883,6 +883,122 @@ def seed_arm_pose(robot, robot_arm):
     getattr(robot, '{}_wrist_y_joint'.format(robot_arm)).joint_angle(0.0)
     getattr(robot, '{}_wrist_p_joint'.format(robot_arm)).joint_angle(0.087)
     getattr(robot, '{}_wrist_r_joint'.format(robot_arm)).joint_angle(0.0)
+
+
+# 差し出さない腕 (IK の最適化対象ではない) の姿勢の候補 [deg] を曲げの
+# 小さい順に並べたもの。値は (shoulder_p_joint, elbow_joint) で、他の関節は
+# seed_arm_pose の値 (reset_pose の肩) のまま。先頭は seed_arm_pose と同じ
+# 体の横に下ろした姿勢。脚と腰を曲げて低くなると、下ろした手の指先が台車の
+# 前方の箱 (地面から 0.32 m) に入り込むため、押し込み前後で腰が低い方の
+# 姿勢で指先が箱にかからない最初の候補に差し替える (select_other_arm_
+# posture)。最後の候補は脚の可動域で最も低い姿勢 (腰 0.50 m) でも指先と
+# 箱の間が約 0.4 m 空く (2026-09-30 計測)。
+OTHER_ARM_POSTURES_DEG = (
+    (-14.0, 0.0),
+    (-20.0, -30.0),
+    (-30.0, -45.0),
+    (-40.0, -60.0),
+)
+# 差し出さない手 (指先を含む) と台車の箱の間に最低限空ける距離 [m]。
+OTHER_ARM_BASE_CLEARANCE = 0.02
+
+# side ('r'/'l') -> 指ありモデルの手・指の表面サンプル (hand_yaw_link 座標系)
+_OTHER_HAND_POINTS_CACHE = {}
+
+
+def other_hand_points(side):
+    """指ありモデルの ``side`` 側の手 (``hand_link`` と指のリンク) の表面
+    サンプルを、``{side}_hand_yaw_link`` の座標系で返す。
+
+    IK は指なしのモデルで解くので、指先の位置はこの点群を指なしのロボット
+    の ``hand_yaw_link`` に載せて求める (``hand_y_joint`` は実機で回らず
+    0 に固定されている -- ``lock_fixed_joints`` 参照 -- ので、その先の
+    指の配置は ``hand_yaw_link`` に対して一定)。指の関節は既定の姿勢。
+    ``hand_yaw_link`` を基準にするのは、指なしの URDF では左手の
+    ``hand_y_joint`` の取り付け位置だけが指ありの URDF と 4 cm 違い、
+    ``hand_link`` 基準だと指先の位置がずれるため。
+    """
+    cached = _OTHER_HAND_POINTS_CACHE.get(side)
+    if cached is not None:
+        return cached
+    # 指ありモデルの読み込みは 1 秒ほどかかるので、左右まとめて 1 回で作る
+    # (main が人物ループの前に呼んでおく)。
+    from aero_demo.aero_urdf_setup import load_aero
+    model = load_aero(use_hand=True)
+    apply_collision_model(model)
+    model.reset_pose()
+    for s in ('r', 'l'):
+        hand_yaw = getattr(model, '{}_hand_yaw_link'.format(s))
+        points = []
+        for link in model.link_list:
+            if link.collision_mesh is None or \
+                    not link.name.startswith(s + '_'):
+                continue
+            if 'feetech' not in link.name and link.name != s + '_hand_link':
+                continue
+            world = (link_surface_samples(link) @ link.worldrot().T
+                     + link.worldpos())
+            points.append((world - hand_yaw.worldpos()) @ hand_yaw.worldrot())
+        _OTHER_HAND_POINTS_CACHE[s] = np.vstack(points)
+    return _OTHER_HAND_POINTS_CACHE[side]
+
+
+def other_hand_base_clearance(robot, robot_arm):
+    """``robot`` の現在の姿勢で、差し出さない手 (指先を含む、
+    ``other_hand_points``) と台車の箱 (``wheel_base_link`` と、それに
+    固定した干渉専用リンク) の最短距離 [m] を返す (入り込んでいれば負)。"""
+    side = 'l' if robot_arm == 'r' else 'r'
+    hand_yaw = getattr(robot, '{}_hand_yaw_link'.format(side))
+    world = (other_hand_points(side) @ hand_yaw.worldrot().T
+             + hand_yaw.worldpos())
+    boxes = [robot.wheel_base_link] + [
+        link for link in getattr(robot, 'extra_collision_links', [])
+        if link.parent_link is robot.wheel_base_link]
+    clearance = float('inf')
+    for box in boxes:
+        prim = getattr(box, 'collision_primitive', None)
+        if prim is None or prim.get('type') != 'box':
+            continue
+        rot = box.worldrot() @ np.asarray(prim['rotation'])
+        center = box.worldpos() + box.worldrot() @ np.asarray(prim['center'])
+        q = np.abs((world - center) @ rot) - np.asarray(prim['half_extents'])
+        dist = (np.linalg.norm(np.maximum(q, 0.0), axis=1)
+                + np.minimum(q.max(axis=1), 0.0))
+        clearance = min(clearance, float(dist.min()))
+    return clearance
+
+
+def apply_other_arm_posture(robot, robot_arm, posture_index):
+    """差し出さない腕を ``OTHER_ARM_POSTURES_DEG[posture_index]`` の姿勢に
+    する (IK は解かず、関節角を直接書き換える)。"""
+    side = 'l' if robot_arm == 'r' else 'r'
+    shoulder_p, elbow = OTHER_ARM_POSTURES_DEG[posture_index]
+    getattr(robot, '{}_shoulder_p_joint'.format(side)).joint_angle(
+        math.radians(shoulder_p))
+    getattr(robot, '{}_elbow_joint'.format(side)).joint_angle(
+        math.radians(elbow))
+
+
+def select_other_arm_posture(robot, robot_arm,
+                             clearance=OTHER_ARM_BASE_CLEARANCE):
+    """``robot`` の現在の姿勢 (押し込み前後で腰が低い方) で、差し出さない
+    手が台車の箱から ``clearance`` 以上離れる、曲げの最も小さい
+    ``OTHER_ARM_POSTURES_DEG`` の添字を返す (どれも満たさなければ
+    ``None``)。``robot`` の差し出さない腕は最後に試した姿勢のままになる。
+    """
+    for index in range(len(OTHER_ARM_POSTURES_DEG)):
+        apply_other_arm_posture(robot, robot_arm, index)
+        if other_hand_base_clearance(robot, robot_arm) >= clearance:
+            return index
+    return None
+
+
+def with_other_arm_posture(robot, angle_vector, robot_arm, posture_index):
+    """``angle_vector`` の差し出さない腕だけを ``posture_index`` の姿勢に
+    差し替えた関節角ベクトルを返す (``robot`` はその姿勢になる)。"""
+    robot.angle_vector(angle_vector)
+    apply_other_arm_posture(robot, robot_arm, posture_index)
+    return robot.angle_vector().copy()
 
 
 def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
@@ -941,12 +1057,51 @@ def lock_fixed_joints(robot):
     の手先だけが大きく (左腕で 180 度前後) ずれていた。
     ``restrict_elbow_range`` と同様、``robot`` 側を書き換えれば
     ``*_whole_body`` にも反映される。
+
+    あわせて ``align_hand_mount_with_hand_model`` で、手の取り付け位置を
+    指ありモデル (実機) に合わせる。
     """
     for name in robot._FIXED_JOINT_NAMES:
         joint = getattr(robot, name)
         joint.min_angle = 0.0
         joint.max_angle = 0.0
         joint.joint_angle(0.0)
+    align_hand_mount_with_hand_model(robot)
+
+
+# {r,l}_hand_y_joint の origin (親 hand_yaw_link から見た hand_link の位置
+# [m])。指ありの URDF (feetech_hand パッケージの aero_with_feetech_hand.
+# urdf) は左右とも z=-0.04 だが、指なしの URDF (aero_description の
+# aero_nohand.urdf) は左だけ z=0 になっている。手先フレーム (eef_grasp_
+# link) は hand_link の子なので、そのままだと指なしで解く左腕の手先が
+# 指ありモデル (実機) より手首側に 4 cm ずれる。
+HAND_Y_JOINT_ORIGIN = (0.0, 0.0, -0.04)
+
+
+def align_hand_mount_with_hand_model(robot):
+    """``{r,l}_hand_y_joint`` の取り付け位置 (``default_coords``) を
+    ``HAND_Y_JOINT_ORIGIN`` (指ありの URDF の値) に合わせる。既に同じ値
+    なら何もしない (指ありモデルに呼んでもよい)。関節角は保つ。"""
+    for side in ('r', 'l'):
+        joint = getattr(robot, '{}_hand_y_joint'.format(side), None)
+        if joint is None:
+            continue
+        origin = np.asarray(HAND_Y_JOINT_ORIGIN, dtype=np.float64)
+        if np.allclose(joint.default_coords.translation, origin):
+            continue
+        # default_coords (関節角 0 のときの子リンクの位置姿勢。FK の抽出や
+        # ヤコビアンが参照する) と、子リンク自身の親からの位置の両方を
+        # 書き換える (RotationalJoint.joint_angle は差分の回転だけを子
+        # リンクに掛けるので、default_coords を変えても子リンクは動か
+        # ない)。回転軸は子リンクの原点を通るので、関節角によらず子
+        # リンクの位置は取り付け位置そのもの。
+        # 子リンクは newcoords で書き換える (translation に直接代入すると
+        # ワールド座標のキャッシュが更新されず、次に関節が動くまで古い
+        # 位置のままになる)。
+        joint.default_coords.translation = origin
+        local = joint.child_link.copy_coords()
+        local.translation = origin.copy()
+        joint.child_link.newcoords(local)
 
 
 def restrict_joint_range_margin(link_list, margin_ratio):
@@ -1348,6 +1503,106 @@ def obstacle_into_link_depth(samples, link, shape):
     return float(-plane_dist.max(axis=1).min())
 
 
+# link_surface_samples の結果も link_collision_shape と同じ理由 (collision_
+# mesh だけで決まり姿勢に依存しない) で、1 リンクにつき 1 回だけ計算して
+# 持つ (id(link) がキー)。
+_LINK_SURFACE_SAMPLES_CACHE = {}
+
+# 自己干渉の貫通判定で使う表面サンプルの間隔 [m] と、1 リンクあたりの
+# 点数の上限 (台車の箱のような大きなリンクでは間隔を粗くして上限に収める)。
+SELF_COLLISION_SAMPLE_SPACING = 0.01
+SELF_COLLISION_MAX_SAMPLES = 2000
+
+
+def link_surface_samples(link):
+    """``link.collision_mesh`` の表面を、ほぼ ``SELF_COLLISION_SAMPLE_
+    SPACING`` 間隔でサンプルした点 (リンクのローカル座標) を返す。
+
+    三角形を細分割した頂点を使うので、乱数を使わず毎回同じ点になる。
+    """
+    cached = _LINK_SURFACE_SAMPLES_CACHE.get(id(link))
+    if cached is not None:
+        return cached
+    import trimesh
+    mesh = link.collision_mesh
+    spacing = max(SELF_COLLISION_SAMPLE_SPACING,
+                  math.sqrt(2.0 * float(mesh.area)
+                            / SELF_COLLISION_MAX_SAMPLES))
+    verts, _ = trimesh.remesh.subdivide_to_size(
+        np.asarray(mesh.vertices, dtype=np.float64),
+        np.asarray(mesh.faces), max_edge=spacing)
+    points = np.asarray(verts, dtype=np.float64)
+    _LINK_SURFACE_SAMPLES_CACHE[id(link)] = points
+    return points
+
+
+def _points_into_link_depth(world_points, link, shape):
+    """ワールド座標の点群 ``world_points`` が ``link`` の凸形状 (``shape``
+    = ``link_collision_shape(link)``) に入り込んだ最大の深さ [m] を返す
+    (入り込んだ点が無ければ 0)。"""
+    (lo, hi), normals, offsets, _ = shape
+    local_pts = (world_points - link.worldpos()) @ link.worldrot()
+    inside_bbox = np.all((local_pts > lo) & (local_pts < hi), axis=1)
+    if not inside_bbox.any():
+        return 0.0
+    plane_dist = local_pts[inside_bbox] @ normals.T - offsets
+    inside = plane_dist.max(axis=1) < 0.0
+    if not inside.any():
+        return 0.0
+    return float(-plane_dist[inside].max(axis=1).min())
+
+
+def _obb_separated(link_a, link_b):
+    """2 リンクの ``collision_mesh`` をそれぞれのローカル座標で包む直方体
+    (``link_collision_shape`` の ``bounds``) 同士が、分離軸判定で離れて
+    いるか。離れていれば中身の凸形状も貫通し得ない。"""
+    (lo_a, hi_a) = link_collision_shape(link_a)[0]
+    (lo_b, hi_b) = link_collision_shape(link_b)[0]
+    rot_a, rot_b = link_a.worldrot(), link_b.worldrot()
+    half_a, half_b = (hi_a - lo_a) / 2.0, (hi_b - lo_b) / 2.0
+    center_a = link_a.worldpos() + rot_a @ ((hi_a + lo_a) / 2.0)
+    center_b = link_b.worldpos() + rot_b @ ((hi_b + lo_b) / 2.0)
+    # 分離軸の候補: 両方の直方体の面の法線 6 本と、辺同士の外積 9 本
+    # (平行な辺の外積は 0 ベクトルになり、判定に影響しない)。
+    cross = np.cross(rot_a.T[:, np.newaxis, :],
+                     rot_b.T[np.newaxis, :, :]).reshape(9, 3)
+    axes = np.vstack([rot_a.T, rot_b.T, cross])
+    extent_a = np.abs(axes @ rot_a) @ half_a
+    extent_b = np.abs(axes @ rot_b) @ half_b
+    return bool(np.any(np.abs(axes @ (center_b - center_a))
+                       > extent_a + extent_b + 1e-9))
+
+
+def self_collision_depth(link_a, link_b, world_samples=None):
+    """ロボットの 2 リンクの凸形状 (``collision_mesh``) がどれだけ貫通
+    しているか [m] を返す (貫通していなければ 0)。
+
+    一方の表面サンプル (``link_surface_samples``) がもう一方の内部に
+    入り込んだ深さを両方向で求め、大きい方を採る。頂点同士の最短距離
+    (常に 0 以上) では、箱の中に別の箱が入り込んでいても貫通として検出
+    できないため、こちらを使う。表面の点は約 1 cm 間隔なので、辺同士が
+    交差するだけの浅い貫通では、実際より小さく (最大でおよそ間隔の半分)
+    見積もることがある。
+
+    ``world_samples`` (dict) を渡すと、表面サンプルのワールド座標を
+    リンクごとにそこへ持って使い回す (同じ姿勢で多数の組を調べる
+    ``collision_pairs_min_distance`` 用)。
+    """
+    if _obb_separated(link_a, link_b):
+        return 0.0
+    depth = 0.0
+    for src, dst in ((link_a, link_b), (link_b, link_a)):
+        pts = None if world_samples is None else world_samples.get(src)
+        if pts is None:
+            pts = (link_surface_samples(src) @ src.worldrot().T
+                   + src.worldpos())
+            if world_samples is not None:
+                world_samples[src] = pts
+        depth = max(depth, _points_into_link_depth(
+            pts, dst, link_collision_shape(dst)))
+    return depth
+
+
 def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
                                  obstacle_links=None, obstacle_samples=None):
     """``robot`` の現在の姿勢 (``angle_vector``/``base_pose`` 適用済み) で、
@@ -1404,11 +1659,17 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
     """
     if not collision_pairs:
         return float('inf')
+    # 指ありモデルなど、robot とは別のモデルで判定するペア
+    # (VerificationPairs) なら、そのモデルの姿勢を robot に合わせる。
+    sync_from = getattr(collision_pairs, 'sync_from', None)
+    if sync_from is not None:
+        sync_from(robot)
     if obstacle_links is None:
         obstacle_links = human_body_obstacles(joint_positions) \
             if joint_positions else None
     min_dist = float('inf')
     world_vertices_by_link = {}
+    world_samples_by_link = {}
     shape_by_link = {}
     samples_by_obstacle = {}
 
@@ -1482,11 +1743,19 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
             if margin > 0.0:
                 dist = margin
             else:
-                verts_a = _world_vertices(link_a)
-                verts_b = _world_vertices(other)
-                dist = float(np.linalg.norm(
-                    verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
-                    axis=-1).min())
+                # 貫通していれば深さを負の距離にする (self_collision_depth
+                # 参照)。貫通していなければ従来通り頂点同士の最短距離
+                # (正の値、実際の距離以上になる近似)。
+                depth = self_collision_depth(
+                    link_a, other, world_samples=world_samples_by_link)
+                if depth > 0.0:
+                    dist = -depth
+                else:
+                    verts_a = _world_vertices(link_a)
+                    verts_b = _world_vertices(other)
+                    dist = float(np.linalg.norm(
+                        verts_a[:, np.newaxis, :]
+                        - verts_b[np.newaxis, :, :], axis=-1).min())
         if dist < min_dist:
             min_dist = dist
     return min_dist
@@ -1685,6 +1954,72 @@ def load_collision_pairs(path, robot):
     return pairs
 
 
+# 自己干渉の事後検証から除く「関節のつながりが近い組」の段数。干渉ジオメトリ
+# を持つリンクだけをたどって数える (前腕 -> 手首 -> 手 -> 指の付け根 が 3)。
+# 近い組はプリミティブ近似の箱同士が関節付近で重なるだけで、実機では
+# 可動域の制約でぶつからないため (ランダム姿勢で前腕と指の付け根が約 7 割、
+# 腰と胴体が約 5 割の姿勢で「貫通」と判定された)。
+SELF_COLLISION_IGNORE_LINK_DISTANCE = 3
+
+
+def _collision_parent(link, collision_links):
+    parent = link.parent_link
+    while parent is not None and parent not in collision_links:
+        parent = parent.parent_link
+    return parent
+
+
+def self_collision_ignored(robot, collision_link_list,
+                           max_link_distance=SELF_COLLISION_IGNORE_LINK_DISTANCE,
+                           tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE):
+    """自己干渉の事後検証から除く組 (``frozenset({link_a, link_b})`` の
+    集合) を返す。MoveIt の Setup Assistant と同じ考え方で、次を除く。
+
+    * 干渉ジオメトリを持つリンクだけでたどった関節のつながりが
+      ``max_link_distance`` 段以内の組。
+    * 既定の姿勢 (``robot.reset_pose()``、無ければ全関節 0) で既に
+      ``tolerance`` を超えて貫通している組 (台車の箱と車輪、胴体と肩など、
+      近似形状が常に重なっている組)。
+
+    ``robot`` の姿勢は判定のために一時的に変えるが、戻してから返す。
+    """
+    collision_links = set(collision_link_list)
+    parent_of = {link: _collision_parent(link, collision_links)
+                 for link in collision_link_list}
+
+    def ancestors(link):
+        chain = [link]
+        while parent_of.get(chain[-1]) is not None:
+            chain.append(parent_of[chain[-1]])
+        return chain
+
+    ancestor_depth = {link: {a: i for i, a in enumerate(ancestors(link))}
+                      for link in collision_link_list}
+    ignored = set()
+    for link_a, link_b in itertools.combinations(collision_link_list, 2):
+        depth_a, depth_b = ancestor_depth[link_a], ancestor_depth[link_b]
+        common = [depth_a[a] + depth_b[a] for a in depth_a if a in depth_b]
+        if common and min(common) <= max_link_distance:
+            ignored.add(frozenset((link_a, link_b)))
+
+    saved_av = robot.angle_vector().copy()
+    saved_coords = robot.copy_worldcoords()
+    try:
+        try:
+            robot.reset_pose()
+        except NotImplementedError:
+            robot.init_pose()
+        for link_a, link_b in itertools.combinations(collision_link_list, 2):
+            key = frozenset((link_a, link_b))
+            if key not in ignored and \
+                    self_collision_depth(link_a, link_b) > tolerance:
+                ignored.add(key)
+    finally:
+        robot.angle_vector(saved_av)
+        robot.newcoords(saved_coords)
+    return ignored
+
+
 def build_collision_verification_pairs(robot, robot_arm):
     """事後検証 (``pick_verified_candidate``/``collision_pairs_min_
     distance``) で使う、干渉しうる組み合わせを総当たりで網羅したペアの
@@ -1696,9 +2031,9 @@ def build_collision_verification_pairs(robot, robot_arm):
     作る全組み合わせに対して行う。
 
     * 自己干渉: ``collision_link_list_for_arm`` の全組み合わせから、
-      ``create_self_collision_pairs`` (``ignore_adjacent=True``) が除く
-      「隣接する (共通の関節で直接つながっている) 組み合わせ」を除いた
-      もの。
+      ``self_collision_ignored`` が除く組み合わせ (関節のつながりが近い
+      組と、既定の姿勢で既に貫通している組。プリミティブ近似の重なりで
+      あって実際の衝突ではない) を除いたもの。
     * 人体との干渉: 同じリンク一覧と ``human_obstacle_names`` の全人体
       セグメントの組み合わせ (除外なし)。
 
@@ -1706,14 +2041,75 @@ def build_collision_verification_pairs(robot, robot_arm):
     ``main`` から人物ループの外で 1 回だけ計算すればよい。
     """
     collision_link_list = collision_link_list_for_arm(robot, robot_arm)
-    self_pairs = create_self_collision_pairs(
-        collision_link_list, ignore_adjacent=True)
-    pairs = [(collision_link_list[link_i], collision_link_list[link_j])
-            for link_i, link_j in self_pairs]
+    ignored = self_collision_ignored(robot, collision_link_list)
+    pairs = [(link_a, link_b) for link_a, link_b in
+             itertools.combinations(collision_link_list, 2)
+             if frozenset((link_a, link_b)) not in ignored]
     for link in collision_link_list:
         for obstacle_index in range(len(human_obstacle_names())):
             pairs.append((link, obstacle_index))
     return pairs
+
+
+class VerificationPairs(list):
+    """事後検証のペアのリスト (``build_collision_verification_pairs`` の
+    戻り値と同じ形式) に、判定に使うモデルを添えたもの。
+
+    ``model`` が ``None`` でなければ、ペアのリンクは IK を解くロボットでは
+    なく ``model`` (指ありの Aero など) のものを指す。``collision_pairs_
+    min_distance`` は判定の前に ``sync_from`` で ``model`` の関節角・台車の
+    位置姿勢を IK のロボットに合わせる。
+    """
+
+    def __init__(self, pairs, model=None):
+        super().__init__(pairs)
+        self.model = model
+        self._joint_map = None
+
+    def with_pairs(self, pairs):
+        """同じ ``model`` で、ペアだけを差し替えたものを返す。"""
+        result = VerificationPairs(pairs, self.model)
+        result._joint_map = self._joint_map
+        return result
+
+    def sync_from(self, robot):
+        if self.model is None or self.model is robot:
+            return
+        if self._joint_map is None:
+            by_name = {joint.name: joint for joint in robot.joint_list}
+            self._joint_map = [(joint, by_name[joint.name])
+                               for joint in self.model.joint_list
+                               if joint.name in by_name]
+        for model_joint, robot_joint in self._joint_map:
+            model_joint.joint_angle(robot_joint.joint_angle())
+        # 台車の位置姿勢は robot 自体 (pick_verified_candidate) と
+        # base_link (apply_robot_pose) のどちらで与えられることもあるので、
+        # 両者の積である base_link のワールド座標に合わせる
+        # (handshake_viewer_common.sync_robot_collision_overlay と同じ)。
+        self.model.newcoords(robot.base_link.copy_worldcoords())
+
+
+COLLISION_VERIFY_MODELS = ('nohand', 'hand')
+
+
+def build_verification_pairs_for_model(robot, verify_model='nohand'):
+    """``verify_model`` のモデルで事後検証する ``VerificationPairs`` を作る。
+
+    ``'nohand'`` は IK を解く ``robot`` (指なし) そのもの。``'hand'`` は
+    指ありの Aero を別に作り (``apply_collision_model`` 済み)、指先まで
+    含めて判定する。IK の最適化は ``robot`` (指なし) のまま。
+    """
+    if verify_model == 'nohand':
+        return VerificationPairs(
+            build_collision_verification_pairs(robot, 'r'))
+    if verify_model != 'hand':
+        raise ValueError('verify_model は {} のどれかです: {!r}'.format(
+            COLLISION_VERIFY_MODELS, verify_model))
+    from aero_demo.aero_urdf_setup import load_aero
+    model = load_aero(use_hand=True)
+    apply_collision_model(model)
+    return VerificationPairs(
+        build_collision_verification_pairs(model, 'r'), model)
 
 
 def attach_camera_optical_coords(robot, pos=None, rot=None):
@@ -2181,6 +2577,31 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         [cylinder_surface_samples(o) for o in obstacle_links]
         if obstacle_links else None)
 
+    # 事後検証のペアを、差し出さない腕 (後で姿勢を差し替える) に関わる組と
+    # それ以外に分ける。それ以外の組は差し替えの影響を受けないので、後処理
+    # (押し込み IK) を解く前に先に検証して、貫通している候補を安く落とす。
+    # 押し込み姿勢は自己干渉の組 (self_verification_pairs) だけを検証する。
+    other_prefix = ('l' if robot_arm == 'r' else 'r') + '_'
+
+    def _subset(keep):
+        if verification_pairs is None:
+            return None
+        pairs = [pair for pair in verification_pairs if keep(pair)]
+        if isinstance(verification_pairs, VerificationPairs):
+            return verification_pairs.with_pairs(pairs)
+        return pairs
+
+    def _involves_other_arm(pair):
+        link_a, other = pair
+        return link_a.name.startswith(other_prefix) or (
+            not isinstance(other, int) and other.name.startswith(other_prefix))
+
+    early_verification_pairs = _subset(
+        lambda pair: not _involves_other_arm(pair))
+    other_arm_verification_pairs = _subset(_involves_other_arm)
+    self_verification_pairs = _subset(
+        lambda pair: not isinstance(pair[1], int))
+
     fallback = None
     examined = 0
     for cost, candidate_index in candidates:
@@ -2194,24 +2615,65 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             turn_degs[turn_index], attempt_index, cost)
         robot.angle_vector(angle_vectors[candidate_index])
         robot.newcoords(base_poses[candidate_index])
+        hover_av = robot.angle_vector().copy()
+        hover_waist_z = float(robot.waist_link.worldpos()[2])
         min_dist = collision_pairs_min_distance(
-            robot, verification_pairs, joint_positions,
+            robot, early_verification_pairs, joint_positions,
             obstacle_links=obstacle_links, obstacle_samples=obstacle_samples)
         if min_dist < -collision_verify_tolerance:
             print('  [collision-verify] {} の候補は IK は収束'
                   'したが、事後検証で {:.4f} m 貫通していたため棄却'
                   'します。'.format(label, min_dist))
             continue
-        if fallback is None:
-            fallback = (turn_index, angle_vectors[candidate_index],
-                       base_poses[candidate_index], cost)
+        # 後処理 (押し込み) を解き、押し込み前後で腰が低い方の姿勢で
+        # 差し出さない腕の姿勢を決める (select_other_arm_posture)。
+        # 差し出さない腕は IK の最適化対象ではないので、決めた姿勢を
+        # hover・押し込みの両方の関節角にそのまま差し替える。台車は後処理で
+        # 動かない。
         post_result = solve_post_process(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop,
             thre=post_process_thre, rthre=post_process_rthre)
+        if post_result is None or \
+                float(robot.waist_link.worldpos()[2]) >= hover_waist_z:
+            robot.angle_vector(hover_av)
+        posture = select_other_arm_posture(robot, robot_arm)
+        if posture is None:
+            print('  [other-arm] {} の候補は差し出さない手の指先が台車に'
+                  'かからない腕の姿勢が無いため棄却します。'.format(label))
+            continue
+        hover_av = with_other_arm_posture(robot, hover_av, robot_arm, posture)
+        min_dist = collision_pairs_min_distance(
+            robot, other_arm_verification_pairs, joint_positions,
+            obstacle_links=obstacle_links, obstacle_samples=obstacle_samples)
+        if min_dist < -collision_verify_tolerance:
+            print('  [collision-verify] {} の候補は差し出さない腕を差し替えた'
+                  '姿勢で {:.4f} m 貫通していたため棄却します。'.format(
+                      label, min_dist))
+            continue
+        if fallback is None:
+            fallback = (turn_index, hover_av, base_poses[candidate_index],
+                        cost)
         if post_result is not None:
-            return (turn_index, angle_vectors[candidate_index],
-                    base_poses[candidate_index], post_result)
+            # 押し込み姿勢は人の掌に触れる姿勢そのものなので、人体との
+            # 干渉は見ず、差し替えた腕を含む自己干渉だけを検証する。
+            press_av = with_other_arm_posture(
+                robot, post_result['joint_angle_vector'], robot_arm, posture)
+            press_dist = collision_pairs_min_distance(
+                robot, self_verification_pairs, joint_positions)
+            if press_dist < -collision_verify_tolerance:
+                print('  [collision-verify] {} の候補は押し込み姿勢で {:.4f} m '
+                      '自己干渉していたため、後処理判定を失敗扱いにします。'
+                      .format(label, press_dist))
+                post_result = None
+            else:
+                post_result = dict(
+                    post_result,
+                    joint_angle_vector=[float(v) for v in press_av],
+                    other_arm_posture=list(OTHER_ARM_POSTURES_DEG[posture]))
+        if post_result is not None:
+            return (turn_index, hover_av, base_poses[candidate_index],
+                    post_result)
         print('  [post-process] {} の候補は干渉検証を通過した '
               'が、後処理判定 (押し付け/視線 IK) には失敗したため、次に '
               '曲げ量コストが低い候補を試します。'.format(label))
@@ -2370,9 +2832,12 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     # effective_collision_pairs と同じ理由で除く。
     effective_verification_pairs = verification_pairs
     if verification_pairs is not None and not collision_obstacles:
-        effective_verification_pairs = [
-            (link_a, other) for link_a, other in verification_pairs
-            if not isinstance(other, int)]
+        self_pairs = [(link_a, other) for link_a, other in verification_pairs
+                      if not isinstance(other, int)]
+        effective_verification_pairs = (
+            verification_pairs.with_pairs(self_pairs)
+            if isinstance(verification_pairs, VerificationPairs)
+            else self_pairs)
     candidate_selection_start = time.time()
     picked = pick_verified_candidate(
         robot, success_flags, angle_vectors, base_poses,
@@ -2683,6 +3148,14 @@ def main():
             '既定のパスにファイルが無ければ、自己干渉・人体との干渉の両方 '
             'を無効にして通常のヤコビアン法の IK を解く。')
     parser.add_argument(
+        '--collision-verify-model', choices=COLLISION_VERIFY_MODELS,
+        default='nohand',
+        help='事後検証 (IK 収束後の干渉チェック) に使うモデル。nohand (既定) '
+            'は IK と同じ指なし、hand は指ありのモデルで指先まで含めて判定 '
+            'する (IK の最適化自体はどちらも指なし)。差し出さない手の指先と '
+            '台車の干渉は、どちらでも腕の姿勢の差し替え (select_other_arm_'
+            'posture) で避ける。hand は 1 姿勢あたり約 30 ms 遅い。')
+    parser.add_argument(
         '--post-process-max-candidates', type=int,
         default=DEFAULT_POST_PROCESS_MAX_CANDIDATES,
         help='pick_verified_candidate が関節の曲げ量コスト昇順に '
@@ -2737,6 +3210,9 @@ def main():
     restrict_leg_range(robot)
     lock_fixed_joints(robot)
     apply_collision_model(robot)
+    # 差し出さない腕の姿勢の差し替え (select_other_arm_posture) に使う指の
+    # 点群を人物ループの前に作っておく (指ありモデルの読み込みに約 1 秒)。
+    other_hand_points('r')
 
     # 干渉回避で実際にチェックする組み合わせは常に collision_pairs
     # (--collision-pairs の JSON) だけで決める。JSON が無ければ干渉回避
@@ -2751,7 +3227,10 @@ def main():
         # 組み合わせだけを除いた総当たりの組み合わせに対して行う。ロボット
         # の構造だけで決まるので人物ループの外で 1 回だけ計算する
         # (robot_arm 引数は結果に影響しないプレースホルダ)。
-        verification_pairs = build_collision_verification_pairs(robot, 'r')
+        verification_pairs = build_verification_pairs_for_model(
+            robot, args.collision_verify_model)
+        print('[collision-verify] 事後検証は {} モデルの {} 組で行います。'
+              .format(args.collision_verify_model, len(verification_pairs)))
     else:
         print('[collision-pairs] {} が見つからないため、干渉回避 (自己干渉'
               '・人体との干渉の両方) を無効にして IK を解きます。'.format(

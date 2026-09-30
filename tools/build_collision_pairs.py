@@ -67,7 +67,8 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from solve_palm_ik import (  # noqa: E402
-    HUMAN_FRONT_DISTANCE, apply_collision_model, collision_link_list_for_arm,
+    HUMAN_FRONT_DISTANCE, align_hand_mount_with_hand_model,
+    apply_collision_model, collision_link_list_for_arm,
     human_capsules, human_translation_offset, load_skeleton_json,
     segment_points_distance, translate_joint_positions)
 
@@ -107,6 +108,7 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
         ``n_samples`` が 0 のときは他の値も空。
     """
     robot = Aero(use_hand=False)
+    align_hand_mount_with_hand_model(robot)
     apply_collision_model(robot)
     collision_link_list = collision_link_list_for_arm(robot, 'r')
     link_names = [link.name for link in collision_link_list]

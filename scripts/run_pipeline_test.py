@@ -281,6 +281,10 @@ def main():
         '--facing-yaw-weight', type=float, default=None,
         help='solve_palm_ik.py に --facing-yaw-weight として渡す (既定は '
             '指定なし = solve_palm_ik.py の既定値)。')
+    parser.add_argument(
+        '--collision-verify-model', choices=('nohand', 'hand'), default=None,
+        help='solve_palm_ik.py に --collision-verify-model として渡す (既定は '
+            '指定なし = solve_palm_ik.py の既定値)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -326,6 +330,9 @@ def main():
         solve_args += ['--front-offset-weight', str(args.front_offset_weight)]
     if args.facing_yaw_weight is not None:
         solve_args += ['--facing-yaw-weight', str(args.facing_yaw_weight)]
+    if args.collision_verify_model is not None:
+        solve_args += ['--collision-verify-model',
+                       args.collision_verify_model]
     solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
                                            solve_args)
     warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)

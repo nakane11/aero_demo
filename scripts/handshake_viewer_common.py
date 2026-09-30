@@ -227,9 +227,9 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
     これだけだと逆向き (円柱がリンクの頂点から離れた面の途中を貫通して
     いる場合) を見逃すので、円柱側の表面からの判定
     (``solve_palm_ik.obstacle_into_link_depth``) も併せて行う。
-    ロボットの自己干渉 (``other`` が ``Link``) は従来通り頂点同士の最短
-    距離のまま (自己干渉ペアはどちらも薄いリンク同士がほとんどで、この
-    見逃しが実質問題にならないため)。
+    ロボットの自己干渉 (``other`` が ``Link``) は、表面サンプルが相手の
+    凸形状に入り込んだ深さで判定する (``solve_palm_ik.self_collision_
+    depth``。頂点同士の最短距離は常に 0 以上で貫通を検出できないため)。
 
     Parameters
     ----------
@@ -309,11 +309,16 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             dist = -depth
             kind, name_b = 'human', obstacle_names[other]
         else:
-            verts_b = _world_vertices(other)
-            dist = float(np.linalg.norm(
-                verts_a[:, np.newaxis, :] - verts_b[np.newaxis, :, :],
-                axis=-1).min())
+            # 自己干渉は spik.collision_pairs_min_distance と同じく、表面
+            # サンプルが相手の凸形状に入り込んだ深さで判定する (頂点同士の
+            # 最短距離は常に 0 以上で、貫通を検出できないため)。包含球が
+            # 重ならない組は貫通し得ないので省略する。
             kind, name_b = 'self', other.name
+            center_gap = (np.linalg.norm(other.worldpos() - link_a.worldpos())
+                          - _shape(link_a)[3] - _shape(other)[3])
+            if center_gap > 0.0:
+                continue
+            dist = -spik.self_collision_depth(link_a, other)
         if dist < -tolerance:
             colliding.append((kind, link_a.name, name_b, dist))
     colliding.sort(key=lambda item: item[3])

@@ -485,6 +485,9 @@ class HandshakePipelineNode(object):
         spik.restrict_leg_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
+        # 差し出さない腕の姿勢の差し替えに使う指の点群を先に作っておく
+        # (spik.other_hand_points、指ありモデルの読み込みに約 1 秒)。
+        spik.other_hand_points('r')
         self._attach_camera_optical_coords()
         # self.robot の関節角ベクトル (motion['joint_names'] と同じ並び) での
         # 「初期姿勢」(両腕を体の横に下ろした姿勢, plan_handshake_motion.
@@ -508,9 +511,15 @@ class HandshakePipelineNode(object):
         # verify_waypoints) の総当たりペアは、ロボットの構造だけで決まり
         # --collision-pairs (最適化用に絞り込んだ組み合わせ) の有無に
         # よらず必要 (plan_handshake_motion.main と同じ理由) なので、
-        # 常に作る。
-        self.verification_pairs = spik.build_collision_verification_pairs(
-            self.robot, 'r')
+        # 常に作る。IK の事後検証は --collision-verify-model (既定は指なし。
+        # 差し出さない手の指先と台車の干渉は腕の姿勢の差し替えで避ける --
+        # spik.select_other_arm_posture)、軌道の waypoint の検証は waypoint
+        # 数だけ繰り返すため常に指なし (指ありにすると 1 姿勢あたり約 30 ms
+        # 増える)。
+        self.verification_pairs = spik.build_verification_pairs_for_model(
+            self.robot, args.collision_verify_model)
+        self.motion_verification_pairs = \
+            spik.build_collision_verification_pairs(self.robot, 'r')
         # jaxls ソルバーも同じ理由 (plan_handshake_motion.main 参照) で
         # ノードの寿命で 1 個だけ作って使い回す (人物/試行ごとに作り直すと
         # JIT キャッシュが効かない)。
@@ -807,7 +816,7 @@ class HandshakePipelineNode(object):
             t0 = time.time()
             phm.plan_person_motion(
                 self.robot, robot_arm, handshake, {}, warmup_human_xy,
-                motion_args, self.verification_pairs, self.solver)
+                motion_args, self.motion_verification_pairs, self.solver)
             log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
                 label, time.time() - t0))
         print('[warmup] 完了しました ({:.1f} 秒)。'.format(
@@ -860,7 +869,7 @@ class HandshakePipelineNode(object):
         # 当たりの組み合わせを、指ありの overlay から作る (指同士/指と他
         # リンクの自己干渉ペアも含む)。ロボットの構造だけで決まり人物ごとの
         # 姿勢には依存しないので、ここで 1 回だけ作る。IK 自体が使う
-        # self.verification_pairs (指なし) とは別物。
+        # self.verification_pairs (IK の事後検証用) とは別物。
         self.hand_verification_pairs = spik.build_collision_verification_pairs(
             self.robot_collision_overlay, 'r')
         self._current_obstacle_links = []  # 人体側の干渉回避ジオメトリ (Cylinder) の overlay。RESET/再 ARM のたびに作り直す
@@ -1338,7 +1347,7 @@ class HandshakePipelineNode(object):
             initial_base_pose = np.array([offset[0], offset[1], 0.0])
             motion = phm.plan_person_motion(
                 self.robot, robot_arm, result, translated_joints, human_xy,
-                motion_args, self.verification_pairs, self.solver,
+                motion_args, self.motion_verification_pairs, self.solver,
                 initial_base_pose=initial_base_pose)
             self._log_debug(dict(
                 event='motion', person=attempt,
@@ -3150,6 +3159,12 @@ def main():
         default=os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'))
     parser.add_argument('--no-human-collision', action='store_true')
     parser.add_argument('--no-self-collision', action='store_true')
+    parser.add_argument(
+        '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
+        default='nohand',
+        help='IK の事後検証 (収束後の干渉チェック) に使うモデル '
+            '(solve_palm_ik.py の --collision-verify-model と同じ意味。既定 '
+            'nohand)。軌道の waypoint の検証は常に指なし。')
     parser.add_argument(
         '--collision-verify-tolerance', type=float,
         default=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE,

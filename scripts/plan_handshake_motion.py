@@ -82,6 +82,7 @@ random_motion_poses/ を共通の入出力先として自動的につながる)
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -666,11 +667,16 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit=None):
     robot.base_link.newcoords(Coordinates())
     for joint, angle in zip(joint_list, q_start):
         joint.joint_angle(float(angle))
-    # 対象アーム以外も腕を下ろした姿勢に
-    for side in ('r', 'l'):
-        if side != robot_arm:
-            elbow_joint = getattr(robot, '{}_elbow_joint'.format(side))
-            elbow_joint.joint_angle(elbow_joint.max_angle)
+    # 対象アーム以外の腕は、IK 結果 (handshake) の姿勢に軌道全体で固定する。
+    # solve_palm_ik.pick_verified_candidate が押し込み前後の腰の高さに
+    # 合わせて差し替えた姿勢 (指先が台車にかからないよう肩・肘を曲げた
+    # もの) で、軌道の最初の waypoint (lead-in の始点) からこの姿勢にして
+    # おく。実機は台車が動き出す前 (lead-in の最初の区間) にこの姿勢へ
+    # 腕を動かす。
+    other = 'l' if robot_arm == 'r' else 'r'
+    for joint in robot.joint_list:
+        if joint.name.startswith(other + '_') and joint.name in name_to_angle:
+            joint.joint_angle(name_to_angle[joint.name])
     return link_list, joint_list, q_start, base_start, q_goal, base_goal
 
 
@@ -871,10 +877,16 @@ def build_obstacle_cache(joint_positions):
 
 
 def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
-                     joint_positions, obstacle_cache=None):
+                     joint_positions, obstacle_cache=None, robot_arm=None):
     """各 waypoint を ``robot`` に反映し、厳密な形状による事後検証
     (``solve_palm_ik.collision_pairs_min_distance``。IK 側の事後検証と
     同じ関数) で最小距離を計測する。
+
+    ``robot_arm`` を渡すと、差し出さない手の指先と台車の箱の距離
+    (``solve_palm_ik.other_hand_base_clearance``。事後検証は指なしの
+    ロボットで行うため、指先は別に見る) も最小距離に含める。脚を曲げて
+    低くなる途中の waypoint で、下ろした手の指先が台車の前方の箱に入り
+    込むことがあるため。
 
     Returns
     -------
@@ -904,9 +916,12 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
         robot.newcoords(Coordinates(
             pos=wp['base_position'],
             rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
-        distances.append(spik.collision_pairs_min_distance(
+        dist = spik.collision_pairs_min_distance(
             robot, verification_pairs, joint_positions,
-            obstacle_links=obstacle_links, obstacle_samples=obstacle_samples))
+            obstacle_links=obstacle_links, obstacle_samples=obstacle_samples)
+        if robot_arm is not None:
+            dist = min(dist, spik.other_hand_base_clearance(robot, robot_arm))
+        distances.append(dist)
     return distances
 
 
@@ -934,9 +949,127 @@ def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
     return traj
 
 
+def current_other_arm_posture(robot_arm, handshake):
+    """``handshake`` (IK 結果) の差し出さない腕の姿勢が
+    ``solve_palm_ik.OTHER_ARM_POSTURES_DEG`` のどれか (添字) を返す
+    (肩 p・肘が最も近いもの)。"""
+    other = 'l' if robot_arm == 'r' else 'r'
+    angles = dict(zip(handshake['joint_names'], handshake['joint_angle_vector']))
+    shoulder_p = math.degrees(angles['{}_shoulder_p_joint'.format(other)])
+    elbow = math.degrees(angles['{}_elbow_joint'.format(other)])
+    errors = [abs(shoulder_p - sp) + abs(elbow - el)
+              for sp, el in spik.OTHER_ARM_POSTURES_DEG]
+    return int(np.argmin(errors))
+
+
+def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
+                                     verification_pairs, joint_positions):
+    """``handshake`` の差し出さない腕だけを ``OTHER_ARM_POSTURES_DEG
+    [posture]`` に差し替えた IK 結果のコピーを返す (IK は解き直さない。
+    ``solve_palm_ik.pick_verified_candidate`` と同じ差し替え)。
+
+    ``pick_verified_candidate`` と同じく、hover 姿勢を ``verification_
+    pairs`` で、押し込み姿勢 (``post_process``) を自己干渉の組だけで
+    検証し直し、どちらかが貫通していれば ``None`` を返す。
+    """
+    tolerance = spik.DEFAULT_COLLISION_VERIFY_TOLERANCE
+    new = copy.deepcopy(handshake)
+
+    def apply(result):
+        name_to_angle = dict(zip(result['joint_names'],
+                                 result['joint_angle_vector']))
+        for joint in robot.joint_list:
+            if joint.name in name_to_angle:
+                joint.joint_angle(name_to_angle[joint.name])
+        robot.newcoords(Coordinates(
+            pos=result['base_position'],
+            rot=rpy_matrix(result['base_yaw'], 0.0, 0.0)))
+        spik.apply_other_arm_posture(robot, robot_arm, posture)
+        result['joint_names'] = [j.name for j in robot.joint_list]
+        result['joint_angle_vector'] = [float(v)
+                                        for v in robot.angle_vector()]
+
+    apply(new)
+    if spik.collision_pairs_min_distance(
+            robot, verification_pairs, joint_positions) < -tolerance:
+        return None
+    post = new.get('post_process')
+    if post is not None:
+        apply(post)
+        self_pairs = [pair for pair in verification_pairs
+                      if not isinstance(pair[1], int)]
+        if isinstance(verification_pairs, spik.VerificationPairs):
+            self_pairs = verification_pairs.with_pairs(self_pairs)
+        if spik.collision_pairs_min_distance(
+                robot, self_pairs, joint_positions) < -tolerance:
+            return None
+        post['other_arm_posture'] = list(spik.OTHER_ARM_POSTURES_DEG[posture])
+    return new
+
+
+def other_hand_min_clearance(robot, robot_arm, motion):
+    """``motion['waypoints']`` 上で、差し出さない手の指先と台車の箱の
+    最短距離 [m] (``solve_palm_ik.other_hand_base_clearance``) の最小値。"""
+    joint_names = motion['joint_names']
+    clearance = float('inf')
+    for wp in motion['waypoints']:
+        name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
+        for joint in robot.joint_list:
+            if joint.name in name_to_angle:
+                joint.joint_angle(name_to_angle[joint.name])
+        clearance = min(clearance,
+                        spik.other_hand_base_clearance(robot, robot_arm))
+    return clearance
+
+
 def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
                        args, verification_pairs, solver,
                        initial_base_pose=INITIAL_BASE_POSE):
+    """1 人分の握手動作の軌道を計画し、結果 dict を返す
+    (``_plan_person_motion_once`` 参照)。
+
+    計画した軌道が通らず、その原因に差し出さない手の指先と台車の箱の干渉
+    (``verify_waypoints`` の ``robot_arm``) が含まれる場合は、差し出さない
+    腕を ``solve_palm_ik.OTHER_ARM_POSTURES_DEG`` の 1 段曲げた姿勢に
+    差し替えて (``handshake_with_other_arm_posture``) 計画し直す。IK 結果
+    では hover・押し込み姿勢でしか指先を見ていないため、途中で脚をより
+    深く曲げる軌道では指先が台車に入り込むことがある。計画し直した軌道が
+    通れば、``handshake`` (IK 結果) もその姿勢に書き換え (破壊的に更新
+    する)、結果の ``other_arm_posture_replanned`` に姿勢 [deg] を入れる。
+    """
+    start_time = time.time()
+    tolerance = DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE
+    motion = _plan_person_motion_once(
+        robot, robot_arm, handshake, joint_positions, human_xy, args,
+        verification_pairs, solver, initial_base_pose=initial_base_pose)
+    posture = current_other_arm_posture(robot_arm, handshake)
+    while (not (motion['verified'] and motion['lead_in_verified'])
+           and posture + 1 < len(spik.OTHER_ARM_POSTURES_DEG)
+           and other_hand_min_clearance(robot, robot_arm, motion)
+           < -tolerance):
+        posture += 1
+        candidate = handshake_with_other_arm_posture(
+            robot, robot_arm, handshake, posture, verification_pairs,
+            joint_positions)
+        if candidate is None:
+            continue
+        retry = _plan_person_motion_once(
+            robot, robot_arm, candidate, joint_positions, human_xy, args,
+            verification_pairs, solver, initial_base_pose=initial_base_pose)
+        if retry['verified'] and retry['lead_in_verified']:
+            handshake.clear()
+            handshake.update(candidate)
+            retry['other_arm_posture_replanned'] = list(
+                spik.OTHER_ARM_POSTURES_DEG[posture])
+            motion = retry
+            break
+    motion['compute_time'] = time.time() - start_time
+    return motion
+
+
+def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
+                             human_xy, args, verification_pairs, solver,
+                             initial_base_pose=INITIAL_BASE_POSE):
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
     軌道の始点は接近開始位置 (人間の手を中心とした半径 (手から最終台車位置
@@ -1169,7 +1302,8 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         joint_names = [j.name for j in robot.joint_list]
         distances = verify_waypoints(
             robot, joint_names, waypoints, verification_pairs,
-            joint_positions, obstacle_cache=obstacle_cache)
+            joint_positions, obstacle_cache=obstacle_cache,
+            robot_arm=robot_arm)
         return dict(
             planned=True,
             kind=kind,
@@ -1459,6 +1593,14 @@ def main():
         n_optimized += int(result['optimized'])
         n_verified += int(result['verified'])
         json_io.save_json(out_path, result)
+        if result.get('other_arm_posture_replanned') is not None:
+            # 差し出さない腕の姿勢を差し替えて計画し直した (plan_person_
+            # motion 参照): IK 結果の JSON も同じ姿勢に書き換えておく
+            # (ビューア・実機が hover/押し込み姿勢に使うため)。
+            json_io.save_json(path, handshake)
+            print('  [other-arm] 差し出さない腕を {} deg に曲げて計画し直し、'
+                  '{} も更新しました。'.format(
+                      result['other_arm_posture_replanned'], path))
         print('[{}/{}] {} -> {} (verified={}, lead_in_verified={}, '
               'min_dist={:.4f} m, {}, approach_angle={:.0f} 度, '
               '{:.1f} 秒)'.format(
