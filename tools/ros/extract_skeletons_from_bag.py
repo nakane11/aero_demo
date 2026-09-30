@@ -39,7 +39,7 @@ clips.py``/``run_camera_pipeline_test.py`` のようにライブ購読はしな�
 
 Usage
 -----
-    # 判定器なしで連続録画した bag から、2.5 秒おきにサンプリング (既定)
+    # 判定器なしで連続録画した bag から、0.5 秒おきにサンプリング (既定)
     python3 tools/ros/extract_skeletons_from_bag.py \
         --bag session1.bag --output-dir /tmp/offer_dataset
 
@@ -73,6 +73,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from aero_demo import json_io  # noqa: E402
+from aero_demo import skeleton_drawing  # noqa: E402
 from aero_demo import skeleton_filters  # noqa: E402
 from aero_demo.people_pose_estimator import (  # noqa: E402
     CameraIntrinsics, PeoplePoseEstimator)
@@ -80,11 +81,10 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
     imgmsg_to_ndarray, transform_to_matrix)
 
 import estimate_palm_poses as epp  # noqa: E402
-# record_palm_offer_clips.py と同じ骨格重畳描画・フォールバック値を再利用
-# する (見た目・判定基準を実カメラパイプラインと揃えるため、この抽出専用
-# ファイルで再実装しない)。
+# record_palm_offer_clips.py と同じフォールバック値を再利用する (判定基準を
+# 実カメラパイプラインと揃えるため、この抽出専用ファイルで再定義しない)。
 from record_palm_offer_clips import (  # noqa: E402
-    _FALLBACK_ROBOT_HAND_POSITION, draw_skeleton_overlay)
+    _FALLBACK_ROBOT_HAND_POSITION)
 
 
 def load_tf_buffer(bag_path):
@@ -109,8 +109,9 @@ def load_tf_buffer(bag_path):
 
 def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
                           slop):
-    """color を基準に、depth/camera_info を最も近い時刻でマッチさせる
+    """color を基準に、depth を最も近い時刻でマッチさせる
     (``message_filters.ApproximateTimeSynchronizer`` のオフライン再現)。
+    camera_info は最も近い時刻のものを添えるだけ (同期の条件にしない)。
 
     Returns
     -------
@@ -137,16 +138,20 @@ def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
                 best_idx, best_dt = i, dt
         return best_idx
 
-    used_depth, used_info = set(), set()
+    # camera_info は同期に含めず、最も時刻の近いものを使い回す
+    # (run_camera_pipeline_test.py と同じ扱い。内部パラメータは変わらない
+    # ので、camera_info の配信周期が画像より粗くても画像を捨てない)。
+    info_stamps = [m.header.stamp.to_sec() for m in info_msgs]
+    used_depth = set()
     frames = []
     for color_msg in color_msgs:
         stamp = color_msg.header.stamp.to_sec()
         di = _closest(depth_msgs, stamp, used_depth)
-        ii = _closest(info_msgs, stamp, used_info)
-        if di is None or ii is None:
+        if di is None or not info_msgs:
             continue
         used_depth.add(di)
-        used_info.add(ii)
+        ii = min(range(len(info_msgs)),
+                 key=lambda i: abs(info_stamps[i] - stamp))
         frames.append((color_msg, depth_msgs[di], info_msgs[ii]))
     frames.sort(key=lambda f: f[0].header.stamp.to_sec())
     return frames
@@ -197,12 +202,19 @@ def _pick_representative_index(frames, trigger_stamp):
 
 def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
                 buf, args, stamp, out_dirs, name):
-    """1 フレーム分の掌推定・骨格重畳画像を計算して保存する共通処理."""
-    palm_estimator.offered_hand_selector.robot_position = \
-        _lookup_robot_position(
-            buf, args.base_frame, args.robot_hand_frame, stamp,
-            args.robot_hand_position)
+    """1 フレーム分の掌推定・骨格重畳画像を計算して保存する共通処理.
+
+    判定の基準にしたロボット手先の位置 (base_link 座標) も掌 JSON の
+    ``robot_position`` に残す。``tune_offer_selector.py`` はこれを読んで
+    同じ基準でスコアを計算し直す (無いと合成骨格向けの仮のロボット位置に
+    なり、実カメラの base_link 座標とは向きが食い違う)。
+    """
+    robot_position = _lookup_robot_position(
+        buf, args.base_frame, args.robot_hand_frame, stamp,
+        args.robot_hand_position)
+    palm_estimator.offered_hand_selector.robot_position = robot_position
     palms = palm_estimator.estimate(joint_positions)
+    palms['robot_position'] = [float(v) for v in robot_position]
 
     json_io.save_json(
         os.path.join(out_dirs['skeletons'], name + '.json'),
@@ -210,8 +222,9 @@ def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
             joint_positions={k: list(v)
                              for k, v in joint_positions.items()},
             height=0.0)))
-    json_io.save_json(os.path.join(out_dirs['palms'], name + '.json'), palms)
-    overlay = draw_skeleton_overlay(
+    # 抽出し直しても label_offer_images.py が付けた human_label は残す。
+    epp.save_json(palms, os.path.join(out_dirs['palms'], name + '.json'))
+    overlay = skeleton_drawing.draw_skeleton_overlay(
         color, person_joints_2d, offered_side=palms['offered_hand'])
     cv2.imwrite(os.path.join(out_dirs['images'], name + '.png'), overlay)
 
@@ -333,10 +346,11 @@ def main():
             '(既定 0.1、message_filters.ApproximateTimeSynchronizer の '
             'slop と同じ意味)。')
     parser.add_argument(
-        '--sample-interval', type=float, default=2.5,
+        '--sample-interval', type=float, default=0.5,
         help='(--single-sample を付けないとき) 何秒おきにサンプリングして '
-            '保存するか (既定 2.5 秒)。判定器の結果には一切関係なく、'
-            '機械的にこの間隔でサンプリングする。')
+            '保存するか (既定 0.5 秒)。判定器の結果には一切関係なく、'
+            '機械的にこの間隔でサンプリングする。差し出して止めている '
+            '時間は 1〜2 秒程度のことが多く、2.5 秒おきでは取りこぼす。')
     parser.add_argument(
         '--single-sample', action='store_true',
         help='bag ごとに 1 フレームだけを代表として保存する '

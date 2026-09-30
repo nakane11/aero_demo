@@ -72,20 +72,30 @@ iter_skeleton_files = json_io.iter_json_files
 AXIS_BLEND_CHOICES = [0.0, 0.25, 0.5, 0.75, 1.0]
 FINGER_RAMP_UPPER_CHOICES = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 APPROACH_HEIGHT_SCALE_CHOICES = [0.0, 0.25, 0.5, 0.75, 1.0]
-SEPARATION_WEIGHT_CHOICES = [0.10, 0.15, 0.20, 0.25, 0.30]
+SEPARATION_WEIGHT_CHOICES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
 
 SIDES = ('R', 'L')
 
 
 def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
-    """(joint_positions, ground_truth_side) のリストを返す.
+    """人手ラベル付きサンプルのリストを返す.
 
     ``label_key`` (既定 ``human_label``、人手の正解ラベル) が掌 JSON に
     無いサンプルは、正解が無いので除外する (``offered_hand`` は自動推定値
     であって正解ではないため、フォールバックには使わない)。
+
+    掌 JSON に ``robot_position`` (``extract_skeletons_from_bag.py`` が
+    保存する、判定の基準にしたロボット手先の base_link 座標) があれば
+    それも返す。無ければ ``None`` (合成骨格向けの仮のロボット位置、
+    ``OfferedHandSelector._robot_position`` 参照)。
+
+    Returns
+    -------
+    list of (name, joint_positions, label, robot_position)
     """
     samples = []
     n_unlabeled = 0
+    n_no_robot = 0
     for skeleton_path in iter_skeleton_files(skeleton_dir):
         name = os.path.basename(skeleton_path)
         palm_path = os.path.join(palm_dir, name)
@@ -97,10 +107,21 @@ def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
             n_unlabeled += 1
             continue
         joint_positions = load_skeleton_json(skeleton_path)
-        samples.append((name, joint_positions, palm_data[label_key]))
+        robot_position = palm_data.get('robot_position')
+        if robot_position is None:
+            n_no_robot += 1
+        samples.append((name, joint_positions, palm_data[label_key],
+                        robot_position))
     if n_unlabeled:
         print('{} 件は "{}" が無いため除外しました (label_offer_images.py '
               'で人手ラベルを付けてください)。'.format(n_unlabeled, label_key))
+    if n_no_robot:
+        print('{} 件は掌 JSON に robot_position が無いため、合成骨格向けの '
+              '仮のロボット位置 (人物の +x {} m・高さ {} m) で評価します '
+              '(実カメラのデータなら extract_skeletons_from_bag.py で抽出し '
+              '直してください)。'.format(
+                  n_no_robot, epp.ROBOT_FORWARD_DISTANCE,
+                  epp.ROBOT_HAND_HEIGHT))
     return samples
 
 
@@ -109,12 +130,14 @@ def precompute_palms(samples):
     事前計算してキャッシュする (探索中に毎回re計算しなくて済むように)。"""
     plain_estimator = epp.PalmPoseEstimator.__new__(epp.PalmPoseEstimator)
     cache = []
-    for name, joint_positions, label in samples:
+    for name, joint_positions, label, robot_position in samples:
         joints = {n: np.asarray(p, dtype=np.float64)
                  for n, p in joint_positions.items()}
         palms = {side: plain_estimator._estimate_one(joints, side)
                 for side in SIDES}
-        cache.append((name, joints, palms, label))
+        if robot_position is not None:
+            robot_position = np.asarray(robot_position, dtype=np.float64)
+        cache.append((name, joints, palms, label, robot_position))
     return cache
 
 
@@ -145,7 +168,10 @@ def scores_for_params(cache, params):
     kwargs = _selector_kwargs(params)
     selector = epp.OfferedHandSelector(**kwargs)
     out = []
-    for name, joints, palms, label in cache:
+    for name, joints, palms, label, robot_position in cache:
+        # サンプルごとに、抽出時に判定の基準にしたロボット手先の位置へ
+        # 差し替える (None なら合成骨格向けの仮の位置)。
+        selector.robot_position = robot_position
         body = epp._body_frame(joints)
         if body is None:
             out.append((label, {'R': None, 'L': None}))
@@ -254,8 +280,10 @@ def main():
     cache = precompute_palms(samples)
 
     # 参考: 現行デフォルトの精度。
-    default_params = dict(axis_blend=0.0, finger_ramp_upper=0.90,
-                          approach_height_scale=1.0, separation_weight=0.10)
+    default_params = dict(
+        axis_blend=0.0, finger_ramp_upper=epp.FINGER_TO_ROBOT_RAMP[1],
+        approach_height_scale=1.0,
+        separation_weight=epp.OFFER_FEATURE_WEIGHTS['separation'])
     default_acc, default_thresh, default_confusion = evaluate(
         cache, default_params)
     print('--- 既定パラメータ ---')

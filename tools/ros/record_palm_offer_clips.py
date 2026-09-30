@@ -28,6 +28,11 @@ lookup_frame_position``) -- はすべて ``run_camera_pipeline_test.py`` と
 のトピック名がこのノードの録画対象と一致しているため、``rosbag play`` が
 再生したトピックをそのまま subscribe できる)。
 
+今の判定器が差し出しを認識できたときにしか保存しないので、「差し出したのに
+認識されなかった」場面はこのノードでは集まらない。見逃しを調べるときは、
+判定器に依存しない ``rosbag record`` で連続録画し、``extract_skeletons_
+from_bag.py`` で抽出する (``docs/dev_tools.md`` 参照)。
+
 Usage
 -----
     python3 tools/ros/record_palm_offer_clips.py
@@ -214,12 +219,17 @@ class PalmOfferClipRecorder(object):
             max_distance=max_distance)
         self.palm_estimator = epp.PalmPoseEstimator(offered_hand_selector)
 
+        # camera_info は同期に含めず最新の 1 つだけ持つ (run_camera_
+        # pipeline_test.py と同じ理由: 画像の転送が遅れると、同じ時刻の
+        # camera_info が queue_size 分の履歴から押し出されて組ができず、
+        # _on_frame がほとんど呼ばれなくなる)。
+        self._latest_camera_info = None
+        rospy.Subscriber(args.camera_info_topic, CameraInfo,
+                         self._on_camera_info, queue_size=1)
         color_sub = message_filters.Subscriber(args.color_topic, Image)
         depth_sub = message_filters.Subscriber(args.depth_topic, Image)
-        info_sub = message_filters.Subscriber(
-            args.camera_info_topic, CameraInfo)
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub, info_sub], queue_size=5, slop=0.1)
+            [color_sub, depth_sub], queue_size=5, slop=0.1)
         self.sync.registerCallback(self._on_frame)
 
         rospy.Subscriber(_TF_TOPIC, TFMessage, self._on_tf, queue_size=50)
@@ -351,7 +361,16 @@ class PalmOfferClipRecorder(object):
     # ------------------------------------------------------------------
     # callbacks
     # ------------------------------------------------------------------
-    def _on_frame(self, color_msg, depth_msg, info_msg):
+    def _on_camera_info(self, msg):
+        self._latest_camera_info = msg
+
+    def _on_frame(self, color_msg, depth_msg):
+        info_msg = self._latest_camera_info
+        if info_msg is None:
+            rospy.logwarn_throttle(
+                5.0, '[record-palm-offer-clips] {} をまだ受信していないため、'
+                '画像を処理しません。'.format(self.args.camera_info_topic))
+            return
         t = rospy.Time.now().to_sec()
         with self._lock:
             self._buffer_append(self.args.color_topic, t, color_msg)

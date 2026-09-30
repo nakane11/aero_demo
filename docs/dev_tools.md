@@ -154,10 +154,27 @@ python3 tools/ros/print_palm_positions.py
 (`estimate_palm_poses.OfferedHandSelector`) の精度を上げるための、
 データ収集 → ラベル付け → チューニングの一連の流れで使う。
 
+### 0. 連続録画
+
+`tools/ros/record_palm_offer_clips.py` は今の判定器が認識できた差し出し
+しか保存しないので、認識されなかった場面を集めるときは `rosbag record`
+で判定器に依存せず連続録画する (トピック名は `run_camera_pipeline_test.py`
+の既定値)。
+
+```bash
+rosbag record -O session1.bag \
+    /camera/color/image_raw/decompressed \
+    /camera/depth/image_raw/decompressed \
+    /camera/color/camera_info /tf /tf_static
+```
+
+`/tf_static` は latched なので、ロボット側が起動済みでも録画開始時に
+受け取れる。
+
 ### 1. `tools/ros/extract_skeletons_from_bag.py`
 
-判定器に依存しない生の rosbag (`rosbag record` で連続録画したもの) を
-読み込み、`--sample-interval` 秒おきに骨格・掌位置姿勢・骨格重畳画像を
+判定器に依存しない生の rosbag (上の連続録画) を読み込み、
+`--sample-interval` 秒 (既定 0.5) おきに骨格・掌位置姿勢・骨格重畳画像を
 機械的にサンプリングして保存するオフライン抽出ツール (roscore 不要)。
 `tools/ros/record_palm_offer_clips.py` が切り出した判定済みクリップを
 `--single-sample` で混ぜることもできる。
@@ -169,7 +186,10 @@ python3 tools/ros/extract_skeletons_from_bag.py \
 
 保存先には `skeletons/`/`palms/`/`images/` の 3 サブディレクトリができる
 (`skeletons/`/`palms/` はそれぞれ `estimate_palm_poses.py`/
-`tune_offer_selector.py` の入力形式と互換)。
+`tune_offer_selector.py` の入力形式と互換)。掌 JSON には判定の基準にした
+ロボット手先の位置 (`robot_position`, TF の `r_eef_grasp_link`) も保存し、
+`tune_offer_selector.py` はそれを使ってスコアを計算し直す。抽出し直しても
+付けた `human_label` は残る。
 
 ### 2. `tools/label_offer_images.py`
 

@@ -239,6 +239,12 @@ python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 同じ差し出し動作を 2 回に分けて録らないよう、1 クリップ保存後
 `--cooldown-seconds` 秒 (既定 3.0) は次のトリガーを無視する。
 
+このノードは今の判定器が認識できた差し出ししか保存しないので、「差し出した
+のに認識されなかった」場面を集めるには使えない。その場合は `rosbag record`
+で連続録画してから `tools/ros/extract_skeletons_from_bag.py` で抽出する
+([`docs/dev_tools.md`](docs/dev_tools.md) の「実カメラデータの収集・
+ラベル付け」参照)。
+
 保存されるファイルはクリップごとに 3 つ:
 
 ```
