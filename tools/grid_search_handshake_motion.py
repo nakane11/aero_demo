@@ -558,6 +558,7 @@ def main():
     spik.restrict_leg_range(robot)
     spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
+    spik.apply_hand_box(robot)
     # 事後検証 (verify_waypoints) の総当たりペアはロボット構造だけで決まり
     # グリッドパラメータに依存しないので1回だけ作る (plan_handshake_motion.
     # main と同じ。'r' はプレースホルダで結果に影響しない)。

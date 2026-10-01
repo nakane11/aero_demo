@@ -131,9 +131,11 @@ DEFAULT_DT = 0.2
 DEFAULT_MAX_ITERATIONS = 60
 
 # 人体障害物との干渉コストが働き始める距離 [m] / 自己干渉のそれ [m]。
-# solve_palm_ik.py の DEFAULT_COLLISION_MARGIN/DEFAULT_SELF_COLLISION_
-# MARGIN と揃えてある。
-DEFAULT_COLLISION_ACTIVATION_DISTANCE = spik.DEFAULT_COLLISION_MARGIN
+# 干渉コストは「この距離より近づいた分」に比例するソフトなコスト (制約
+# ではない)。人体は事後検証 (DEFAULT_HUMAN_CLEARANCE) と同じ値にそろえて
+# いる (+2 cm の余裕を足しても合成人物 25 人の結果は同じだった)。自己干渉は
+# solve_palm_ik.py の DEFAULT_SELF_COLLISION_MARGIN と揃えてある。
+DEFAULT_COLLISION_ACTIVATION_DISTANCE = spik.DEFAULT_HOVER_HUMAN_CLEARANCE
 DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE = (
     spik.DEFAULT_SELF_COLLISION_MARGIN)
 
@@ -156,8 +158,11 @@ INITIAL_BASE_POSE = (0.0, 0.0, 0.0)
 # 経路の膨らみ (初期位置 -> 目標位置の線分からの最大距離の平均) が 0.40 ->
 # 0.25 m、横向きの移動が 0.59 -> 0.34 m に減ったため 0.2 m にした。0 m に
 # するとさらに減る (0.15/0.17 m) が、向きの変化が人の手の近くの短い円弧に
-# 詰め込まれる (2026-09-25)。
-DEFAULT_APPROACH_DISTANCE = 0.2  # [m]
+# 詰め込まれる (2026-09-25)。人体全体から 6 cm 離す検証にしてからは、人の
+# 背後から回り込む配置で接近開始位置が人の真横 (立ち位置から約 0.65 m) に
+# 来て台車が脛に触れる人がいたため 0.3 m にした (合成人物 25 人で軌道が
+# 通る人 21 -> 23 人、経路の膨らみ 0.13 -> 0.18 m、2026-10-01)。
+DEFAULT_APPROACH_DISTANCE = 0.3  # [m]
 
 # 初期位置の方が人間に近く、接近開始位置を縮めた結果がこれ未満になった
 # ら、接近開始位置を置かずに初期位置から直接計画する [m]。
@@ -201,11 +206,20 @@ DEFAULT_PRETOUCH_IK_STOP = 50
 DEFAULT_PRETOUCH_IK_THRE = 0.01  # [m]
 DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 
-# 経路上の waypoint の事後検証で許容する最大貫通量 [m]。solve_palm_ik.py
-# 自身の最終姿勢の判定 (``DEFAULT_COLLISION_VERIFY_TOLERANCE`` = 1 mm) は
-# 「実際に人間に触れる/押し付ける」姿勢そのものの判定なので厳しいが、
-# 経路上の通過点はそこまで厳密でなくてよいとして 1 cm まで許容する。
-DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = 0.01  # [m]
+# 経路上の waypoint の事後検証 (自己干渉の組の貫通) で許容する最大貫通量
+# [m]。solve_palm_ik.py の IK の事後検証と同じ 0 (少しでも貫通したら
+# 不合格)。人体とは貫通ではなく DEFAULT_HUMAN_CLEARANCE 離れていることを
+# 見る (``verify_human_clearance``、solve_palm_ik.self_collision_pairs 参照)。
+DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
+    spik.DEFAULT_COLLISION_VERIFY_TOLERANCE)  # [m]
+
+# 押し込みの前 (lead-in・接近軌道・hover 姿勢) に、ロボット (事後検証の
+# モデル、既定は指先を含む) と人体 (差し出された手も含む全身) の間に空ける
+# 距離 [m]。回り込みの途中で指先などが人に触れるのを防ぐ。hover 姿勢は
+# solve_palm_ik.py が同じ距離 (DEFAULT_HOVER_HUMAN_CLEARANCE) を満たす
+# 候補だけを採用しているので、最後の waypoint まで一律に要求できる
+# (``verify_human_clearance``)。
+DEFAULT_HUMAN_CLEARANCE = spik.DEFAULT_HOVER_HUMAN_CLEARANCE  # [m]
 
 # 接近区間のこの割合以降で、首を押し込み姿勢 (掌を向く視線) の角度へ
 # 補間する (blend_head_to_post_process 参照)。
@@ -588,21 +602,29 @@ def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
                    joint_positions, human_xy, obstacle_cache):
     """lead-in の waypoint のうち、台車が人間の立ち位置から
     ``LEAD_IN_CHECK_RADIUS`` 以内に入るものだけ ``verify_waypoints`` で
-    干渉を検証し、waypoint ごとの最小距離 (検証しなかったものは ``None``)
-    を返す。"""
+    干渉を、``verify_human_clearance`` で人体との距離 (差し出された手も
+    含む全身に ``DEFAULT_HUMAN_CLEARANCE``) を検証し、waypoint ごとの
+    最小距離と人体との距離の余裕のリストの組 (検証しなかったものは
+    ``None``) を返す。"""
     near = [i for i, wp in enumerate(lead_in)
             if math.hypot(wp['base_position'][0] - human_xy[0],
                           wp['base_position'][1] - human_xy[1])
             <= LEAD_IN_CHECK_RADIUS]
     distances = [None] * len(lead_in)
+    clearances = [None] * len(lead_in)
     if near:
+        near_waypoints = [lead_in[i] for i in near]
         checked = verify_waypoints(
-            robot, joint_names, [lead_in[i] for i in near],
+            robot, joint_names, near_waypoints,
             verification_pairs, joint_positions,
             obstacle_cache=obstacle_cache)
-        for i, d in zip(near, checked):
+        checked_clearances = verify_human_clearance(
+            robot, joint_names, near_waypoints, verification_pairs,
+            obstacle_cache)
+        for i, d, c in zip(near, checked, checked_clearances):
             distances[i] = float(d)
-    return distances
+            clearances[i] = float(c)
+    return distances, clearances
 
 
 def unwrap_start_yaw(base_start, base_goal):
@@ -703,16 +725,17 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
     problem.add_smoothness_cost(weight=smoothness_weight)
     problem.add_acceleration_cost(weight=acceleration_weight)
     problem.add_joint_limit_constraint()
+    # add_collision_cost が内部で collision_link_list の各リンクの
+    # link.collision_primitive (apply_collision_model が差し替えた
+    # box/cylinder/sphere, solve_palm_ik.py と全く同じ形状) から
+    # problem.collision_primitives を組み立てる (モジュール docstring
+    # 参照)。手のリンクは solve_palm_ik.apply_hand_box で指まで覆う箱に
+    # なっている。add_self_collision_cost はその結果を直後に参照する。
     problem.add_collision_cost(
         collision_link_list, world_obstacles,
         weight=collision_weight,
         activation_distance=collision_activation_distance,
         as_constraint=True)
-    # add_collision_cost が内部で collision_link_list の各リンクの
-    # link.collision_primitive (apply_collision_model が差し替えた
-    # box/cylinder/sphere, solve_palm_ik.py と全く同じ形状) から
-    # problem.collision_primitives を組み立てる (モジュール docstring
-    # 参照)。add_self_collision_cost はその結果を直後に参照する。
     problem.add_self_collision_cost(
         weight=self_collision_weight,
         activation_distance=self_collision_activation_distance,
@@ -876,11 +899,31 @@ def build_obstacle_cache(joint_positions):
     return obstacle_links, obstacle_samples
 
 
+_SELF_PAIRS_CACHE = {}
+
+
+def _self_pairs_cached(verification_pairs):
+    # 自己干渉の組の部分集合は verification_pairs ごとに 1 回だけ作る
+    # (VerificationPairs は組ごとの計算計画を自分に持つので、毎回作り直すと
+    # それも作り直しになる)。
+    if verification_pairs is None:
+        return None
+    key = id(verification_pairs)
+    cached = _SELF_PAIRS_CACHE.get(key)
+    if cached is None or cached[0] is not verification_pairs:
+        cached = (verification_pairs,
+                  spik.self_collision_pairs(verification_pairs))
+        _SELF_PAIRS_CACHE[key] = cached
+    return cached[1]
+
+
 def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
                      joint_positions, obstacle_cache=None, robot_arm=None):
     """各 waypoint を ``robot`` に反映し、厳密な形状による事後検証
     (``solve_palm_ik.collision_pairs_min_distance``。IK 側の事後検証と
-    同じ関数) で最小距離を計測する。
+    同じ関数) で、``verification_pairs`` のうち自己干渉の組 (``solve_palm_
+    ik.self_collision_pairs``) の最小距離を計測する。人体とは貫通ではなく
+    離れている量を ``verify_human_clearance`` で見る。
 
     ``robot_arm`` を渡すと、差し出さない手の指先と台車の箱の距離
     (``solve_palm_ik.other_hand_base_clearance``。事後検証は指なしの
@@ -907,6 +950,7 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
     else:
         obstacle_links, obstacle_samples = build_obstacle_cache(
             joint_positions)
+    verification_pairs = _self_pairs_cached(verification_pairs)
     distances = []
     for wp in waypoints:
         name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
@@ -923,6 +967,59 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
             dist = min(dist, spik.other_hand_base_clearance(robot, robot_arm))
         distances.append(dist)
     return distances
+
+
+def _apply_waypoint(robot, joint_names, wp):
+    name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
+    for joint in robot.joint_list:
+        if joint.name in name_to_angle:
+            joint.joint_angle(name_to_angle[joint.name])
+    robot.newcoords(Coordinates(
+        pos=wp['base_position'],
+        rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
+
+
+def verify_human_clearance(robot, joint_names, waypoints, verification_pairs,
+                           obstacle_cache):
+    """各 waypoint で、``verification_pairs`` のモデル (既定は指あり) と
+    人体 (全身) の最短距離 (``solve_palm_ik.human_obstacle_clearances``)
+    から ``DEFAULT_HUMAN_CLEARANCE`` を引いた余裕 [m] を求め、waypoint
+    ごとのリストで返す (0 以上なら通過。人体の障害物が無ければ ``inf``)。
+
+    貫通は ``verify_waypoints`` で別に見る (こちらは離れている量の判定)。
+    """
+    obstacle_links = obstacle_cache[0]
+    if not obstacle_links or not waypoints:
+        return [float('inf')] * len(waypoints)
+    # --collision-verify-model mixed (既定) なら指ありモデルで測る。
+    verification_pairs = spik.human_clearance_pairs(verification_pairs)
+    margins = []
+    for wp in waypoints:
+        _apply_waypoint(robot, joint_names, wp)
+        per_obstacle = spik.human_obstacle_clearances(
+            robot, verification_pairs, obstacle_links,
+            cull_distance=DEFAULT_HUMAN_CLEARANCE)
+        margins.append(min(per_obstacle.values(), default=float('inf'))
+                       - DEFAULT_HUMAN_CLEARANCE)
+    return margins
+
+
+def motion_passes(distances, clearance_margins):
+    """貫通の許容量 (``DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE``) と人体
+    との距離 (``verify_human_clearance`` の余裕が 0 以上) の両方を満たすか。
+    ``None`` (検証しなかった waypoint) は無視する。"""
+    return (all(d is None or d >= -DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE
+                for d in distances)
+            and all(c is None or c >= 0.0 for c in clearance_margins))
+
+
+def motion_margin(candidate):
+    """未通過の候補の比較用: 貫通の許容量・人体との距離のうち、より
+    足りていない方の余裕 [m] (大きいほど良い、0 以上なら通過)。"""
+    return min(
+        min(candidate['waypoint_min_distances'])
+        + DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
+        min(candidate['waypoint_human_clearance_margins']))
 
 
 def not_planned_result(reason):
@@ -968,11 +1065,13 @@ def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
     [posture]`` に差し替えた IK 結果のコピーを返す (IK は解き直さない。
     ``solve_palm_ik.pick_verified_candidate`` と同じ差し替え)。
 
-    ``pick_verified_candidate`` と同じく、hover 姿勢を ``verification_
-    pairs`` で、押し込み姿勢 (``post_process``) を自己干渉の組だけで
-    検証し直し、どちらかが貫通していれば ``None`` を返す。
+    ``pick_verified_candidate`` と同じく、hover 姿勢・押し込み姿勢
+    (``post_process``) の自己干渉の組の貫通と、hover 姿勢で人体から
+    ``DEFAULT_HUMAN_CLEARANCE`` 離れていることを検証し直し、満たさなければ
+    ``None`` を返す。
     """
     tolerance = spik.DEFAULT_COLLISION_VERIFY_TOLERANCE
+    self_pairs = _self_pairs_cached(verification_pairs)
     new = copy.deepcopy(handshake)
 
     def apply(result):
@@ -991,15 +1090,19 @@ def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
 
     apply(new)
     if spik.collision_pairs_min_distance(
-            robot, verification_pairs, joint_positions) < -tolerance:
+            robot, self_pairs, joint_positions) < -tolerance:
         return None
+    if joint_positions:
+        clearances = spik.human_obstacle_clearances(
+            robot, spik.human_clearance_pairs(verification_pairs),
+            spik.human_body_obstacles(joint_positions),
+            cull_distance=DEFAULT_HUMAN_CLEARANCE)
+        if min(clearances.values(), default=float('inf')) \
+                < DEFAULT_HUMAN_CLEARANCE:
+            return None
     post = new.get('post_process')
     if post is not None:
         apply(post)
-        self_pairs = [pair for pair in verification_pairs
-                      if not isinstance(pair[1], int)]
-        if isinstance(verification_pairs, spik.VerificationPairs):
-            self_pairs = verification_pairs.with_pairs(self_pairs)
         if spik.collision_pairs_min_distance(
                 robot, self_pairs, joint_positions) < -tolerance:
             return None
@@ -1080,9 +1183,13 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     初期位置からそこまでの直進 (lead-in, ``build_lead_in_waypoints``) は
     最適化せず、人間の近く (``LEAD_IN_CHECK_RADIUS`` 以内) の waypoint
     だけ干渉を検証して、結果の ``lead_in_waypoints``/``lead_in_min_
-    distances`` (検証しなかった waypoint は ``None``)/``lead_in_verified``
-    に入れる。``verified``/``waypoint_min_distances`` は従来通り接近開始
-    位置から先の軌道 (``waypoints``) だけの結果。
+    distances``/``lead_in_human_clearance_margins`` (検証しなかった
+    waypoint は ``None``)/``lead_in_verified`` に入れる。``verified``/
+    ``waypoint_min_distances``/``waypoint_human_clearance_margins`` は
+    従来通り接近開始位置から先の軌道 (``waypoints``) だけの結果。どちらも、
+    貫通の許容量に加えて人体との距離 (``verify_human_clearance``、
+    ``DEFAULT_HUMAN_CLEARANCE`` 参照) を満たすときだけ通過とする
+    (``motion_passes``)。
 
     ロボットが人の背後・横にいて回り込む必要がある配置に対応するため、
     上記の位置 (角度 0) で lead-in かその先の軌道 (下記の最適化込み) が
@@ -1157,13 +1264,11 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         joint_names = [j.name for j in robot.joint_list]
         lead_in = build_lead_in_waypoints(
             initial_base_pose, first_waypoint, joint_names)
-        distances = verify_lead_in(
+        distances, clearances = verify_lead_in(
             robot, joint_names, lead_in, verification_pairs,
             joint_positions, human_xy, obstacle_cache)
-        verified = all(
-            d is None or d >= -DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE
-            for d in distances)
-        return lead_in, distances, verified
+        verified = motion_passes(distances, clearances)
+        return lead_in, distances, clearances, verified
 
     # まず角度 0 の候補 (従来の接近開始位置) で、従来と全く同じ計画
     # (最適化込み) を行う。lead-in・その先の軌道の両方が通れば、それを
@@ -1172,7 +1277,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     zero, others = candidates[0], candidates[1:]
     zero_lead_in = check_lead_in(zero[1])
     zero_motion = None
-    if zero_lead_in[2]:
+    if zero_lead_in[-1]:
         zero_motion = _plan_from_start(
             robot, robot_arm, handshake, joint_positions, zero[1], args,
             verification_pairs, solver, obstacle_cache, orbit=orbit)
@@ -1190,7 +1295,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         for candidate in others:
             n_tried += 1
             lead_in_check = check_lead_in(candidate[1])
-            if not lead_in_check[2]:
+            if not lead_in_check[-1]:
                 continue
             if first_lead_in_ok is None:
                 first_lead_in_ok = (candidate, lead_in_check)
@@ -1217,7 +1322,8 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
                     args, verification_pairs, solver, obstacle_cache, orbit=orbit)
             best = (zero, zero_lead_in, zero_motion)
 
-    (angle, _), (lead_in, lead_in_distances, lead_in_verified), motion = best
+    ((angle, _), (lead_in, lead_in_distances, lead_in_clearances,
+                  lead_in_verified), motion) = best
     motion['head_gaze_blended'] = blend_head_to_post_process(
         robot, motion, handshake)
     motion['approach_distance'] = approach_distance
@@ -1225,6 +1331,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     motion['approach_candidates_tried'] = n_tried
     motion['lead_in_waypoints'] = lead_in
     motion['lead_in_min_distances'] = lead_in_distances
+    motion['lead_in_human_clearance_margins'] = lead_in_clearances
     motion['lead_in_verified'] = lead_in_verified
     motion['compute_time'] = time.time() - start_time
     return motion
@@ -1304,11 +1411,14 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             robot, joint_names, waypoints, verification_pairs,
             joint_positions, obstacle_cache=obstacle_cache,
             robot_arm=robot_arm)
+        clearances = verify_human_clearance(
+            robot, joint_names, waypoints, verification_pairs,
+            obstacle_cache)
         return dict(
             planned=True,
             kind=kind,
             optimized=kind == 'optimized',
-            verified=min(distances) >= -DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
+            verified=motion_passes(distances, clearances),
             attempt=attempt,
             cost=cost,
             n_waypoints=args.n_waypoints,
@@ -1317,19 +1427,41 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             joint_names=joint_names,
             waypoints=waypoints,
             waypoint_min_distances=[float(d) for d in distances],
+            waypoint_human_clearance_margins=[float(c) for c in clearances],
             solve_time=solve_time,
         )
+
+    # 試した候補ごとの合否 (結果の candidates_tried、どの候補がなぜ落ちたか
+    # を後から調べるため)。
+    tried = []
+
+    def record(candidate):
+        dists = candidate['waypoint_min_distances']
+        margins = candidate['waypoint_human_clearance_margins']
+        tried.append(dict(
+            kind=candidate['kind'], attempt=candidate['attempt'],
+            verified=candidate['verified'],
+            min_distance=float(min(dists)),
+            min_distance_waypoint=int(np.argmin(dists)),
+            human_clearance_margin=float(min(margins)),
+            human_clearance_waypoint=int(np.argmin(margins))))
+        candidate['candidates_tried'] = tried
+        candidate['pretouch_status'] = pretouch_status
+        return candidate
 
     initial_traj = build_initial_trajectory(
         q_start, base_start, q_goal, base_goal, args.n_waypoints,
         orbit=orbit)
     candidates = []
     normal = palm_normal_direction(handshake, joint_positions)
+    pretouch_status = 'no_palm_normal'
     if normal is not None:
         q_pre = solve_pretouch_pose(
             robot, robot_arm, link_list, joint_list, handshake, q_goal,
             base_goal, normal, DEFAULT_PRETOUCH_STANDOFF)
+        pretouch_status = 'ik_failed'
         if q_pre is not None:
+            pretouch_status = 'built'
             candidates.append(('pretouch', build_pretouch_trajectory(
                 q_start, base_start, q_pre, q_goal, base_goal,
                 args.n_waypoints, DEFAULT_PRETOUCH_SPLIT, orbit=orbit)))
@@ -1339,11 +1471,10 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     best = None
     best_trajectory = None
     for kind, trajectory in candidates:
-        candidate = make_candidate(trajectory, kind)
+        candidate = record(make_candidate(trajectory, kind))
         if candidate['verified'] and not force_optimize:
             return candidate
-        if best is None or (min(candidate['waypoint_min_distances'])
-                            > min(best['waypoint_min_distances'])):
+        if best is None or motion_margin(candidate) > motion_margin(best):
             best = candidate
             best_trajectory = trajectory
         if candidate['verified']:
@@ -1365,12 +1496,15 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     for joint, angle in zip(joint_list, q_start):
         joint.joint_angle(float(angle))
 
+    # 人体 (全身) から離す距離は活性化距離 (DEFAULT_COLLISION_ACTIVATION_
+    # DISTANCE、事後検証の DEFAULT_HUMAN_CLEARANCE + 余裕) だけで表す。
     world_obstacles = human_body_cylinder_obstacles(joint_positions)
     collision_link_list = spik.collision_link_list_for_arm(robot, robot_arm)
     problem = build_problem(
         robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
         world_obstacles, collision_link_list,
-        DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+        getattr(args, 'collision_activation_distance',
+                DEFAULT_COLLISION_ACTIVATION_DISTANCE),
         DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
         DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
         collision_weight=100.0,
@@ -1396,14 +1530,13 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
                 0.3)
         solve_start = time.time()
         result = solver.solve(problem, warm_start)
-        candidate = make_candidate(
+        candidate = record(make_candidate(
             result.trajectory, 'optimized', attempt, float(result.cost),
-            time.time() - solve_start)
+            time.time() - solve_start))
         if candidate['verified']:
             best = candidate
             break
-        if (min(candidate['waypoint_min_distances'])
-                > min(best['waypoint_min_distances'])):
+        if motion_margin(candidate) > motion_margin(best):
             best = candidate
     return best
 
@@ -1445,7 +1578,8 @@ def _warmup_solver(robot, solver, args):
         problem = build_problem(
             robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
             world_obstacles, collision_link_list,
-            DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+            getattr(args, 'collision_activation_distance',
+                    DEFAULT_COLLISION_ACTIVATION_DISTANCE),
             DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
             DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
             collision_weight=100.0, self_collision_weight=100.0)
@@ -1528,6 +1662,18 @@ def main():
             'する)。スキップすると、人物ループ中に初めてその腕を最適化 '
             'する人物がトレース/コンパイルを肩代わりして突出して遅く '
             'なる。')
+    parser.add_argument(
+        '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
+        default=spik.DEFAULT_COLLISION_VERIFY_MODEL,
+        help='経路上の waypoint の事後検証に使うモデル (solve_palm_ik.py の '
+            '--collision-verify-model と同じ意味)。mixed (既定) は自己干渉を '
+            '最適化と同じ指なし+手の箱、人体との距離を指ありで判定。nohand は'
+            '両方とも箱、hand は両方とも指あり。')
+    parser.add_argument(
+        '--collision-activation-distance', type=float,
+        default=DEFAULT_COLLISION_ACTIVATION_DISTANCE,
+        help='軌道最適化で人体との干渉コストが働き始める距離 [m] (既定 {})。'
+            .format(DEFAULT_COLLISION_ACTIVATION_DISTANCE))
     args = parser.parse_args()
 
     files = json_io.iter_json_files(args.input_dir)
@@ -1542,11 +1688,16 @@ def main():
     spik.restrict_leg_range(robot)
     spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
+    spik.apply_hand_box(robot)
     # 事後検証 (verify_waypoints) の総当たりペアは、ロボットの構造だけで
     # 決まり人物ごとの姿勢に依存しないので人物ループの外で 1 回だけ作る
     # (solve_palm_ik.py の main と同じ理由。robot_arm 引数は結果に
-    # 影響しないプレースホルダ)。
-    verification_pairs = spik.build_collision_verification_pairs(robot, 'r')
+    # 影響しないプレースホルダ)。--collision-verify-model hand (既定) なら
+    # 指ありのモデルで指先まで含めて検証する (最適化は指なしのまま)。
+    verification_pairs = spik.build_verification_pairs_for_model(
+        robot, args.collision_verify_model)
+    print('[collision-verify] 軌道の事後検証は {} モデルの {} 組で行います。'
+          .format(args.collision_verify_model, len(verification_pairs)))
     # jaxls ソルバーも人物ループの外で 1 個だけ作って使い回す。人物・試行
     # ごとに作り直すと JaxlsSolver の JIT キャッシュ (_cached_problem) が
     # 3 回の motion-attempts リトライの間しか効かず、次の人物では毎回

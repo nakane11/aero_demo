@@ -485,6 +485,8 @@ class HandshakePipelineNode(object):
         spik.restrict_leg_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
+        # 手のリンクを指まで覆う箱にする (IK・軌道最適化で共通)。
+        spik.apply_hand_box(self.robot)
         # 差し出さない腕の姿勢の差し替えに使う指の点群を先に作っておく
         # (spik.other_hand_points、指ありモデルの読み込みに約 1 秒)。
         spik.other_hand_points('r')
@@ -511,15 +513,12 @@ class HandshakePipelineNode(object):
         # verify_waypoints) の総当たりペアは、ロボットの構造だけで決まり
         # --collision-pairs (最適化用に絞り込んだ組み合わせ) の有無に
         # よらず必要 (plan_handshake_motion.main と同じ理由) なので、
-        # 常に作る。IK の事後検証は --collision-verify-model (既定は指なし。
-        # 差し出さない手の指先と台車の干渉は腕の姿勢の差し替えで避ける --
-        # spik.select_other_arm_posture)、軌道の waypoint の検証は waypoint
-        # 数だけ繰り返すため常に指なし (指ありにすると 1 姿勢あたり約 30 ms
-        # 増える)。
+        # 常に作る。IK・軌道の waypoint のどちらの事後検証も
+        # --collision-verify-model (既定 mixed: 自己干渉は IK・軌道最適化と
+        # 同じ指なし+手の箱、人体との距離は指あり) のモデルで行う。
         self.verification_pairs = spik.build_verification_pairs_for_model(
             self.robot, args.collision_verify_model)
-        self.motion_verification_pairs = \
-            spik.build_collision_verification_pairs(self.robot, 'r')
+        self.motion_verification_pairs = self.verification_pairs
         # jaxls ソルバーも同じ理由 (plan_handshake_motion.main 参照) で
         # ノードの寿命で 1 個だけ作って使い回す (人物/試行ごとに作り直すと
         # JIT キャッシュが効かない)。
@@ -1626,8 +1625,8 @@ class HandshakePipelineNode(object):
         で、``colliding_link_pairs`` による事後検証をやり直し、結果の文字列
         (``_update_status_text`` が表示する) を ``self._collision_pairs_text``
         に保存する。IK の探索自体は指なしで行っているため、この検証は表示
-        用の別チェックであり ``motion['waypoint_min_distances']`` (指なしで
-        の判定) を上書きするものではない。
+        用の別チェックであり ``motion['waypoint_min_distances']`` (計画時の
+        判定) を上書きするものではない。
 
         人体側は ``self._current_obstacle_links`` (``_update_skeleton_view``
         が画面に表示している、まさにその半透明 Cylinder) をそのまま渡すので、
@@ -2890,10 +2889,18 @@ class HandshakePipelineNode(object):
                     'OK' if motion.get('lead_in_verified', True)
                     else 'NG (人間の近くで干渉あり)')
                 waypoint_index = int(self.waypoint_slider.value)
-                content += ('\n\n**軌道:** {} / 計画時 (指なし) の検証: {} / '
+                model_label = (
+                    '指あり' if getattr(
+                        self.motion_verification_pairs, 'model', None)
+                    is not None
+                    else '箱+人体距離は指あり' if getattr(
+                        self.motion_verification_pairs, 'clearance_pairs',
+                        None)
+                    else '指なし+手の箱')
+                content += ('\n\n**軌道:** {} / 計画時 ({}) の検証: {} / '
                            '初期位置からの直進の検証: {}\n\n'
                            'waypoint {}/{}'.format(
-                               kind, verified_text, lead_in_text,
+                               kind, model_label, verified_text, lead_in_text,
                                waypoint_index, self.waypoint_slider.max))
                 if waypoint_index < n_prepend:
                     lead_in_dists = motion.get('lead_in_min_distances', [])
@@ -2903,21 +2910,22 @@ class HandshakePipelineNode(object):
                         ' (初期位置から接近開始位置への直進、人間から離れて'
                         'いるため干渉検証の対象外)' if dist is None
                         else ' (初期位置から接近開始位置への直進、計画時 '
-                             '(指なし) の干渉余裕: {:+.4f} m)'.format(dist))
+                             '({}) の干渉余裕: {:+.4f} m)'.format(
+                                 model_label, dist))
                 elif waypoint_index < n_prepend + n_approach:
                     dist = motion['waypoint_min_distances'][
                         waypoint_index - n_prepend]
-                    content += (' (この waypoint の計画時 (指なし) の干渉'
-                               '余裕: {:+.4f} m)'.format(dist))
+                    content += (' (この waypoint の計画時 ({}) の干渉'
+                               '余裕: {:+.4f} m)'.format(model_label, dist))
                 else:
                     content += (' (掌への押し込み、経路計画の干渉検証の対象外)')
             else:
                 content += ('\n\n**軌道:** 計画なし ({})'.format(
                     'IK 失敗' if not result['solved'] else '計算中'))
-        # 干渉しているかどうかの結論は、上の計画時 (指なし) の干渉余裕では
-        # なく下の事後検証で出す -- 経路計画・IK は指なしロボットで解いて
-        # いる (self.verification_pairs/motion の waypoint_min_distances)
-        # ため、指先や表示専用フレーム (初期位置からの移動/掌への押し込み)
+        # 干渉しているかどうかの結論は、上の計画時の干渉余裕ではなく下の
+        # 事後検証で出す -- 計画時の検証 (self.verification_pairs/motion の
+        # waypoint_min_distances) は計画した waypoint だけが対象なので、
+        # 表示専用フレーム (初期位置からの移動/掌への押し込み)
         # を含む「いま画面に出ている姿勢が実際に貫通しているか」は、表示
         # 中の waypoint の姿勢に対して指ありで解き直した _refresh_collision
         # _pairs_text の結果だけが答えられる。両方に貫通の有無を書くと、
@@ -3161,10 +3169,10 @@ def main():
     parser.add_argument('--no-self-collision', action='store_true')
     parser.add_argument(
         '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
-        default='nohand',
-        help='IK の事後検証 (収束後の干渉チェック) に使うモデル '
+        default=spik.DEFAULT_COLLISION_VERIFY_MODEL,
+        help='IK と軌道の waypoint の事後検証 (干渉チェック) に使うモデル '
             '(solve_palm_ik.py の --collision-verify-model と同じ意味。既定 '
-            'nohand)。軌道の waypoint の検証は常に指なし。')
+            'mixed = 自己干渉は指なし+手の箱、人体との距離は指あり)。')
     parser.add_argument(
         '--collision-verify-tolerance', type=float,
         default=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE,

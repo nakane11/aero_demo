@@ -282,9 +282,11 @@ def main():
         help='solve_palm_ik.py に --facing-yaw-weight として渡す (既定は '
             '指定なし = solve_palm_ik.py の既定値)。')
     parser.add_argument(
-        '--collision-verify-model', choices=('nohand', 'hand'), default=None,
-        help='solve_palm_ik.py に --collision-verify-model として渡す (既定は '
-            '指定なし = solve_palm_ik.py の既定値)。')
+        '--collision-verify-model', choices=('mixed', 'nohand', 'hand'),
+        default=None,
+        help='solve_palm_ik.py と (--plan-motion 指定時) plan_handshake_'
+            'motion.py に --collision-verify-model として渡す (既定は指定なし '
+            '= 各スクリプトの既定値)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -364,6 +366,9 @@ def main():
                 str(v) for v in args.initial_base_pose]
         if args.approach_distance is not None:
             motion_args += ['--approach-distance', str(args.approach_distance)]
+        if args.collision_verify_model is not None:
+            motion_args += ['--collision-verify-model',
+                            args.collision_verify_model]
         motion_elapsed, motion_stdout = run_step(
             '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
