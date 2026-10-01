@@ -1593,22 +1593,6 @@ def link_surface_samples(link):
     return points
 
 
-def _points_into_link_depth(world_points, link, shape):
-    """ワールド座標の点群 ``world_points`` が ``link`` の凸形状 (``shape``
-    = ``link_collision_shape(link)``) に入り込んだ最大の深さ [m] を返す
-    (入り込んだ点が無ければ 0)。"""
-    (lo, hi), normals, offsets, _ = shape
-    local_pts = (world_points - link.worldpos()) @ link.worldrot()
-    inside_bbox = np.all((local_pts > lo) & (local_pts < hi), axis=1)
-    if not inside_bbox.any():
-        return 0.0
-    plane_dist = local_pts[inside_bbox] @ normals.T - offsets
-    inside = plane_dist.max(axis=1) < 0.0
-    if not inside.any():
-        return 0.0
-    return float(-plane_dist[inside].max(axis=1).min())
-
-
 def _obb_separated(link_a, link_b):
     """2 リンクの ``collision_mesh`` をそれぞれのローカル座標で包む直方体
     (``link_collision_shape`` の ``bounds``) 同士が、分離軸判定で離れて
@@ -1630,7 +1614,97 @@ def _obb_separated(link_a, link_b):
                        > extent_a + extent_b + 1e-9))
 
 
-def self_collision_depth(link_a, link_b, world_samples=None):
+def _obb_separated_batch(lo, hi, rots, positions, index_a, index_b):
+    """``_obb_separated`` を多数の組でまとめて判定する。``lo``/``hi`` は
+    リンクごとの ``link_collision_shape`` の ``bounds`` (``(L, 3)``)、
+    ``rots``/``positions`` はリンクごとのワールドの姿勢 (``(L, 3, 3)``/
+    ``(L, 3)``)、``index_a``/``index_b`` は組ごとのリンクの添字 (``(J,)``)。
+    組ごとの bool の配列 (``(J,)``) を返す。"""
+    rot_a, rot_b = rots[index_a], rots[index_b]
+    half_a = (hi[index_a] - lo[index_a]) / 2.0
+    half_b = (hi[index_b] - lo[index_b]) / 2.0
+    center_a = positions[index_a] + np.einsum(
+        'jmn,jn->jm', rot_a, (hi[index_a] + lo[index_a]) / 2.0)
+    center_b = positions[index_b] + np.einsum(
+        'jmn,jn->jm', rot_b, (hi[index_b] + lo[index_b]) / 2.0)
+    axes_a = rot_a.transpose(0, 2, 1)
+    axes_b = rot_b.transpose(0, 2, 1)
+    cross = np.cross(axes_a[:, :, np.newaxis, :],
+                     axes_b[:, np.newaxis, :, :]).reshape(-1, 9, 3)
+    axes = np.concatenate([axes_a, axes_b, cross], axis=1)
+    extent_a = np.einsum('jkm,jm->jk', np.abs(axes @ rot_a), half_a)
+    extent_b = np.einsum('jkm,jm->jk', np.abs(axes @ rot_b), half_b)
+    gap = np.abs(np.einsum('jkm,jm->jk', axes, center_b - center_a))
+    return np.any(gap > extent_a + extent_b + 1e-9, axis=1)
+
+
+# link_surface_samples を空間的に分けた塊 (1 リンクにつき 1 回だけ作る、
+# id(link) がキー)。
+_LINK_SAMPLE_CHUNKS_CACHE = {}
+SELF_COLLISION_CHUNK_SIZE = 128
+
+
+def _link_sample_chunks(link):
+    """``link_surface_samples(link)`` を、最も広がった軸で中央値分割する
+    ことを繰り返して ``SELF_COLLISION_CHUNK_SIZE`` 点以下の塊に分ける。
+    ``(塊ごとの点 (ローカル座標) のリスト, 塊の中心 (C, 3), 塊を包む球の
+    半径 (C,))`` を返す。"""
+    cached = _LINK_SAMPLE_CHUNKS_CACHE.get(id(link))
+    if cached is not None:
+        return cached
+    chunks = []
+    stack = [link_surface_samples(link)]
+    while stack:
+        pts = stack.pop()
+        if len(pts) <= SELF_COLLISION_CHUNK_SIZE:
+            chunks.append(pts)
+            continue
+        axis = int(np.argmax(pts.max(axis=0) - pts.min(axis=0)))
+        order = np.argsort(pts[:, axis], kind='stable')
+        half = len(pts) // 2
+        stack += [pts[order[:half]], pts[order[half:]]]
+    centers = np.array([(c.max(axis=0) + c.min(axis=0)) / 2.0
+                        for c in chunks])
+    radii = np.array([np.linalg.norm(c - center, axis=1).max()
+                      for c, center in zip(chunks, centers)])
+    cached = (chunks, centers, radii)
+    _LINK_SAMPLE_CHUNKS_CACHE[id(link)] = cached
+    return cached
+
+
+def _link_samples_into_link_depth(src, dst):
+    """``src`` の表面サンプルが ``dst`` の凸形状に入り込んだ最大の深さ [m]
+    (入り込んだ点が無ければ 0)。包む球が ``dst`` の包む直方体に届かない
+    塊の点は、直方体の中に入り得ないので座標変換ごと省く。"""
+    (lo, hi), normals, offsets, _ = link_collision_shape(dst)
+    chunks, centers, radii = _link_sample_chunks(src)
+    # src のローカル座標 -> dst のローカル座標
+    rot = dst.worldrot().T @ src.worldrot()
+    trans = dst.worldrot().T @ (src.worldpos() - dst.worldpos())
+    local_centers = centers @ rot.T + trans
+    reach = np.all((local_centers + radii[:, np.newaxis] > lo)
+                   & (local_centers - radii[:, np.newaxis] < hi), axis=1)
+    depth = 0.0
+    for i in np.nonzero(reach)[0]:
+        local_pts = chunks[i] @ rot.T + trans
+        inside_bbox = np.all((local_pts > lo) & (local_pts < hi), axis=1)
+        if not inside_bbox.any():
+            continue
+        plane_dist = local_pts[inside_bbox] @ normals.T - offsets
+        inside = plane_dist.max(axis=1) < 0.0
+        if inside.any():
+            depth = max(depth, float(-plane_dist[inside].max(axis=1).min()))
+    return depth
+
+
+def _penetration_depth(link_a, link_b):
+    """``self_collision_depth`` のうち、包む直方体の分離判定を済ませた後の
+    表面サンプルによる深さの計算。"""
+    return max(_link_samples_into_link_depth(link_a, link_b),
+               _link_samples_into_link_depth(link_b, link_a))
+
+
+def self_collision_depth(link_a, link_b):
     """ロボットの 2 リンクの凸形状 (``collision_mesh``) がどれだけ貫通
     しているか [m] を返す (貫通していなければ 0)。
 
@@ -1640,24 +1714,10 @@ def self_collision_depth(link_a, link_b, world_samples=None):
     できないため、こちらを使う。表面の点は約 1 cm 間隔なので、辺同士が
     交差するだけの浅い貫通では、実際より小さく (最大でおよそ間隔の半分)
     見積もることがある。
-
-    ``world_samples`` (dict) を渡すと、表面サンプルのワールド座標を
-    リンクごとにそこへ持って使い回す (同じ姿勢で多数の組を調べる
-    ``collision_pairs_min_distance`` 用)。
     """
     if _obb_separated(link_a, link_b):
         return 0.0
-    depth = 0.0
-    for src, dst in ((link_a, link_b), (link_b, link_a)):
-        pts = None if world_samples is None else world_samples.get(src)
-        if pts is None:
-            pts = (link_surface_samples(src) @ src.worldrot().T
-                   + src.worldpos())
-            if world_samples is not None:
-                world_samples[src] = pts
-        depth = max(depth, _points_into_link_depth(
-            pts, dst, link_collision_shape(dst)))
-    return depth
+    return _penetration_depth(link_a, link_b)
 
 
 def collision_pair_name(pair):
@@ -1756,7 +1816,6 @@ def collision_pair_distances(robot, collision_pairs, joint_positions,
     plan = _pair_plan(collision_pairs)
     dists = np.empty(len(collision_pairs))
     world_vertices_by_link = {}
-    world_samples_by_link = {}
     samples_by_obstacle = {}
 
     def _world_vertices(link):
@@ -1792,7 +1851,32 @@ def collision_pair_distances(robot, collision_pairs, joint_positions,
                    - radii[self_a] - radii[self_b])
         dists[self_k] = margins
         rigid = _rigid_self_pairs(collision_pairs, plan)
-        for j in np.nonzero(~(margins > 0.0))[0]:
+        near = np.nonzero(~(margins > 0.0))[0]
+        if len(near):
+            # 包む直方体の分離判定と、片方が箱 (頂点 8 個) の組の頂点同士の
+            # 最短距離は、残った組をまとめて計算する (1 組ずつだと waypoint
+            # あたり数十組の Python ループが検証時間の大半を占めていた)。
+            lo, hi, box_verts, padded_verts, n_verts = _pair_plan_boxes(plan)
+            rots = np.array([link.worldrot() for link in links])
+            near_a, near_b = self_a[near], self_b[near]
+            separated = _obb_separated_batch(
+                lo, hi, rots, positions, near_a, near_b)
+            a_is_box = n_verts[near_a] == 8
+            b_is_box = n_verts[near_b] == 8
+            box_pair = a_is_box | b_is_box
+            box_dist = np.full(len(near), np.nan)
+            box_side = np.where(a_is_box, near_a, near_b)
+            other_side = np.where(a_is_box, near_b, near_a)
+            # 箱同士 (8 x 8 点) と、片方だけ箱 (8 点 x 頂点数をそろえるため
+            # NaN で埋めた相手) に分けて、全点の組の距離の最小値を求める。
+            for group, other_verts in ((a_is_box & b_is_box, box_verts),
+                                       (a_is_box ^ b_is_box, padded_verts)):
+                if not group.any():
+                    continue
+                box_dist[group] = _min_vertex_distances(
+                    box_verts, other_verts, rots, positions,
+                    box_side[group], other_side[group])
+        for i, j in enumerate(near):
             link_a, link_b = links[self_a[j]], links[self_b[j]]
             key = (link_a, link_b)
             if rigid[j] and key in _RIGID_PAIR_DISTANCE_CACHE:
@@ -1801,10 +1885,12 @@ def collision_pair_distances(robot, collision_pairs, joint_positions,
             # 貫通していれば深さを負の距離にする (self_collision_depth
             # 参照)。貫通していなければ従来通り頂点同士の最短距離
             # (正の値、実際の距離以上になる近似)。
-            depth = self_collision_depth(
-                link_a, link_b, world_samples=world_samples_by_link)
+            depth = 0.0 if separated[i] else _penetration_depth(
+                link_a, link_b)
             if depth > 0.0:
                 dist = -depth
+            elif box_pair[i]:
+                dist = float(box_dist[i])
             else:
                 verts_a = _world_vertices(link_a)
                 verts_b = _world_vertices(link_b)
@@ -1901,6 +1987,55 @@ def _pair_plan(collision_pairs):
     if isinstance(collision_pairs, VerificationPairs):
         collision_pairs._plan = plan
     return plan
+
+
+def _min_vertex_distances(verts_a, verts_b, rots, positions, index_a,
+                          index_b):
+    """リンクごとのローカルの頂点 ``verts_a``/``verts_b`` (``(L, V, 3)``、
+    NaN の点は無視する) をワールドに置いたときの、組 (``index_a``/
+    ``index_b``) ごとの頂点同士の最短距離 (``(J,)``)。
+
+    ``verts_a`` の点を ``index_b`` 側のリンクの座標系に移し、
+    |a - b|^2 = |a|^2 + |b|^2 - 2 a.b を行列積で求める (差の配列
+    ``(J, Va, Vb, 3)`` を作らないため。座標はリンクの大きさ程度なので、
+    桁落ちは 1e-9 m 程度)。"""
+    rot_a, rot_b = rots[index_a], rots[index_b]
+    world_a = (np.einsum('jvn,jmn->jvm', verts_a[index_a], rot_a)
+               + positions[index_a][:, np.newaxis, :])
+    local_a = np.einsum('jvm,jmn->jvn',
+                        world_a - positions[index_b][:, np.newaxis, :], rot_b)
+    local_b = verts_b[index_b]
+    sq = (np.einsum('jan,jan->ja', local_a, local_a)[:, :, np.newaxis]
+          + np.einsum('jbn,jbn->jb', local_b, local_b)[:, np.newaxis, :]
+          - 2.0 * np.einsum('jan,jbn->jab', local_a, local_b))
+    return np.sqrt(np.maximum(
+        np.fmin.reduce(sq.reshape(len(sq), -1), axis=1), 0.0))
+
+
+def _pair_plan_boxes(plan):
+    """``plan`` のリンクごとの、包む直方体の ``bounds`` (``(L, 3)`` の
+    ``lo``/``hi``)、頂点 8 個 (箱) のリンクのローカルの頂点 (``(L, 8, 3)``、
+    箱でないリンクは NaN)、全リンクのローカルの頂点を最大の頂点数まで NaN
+    で埋めたもの (``(L, V, 3)``)、頂点数 (``(L,)``)。``plan`` に持たせて
+    使い回す。"""
+    boxes = plan.get('boxes')
+    if boxes is not None:
+        return boxes
+    links = plan['links']
+    bounds = [link_collision_shape(link)[0] for link in links]
+    verts = [np.asarray(link.collision_mesh.vertices, dtype=np.float64)
+             for link in links]
+    n_verts = np.array([len(v) for v in verts])
+    padded = np.full((len(links), n_verts.max(), 3), np.nan)
+    box_verts = np.full((len(links), 8, 3), np.nan)
+    for i, v in enumerate(verts):
+        padded[i, :len(v)] = v
+        if len(v) == 8:
+            box_verts[i] = v
+    boxes = (np.array([b[0] for b in bounds]),
+             np.array([b[1] for b in bounds]), box_verts, padded, n_verts)
+    plan['boxes'] = boxes
+    return boxes
 
 
 def _rigid_self_pairs(collision_pairs, plan):
