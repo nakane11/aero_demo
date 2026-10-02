@@ -1689,6 +1689,10 @@ def main():
     spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
     spik.apply_hand_box(robot)
+    # 差し出さない腕の姿勢の差し替え (handshake_with_other_arm_posture) に
+    # 使う指の点群を人物ループの前に作っておく (指ありモデルの読み込みに
+    # 約 1 秒、solve_palm_ik.py の main と同じ)。
+    spik.other_hand_points('r')
     # 事後検証 (verify_waypoints) の総当たりペアは、ロボットの構造だけで
     # 決まり人物ごとの姿勢に依存しないので人物ループの外で 1 回だけ作る
     # (solve_palm_ik.py の main と同じ理由。robot_arm 引数は結果に

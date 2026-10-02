@@ -1989,6 +1989,55 @@ def _pair_plan(collision_pairs):
     return plan
 
 
+def _ragged_arange(starts, counts):
+    """``np.concatenate([np.arange(s, s + c) for s, c in zip(starts,
+    counts)])`` をループなしで作る。"""
+    offsets = np.r_[0, np.cumsum(counts)[:-1]]
+    return (np.repeat(starts - offsets, counts)
+            + np.arange(int(np.sum(counts))))
+
+
+def _human_pair_plan(plan):
+    """``human_obstacle_clearances`` 用に ``plan`` (``_pair_plan``) へ足して
+    使い回す値: 人体との組に現れるリンクの通し番号 (``link_ids``)、
+    ``human_a`` をその並びの位置に詰め直したもの (``local_a``)、組に現れる
+    障害物の添字 (``obstacles``)、リンクごとの表面サンプルの間隔
+    (``spacing``、``_link_surface_sample_spacing``。人体と組まないリンクは
+    0)。さらに ``link_ids`` のリンクの表面サンプルの塊
+    (``_link_sample_chunks``) を全部並べたもの: 塊の中心 (``chunk_
+    centers``)・包む球の半径 (``chunk_radii``)・点 (``points``) と、
+    リンクごとの塊の範囲 (``chunk_start``/``chunk_count``、``local_a``
+    で引く)、塊ごとの点の範囲 (``chunk_point_start``/``chunk_point_
+    count``)。座標はリンクのローカル座標。"""
+    human_plan = plan.get('human_plan')
+    if human_plan is not None:
+        return human_plan
+    link_ids, local_a = np.unique(plan['human_a'], return_inverse=True)
+    spacing = np.zeros(len(plan['links']))
+    chunk_centers, chunk_radii, chunk_points, chunk_count = [], [], [], []
+    for i in link_ids:
+        spacing[i] = _link_surface_sample_spacing(plan['links'][i])
+        chunks, centers, radii = _link_sample_chunks(plan['links'][i])
+        chunk_points += chunks
+        chunk_centers.append(centers)
+        chunk_radii.append(radii)
+        chunk_count.append(len(chunks))
+    chunk_count = np.array(chunk_count)
+    chunk_point_count = np.array([len(c) for c in chunk_points])
+    human_plan = dict(
+        link_ids=link_ids, local_a=local_a.reshape(-1),
+        obstacles=np.unique(plan['human_o']).tolist(), spacing=spacing,
+        chunk_centers=np.vstack(chunk_centers),
+        chunk_radii=np.concatenate(chunk_radii),
+        points=np.vstack(chunk_points),
+        chunk_count=chunk_count,
+        chunk_start=np.r_[0, np.cumsum(chunk_count)[:-1]],
+        chunk_point_count=chunk_point_count,
+        chunk_point_start=np.r_[0, np.cumsum(chunk_point_count)[:-1]])
+    plan['human_plan'] = human_plan
+    return human_plan
+
+
 def _min_vertex_distances(verts_a, verts_b, rots, positions, index_a,
                           index_b):
     """リンクごとのローカルの頂点 ``verts_a``/``verts_b`` (``(L, V, 3)``、
@@ -2117,30 +2166,83 @@ def human_obstacle_clearances(robot, collision_pairs, obstacle_links,
     human_a, human_o = plan['human_a'], plan['human_o']
     if not len(human_a):
         return {}
+    human_plan = _human_pair_plan(plan)
     links = plan['links']
-    positions = np.array([link.worldpos() for link in links])
+    # 人体との組に現れるリンクだけ位置を取り、human_a を詰めた通し番号
+    # (human_plan['local_a']) で引く。
+    positions = np.array([links[i].worldpos()
+                          for i in human_plan['link_ids']])
     centers = np.array([o.worldpos() for o in obstacle_links])
     obstacle_radii = np.array([math.hypot(o.radius, o.height / 2.0)
                                for o in obstacle_links])
-    diff = centers[human_o] - positions[human_a]
+    diff = centers[human_o] - positions[human_plan['local_a']]
     gaps = (np.sqrt(np.einsum('ij,ij->i', diff, diff))
             - plan['radii'][human_a] - obstacle_radii[human_o])
-    world_points = {}
-    for j in np.nonzero(gaps < cull_distance)[0]:
-        link = links[human_a[j]]
-        if link not in world_points:
-            world_points[link] = (link_surface_samples(link)
-                                  @ link.worldrot().T + link.worldpos())
+    near = np.nonzero(gaps < cull_distance)[0]
+    if len(near):
+        obstacle_rots = np.array([o.worldrot() for o in obstacle_links])
+        obstacle_r = np.array([o.radius for o in obstacle_links])
+        obstacle_half_h = np.array([o.height / 2.0 for o in obstacle_links])
+        rots = np.array([links[i].worldrot() for i in human_plan['link_ids']])
+
+        def cylinder_distances(local_points, a, o):
+            # リンク a (human_plan の通し番号) のローカル座標の点と円柱 o
+            # の符号付き距離 (points_cylinder_distance を点ごとの円柱で
+            # 並べたもの)。全て同じ長さの配列。
+            world = (np.einsum('nij,nj->ni', rots[a], local_points)
+                     + positions[a])
+            local = np.einsum('ni,nij->nj', world - centers[o],
+                              obstacle_rots[o])
+            dr = np.sqrt(local[:, 0] ** 2 + local[:, 1] ** 2) - obstacle_r[o]
+            da = np.abs(local[:, 2]) - obstacle_half_h[o]
+            outside = np.sqrt(np.maximum(dr, 0.0) ** 2
+                              + np.maximum(da, 0.0) ** 2)
+            return np.where((dr > 0.0) | (da > 0.0), outside,
+                            np.maximum(dr, da))
+
+        # 近い組すべての「組 x 塊」を並べて一度に計算する。符号付き距離は
+        # 1-Lipschitz なので、塊の点の距離は「塊の中心の距離 ± 塊を包む
+        # 球の半径」に収まる。下限がその組の上限の最小を超える塊は最小値を
+        # 持ち得ないので、その点は計算しなくても組の最小値は変わらない。
+        a = human_plan['local_a'][near]
+        o = human_o[near]
+        n_chunks = human_plan['chunk_count'][a]
+        pair_of_chunk = np.repeat(np.arange(len(near)), n_chunks)
+        chunk = _ragged_arange(human_plan['chunk_start'][a], n_chunks)
+        chunk_a, chunk_o = a[pair_of_chunk], o[pair_of_chunk]
+        center_dist = cylinder_distances(
+            human_plan['chunk_centers'][chunk], chunk_a, chunk_o)
+        radii = human_plan['chunk_radii'][chunk]
+        lower = center_dist - radii
+        chunk_offsets = np.r_[0, np.cumsum(n_chunks)[:-1]]
+        upper = np.minimum.reduceat(center_dist + radii, chunk_offsets)
         # 細分割した三角形の辺は最長で spacing なので、表面上のどの点も
         # いずれかのサンプル点から spacing / sqrt(3) 以内にある。
-        gaps[j] = (float(points_cylinder_distance(
-            world_points[link], obstacle_links[human_o[j]]).min())
-            - _link_surface_sample_spacing(link) / math.sqrt(3.0))
-    clearances = {}
-    for index, gap in zip(human_o.tolist(), gaps.tolist()):
-        if gap < clearances.get(index, float('inf')):
-            clearances[index] = gap
-    return clearances
+        margin = human_plan['spacing'][human_a[near]] / math.sqrt(3.0)
+        # 下限から margin を引いても cull_distance 以上の塊は、組の値を
+        # cull_distance 未満にし得ないので省く (そうした組の値は塊の下限の
+        # 最小 = 真の値以下、包含球の隙間と同じ扱い)。
+        keep = ((lower <= upper[pair_of_chunk])
+                & (lower - margin[pair_of_chunk] < cull_distance))
+        gaps[near] = np.minimum.reduceat(lower, chunk_offsets) - margin
+        if keep.any():
+            kept, kept_pair = chunk[keep], pair_of_chunk[keep]
+            n_points = human_plan['chunk_point_count'][kept]
+            pair_of_point = np.repeat(kept_pair, n_points)
+            point = _ragged_arange(human_plan['chunk_point_start'][kept],
+                                   n_points)
+            dist = cylinder_distances(human_plan['points'][point],
+                                      a[pair_of_point], o[pair_of_point])
+            # 点は組の順に並んでいる。下限の最小を最小値で置き換える
+            # (残った組では最小値を持ち得る塊が全て残っている)。
+            point_offsets = np.r_[
+                0, np.flatnonzero(np.diff(pair_of_point)) + 1]
+            pairs = pair_of_point[point_offsets]
+            gaps[near[pairs]] = (np.minimum.reduceat(dist, point_offsets)
+                                 - margin[pairs])
+    per_obstacle = np.full(len(obstacle_links), np.inf)
+    np.minimum.at(per_obstacle, human_o, gaps)
+    return {int(i): float(per_obstacle[i]) for i in human_plan['obstacles']}
 
 
 _HAND_BOX_CACHE = {}

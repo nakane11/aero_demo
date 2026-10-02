@@ -243,6 +243,39 @@ def test_human_obstacle_clearances_agree(robot):
     assert n_compared >= 3
 
 
+def test_human_obstacle_clearances_match_brute_force(robot):
+    """``human_obstacle_clearances`` (塊の下限で点を省く) が、全サンプル点
+    と円柱の距離の最小値から間隔の分を引いた値と、``cull_distance`` 未満
+    では一致し、それ以上では ``cull_distance`` 未満にならない。"""
+    rng = np.random.default_rng(5)
+    link_list = robot.rarm_whole_body.link_list
+    collision_links = _collision_links(robot)
+    cull = MAX_COMPARED_DISTANCE
+    n_below = 0
+    for _ in range(5):
+        robot.reset_pose()
+        obstacles = _random_cylinders(rng, robot.rarm_end_coords.worldpos())
+        _set_random_pose(robot, rng, link_list)
+        pairs = [(link, i) for link in collision_links
+                 for i in range(len(obstacles))]
+        clearances = spik.human_obstacle_clearances(
+            robot, pairs, obstacles, cull_distance=cull)
+        for oi, clearance in clearances.items():
+            expected = min(
+                float(spik.points_cylinder_distance(
+                    spik.link_surface_samples(link) @ link.worldrot().T
+                    + link.worldpos(), obstacles[oi]).min())
+                - spik._link_surface_sample_spacing(link) / np.sqrt(3.0)
+                for link in collision_links)
+            if expected < cull:
+                n_below += 1
+                assert abs(clearance - expected) < 1e-12, \
+                    (oi, clearance, expected)
+            else:
+                assert clearance >= cull, (oi, clearance, expected)
+    assert n_below >= 3
+
+
 def test_gradient_is_finite(robot):
     """深く貫通した組・軸上の点を含む姿勢でも、コストの勾配が有限。"""
     robot.reset_pose()
