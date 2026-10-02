@@ -78,6 +78,7 @@ from solve_palm_ik import translate_joint_positions  # noqa: E402
 
 from skrobot.viewers import ViserViewer  # noqa: E402
 
+from view_handshake_poses import SKIN_COLOR  # noqa: E402
 from view_handshake_poses import build_smpl_mesh  # noqa: E402
 from view_handshake_poses import look_at_pose  # noqa: E402
 from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa: E402,E501
@@ -85,7 +86,6 @@ from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa:
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
-from skrobot.model import Link  # noqa: E402
 
 # 干渉回避用モデル (人体障害物・ロボット自身のプリミティブ近似) の色、
 # apply_waypoint_pose/build_display_waypoints/build_robot_collision_
@@ -377,7 +377,7 @@ def main():
         for obstacle_link in current_obstacle_links:
             set_link_visible(obstacle_link, visible)
 
-    current_mesh_link = [None]
+    human_mesh_handle = [None]
     current_obstacle_links = []
     current = {'name': None, 'motion': None,
               'person': None, 'model': None}
@@ -448,11 +448,21 @@ def main():
         gaze_target = hand_move_target.worldpos()
         pose = look_at_pose(current['model'], current['person'], gaze_target)
         mesh = build_smpl_mesh(current['model'], current['person'], pose)
-        link = Link(visual_mesh=mesh, name='smpl_human')
-        if current_mesh_link[0] is not None:
-            viewer.delete(current_mesh_link[0])
-        viewer.add(link)
-        current_mesh_link[0] = link
+        # 毎フレーム viewer.delete -> viewer.add で作り直すと、ブラウザ側で
+        # GLB を読み込み終えるまで人が消えて (半透明の干渉ジオメトリも
+        # 巻き込んで) Play 中に点滅する。viser のメッシュを 1 つだけ作り、
+        # 以後は頂点を書き換えるだけにする (SMPL は男女とも同じ面構成)。
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.uint32)
+        handle = human_mesh_handle[0]
+        if handle is None or handle.faces.shape != faces.shape:
+            if handle is not None:
+                handle.remove()
+            human_mesh_handle[0] = viewer._server.scene.add_mesh_simple(
+                'smpl_human', vertices=vertices, faces=faces,
+                color=tuple(SKIN_COLOR[:3]))
+        else:
+            handle.vertices = vertices
 
         colliding = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
