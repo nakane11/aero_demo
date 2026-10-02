@@ -301,6 +301,13 @@ LEG_LOW_SIDE_MARGIN_RATIO = 0.1
 # 少し余裕を持たせてこの値まで狭める (restrict_waist_range 参照)。
 WAIST_P_MAX_ANGLE_DEG = 32.5
 
+# 首ピッチ (neck_p_joint) の上限 [deg]。URDF 上は 55 度だが、実機は 45.44 度
+# より先を指令してもそこで止まる (2026-10-02 実機で確認、下限の -15 度は
+# 届く)。視線を掌に向ける押し込み姿勢で 45 度を超える解があり、その分だけ
+# 実機の視線が下がりきらずにずれるため、少し余裕を持たせてこの値まで狭める
+# (restrict_neck_range 参照)。
+NECK_P_MAX_ANGLE_DEG = 44.5
+
 # 干渉回避付きバッチ IK (solve_person_ik) だけに適用する、関節可動域の
 # 上下マージン比率 (restrict_joint_range_margin 参照)。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
@@ -1111,7 +1118,20 @@ def restrict_waist_range(robot, max_angle_deg=WAIST_P_MAX_ANGLE_DEG):
     ``*_whole_body``・バッチ IK・軌道計画・押し込み IK のすべてに効く。
     URDF の上限より広げることはしない。
     """
-    joint = robot.waist_p_joint
+    _restrict_max_angle(robot.waist_p_joint, max_angle_deg)
+
+
+def restrict_neck_range(robot, max_angle_deg=NECK_P_MAX_ANGLE_DEG):
+    """``neck_p_joint`` の上限 (下向き側) を ``max_angle_deg`` まで狭める
+    (``NECK_P_MAX_ANGLE_DEG`` 参照)。``restrict_waist_range`` と同様。
+    """
+    _restrict_max_angle(robot.neck_p_joint, max_angle_deg)
+
+
+def _restrict_max_angle(joint, max_angle_deg):
+    """``joint`` の上限を ``max_angle_deg`` まで狭める (URDF の上限より
+    広げない)。URDF の可動域を ``_urdf_range`` に覚えておくので、2 回
+    呼んでも狭め直さない。"""
     if not hasattr(joint, '_urdf_range'):
         joint._urdf_range = (joint.min_angle, joint.max_angle)
     joint.max_angle = min(joint._urdf_range[1], math.radians(max_angle_deg))
@@ -3188,7 +3208,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             facing_yaw_weight=0.0,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
-                            placement_joint_positions=None):
+                            placement_joint_positions=None,
+                            facing_sign=1.0):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、**関節の曲げ量コスト (``joint_bend_cost``)
@@ -3222,6 +3243,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     方向は ``placement_joint_positions`` (``None`` なら ``joint_
     positions``) から求める (干渉判定用に体幹をずらした骨格
     (``shift_torso_joints_from_surface``) で立ち位置まで変えないため)。
+    ``facing_sign`` を -1 にすると、向きのずれを人の正面方向の反対 (人と
+    向かい合う向き) から測る (前方ずれも反対向きに測る)。
 
     まず 1 を満たす候補全てについて、``angle_vectors`` の値から直接
     (``robot`` の状態を書き換えずに) 曲げ量コストだけを計算し、昇順に
@@ -3273,6 +3296,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             and placement_joint_positions:
         standing_xy = human_standing_xy(placement_joint_positions)
         facing = human_facing_direction(placement_joint_positions)
+        if facing is not None:
+            facing = facing_sign * facing
 
     def candidate_cost(candidate_index):
         cost = _joint_bend_cost_from_vector(
@@ -3500,7 +3525,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     offered_hand_penalty=True,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
-                    placement_joint_positions=None):
+                    placement_joint_positions=None,
+                    facing_sign=1.0):
     """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
     初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
@@ -3672,7 +3698,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         front_offset_weight=front_offset_weight,
         facing_yaw_weight=facing_yaw_weight,
         hover_human_clearance=hover_human_clearance,
-        placement_joint_positions=placement_joint_positions)
+        placement_joint_positions=placement_joint_positions,
+        facing_sign=facing_sign)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -4091,6 +4118,7 @@ def main():
     restrict_elbow_range(robot)
     restrict_leg_range(robot)
     restrict_waist_range(robot)
+    restrict_neck_range(robot)
     lock_fixed_joints(robot)
     apply_collision_model(robot)
     # 手のリンクを指まで覆う箱にする (IK・軌道最適化で共通)。

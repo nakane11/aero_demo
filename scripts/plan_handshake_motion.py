@@ -1693,6 +1693,7 @@ def main():
     spik.restrict_elbow_range(robot)
     spik.restrict_leg_range(robot)
     spik.restrict_waist_range(robot)
+    spik.restrict_neck_range(robot)
     spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
     spik.apply_hand_box(robot)
