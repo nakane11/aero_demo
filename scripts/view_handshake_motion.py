@@ -60,6 +60,7 @@ from generate_random_human_poses import load_smpl_models  # noqa: E402
 from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR as COLLISION_OBSTACLE_COLOR  # noqa: E402,E501
 from handshake_viewer_common import apply_waypoint_pose  # noqa: E402
 from handshake_viewer_common import build_display_waypoints  # noqa: E402
+import side_by_side_transition as sbs  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
 from handshake_viewer_common import collision_pairs_text  # noqa: E402
@@ -247,8 +248,9 @@ class PlaybackControls(object):
             self.waypoint_slider.value = idx
 
 
-def status_text(name, person_i, n_people, motion, n_display_waypoints,
+def status_text(name, person_i, n_people, motion, display_waypoints,
                 n_approach, waypoint_index, collision_text):
+    n_display_waypoints = len(display_waypoints)
     kind = KIND_LABELS.get(motion['kind'], motion['kind'])
     verified_text = 'OK (経路全体で干渉なし)' if motion['verified'] \
         else 'NG (経路上に干渉が残る waypoint あり)'
@@ -259,9 +261,16 @@ def status_text(name, person_i, n_people, motion, n_display_waypoints,
         dist = motion['waypoint_min_distances'][waypoint_index]
         body = 'この waypoint の干渉余裕: {:+.4f} m ({})\n\n'.format(
             dist, '貫通' if dist < 0 else '干渉なし')
+    elif display_waypoints[waypoint_index].get('transition'):
+        body = ('横並び移動 (掌を合わせたまま台車を動かす): {}\n\n'.format(
+            sbs.transition_summary(motion['transition'])))
     else:
         body = ('掌への押し込み (solve_palm_ik.py の後処理判定, 表示のみ '
                 '-- 経路の検証対象ではない)\n\n')
+        transition = motion.get('transition')
+        if transition is not None:
+            body += '横並び移動: {}\n\n'.format(
+                sbs.transition_summary(transition))
     return header + body + collision_text
 
 
@@ -445,7 +454,7 @@ def main():
             tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
         label_text.content = status_text(
             current['name'], controls.person_index, controls.n_people,
-            motion, len(current['display_waypoints']), current['n_approach'],
+            motion, current['display_waypoints'], current['n_approach'],
             idx, collision_pairs_text(colliding))
         viewer.redraw()
 

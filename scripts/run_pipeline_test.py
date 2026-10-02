@@ -287,6 +287,12 @@ def main():
         help='solve_palm_ik.py と (--plan-motion 指定時) plan_handshake_'
             'motion.py に --collision-verify-model として渡す (既定は指定なし '
             '= 各スクリプトの既定値)。')
+    parser.add_argument(
+        '--side-by-side-transition', action='store_true',
+        help='--plan-motion 指定時、plan_handshake_motion.py に '
+            '--side-by-side-transition を渡し、押し込んだ後に掌を合わせた '
+            'まま台車を動かして横並びへ移る区間も計画する (ビューアでは '
+            '押し込みの後に続けて再生される)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -369,6 +375,8 @@ def main():
         if args.collision_verify_model is not None:
             motion_args += ['--collision-verify-model',
                             args.collision_verify_model]
+        if args.side_by_side_transition:
+            motion_args.append('--side-by-side-transition')
         motion_elapsed, motion_stdout = run_step(
             '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
@@ -390,6 +398,10 @@ def main():
               '補間した人数: {} / {}'.format(
                   motion_summary['n_head_blended'],
                   motion_summary['n_planned']))
+        if args.side_by_side_transition:
+            for line in motion_stdout.splitlines():
+                if line.startswith('横並び移動:') or '[transition]' in line:
+                    print('[4.5/5] {}'.format(line.strip()))
         if motion_warmup_lines:
             for line in motion_warmup_lines:
                 print('[4.5/5] {}'.format(line))

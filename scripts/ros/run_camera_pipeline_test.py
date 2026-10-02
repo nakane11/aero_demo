@@ -140,6 +140,7 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
 import plan_handshake_motion as phm  # noqa: E402
+import side_by_side_transition as sbs  # noqa: E402
 from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
 from handshake_viewer_common import apply_robot_pose as apply_result_pose  # noqa: E402,E501
 from handshake_viewer_common import apply_waypoint_pose  # noqa: E402
@@ -152,6 +153,7 @@ from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible as common_set_link_visible  # noqa: E402,E501
 from handshake_viewer_common import sync_robot_collision_overlay  # noqa: E402
+from handshake_viewer_common import transition_waypoints  # noqa: E402
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr  # noqa: E402
@@ -646,6 +648,7 @@ class HandshakePipelineNode(object):
         self._display_waypoints = None    # build_display_waypoints の表示用 waypoint リスト or None
         self._display_n_prepend = 0        # 上記の先頭のうち、初期位置->経路開始点の表示専用フレームの個数
         self._display_n_approach = 0      # 上記のうち経路計画済み (表示専用の先頭/末尾フレームでない) 個数
+        self._display_n_transition = 0    # 上記の末尾のうち、押し込み後の横並び移動の個数
         self._collision_pairs_text = ''   # 指ありでの事後検証結果 (colliding_link_pairs/collision_pairs_text の戻り値)。_refresh_collision_pairs_text で更新する
         # 骨格表示のちらつき対策 (spin 参照)。いずれも spin() のスレッドから
         # のみ読み書きするため lock は不要。
@@ -1227,6 +1230,7 @@ class HandshakePipelineNode(object):
             self._display_waypoints = None
             self._display_n_prepend = 0
             self._display_n_approach = 0
+            self._display_n_transition = 0
             self._handshake_total_time = None
         self.play_checkbox.value = False
         self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
@@ -1487,6 +1491,30 @@ class HandshakePipelineNode(object):
                     float(d) for d in motion['waypoint_min_distances']],
                 kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                 compute_time=motion['compute_time']))
+            # 押し込んだ後、掌を合わせたまま台車を動かして人とさらに横並び
+            # になる区間 (sbs.plan_transition)。押し込み姿勢 (post_process)
+            # が無い・接近の軌道が検証に通らないなら実機は動かさないので
+            # 計画しない。
+            if (args.side_by_side_transition
+                    and result.get('post_process') is not None
+                    and self._motion_verified(motion)):
+                transition = sbs.plan_transition(
+                    self.robot, robot_arm, offered_hand,
+                    result['post_process'], translated_joints,
+                    collision_joints, self.verification_pairs,
+                    self.collision_pairs, self.base_limits)
+                motion['transition'] = transition
+                print('[transition] 試行{}: 横並び移動 {}'.format(
+                    attempt, sbs.transition_summary(transition)))
+                self._log_debug(dict(
+                    event='transition', person=attempt,
+                    verified=transition['verified'],
+                    fraction=transition['fraction'],
+                    x_margin=transition['x_margin'],
+                    placement_before=transition['placement_before'],
+                    placement_after=transition['placement_after'],
+                    reason=transition['reason'],
+                    compute_time=transition['compute_time']))
 
         # 最終の台車位置と人の位置関係 (方位・前方ずれ・向きのずれ、
         # docs/handshake_base_placement.md)。IK と同じ仮想座標系で計算する
@@ -1558,8 +1586,12 @@ class HandshakePipelineNode(object):
                     self._initial_joint_angle_vector)))
             n_prepend = len(prepend_waypoints)
             display_waypoints = prepend_waypoints + display_waypoints
+            # build_display_waypoints は押し込みの後に横並び移動の waypoint
+            # を続ける (末尾の n_transition 個)。
+            n_transition = len(transition_waypoints(motion))
         else:
             display_waypoints, n_prepend, n_approach = None, 0, 0
+            n_transition = 0
         with self._lock:
             self._current_result = result
             self._current_motion = motion
@@ -1567,6 +1599,7 @@ class HandshakePipelineNode(object):
             self._display_waypoints = display_waypoints
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
+            self._display_n_transition = n_transition
         # --auto-execute が指定されていて、実際に self.ri への接続も成功
         # していて、IK・軌道計画が成功し、かつ軌道の干渉検証
         # (verified/lead_in_verified) に通っている場合だけ実機を動かせる
@@ -1735,7 +1768,9 @@ class HandshakePipelineNode(object):
         ``base_link`` 座標系へ戻す (破壊的に書き換える)。waypoint の関節角は
         台車位置に依存しないのでそのままでよい。"""
         dx, dy = offset
-        for wp in motion['waypoints'] + motion.get('lead_in_waypoints', []):
+        transition = motion.get('transition') or {}
+        for wp in (motion['waypoints'] + motion.get('lead_in_waypoints', [])
+                   + transition.get('waypoints', [])):
             wp['base_position'][0] -= dx
             wp['base_position'][1] -= dy
 
@@ -1981,6 +2016,7 @@ class HandshakePipelineNode(object):
             display_waypoints = self._display_waypoints
             n_prepend = self._display_n_prepend
             n_approach = self._display_n_approach
+            n_transition = self._display_n_transition
         if not self.args.auto_execute:
             print('[execute] --auto-execute が指定されていないため実機を '
                   '動かせません。')
@@ -2011,14 +2047,19 @@ class HandshakePipelineNode(object):
         joint_names = motion['joint_names']
         # 接近区間 (display_waypoints[:reach_boundary]) は hover 目標
         # (waypoint index reach_boundary - 1) で終わり、押し込み区間
-        # (display_waypoints[reach_boundary - 1:]、先頭に hover 目標を含む)
-        # がそれに続く。
+        # (display_waypoints[reach_boundary - 1:press_end]、先頭に hover
+        # 目標を含む) がそれに続く。末尾の n_transition 個は押し込み後の
+        # 横並び移動 (sbs.plan_transition)。
+        transition_waypoints_ = display_waypoints[
+            len(display_waypoints) - n_transition:]
+        display_waypoints = display_waypoints[
+            :len(display_waypoints) - n_transition]
         reach_boundary = min(max(n_prepend + n_approach, 1),
                              len(display_waypoints))
         print('[execute] 実機で waypoint を {} 個実行します '
-              '(接近={}個+押し込み={}個)。'.format(
-                  len(display_waypoints), reach_boundary,
-                  len(display_waypoints) - reach_boundary))
+              '(接近={}個+押し込み={}個+横並び移動={}個)。'.format(
+                  len(display_waypoints) + n_transition, reach_boundary,
+                  len(display_waypoints) - reach_boundary, n_transition))
 
         self._say(self.args.speech_start_text)
 
@@ -2074,7 +2115,40 @@ class HandshakePipelineNode(object):
             self._capture_grasp_images(
                 press_waypoints[-1], joint_names, result)
 
+        if transition_waypoints_ and reach_boundary < len(display_waypoints):
+            self._execute_transition(
+                press_waypoints[-1], display_waypoints[-1],
+                transition_waypoints_, joint_names, robot_arm)
+
         print('[execute] 実行を終了しました。')
+
+    def _execute_transition(self, press_wp, planned_press_wp, waypoints,
+                            joint_names, robot_arm):
+        """押し込み後の横並び移動 (掌を合わせたまま台車を動かす、
+        ``sbs.plan_transition``) を実行する。
+
+        押し込みを解き直した (``_refine_press_in``) ときは、実際の押し込み
+        姿勢 ``press_wp`` と計画時の押し込み姿勢 ``planned_press_wp`` の
+        関節角の差を、横並び移動の各 waypoint にそのまま足す (掌の検出し
+        直しによる補正は数 cm 以内なので、移動中も同じだけずらしておく)。
+        掌を合わせたまま人を連れて動くので、各区間を
+        ``--side-by-side-segment-time`` 秒以上かけてゆっくり動かす。
+        """
+        delta = (np.asarray(press_wp['joint_angle_vector'])
+                 - np.asarray(planned_press_wp['joint_angle_vector']))
+        segment = [press_wp] + [
+            dict(wp, joint_angle_vector=[
+                float(v) for v in np.asarray(wp['joint_angle_vector'])
+                + delta])
+            for wp in waypoints]
+        self._say(self.args.speech_transition_text)
+        print('[execute] 掌を合わせたまま横並びの位置へ移動します '
+              '(waypoint {} 個)。'.format(len(waypoints)))
+        self._execute_waypoint_segment(
+            segment, joint_names,
+            min_segment_time=self.args.side_by_side_segment_time)
+        self._wait_joint_settle(
+            '横並び移動終了', segment[-1], joint_names, robot_arm)
 
     def _collect_hand_frames(self, n_frames, timeout):
         """呼び出し以降に届いた (base_link 座標系に変換できた) カメラ
@@ -2570,10 +2644,12 @@ class HandshakePipelineNode(object):
         except Exception:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             pass
 
-    def _execute_waypoint_segment(self, waypoints, joint_names):
+    def _execute_waypoint_segment(self, waypoints, joint_names,
+                                  min_segment_time=MIN_SEGMENT_TIME):
         """``waypoints`` (先頭要素を基準にした 1 区間分) を、waypoint の
         境界で止まらない滑らかな軌道として実機で実行する (台車・腕は並行
         して動く、``_execute_on_robot`` が分割前に行っていたのと同じ処理)。
+        waypoint 間の所要時間は ``min_segment_time`` 秒以上にする。
 
         Returns
         -------
@@ -2636,7 +2712,7 @@ class HandshakePipelineNode(object):
         # 外れるため)。
         time_list = self._limited_time_list(
             arm_angle_vectors, base_trajectory_points,
-            [MIN_SEGMENT_TIME] * len(waypoints))
+            [min_segment_time] * len(waypoints))
         start_odom_coords = None
         if arm_angle_vectors:
             self.ri.angle_vector_sequence(arm_angle_vectors, time_list)
@@ -3669,6 +3745,20 @@ def main():
                 'もう一度手を出してください',
         help='軌道計画の接近の途中 (lead-in・回り込み) の干渉で実機を動かせ'
             'なかったときに発話する文 (手の出し方は助言しない)。')
+    parser.add_argument(
+        '--no-side-by-side-transition', dest='side_by_side_transition',
+        action='store_false',
+        help='押し込んだ後に、掌を合わせたまま台車を動かして人とさらに横並び '
+            'になる移動 (side_by_side_transition.plan_transition) を行わない '
+            '(既定では、移動先が押し込み時より横並びに近くなるときに行う)。')
+    parser.add_argument(
+        '--side-by-side-segment-time', type=float, default=0.5,
+        help='横並び移動の waypoint (台車 5 cm/5 度ごと) 1 区間にかける最短 '
+            '時間 [秒] (既定 0.5、人を連れて動くのでゆっくりにする)。')
+    parser.add_argument(
+        '--speech-transition-text', type=str,
+        default='一緒に横に並びますね',
+        help='横並び移動を始めるときに発話する文 (空文字列で発話しない)。')
     parser.add_argument(
         '--speech-voice', type=str, default='四国めたん-ノーマル',
         help='発話に使う声 (sound_play の voice、既定 "四国めたん-ノーマル")。')

@@ -118,6 +118,7 @@ from skrobot.planner.trajectory_optimization.solvers import (  # noqa: E402
 from skrobot.planner.trajectory_optimization.trajectory import (  # noqa: E402
     interpolate_trajectory)
 
+import side_by_side_transition as sbs  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402  (パス追加後に import)
 
 # 1 人分の軌道の waypoint 数 (始点・終点を含む)。
@@ -1680,6 +1681,16 @@ def main():
             '離れる水平方向へずらす距離 [m] (solve_palm_ik.py の同名の '
             'フラグと同じ値を指定する。実カメラの骨格なら {}、既定 0)。'
             .format(spik.DEFAULT_TORSO_SURFACE_OFFSET))
+    parser.add_argument(
+        '--side-by-side-transition', action='store_true',
+        help='押し込んだ後、掌を合わせたまま台車を動かして人とさらに横並び '
+            'になる区間も計画し、軌道 JSON の transition に保存する '
+            '(side_by_side_transition.plan_transition)。')
+    parser.add_argument(
+        '--collision-pairs', type=str,
+        default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
+        help='--side-by-side-transition の移動先のバッチ IK で使う干渉ペア '
+            '(solve_palm_ik.py の同名のフラグと同じ)。')
     args = parser.parse_args()
 
     files = json_io.iter_json_files(args.input_dir)
@@ -1719,7 +1730,26 @@ def main():
     if not args.no_warmup:
         _warmup_solver(robot, solver, args)
 
+    transition_pairs = None
+    base_limits = [tuple(spik.DEFAULT_BASE_X_RANGE),
+                   tuple(spik.DEFAULT_BASE_Y_RANGE),
+                   tuple(spik.DEFAULT_BASE_YAW_RANGE)]
+    if args.side_by_side_transition:
+        if os.path.exists(args.collision_pairs):
+            transition_pairs = spik.load_collision_pairs(
+                args.collision_pairs, robot)
+        # 最初のバッチ IK は台車の全可動域で解いておく (人ごとに絞った
+        # 可動域で最初に呼ぶと以後の結果が壊れる、solve_palm_ik.py の
+        # _warmup_batch_ik と同じ)。
+        for robot_arm, hand in (('l', 'R'), ('r', 'L')):
+            spik.solve_person_ik(
+                robot, spik._WARMUP_PALM, hand, robot_arm,
+                spik.human_body_obstacles({}), base_limits=base_limits,
+                collision_pairs=transition_pairs, joint_positions={},
+                verification_pairs=verification_pairs)
+
     n_optimized = n_verified = n_total = n_not_planned = 0
+    n_transition = n_transition_verified = 0
     for i, path in enumerate(files):
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))
@@ -1760,6 +1790,17 @@ def main():
         n_total += 1
         n_optimized += int(result['optimized'])
         n_verified += int(result['verified'])
+        post = handshake.get('post_process')
+        if args.side_by_side_transition and post is not None:
+            transition = sbs.plan_transition(
+                robot, handshake['robot_arm'], handshake['offered_hand'],
+                post, joint_positions, collision_joints, verification_pairs,
+                transition_pairs, base_limits)
+            result['transition'] = transition
+            n_transition += 1
+            n_transition_verified += int(transition['verified'])
+            print('  [transition] 横並び移動: {}'.format(
+                sbs.transition_summary(transition)))
         json_io.save_json(out_path, result)
         if result.get('other_arm_posture_replanned') is not None:
             # 差し出さない腕の姿勢を差し替えて計画し直した (plan_person_
@@ -1782,6 +1823,9 @@ def main():
     print('{}/{} verified (うち最適化まで要した人数 {} / '
           '対象外・IK失敗 {} 人)。'.format(
               n_verified, n_total, n_optimized, n_not_planned))
+    if args.side_by_side_transition:
+        print('横並び移動: {}/{} verified。'.format(
+            n_transition_verified, n_transition))
 
 
 if __name__ == '__main__':

@@ -440,7 +440,29 @@ def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINT
         return waypoints, n_approach
     waypoints += build_press_in_waypoints(
         waypoints[-1], motion['joint_names'], post, n_press_in)
+    waypoints += transition_waypoints(motion)
     return waypoints, n_approach
+
+
+def transition_waypoints(motion):
+    """``motion['transition']`` (``plan_handshake_motion.py --side-by-side-
+    transition`` が計画した、掌を合わせたまま台車を動かして横並びへ移る
+    区間) の waypoint を、関節角を ``motion['joint_names']`` の並びに
+    直して返す (横並び移動をしないなら空)。押し込み区間の後に続けて
+    表示・実行する。表示で区別できるよう ``transition: True`` を付ける。"""
+    transition = motion.get('transition')
+    if not transition or not transition.get('verified'):
+        return []
+    joint_names = motion['joint_names']
+    waypoints = []
+    for wp in transition['waypoints']:
+        name_to_angle = dict(zip(transition['joint_names'],
+                                 wp['joint_angle_vector']))
+        waypoints.append(dict(
+            wp, transition=True,
+            joint_angle_vector=[float(name_to_angle[name])
+                                for name in joint_names]))
+    return waypoints
 
 
 def build_press_in_waypoints(last_wp, joint_names, post,
