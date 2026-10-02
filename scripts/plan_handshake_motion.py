@@ -1674,6 +1674,12 @@ def main():
         default=DEFAULT_COLLISION_ACTIVATION_DISTANCE,
         help='軌道最適化で人体との干渉コストが働き始める距離 [m] (既定 {})。'
             .format(DEFAULT_COLLISION_ACTIVATION_DISTANCE))
+    parser.add_argument(
+        '--torso-surface-offset', type=float, default=0.0,
+        help='干渉判定に使う骨格の体幹の関節 (首・肩・腰) を、カメラから '
+            '離れる水平方向へずらす距離 [m] (solve_palm_ik.py の同名の '
+            'フラグと同じ値を指定する。実カメラの骨格なら {}、既定 0)。'
+            .format(spik.DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
 
     files = json_io.iter_json_files(args.input_dir)
@@ -1740,8 +1746,13 @@ def main():
         if human_xy is None:
             human_xy = np.array([spik.HUMAN_FRONT_DISTANCE, 0.0])
 
+        # 軌道計画が骨格を使うのは干渉判定だけなので、体幹を体の奥へ
+        # ずらした骨格を渡す (solve_palm_ik.py の --torso-surface-offset と
+        # 同じ値を指定する、カメラは平行移動後の offset の位置)。
+        collision_joints = spik.shift_torso_joints_from_surface(
+            joint_positions, offset, args.torso_surface_offset)
         result = plan_person_motion(
-            robot, handshake['robot_arm'], handshake, joint_positions,
+            robot, handshake['robot_arm'], handshake, collision_joints,
             human_xy, args, verification_pairs, solver,
             initial_base_pose=np.array(args.initial_base_pose))
         n_total += 1

@@ -1250,9 +1250,16 @@ class HandshakePipelineNode(object):
         translated_joints = spik.translate_joint_positions(
             joint_positions, offset)
         translated_palm = spik.translate_palm(palm, offset)
+        # 関節は深度画像の表面の点なので、干渉判定 (障害物・事後検証・
+        # 軌道計画) だけは体幹の関節を体の奥へずらした骨格を使う
+        # (spik.shift_torso_joints_from_surface 参照)。カメラ (base_link
+        # 原点) は平行移動後は offset の位置。立ち位置・向き・左右の判定
+        # には translated_joints をそのまま使う。
+        collision_joints = spik.shift_torso_joints_from_surface(
+            translated_joints, offset, args.torso_surface_offset)
         collision_obstacles = (
             [] if (args.no_human_collision or self.collision_pairs is None)
-            else spik.human_body_obstacles(translated_joints))
+            else spik.human_body_obstacles(collision_joints))
 
         # solve_palm_ik.py の main() と同じく、差し出している手の側・人間の
         # 正面方向に合わせてこの人物専用の base_limits (台車の可動域) を
@@ -1299,7 +1306,8 @@ class HandshakePipelineNode(object):
                 self_collision=(not args.no_self_collision
                                 and self.collision_pairs is not None),
                 collision_pairs=self.collision_pairs,
-                joint_positions=translated_joints,
+                joint_positions=collision_joints,
+                placement_joint_positions=translated_joints,
                 verification_pairs=self.verification_pairs)
 
         if picked is None:
@@ -1345,7 +1353,7 @@ class HandshakePipelineNode(object):
             # 同じ仮想座標系 (実座標 + offset) に直した値を渡す。
             initial_base_pose = np.array([offset[0], offset[1], 0.0])
             motion = phm.plan_person_motion(
-                self.robot, robot_arm, result, translated_joints, human_xy,
+                self.robot, robot_arm, result, collision_joints, human_xy,
                 motion_args, self.motion_verification_pairs, self.solver,
                 initial_base_pose=initial_base_pose)
             self._log_debug(dict(
@@ -2823,6 +2831,8 @@ class HandshakePipelineNode(object):
         そのものを見せる (``_solve_handshake`` が IK 計算時に使うのと同じ
         関数 -- 人物が仮想的に平行移動される前の実座標系の
         ``joint_positions`` を渡すので、骨格線と同じ位置に重なって見える)。
+        ``_solve_handshake`` と同じく体幹の関節を体の奥へずらしてから作る
+        (実座標系なのでカメラは base_link 原点)。
         """
         with self._viewer_lock:
             for link in self._skeleton_links:
@@ -2837,7 +2847,10 @@ class HandshakePipelineNode(object):
                 self.viewer.delete(obstacle_link)
             self._current_obstacle_links = (
                 [] if joint_positions is None
-                else spik.human_body_obstacles(joint_positions))
+                else spik.human_body_obstacles(
+                    spik.shift_torso_joints_from_surface(
+                        joint_positions, (0.0, 0.0),
+                        self.args.torso_surface_offset)))
             for obstacle_link in self._current_obstacle_links:
                 palm_plane_view.set_color(
                     obstacle_link, HUMAN_COLLISION_OBSTACLE_COLOR)
@@ -3174,6 +3187,12 @@ def main():
         '--collision-pairs', type=str,
         default=os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'))
     parser.add_argument('--no-human-collision', action='store_true')
+    parser.add_argument(
+        '--torso-surface-offset', type=float,
+        default=spik.DEFAULT_TORSO_SURFACE_OFFSET,
+        help='干渉判定に使う骨格の体幹の関節 (首・肩・腰) を、カメラから '
+            '離れる水平方向へずらす距離 [m] (既定 {}、関節が体の表面にある '
+            'ため)。0 で従来どおり。'.format(spik.DEFAULT_TORSO_SURFACE_OFFSET))
     parser.add_argument('--no-self-collision', action='store_true')
     parser.add_argument(
         '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,

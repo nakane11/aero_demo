@@ -413,6 +413,42 @@ def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
     return float(np.clip(radius, MIN_TORSO_RADIUS, MAX_TORSO_RADIUS))
 
 
+# 実カメラの骨格 (``PeoplePoseEstimator``) の関節は深度画像の表面の点
+# そのもので、体の中心ではない。そのままだと胴体の円柱の軸が胸の表面に
+# 乗り、半径のほぼ全部が体の前に張り出す (data2/session1.bag の 50
+# フレームで、見えている体の表面より胴体が中央値 8.7 cm、首-肩が 5.8 cm
+# 前に出ていた)。``shift_torso_joints_from_surface`` で体幹の関節だけを
+# 視点 (カメラ = ロボット) から離れる水平方向へこの距離だけずらすと、
+# 胴体の張り出しは 2 cm 程度になる。左右の幅は変わらない。合成データ
+# (SMPL) の関節は体の内部にあるので、合成データには使わない。
+TORSO_SURFACE_JOINTS = ('Neck', 'RShoulder', 'LShoulder', 'RHip', 'LHip')
+DEFAULT_TORSO_SURFACE_OFFSET = 0.07  # [m]
+
+
+def shift_torso_joints_from_surface(joint_positions, viewpoint_xy,
+                                    offset=DEFAULT_TORSO_SURFACE_OFFSET):
+    """``TORSO_SURFACE_JOINTS`` を、``viewpoint_xy`` (骨格を観測した
+    カメラの x/y、骨格と同じ座標系) から離れる水平方向へ ``offset`` [m]
+    ずらしたコピーを返す (``DEFAULT_TORSO_SURFACE_OFFSET`` の説明参照)。干渉
+    判定用の骨格を作るためのもので、立ち位置・向きの計算には元の骨格を
+    使う。``offset`` が 0 以下なら ``joint_positions`` をそのまま返す。"""
+    if offset <= 0.0 or not joint_positions:
+        return joint_positions
+    viewpoint_xy = np.asarray(viewpoint_xy, dtype=np.float64)[:2]
+    shifted = dict(joint_positions)
+    for name in TORSO_SURFACE_JOINTS:
+        if name not in shifted:
+            continue
+        pos = np.array(shifted[name], dtype=np.float64)
+        direction = pos[:2] - viewpoint_xy
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-6:
+            continue
+        pos[:2] += direction / norm * offset
+        shifted[name] = pos.tolist()
+    return shifted
+
+
 # 実カメラでは、体幹に近い関節 (肩・腰等) は検出できていても、その先
 # (肘から下・膝から下等) がカメラ視野外/オクルージョンで検出できない
 # ことがある。単に検出できた部分だけを障害物にすると、検出できなかった
@@ -3128,7 +3164,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             front_offset_weight=0.0,
                             facing_yaw_weight=0.0,
                             hover_human_clearance=(
-                                DEFAULT_HOVER_HUMAN_CLEARANCE)):
+                                DEFAULT_HOVER_HUMAN_CLEARANCE),
+                            placement_joint_positions=None):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、**関節の曲げ量コスト (``joint_bend_cost``)
@@ -3158,7 +3195,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     (``DEFAULT_FRONT_OFFSET_WEIGHT`` 参照)。``facing_yaw_weight`` > 0
     のときは、同様に「台車の向きが人の正面方向からずれた角度 [rad] の
     絶対値 × ``facing_yaw_weight``」も足す (``DEFAULT_FACING_YAW_WEIGHT``
-    参照)。以下の「曲げ量コスト」はこの合計を指す。
+    参照)。以下の「曲げ量コスト」はこの合計を指す。人の立ち位置・正面
+    方向は ``placement_joint_positions`` (``None`` なら ``joint_
+    positions``) から求める (干渉判定用に体幹をずらした骨格
+    (``shift_torso_joints_from_surface``) で立ち位置まで変えないため)。
 
     まず 1 を満たす候補全てについて、``angle_vectors`` の値から直接
     (``robot`` の状態を書き換えずに) 曲げ量コストだけを計算し、昇順に
@@ -3204,10 +3244,12 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     # facing_yaw_weight > 0 のときは、台車の向きが人の正面方向からずれた
     # 角度 [rad] の絶対値にこの重みを掛けて足す (人と同じ向きに揃える)。
     standing_xy = facing = None
+    if placement_joint_positions is None:
+        placement_joint_positions = joint_positions
     if (front_offset_weight > 0.0 or facing_yaw_weight > 0.0) \
-            and joint_positions:
-        standing_xy = human_standing_xy(joint_positions)
-        facing = human_facing_direction(joint_positions)
+            and placement_joint_positions:
+        standing_xy = human_standing_xy(placement_joint_positions)
+        facing = human_facing_direction(placement_joint_positions)
 
     def candidate_cost(candidate_index):
         cost = _joint_bend_cost_from_vector(
@@ -3434,7 +3476,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     n_turn_candidates=None,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     offered_hand_penalty=True,
-                    collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY):
+                    collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
+                    placement_joint_positions=None):
     """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
     初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
@@ -3605,7 +3648,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         post_process_max_candidates=post_process_max_candidates,
         front_offset_weight=front_offset_weight,
         facing_yaw_weight=facing_yaw_weight,
-        hover_human_clearance=hover_human_clearance)
+        hover_human_clearance=hover_human_clearance,
+        placement_joint_positions=placement_joint_positions)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -3999,6 +4043,13 @@ def main():
         help='バッチ IK の干渉ペナルティでのロボット側の形状 (既定 {}。'
             'DEFAULT_IK_COLLISION_GEOMETRY 参照)。'.format(
                 DEFAULT_IK_COLLISION_GEOMETRY))
+    parser.add_argument(
+        '--torso-surface-offset', type=float, default=0.0,
+        help='干渉判定に使う骨格の体幹の関節 (首・肩・腰) を、カメラ '
+            '(base_link 原点) から離れる水平方向へずらす距離 [m]。実カメラの '
+            '骨格 (関節が体の表面にある) を解くときは {} を指定する。既定 0 '
+            '(合成データの関節は体の内部にあるため)。'.format(
+                DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
     TARGET_HOVER_OFFSET = args.target_hover_offset
 
@@ -4127,15 +4178,20 @@ def main():
                 joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
             joint_positions = translate_joint_positions(
                 joint_positions, offset)
+            # 干渉判定だけは体幹の関節を体の奥へずらした骨格で行う (実
+            # カメラの骨格のとき、--torso-surface-offset 参照)。カメラは
+            # 平行移動前の原点にあったので、平行移動後は offset の位置。
+            collision_joints = shift_torso_joints_from_surface(
+                joint_positions, offset, args.torso_surface_offset)
             collision_obstacles = (
                 [] if collision_pairs is None
-                else human_body_obstacles(joint_positions))
+                else human_body_obstacles(collision_joints))
             palm = translate_palm(palm, offset)
         else:
             print('  {} に骨格 JSON が無いため、この人物は人体との干渉回避 '
                   'なしで解きます。'.format(skeleton_path))
             collision_obstacles = []
-            joint_positions = None
+            joint_positions = collision_joints = None
 
         # 差し出している手の側 (人間の中心より、手を差し出している側に
         # 台車を立たせる) を、台車の y 可動範囲を制限することで反映する
@@ -4183,7 +4239,8 @@ def main():
             x_margins=args.base_x_standing_margins,
             front_offset_weight=args.front_offset_weight,
             facing_yaw_weight=args.facing_yaw_weight,
-            joint_positions=joint_positions, **ik_kwargs)
+            joint_positions=collision_joints,
+            placement_joint_positions=joint_positions, **ik_kwargs)
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, target_pos, rots[-1], person_base_limits,
