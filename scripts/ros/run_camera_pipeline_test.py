@@ -215,6 +215,13 @@ FAILURE_NEAR_HAND_FRACTION = 0.7
 RETRY_MIN_DISPLACEMENT = 0.05
 RETRY_MIN_ROTATION_DEG = 20.0
 RETRY_LOST_TIME = 0.5
+# 失敗後に ARMED へ戻ってから、次の差し出しを受け付け始めるまでの待ち時間
+# [秒] (カメラ画像の時刻で測る)。失敗の発話が終わる前に手の揺れだけで
+# 再試行が始まり、数秒おきに助言を繰り返すのを防ぐ。発話の長さ分
+# (RETRY_COOLDOWN_PER_CHAR × 文字数) を RETRY_COOLDOWN_BASE に足す。待っている
+# 間は掌の基準も取らない (待ち終わった後の最初の姿勢が基準になる)。
+RETRY_COOLDOWN_BASE = 3.0
+RETRY_COOLDOWN_PER_CHAR = 0.2
 
 # 台車の速度上限。実機の base_controller (pr2_base_trajectory_action) が
 # 使っている aero_base_link.yaml の base_link_x/y/pan の max_velocity と
@@ -639,6 +646,7 @@ class HandshakePipelineNode(object):
         self._busy = False                # IK 計算中は次フレームの処理を止める
         # うなずき (_nod_head) が終わっていれば set。_execute_on_robot は
         # これを待ってから実機を動かす。
+        self._last_failure_speech = None
         self._nod_done = threading.Event()
         self._nod_done.set()
         self._frozen_joint_positions = None  # offered_hand が決まった瞬間の骨格 (以後この骨格を固定表示する) or None
@@ -1205,7 +1213,11 @@ class HandshakePipelineNode(object):
         """
         self._latest_offer_selection = None
         self._retry_reference = (
-            dict(palms={}, lost_since={}) if wait_offer_change else None)
+            dict(palms={}, lost_since={}, until=None,
+                 cooldown=RETRY_COOLDOWN_BASE + RETRY_COOLDOWN_PER_CHAR * len(
+                     self._last_failure_speech or ''))
+            if wait_offer_change else None)
+        self._last_failure_speech = None
         with self._lock:
             self._handshake_total_time = None
         # ARMED 中も RESET ボタンで IDLE に戻せるようにする (ARM ボタンは
@@ -1254,6 +1266,10 @@ class HandshakePipelineNode(object):
         しない。
         """
         reference = self._retry_reference
+        if reference['until'] is None:
+            reference['until'] = stamp + reference['cooldown']
+        if stamp < reference['until']:
+            return False
         for side in ('R', 'L'):
             palm = palms.get(side)
             ref = reference['palms'].get(side)
@@ -1661,6 +1677,7 @@ class HandshakePipelineNode(object):
             speech = self._failure_speech(
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
+                self._last_failure_speech = speech
                 self._say(speech)
                 return 'failed'
         return 'solved'
