@@ -3208,8 +3208,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             facing_yaw_weight=0.0,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
-                            placement_joint_positions=None,
-                            facing_sign=1.0):
+                            placement_joint_positions=None):
     """``batch_inverse_kinematics`` が返した候補群 (``success_flags``/
     ``angle_vectors``/``base_poses``。全て同じ添字で対応する) の中から、
     以下を全て満たす候補を、**関節の曲げ量コスト (``joint_bend_cost``)
@@ -3243,8 +3242,6 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     方向は ``placement_joint_positions`` (``None`` なら ``joint_
     positions``) から求める (干渉判定用に体幹をずらした骨格
     (``shift_torso_joints_from_surface``) で立ち位置まで変えないため)。
-    ``facing_sign`` を -1 にすると、向きのずれを人の正面方向の反対 (人と
-    向かい合う向き) から測る (前方ずれも反対向きに測る)。
 
     まず 1 を満たす候補全てについて、``angle_vectors`` の値から直接
     (``robot`` の状態を書き換えずに) 曲げ量コストだけを計算し、昇順に
@@ -3296,8 +3293,6 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             and placement_joint_positions:
         standing_xy = human_standing_xy(placement_joint_positions)
         facing = human_facing_direction(placement_joint_positions)
-        if facing is not None:
-            facing = facing_sign * facing
 
     def candidate_cost(candidate_index):
         cost = _joint_bend_cost_from_vector(
@@ -3525,8 +3520,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     offered_hand_penalty=True,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
-                    placement_joint_positions=None,
-                    facing_sign=1.0):
+                    placement_joint_positions=None):
     """1 人分について、``turn_candidates_deg(hand)`` の全ての向き × 全ての
     初期値 (``attempts_per_pose`` 個) を、その人の身体 (``collision_
     obstacles``) を障害物とした干渉回避付きバッチ IK でまとめて解く。
@@ -3698,8 +3692,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         front_offset_weight=front_offset_weight,
         facing_yaw_weight=facing_yaw_weight,
         hover_human_clearance=hover_human_clearance,
-        placement_joint_positions=placement_joint_positions,
-        facing_sign=facing_sign)
+        placement_joint_positions=placement_joint_positions)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
