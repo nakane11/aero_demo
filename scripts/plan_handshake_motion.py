@@ -1024,7 +1024,8 @@ def motion_margin(candidate):
 
 
 def not_planned_result(reason):
-    """経路計画の対象外だった人物 (IK 未対象/IK 失敗) のための結果 dict."""
+    """経路計画の対象外だった人物 (IK 未対象/IK 失敗/押し込み姿勢が解けな
+    かった) のための結果 dict."""
     return dict(planned=False, not_planned_reason=reason)
 
 
@@ -1753,9 +1754,13 @@ def main():
     for i, path in enumerate(files):
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))
-        if not handshake.get('target') or not handshake.get('solved'):
+        # 押し込み姿勢 (post_process) が解けなかった人は、hover までの経路を
+        # 作っても掌を合わせられない (実機でも動かさない) ので計画しない。
+        if (not handshake.get('target') or not handshake.get('solved')
+                or handshake.get('post_process') is None):
             reason = ('not_target' if not handshake.get('target')
-                      else 'ik_not_solved')
+                      else 'ik_not_solved' if not handshake.get('solved')
+                      else 'no_press')
             json_io.save_json(out_path, not_planned_result(reason))
             n_not_planned += 1
             print('[{}/{}] {} -> {} (not planned: {})'.format(
@@ -1821,7 +1826,7 @@ def main():
                   result['compute_time']))
 
     print('{}/{} verified (うち最適化まで要した人数 {} / '
-          '対象外・IK失敗 {} 人)。'.format(
+          '対象外・IK失敗・押し込み失敗 {} 人)。'.format(
               n_verified, n_total, n_optimized, n_not_planned))
     if args.side_by_side_transition:
         print('横並び移動: {}/{} verified。'.format(

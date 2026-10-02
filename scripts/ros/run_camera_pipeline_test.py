@@ -1453,14 +1453,19 @@ class HandshakePipelineNode(object):
         result['base_x_standing_margin'] = x_margin
 
         # IK が解けたら続けて軌道計画を行う (plan_handshake_motion.py の
-        # main と同じ、target かつ solved の人物だけが対象)。IK は
+        # main と同じ、target かつ solved で押し込み姿勢 (post_process) も
+        # 解けた人物だけが対象 -- 押し込みが無いと掌を合わせられず実機も
+        # 動かさないので、hover までの経路を計画しても無駄になる)。IK は
         # translated_joints/translated_palm を使う仮想座標系で解いている
         # ため、軌道計画もこの座標系のまま (result を untranslate する前)
         # に行う -- plan_person_motion 自身が呼ぶ human_body_cylinder_
         # obstacles/orbit_base_start が、この座標系の joint_positions/
         # result['base_position'] と対応している必要があるため。
         motion = None
-        if result['solved']:
+        if result['solved'] and result.get('post_process') is None:
+            print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
+                  'かったため、軌道計画をしません。'.format(attempt))
+        elif result['solved']:
             human_xy = spik.human_standing_xy(translated_joints)
             if human_xy is None:
                 human_xy = np.array([args.human_front_distance, 0.0])
@@ -1541,8 +1546,10 @@ class HandshakePipelineNode(object):
                 attempt, offered_hand, robot_arm,
                 collision_ik_time + candidate_selection_time))
         elif motion is None:
-            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし。'.format(
-                attempt, offered_hand, robot_arm))
+            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし{}。'.format(
+                attempt, offered_hand, robot_arm,
+                ' (押し込み姿勢が解けない)'
+                if result.get('post_process') is None else ''))
         else:
             print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画{} '
                   '({}、IK {:.1f} 秒 + 軌道 {:.1f} 秒)。'.format(
@@ -3320,7 +3327,9 @@ class HandshakePipelineNode(object):
                     content += (' (掌への押し込み、経路計画の干渉検証の対象外)')
             else:
                 content += ('\n\n**軌道:** 計画なし ({})'.format(
-                    'IK 失敗' if not result['solved'] else '計算中'))
+                    'IK 失敗' if not result['solved']
+                    else '押し込み姿勢が解けない'
+                    if result.get('post_process') is None else '計算中'))
         # 干渉しているかどうかの結論は、上の計画時の干渉余裕ではなく下の
         # 事後検証で出す -- 計画時の検証 (self.verification_pairs/motion の
         # waypoint_min_distances) は計画した waypoint だけが対象なので、

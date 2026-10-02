@@ -249,7 +249,7 @@ class PlaybackControls(object):
 
 
 def status_text(name, person_i, n_people, motion, display_waypoints,
-                n_approach, waypoint_index, collision_text):
+                n_approach, waypoint_index, collision_text, has_post_process):
     n_display_waypoints = len(display_waypoints)
     kind = KIND_LABELS.get(motion['kind'], motion['kind'])
     verified_text = 'OK (経路全体で干渉なし)' if motion['verified'] \
@@ -257,6 +257,12 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
     header = '**{}** ({}/{})  waypoint {}/{}\n\n経路: {}  検証: {}\n\n'.format(
         name, person_i + 1, n_people, waypoint_index,
         n_display_waypoints - 1, kind, verified_text)
+    # 検証の OK は接近経路の干渉だけで、掌を合わせられるかは別 (押し込み
+    # 姿勢の IK が解けなかった人は hover で終わり、実機でも動かさない)。
+    if not has_post_process:
+        header += ('**押し込み: なし** (solve_palm_ik.py の後処理判定が解けず、'
+                   '経路は hover で終わる -- 掌は合わない。実機では動かさない)'
+                   '\n\n')
     if waypoint_index < n_approach:
         dist = motion['waypoint_min_distances'][waypoint_index]
         body = 'この waypoint の干渉余裕: {:+.4f} m ({})\n\n'.format(
@@ -455,7 +461,8 @@ def main():
         label_text.content = status_text(
             current['name'], controls.person_index, controls.n_people,
             motion, current['display_waypoints'], current['n_approach'],
-            idx, collision_pairs_text(colliding))
+            idx, collision_pairs_text(colliding),
+            current['handshake'].get('post_process') is not None)
         viewer.redraw()
 
     controls.on_person_change = refresh_person
