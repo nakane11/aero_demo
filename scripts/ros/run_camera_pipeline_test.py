@@ -15,7 +15,12 @@
 * IK が解けたら続けて ``plan_handshake_motion.py`` と同じ要領で、
   ロボットの初期姿勢から握手姿勢へ至る干渉回避付きの軌道 (waypoint 列)
   を計画する
-* ``--armed-timeout`` 秒たっても決まらなければ諦めて ``IDLE`` に戻る
+* ``ARMED`` では差し出し手が決まるまで時間制限なく待つ。結果が出たら
+  ``RESET`` ボタンで ``IDLE`` に戻し、``ARM`` ボタンで次の人を待つ。
+  ただし ``--auto-execute`` で IK・軌道計画に失敗して実機を動かせなかった
+  ときは ``ARMED`` のまま次の差し出しを待つ (同じ手で失敗を繰り返さない
+  よう、掌を動かすか向きを変えるまで次の差し出しは受け付けない、
+  ``_offer_changed`` 参照)
 
 IK 自体は指なしロボット (``self.robot``) で解く (自己干渉ペアの組み合わせ
 を抑えるため)。画面の状態表示では指ありモデルで事後検証を別に行い、
@@ -196,6 +201,18 @@ MIN_SEGMENT_TIME = 1.0 / 15.0
 # (押し込み付近) なら、手の出し方が原因とみなして出し方を助言する
 # (_failure_cause 参照)。
 FAILURE_NEAR_HAND_FRACTION = 0.7
+
+# 実機の実行後・失敗後に ARMED へ戻ったとき、戻った時点の掌から位置が
+# RETRY_MIN_DISPLACEMENT [m] 以上動くか、法線が RETRY_MIN_ROTATION_DEG
+# 以上傾くか、RETRY_LOST_TIME [s] 以上続けて見えなくなるまでは、その手の
+# 差し出しを受け付けない (_offer_changed 参照)。差し出したままの手で同じ
+# IK を解き直して失敗を繰り返したり、握手を終えた直後の手に再び向かったり
+# しないため。位置の閾値は差し出し判定の静止判定 (epp.STILLNESS_MAX_
+# DISPLACEMENT = 5 cm) に合わせ、向きは「手のひらを斜め下に」の助言 (45 度)
+# で確実に越える値にしてある。
+RETRY_MIN_DISPLACEMENT = 0.05
+RETRY_MIN_ROTATION_DEG = 20.0
+RETRY_LOST_TIME = 0.5
 
 # 台車の速度上限。実機の base_controller (pr2_base_trajectory_action) が
 # 使っている aero_base_link.yaml の base_link_x/y/pan の max_velocity と
@@ -594,11 +611,15 @@ class HandshakePipelineNode(object):
         self._hand_frames = []
         self._current_palm = None         # 直近の IK に使った掌 (base_link 座標系、平行移動前) or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 (offered_hand_selector.select の戻り値) or None
-        # 'idle' (ARM 待ち) -> 'armed' (差し出し手待ち) -> 'solving'
-        # (offered_hand が決まって IK 計算中) -> 'result' (IK 完了、結果
-        # 表示中。RESET ボタンで 'idle' に戻る)。
+        # 'idle' (ARM 待ち) -> 'armed' (差し出し手待ち、時間制限なし) ->
+        # 'solving' (offered_hand が決まって IK 計算中) -> 'result' (IK 完了、
+        # 結果表示中・実機で実行中。RESET ボタンで 'idle' に戻る)。
+        # --auto-execute で失敗して実機を動かせなければ 'armed' に戻る
+        # (_try_handshake 参照)。'armed' に時間制限はない。
         self.state = 'idle'
-        self.armed_deadline = None
+        # ARMED に戻った時点の左右の掌 (_offer_changed 参照)。None なら
+        # 差し出しをすぐ受け付ける。
+        self._retry_reference = None
         self._busy = False                # IK 計算中は次フレームの処理を止める
         # うなずき (_nod_head) が終わっていれば set。_execute_on_robot は
         # これを待ってから実機を動かす。
@@ -731,15 +752,8 @@ class HandshakePipelineNode(object):
 
         if args.auto_arm:
             # ARM ボタンクリックの代わりに起動直後から ARMED にする
-            # (_on_arm ボタンハンドラと全く同じ処理、--bag での無人テスト用)。
-            self.state = 'armed'
-            self.armed_deadline = time.time() + args.armed_timeout
-            self._latest_offer_selection = None
-            with self._lock:
-                self._handshake_total_time = None
-            print('[auto-arm] 起動直後に ARMED 状態にしました '
-                  '(--auto-arm)。{:.0f} 秒以内に手を差し出してください。'
-                  .format(args.armed_timeout))
+            # (--bag での無人テスト用、実機の姿勢は動かさない)。
+            self._arm('--auto-arm', move_to_initial_pose=False)
 
     _WARMUP_PALM = dict(
         position=[0.5, 0.0, 1.0],
@@ -899,44 +913,14 @@ class HandshakePipelineNode(object):
 
         @self.arm_button.on_click
         def _on_arm(_):  # noqa: ANN001  (viser の GuiEvent は型を問わない)
-            self.state = 'armed'
-            self.armed_deadline = time.time() + self.args.armed_timeout
-            self._latest_offer_selection = None
-            with self._lock:
-                self._handshake_total_time = None
-            if self.ri is not None:
-                # 腕を初期姿勢まで下ろす動作 (_move_to_initial_pose)。
-                # self.ri は --auto-execute の指定に関わらず接続を試みて
-                # いるため (__init__ 参照)、接続さえ成功していれば
-                # --auto-execute を指定していない場合でも実行する。
-                # 実機通信 (joint_states 待ち/action 送信) をこの GUI
-                # コールバックのスレッドで直接行うとブロックするため、
-                # _execute_on_robot と同様に別スレッドに逃がす。
-                threading.Thread(
-                    target=self._move_to_initial_pose, daemon=True).start()
-            print('[ARM] ARMED になりました。{:.0f} 秒以内に手を差し出して'
-                  'ください。'.format(self.args.armed_timeout))
+            self._arm('ARM ボタン')
 
         @self.reset_button.on_click
         def _on_reset(_):  # noqa: ANN001
-            with self._lock:
-                self._frozen_joint_positions = None
-                self._current_result = None
-                self._current_motion = None
-                self._display_waypoints = None
-                self._display_n_prepend = 0
-                self._display_n_approach = 0
-                self._handshake_total_time = None
-            self.play_checkbox.value = False
-            self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
-            self.reset_button.visible = False
-            self.arm_button.visible = True
+            self._reset_view()
             self.state = 'idle'
-            with self._viewer_lock:
-                for obstacle_link in self._current_obstacle_links:
-                    self.viewer.delete(obstacle_link)
-                self._current_obstacle_links = []
-                self.viewer.redraw()
+            self._retry_reference = None
+            self._latest_offer_selection = None
             print('[RESET] 骨格表示とロボットの姿勢を初期状態に戻しました。')
 
         self._status_text = self.viewer._server.gui.add_markdown('')
@@ -1187,12 +1171,99 @@ class HandshakePipelineNode(object):
             self._try_handshake(armed_joint_positions,
                                 color_msg.header.stamp.to_sec())
 
-        if (self.state == 'armed' and self.armed_deadline is not None
-               and time.time() > self.armed_deadline):
-            self.state = 'idle'
-            self.armed_deadline = None
-            print('[ARMED] タイムアウトしました。差し出し手が決まりません '
-                  'でした。')
+    def _arm(self, reason, move_to_initial_pose=True, wait_offer_change=False):
+        """ARMED にする (差し出し手を時間制限なく待つ).
+
+        ``move_to_initial_pose`` なら実機を初期姿勢まで戻す
+        (``_move_to_initial_pose``)。``self.ri`` は ``--auto-execute`` の
+        指定に関わらず接続を試みているため (``__init__`` 参照)、接続さえ
+        成功していれば ``--auto-execute`` を指定していない場合でも実行
+        する。実機通信 (joint_states 待ち/action 送信) は呼び出し元 (GUI
+        コールバック・カメラのコールバック) のスレッドで直接行うとブロック
+        するため、別スレッドに逃がす。
+
+        ``wait_offer_change`` なら、ARMED に戻った時点の掌から手を動かす
+        まで次の差し出しを受け付けない (``_offer_changed`` 参照)。
+        """
+        self._latest_offer_selection = None
+        self._retry_reference = (
+            dict(palms={}, lost_since={}) if wait_offer_change else None)
+        with self._lock:
+            self._handshake_total_time = None
+        # ARMED 中も RESET ボタンで IDLE に戻せるようにする (ARM ボタンは
+        # 押しても意味がないので隠す)。
+        self.arm_button.visible = False
+        self.reset_button.visible = True
+        self.state = 'armed'
+        if move_to_initial_pose and self.ri is not None:
+            threading.Thread(
+                target=self._move_to_initial_pose, daemon=True).start()
+        print('[ARM] ARMED になりました ({})。手を差し出してください{}。'.format(
+            reason, ' (今の手を動かすか向きを変えてから)'
+            if wait_offer_change else ''))
+
+    def _reset_view(self):
+        """固定表示の骨格・IK と軌道の結果・人体の干渉ジオメトリを消して、
+        画面を初期位置の表示に戻す (RESET ボタンと同じ、状態は変えない)。"""
+        with self._lock:
+            self._frozen_joint_positions = None
+            self._current_result = None
+            self._current_motion = None
+            self._display_waypoints = None
+            self._display_n_prepend = 0
+            self._display_n_approach = 0
+            self._handshake_total_time = None
+        self.play_checkbox.value = False
+        self._set_waypoint_slider_range(0)  # 表示を初期位置に戻す (_apply_current_waypoint 経由で事後検証も更新される)
+        self.reset_button.visible = False
+        self.arm_button.visible = True
+        with self._viewer_lock:
+            for obstacle_link in self._current_obstacle_links:
+                self.viewer.delete(obstacle_link)
+            self._current_obstacle_links = []
+            self.viewer.redraw()
+
+    def _offer_changed(self, palms, stamp):
+        """ARMED に戻った時点 (``_arm`` の ``wait_offer_change``) から、
+        どちらかの手を動かしたか.
+
+        左右の掌は、ARMED に戻ってから最初に見えたフレームの位置・法線を
+        基準にする。基準から ``RETRY_MIN_DISPLACEMENT`` 以上動くか、法線が
+        ``RETRY_MIN_ROTATION_DEG`` 以上傾くか、``RETRY_LOST_TIME`` 以上
+        続けて見えなくなった (手を下ろした) ら True。手のランドマークは
+        単発で欠けることがあるので、見えなくなっただけではすぐには True に
+        しない。
+        """
+        reference = self._retry_reference
+        for side in ('R', 'L'):
+            palm = palms.get(side)
+            ref = reference['palms'].get(side)
+            if palm is None:
+                if ref is None:
+                    continue
+                since = reference['lost_since'].setdefault(side, stamp)
+                if stamp - since >= RETRY_LOST_TIME:
+                    print('[ARM] {}手が見えなくなったので、次の差し出しを'
+                          '受け付けます。'.format(side))
+                    return True
+                continue
+            reference['lost_since'].pop(side, None)
+            if ref is None:
+                reference['palms'][side] = palm
+                continue
+            displacement = float(np.linalg.norm(
+                np.asarray(palm['position']) - np.asarray(ref['position'])))
+            cos = float(np.dot(
+                hand_offer_advice._unit(palm['y_axis']),
+                hand_offer_advice._unit(ref['y_axis'])))
+            rotation = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+            if (displacement >= RETRY_MIN_DISPLACEMENT
+                    or rotation >= RETRY_MIN_ROTATION_DEG):
+                print('[ARM] {}手が動いたので (位置 {:.0f} mm、向き {:.0f} 度)、'
+                      '次の差し出しを受け付けます。'.format(
+                          side, displacement * 1e3, rotation))
+                return True
+        return False
 
     def _try_handshake(self, joint_positions, stamp):
         handshake_t0 = time.time()
@@ -1210,10 +1281,13 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._latest_offer_selection = selection
 
+        if self._retry_reference is not None:
+            if not self._offer_changed(palms, stamp):
+                return
+            self._retry_reference = None
         offered_hand = palms['offered_hand']
         if offered_hand is None:
             return
-        self.armed_deadline = None
         self._busy = True
         if self.ri is not None:
             # 差し出し手が決まったことを伝えるうなずき。軌道計画と並行に
@@ -1228,13 +1302,28 @@ class HandshakePipelineNode(object):
         self.state = 'solving'
         self.arm_button.visible = False
         self.reset_button.visible = True
+        outcome = None
         try:
-            self._solve_handshake(joint_positions, palms, offered_hand)
+            outcome = self._solve_handshake(joint_positions, palms, offered_hand)
         finally:
             self._busy = False
             self.state = 'result'
             with self._lock:
                 self._handshake_total_time = time.time() - handshake_t0
+        if outcome == 'execute':
+            # 別スレッドへ逃がす -- この関数はカメラフレームのコールバック
+            # スレッドで動いており、ここで実機の動作完了まで待つと以後の
+            # フレームを取りこぼすため。実行後は結果を表示したまま RESET
+            # ボタンを待つ (RESET 後に ARM ボタンで次の人へ)。
+            threading.Thread(
+                target=self._execute_on_robot, daemon=True).start()
+        elif outcome == 'failed':
+            # 失敗して実機を動かせなかった: ARMED のまま次の差し出しを
+            # 待つ。実機は動いていないので初期姿勢へは戻さない。失敗した
+            # 骨格の固定表示は消して、最新の骨格の表示に戻す。
+            self._reset_view()
+            self._arm('失敗', move_to_initial_pose=False,
+                      wait_offer_change=True)
 
     def _log_debug(self, record):
         """デバッグ用ログを JSON 1 行としてログファイルにだけ書く
@@ -1498,18 +1587,19 @@ class HandshakePipelineNode(object):
         if args.save_dir:
             self._save_attempt(joint_positions, palms, result, motion)
 
-        # --auto-execute: 実機を動かせる状態になった時点で自動的に実行する
-        # (--bag/--auto-arm での無人テストや、ブラウザを開けない状況で
-        # 使う)。別スレッドへ逃がす -- この _solve_handshake はカメラ
-        # フレームのコールバックスレッドで動いており、ここで実機の動作
-        # 完了まで待つと以後のフレームを取りこぼすため。
+        # 戻り値 (_try_handshake が見る):
+        # 'execute': --auto-execute で実機を動かせる (実行後は RESET ボタン
+        #     を待つ)。
+        # 'failed': --auto-execute で IK・軌道計画に失敗して動かせなかった
+        #     (ARMED のまま次の差し出しを待つ)。
+        # 'solved': それ以外 (--auto-execute なしの確認用。結果を表示した
+        #     まま RESET ボタンを待つ)。
         if executable:
             print('[auto-execute] IK・軌道計画が成功したため実機を動かします '
                   '(--auto-execute)。')
-            threading.Thread(
-                target=self._execute_on_robot, daemon=True).start()
-        elif not (result['solved'] and has_post_process
-                  and motion is not None and self._motion_verified(motion)):
+            return 'execute'
+        if not (result['solved'] and has_post_process
+                and motion is not None and self._motion_verified(motion)):
             # IK が解けなかった、または軌道が干渉検証に通らなかったため
             # 実機を動かせなかったことを人に伝える。手の出し方が原因と
             # 考えられるときは、どう出し直してほしいかも伝える。
@@ -1517,6 +1607,8 @@ class HandshakePipelineNode(object):
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
                 self._say(speech)
+                return 'failed'
+        return 'solved'
 
     def _failure_speech(self, attempt, result, motion, joint_positions, palm,
                         offered_hand):
@@ -2955,10 +3047,11 @@ class HandshakePipelineNode(object):
         骨格が offered_hand 決定時のもので固定されているかどうか
         (``_frozen_joint_positions`` 参照)。
         """
-        if self.state == 'armed' and self.armed_deadline is not None:
-            remaining = max(0.0, self.armed_deadline - time.time())
-            state_text = 'ARMED (残り {:.1f} 秒。手を差し出してください)'.format(
-                remaining)
+        if self.state == 'armed':
+            state_text = ('ARMED (手を差し出してください)'
+                          if self._retry_reference is None else
+                          'ARMED (今の手を動かすか向きを変えてから、'
+                          'もう一度差し出してください)')
         elif self.state == 'solving':
             state_text = 'IK を計算中です...'
         elif self.state == 'result':
@@ -3065,12 +3158,6 @@ class HandshakePipelineNode(object):
                 is_base_frame = self._latest_is_base_frame
                 frozen_joint_positions = self._frozen_joint_positions
 
-            if (self.state == 'armed' and self.armed_deadline is not None
-                   and time.time() > self.armed_deadline):
-                self.state = 'idle'
-                self.armed_deadline = None
-                print('[ARMED] タイムアウトしました。差し出し手が決まりませんでした。')
-
             # 差し出し手が決まった後 (frozen_joint_positions が設定されて
             # 以降、RESET されるまで) は、その時点の骨格を固定表示する
             # (カメラの最新フレームでは上書きしない)。
@@ -3154,10 +3241,6 @@ def main():
             'がズレていると、既定の 10 秒では両者の有効期間が重ならず '
             'TF が引けないことがある。根本的にはマシン間の時刻同期が '
             '必要 (NTP/chrony)。')
-    parser.add_argument(
-        '--armed-timeout', type=float, default=60.0,
-        help='ARMED になってから offered_hand が決まらなければ諦めて '
-            'IDLE に戻るまでの秒数 (既定 60.0)。')
     parser.add_argument(
         '--client-wait-timeout', type=float, default=30.0,
         help='viser のブラウザクライアント接続を待つ 1 回あたりの秒数 '
@@ -3410,7 +3493,8 @@ def main():
             '関節の両方を実機で自動的に動かす (AeroROSRobotInterface。'
             '台車は go_pos_unsafe 相当の相対移動、move_to/move_base の '
             'costmap は使わない。--auto-arm と組み合わせるとブラウザ操作 '
-            'なしで一連の動作を実行できる)。指定しなければ実機は動かさず、'
+            'なしで一連の動作を実行できる。失敗して動かせなければ ARMED '
+            'のまま次の差し出しを待つ)。指定しなければ実機は動かさず、'
             'viser 画面での waypoint スライダー/Play による確認のみになる '
             '(既定オフ)。')
     parser.add_argument(
