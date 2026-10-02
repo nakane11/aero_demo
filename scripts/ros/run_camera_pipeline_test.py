@@ -119,6 +119,7 @@ os.environ.setdefault(
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS', '0')
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 
+from aero_demo import hand_offer_advice  # noqa: E402
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
 from aero_demo import skeleton_drawing  # noqa: E402
@@ -190,6 +191,11 @@ HEAD_NOD_MOVE_TIME = 0.5
 # が下限だった)。この下限はほとんど動かない区間の時間が 0 に潰れない
 # ためだけのもので、腕のコントローラの制御周期 (15Hz) 1 周期分にしてある。
 MIN_SEGMENT_TIME = 1.0 / 15.0
+
+# 軌道の干渉検証で通らなかった waypoint が全て接近区間のこの割合より後ろ
+# (押し込み付近) なら、手の出し方が原因とみなして出し方を助言する
+# (_failure_cause 参照)。
+FAILURE_NEAR_HAND_FRACTION = 0.7
 
 # 台車の速度上限。実機の base_controller (pr2_base_trajectory_action) が
 # 使っている aero_base_link.yaml の base_link_x/y/pan の max_velocity と
@@ -678,6 +684,18 @@ class HandshakePipelineNode(object):
             except Exception as exc:  # noqa: BLE001
                 print('[speech] SoundClient の初期化に失敗したため発話し '
                       'ません ({})。'.format(exc))
+        # IK に失敗したときに、どう手を出し直してほしいかを伝えるための
+        # reachability map の表 (_failure_speech 参照)。発話しないときも
+        # [advice] の表示には使う。
+        self.offer_advisor = None
+        if args.speech_advice:
+            try:
+                self.offer_advisor = hand_offer_advice.OfferAdvisor(
+                    args.hand_offer_table)
+            except Exception as exc:  # noqa: BLE001
+                print('[advice] 手の出し方の表 ({}) を読めないため、IK 失敗時'
+                      'に出し方を助言しません ({})。'.format(
+                          args.hand_offer_table, exc))
 
         # デバッグ用: カメラ画像に検出できた 2D 骨格を重ねた画像を publish
         # する (draw_skeleton_overlay 参照)。rqt_image_view 等で購読すれば、
@@ -1490,10 +1508,80 @@ class HandshakePipelineNode(object):
                   '(--auto-execute)。')
             threading.Thread(
                 target=self._execute_on_robot, daemon=True).start()
-        elif args.auto_execute:
+        elif not (result['solved'] and has_post_process
+                  and motion is not None and self._motion_verified(motion)):
             # IK が解けなかった、または軌道が干渉検証に通らなかったため
-            # 実機を動かせなかったことを人に伝える。
-            self._say(args.speech_fail_text)
+            # 実機を動かせなかったことを人に伝える。手の出し方が原因と
+            # 考えられるときは、どう出し直してほしいかも伝える。
+            speech = self._failure_speech(
+                attempt, result, motion, joint_positions, palm, offered_hand)
+            if args.auto_execute:
+                self._say(speech)
+
+    def _failure_speech(self, attempt, result, motion, joint_positions, palm,
+                        offered_hand):
+        """実機を動かせなかったときに発話する文を返す.
+
+        失敗の原因が手の出し方と考えられる場合 (IK の失敗・後処理が
+        解けない・軌道の干渉が押し込み付近だけ、``_failure_cause``) は、
+        reachability map で今の出し方に一番近い解ける出し方を探し
+        (``hand_offer_advice``)、その差 (「あと 10 センチ前に出して」
+        など) を ``--speech-fail-text`` に続ける。助言が見つからなければ
+        ``--speech-retry-text`` を続ける。接近の途中の干渉が原因なら
+        手の出し方を直しても通りにくいので ``--speech-approach-fail-text``
+        にする。
+        """
+        args = self.args
+        cause = self._failure_cause(result, motion)
+        if cause == 'approach':
+            print('[advice] 試行{}: 接近の途中で干渉したため、手の出し方は'
+                  '助言しません。'.format(attempt))
+            self._log_debug(dict(event='advice', person=attempt, cause=cause))
+            return args.speech_approach_fail_text
+        measure = hand_offer_advice.measure_offer(
+            joint_positions, palm, offered_hand)
+        advice, target = [], None
+        if self.offer_advisor is not None and measure is not None:
+            advice, target = self.offer_advisor.advise(measure, offered_hand)
+        text = hand_offer_advice.advice_speech(advice)
+        if measure is not None:
+            print('[advice] 試行{} ({}): 今の出し方 前{forward:.2f} 外{lateral:.2f} '
+                  '高さ{height:.2f} m、指先 yaw{yaw:.0f} pitch{pitch:.0f}、'
+                  'ひねり{roll:.0f} 度 -> {}'.format(
+                      attempt, cause, text or '(助言なし)', **measure))
+        self._log_debug(dict(
+            event='advice', person=attempt, cause=cause, measure=measure,
+            target=target, advice=[[k, d] for k, d, _ in advice], text=text))
+        tail = text or args.speech_retry_text
+        return '。'.join(t for t in (args.speech_fail_text, tail) if t)
+
+    @staticmethod
+    def _failure_cause(result, motion,
+                       near_hand_fraction=FAILURE_NEAR_HAND_FRACTION):
+        """実機を動かせなかった原因を分類する.
+
+        ``ik``: IK が解けなかった。``no_press``: 解けたが後処理 (押し込み・
+        視線) が解けず押し込み区間がない。``near_hand``: 軌道の干渉検証で
+        通らなかった waypoint が全て押し込み付近 (接近区間の後ろ
+        ``near_hand_fraction``) にあり、lead-in は通っている -- 手が体に
+        近すぎるなど手の出し方が原因と考えられる。``approach``: それ以外の
+        軌道の失敗 (lead-in や回り込みの途中の干渉)。
+        """
+        if not result['solved']:
+            return 'ik'
+        if result.get('post_process') is None:
+            return 'no_press'
+        if motion is None or not motion['lead_in_verified']:
+            return 'approach'
+        distances = motion['waypoint_min_distances']
+        margins = motion.get('waypoint_human_clearance_margins') or \
+            [None] * len(distances)
+        failed = [i for i, (d, c) in enumerate(zip(distances, margins))
+                  if not phm.motion_passes([d], [c])]
+        start = near_hand_fraction * (len(distances) - 1)
+        if failed and min(failed) >= start:
+            return 'near_hand'
+        return 'approach'
 
     @staticmethod
     def _motion_verified(motion):
@@ -3345,6 +3433,29 @@ def main():
         default='ごめんなさい、うまく手を出せませんでした',
         help='--auto-execute で IK・軌道計画に失敗して実機を動かせなかった '
             'ときに発話する文 (空文字列で発話しない)。')
+    parser.add_argument(
+        '--no-speech-advice', dest='speech_advice', action='store_false',
+        help='IK 失敗などで実機を動かせなかったときに、--speech-fail-text に'
+            '続けてどう手を出し直してほしいか (reachability map で一番近い'
+            '解ける出し方との差、aero_demo.hand_offer_advice) を伝えない '
+            '(既定では伝える)。')
+    parser.add_argument(
+        '--hand-offer-table', type=str,
+        default=hand_offer_advice.DEFAULT_TABLE_PATH,
+        help='手の出し方の助言に使う reachability map の表 '
+            '(tools/build_hand_offer_reachability.py が作る、既定 '
+            'config/hand_offer_reachability.json)。')
+    parser.add_argument(
+        '--speech-retry-text', type=str,
+        default='手の位置を少し変えて、もう一度差し出してください',
+        help='手の出し方が原因と考えられるが、直し方が見つからなかった'
+            'ときに --speech-fail-text に続けて発話する文。')
+    parser.add_argument(
+        '--speech-approach-fail-text', type=str,
+        default='ごめんなさい、近づく道が見つかりませんでした。'
+                'もう一度手を出してください',
+        help='軌道計画の接近の途中 (lead-in・回り込み) の干渉で実機を動かせ'
+            'なかったときに発話する文 (手の出し方は助言しない)。')
     parser.add_argument(
         '--speech-voice', type=str, default='四国めたん-ノーマル',
         help='発話に使う声 (sound_play の voice、既定 "四国めたん-ノーマル")。')
