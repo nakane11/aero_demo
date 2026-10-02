@@ -1441,9 +1441,14 @@ class HandshakePipelineNode(object):
         # していて、IK・軌道計画が成功し、かつ軌道の干渉検証
         # (verified/lead_in_verified) に通っている場合だけ実機を動かせる
         # (_motion_verified 参照、人との干渉が残ったままの軌道では動かさ
-        # ない)。
+        # ない)。後処理 (押し付け/視線 IK) に全候補が失敗して後処理前の
+        # 解 (hover 姿勢のみ、result['post_process'] が None) を採用した
+        # 場合も、押し込み区間がなく掌を合わせられないので動かさない
+        # (spik.pick_verified_candidate のフォールバック参照)。
+        has_post_process = result.get('post_process') is not None
         executable = (
             args.auto_execute and self.ri is not None and result['solved']
+            and has_post_process
             and motion is not None and display_waypoints is not None
             and self._motion_verified(motion))
         if motion is not None and not self._motion_verified(motion):
@@ -1451,6 +1456,9 @@ class HandshakePipelineNode(object):
                   'lead_in_verified={})、--auto-execute でも実機を動かし'
                   'ません。'.format(
                       motion['verified'], motion['lead_in_verified']))
+        if result['solved'] and not has_post_process:
+            print('[execute] 後処理 (押し付け/視線 IK) が解けず押し込み区間が'
+                  'ないため、--auto-execute でも実機を動かしません。')
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -3046,9 +3054,9 @@ def main():
             'TF が引けないことがある。根本的にはマシン間の時刻同期が '
             '必要 (NTP/chrony)。')
     parser.add_argument(
-        '--armed-timeout', type=float, default=30.0,
+        '--armed-timeout', type=float, default=60.0,
         help='ARMED になってから offered_hand が決まらなければ諦めて '
-            'IDLE に戻るまでの秒数 (既定 30.0)。')
+            'IDLE に戻るまでの秒数 (既定 60.0)。')
     parser.add_argument(
         '--client-wait-timeout', type=float, default=30.0,
         help='viser のブラウザクライアント接続を待つ 1 回あたりの秒数 '
