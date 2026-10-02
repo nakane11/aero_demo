@@ -365,6 +365,18 @@ def collision_pairs_text(colliding):
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
+def project_base_point(frame, point):
+    """``_collect_hand_frames`` のフレーム ``frame`` の画像に、base_link
+    系の点 ``point`` を投影した画素 ``(u, v)`` とカメラからの奥行き [m]
+    を返す (カメラの後ろなら ``(None, None)``)。"""
+    intr = frame['intrinsics']
+    p = np.linalg.inv(frame['camera_to_base']) @ np.append(point, 1.0)
+    if p[2] <= 0:
+        return None, None
+    return ((int(intr.fx * p[0] / p[2] + intr.cx),
+             int(intr.fy * p[1] / p[2] + intr.cy)), p[2])
+
+
 # ログの出し分け (2026-09-29 ユーザー要望)。成功/失敗などの状態遷移に
 # 当たる重要なログは従来どおり print で画面に出し、[debug] などの詳細な
 # 数値ログは log_debug で LOG_DIR 以下のログファイルにだけ書く。画面に
@@ -1157,9 +1169,10 @@ class HandshakePipelineNode(object):
             with self._lock:
                 if self._hand_frames_requested:
                     # 失敗時に画像として保存できるよう、画像・カメラの
-                    # 姿勢・内部パラメータも一緒に持つ (_save_refine_failure)。
+                    # 姿勢・内部パラメータも一緒に持つ (_save_refine_failure/
+                    # _save_grasp_capture)。
                     self._hand_frames.append(dict(
-                        hands=hands, color=color,
+                        hands=hands, color=color, depth=depth_m,
                         camera_to_base=camera_to_base, intrinsics=intrinsics,
                         stamp=color_msg.header.stamp.to_sec()))
 
@@ -2056,13 +2069,19 @@ class HandshakePipelineNode(object):
 
         self._say(self.args.speech_done_text)
 
+        if (self.args.grasp_capture_duration > 0
+                and reach_boundary < len(display_waypoints)):
+            self._capture_grasp_images(
+                press_waypoints[-1], joint_names, result)
+
         print('[execute] 実行を終了しました。')
 
     def _collect_hand_frames(self, n_frames, timeout):
         """呼び出し以降に届いた (base_link 座標系に変換できた) カメラ
         フレームについて手だけの検出 (``estimate_hands_3d``) を行わせ、
         ``n_frames`` 枚分 (``timeout`` 秒で届かなければそれまでの分) の
-        結果 (フレームごとの検出した手のリスト) を返す。"""
+        結果 (フレームごとの検出した手のリスト) を返す。``n_frames`` が
+        None なら ``timeout`` 秒の間に届いた分を全て返す。"""
         with self._lock:
             self._hand_frames = []
             self._hand_frames_requested = True
@@ -2070,7 +2089,8 @@ class HandshakePipelineNode(object):
         try:
             while not rospy.is_shutdown() and time.time() < deadline:
                 with self._lock:
-                    if len(self._hand_frames) >= n_frames:
+                    if (n_frames is not None
+                            and len(self._hand_frames) >= n_frames):
                         break
                 rospy.sleep(0.01)
         finally:
@@ -2172,20 +2192,10 @@ class HandshakePipelineNode(object):
                 cv2.imwrite(os.path.join(out_dir, 'frame{}_raw.png'.format(i)),
                             color)
                 image = color.copy()
-                intr = frame['intrinsics']
-                base_to_camera = np.linalg.inv(frame['camera_to_base'])
-
-                def project(point):
-                    p = base_to_camera @ np.append(point, 1.0)
-                    if p[2] <= 0:
-                        return None, None
-                    return ((int(intr.fx * p[0] / p[2] + intr.cx),
-                             int(intr.fy * p[1] / p[2] + intr.cy)), p[2])
-
-                uv, depth = project(expected_position)
+                uv, depth = project_base_point(frame, expected_position)
                 if uv is not None:
-                    radius = int(intr.fx * PRESS_IN_REFINE_MAX_HAND_DISTANCE
-                                 / depth)
+                    radius = int(frame['intrinsics'].fx
+                                 * PRESS_IN_REFINE_MAX_HAND_DISTANCE / depth)
                     cv2.drawMarker(image, uv, (0, 0, 255), cv2.MARKER_CROSS,
                                    30, 3)
                     cv2.circle(image, uv, radius, (0, 0, 255), 2)
@@ -2196,7 +2206,8 @@ class HandshakePipelineNode(object):
                     for u, v in pixels:
                         cv2.circle(image, (int(u), int(v)), 3, (0, 255, 0), -1)
                     if cand['palm_position'] is not None:
-                        palm_uv, _ = project(np.asarray(cand['palm_position']))
+                        palm_uv, _ = project_base_point(
+                            frame, np.asarray(cand['palm_position']))
                         if palm_uv is not None:
                             cv2.drawMarker(image, palm_uv, (255, 0, 0),
                                            cv2.MARKER_SQUARE, 16, 2)
@@ -2218,6 +2229,114 @@ class HandshakePipelineNode(object):
                   '保存しました。'.format(out_dir))
         except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
             print('[execute][refine][WARN] 画像の保存に失敗しました ({})。'
+                  .format(exc))
+
+    def _capture_grasp_images(self, press_wp, joint_names, result):
+        """押し込み終了 (「どうぞ」の発話) 後、``--grasp-capture-duration``
+        秒の間に届いたカメラフレームを、人が握ったかどうかの判定を作る
+        ための資料として保存する (一時的なデータ収集用)。
+
+        保存 (PNG の書き出し) は数秒かかるので別スレッドで行う。画像の
+        注釈・``record.json`` に使う計画時の掌とロボットの手先の位置は、
+        押し込み終了の waypoint ``press_wp`` の台車位置 (= hover 目標、
+        実機が今いるはずの位置) から見た base_link 系に直したもの。腕の
+        追従遅れ・台車のスリップは含まない。
+        """
+        with self._lock:
+            planned_palm = self._current_palm
+        robot_arm = result['robot_arm']
+        self._place_robot_at_waypoint(joint_names, press_wp)
+        base = self.robot.base_link
+        base_rot = base.worldrot().copy()
+        base_pos = base.worldpos().copy()
+        end_coords = (self.robot.rarm_end_coords if robot_arm == 'r'
+                      else self.robot.larm_end_coords)
+        record = dict(
+            event='grasp_capture', robot_arm=robot_arm,
+            offered_hand=result['offered_hand'],
+            robot_hand_position=[float(v) for v in base_rot.T @ (
+                end_coords.worldpos() - base_pos)])
+        if planned_palm is not None:
+            record['expected_palm_position'] = [float(v) for v in base_rot.T @ (
+                np.asarray(planned_palm['position']) - base_pos)]
+            record['expected_palm_normal'] = [float(v) for v in base_rot.T @
+                                              np.asarray(planned_palm['y_axis'])]
+        t0 = time.time()
+        hand_frames = self._collect_hand_frames(
+            None, self.args.grasp_capture_duration)
+        log_debug('[execute][grasp] 押し込み後の画像を {} フレーム取得しました '
+                  '({:.2f}s)。'.format(len(hand_frames), time.time() - t0))
+        if hand_frames:
+            threading.Thread(
+                target=self._save_grasp_capture, args=(hand_frames, record),
+                daemon=True).start()
+
+    def _save_grasp_capture(self, hand_frames, record):
+        """``_capture_grasp_images`` で集めたフレームを保存する
+        (``--save-dir`` があればその下の ``grasp_captures/``、無ければ
+        ``/tmp/aero_demo_grasp_captures/`` の下の時刻のディレクトリ)。
+
+        フレームごとに元画像 (``frame{i:03d}_raw.png``)、深度
+        (``frame{i:03d}_depth.png``、16bit・mm 単位、欠損は 0)、検出した
+        手のランドマークと計画時の掌 (赤の十字)・ロボットの手先 (水色の
+        十字) を描いた画像 (``frame{i:03d}.png``) を保存し、``record`` に
+        フレームごとの時刻・カメラの姿勢・内部パラメータ・検出した手を
+        加えて ``record.json`` に書く。
+        """
+        root = (os.path.join(self.args.save_dir, 'grasp_captures')
+                if self.args.save_dir else '/tmp/aero_demo_grasp_captures')
+        out_dir = os.path.join(root, time.strftime('%Y%m%d_%H%M%S'))
+        markers = [('expected palm', record.get('expected_palm_position'),
+                    (0, 0, 255)),
+                   ('robot hand', record['robot_hand_position'],
+                    (255, 255, 0))]
+        frames = []
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            for i, frame in enumerate(hand_frames):
+                prefix = os.path.join(out_dir, 'frame{:03d}'.format(i))
+                cv2.imwrite(prefix + '_raw.png', frame['color'])
+                depth_mm = np.nan_to_num(frame['depth'] * 1e3, nan=0.0,
+                                         posinf=0.0, neginf=0.0)
+                cv2.imwrite(prefix + '_depth.png',
+                            np.clip(depth_mm, 0, 65535).astype(np.uint16))
+                image = frame['color'].copy()
+                for label, point, color in markers:
+                    if point is None:
+                        continue
+                    uv, _ = project_base_point(frame, np.asarray(point))
+                    if uv is not None:
+                        cv2.drawMarker(image, uv, color, cv2.MARKER_CROSS,
+                                       30, 3)
+                        cv2.putText(image, label, (uv[0] + 10, uv[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                for hand in frame['hands']:
+                    pixels = list(hand['pixels'].values())
+                    for u, v in pixels:
+                        cv2.circle(image, (int(u), int(v)), 3, (0, 255, 0), -1)
+                    if pixels:
+                        u0, v0 = pixels[0]
+                        cv2.putText(image, '{} {:.2f}'.format(
+                            hand['side'], hand['score']),
+                            (int(u0), int(v0) + 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imwrite(prefix + '.png', image)
+                intr = frame['intrinsics']
+                frames.append(dict(
+                    stamp=frame['stamp'],
+                    camera_to_base=np.asarray(frame['camera_to_base']).tolist(),
+                    intrinsics=dict(fx=intr.fx, fy=intr.fy, cx=intr.cx,
+                                    cy=intr.cy),
+                    hands=[dict(side=hand['side'], score=float(hand['score']),
+                                positions={k: [float(x) for x in p] for k, p
+                                           in hand['positions'].items()})
+                           for hand in frame['hands']]))
+            json_io.save_json(os.path.join(out_dir, 'record.json'),
+                              dict(record, frames=frames))
+            print('[execute][grasp] 押し込み後の画像 {} 枚を {} に保存しました。'
+                  .format(len(hand_frames), out_dir))
+        except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
+            print('[execute][grasp][WARN] 画像の保存に失敗しました ({})。'
                   .format(exc))
 
     def _place_robot_at_waypoint(self, joint_names, waypoint):
@@ -3514,6 +3633,14 @@ def main():
         '--speech-done-text', type=str, default='どうぞ、手を握ってください',
         help='--auto-execute で掌を差し出し終えたときに発話する文 '
             '(空文字列で発話しない)。')
+    parser.add_argument(
+        '--grasp-capture-duration', type=float, default=3.0,
+        help='--auto-execute で押し込み終了 (--speech-done-text の発話) 後、'
+            'この秒数の間のカメラ画像 (カラー・深度・手の検出結果) を、握ら'
+            'れたかどうかの判定を作るための資料として保存する (--save-dir '
+            'があればその下の grasp_captures/、無ければ /tmp/aero_demo_grasp_'
+            'captures/。_capture_grasp_images 参照)。0 で保存しない '
+            '(既定 3.0)。')
     parser.add_argument(
         '--speech-fail-text', type=str,
         default='ごめんなさい、うまく手を出せませんでした',
