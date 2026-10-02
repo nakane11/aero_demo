@@ -506,6 +506,7 @@ class HandshakePipelineNode(object):
         self.robot = Aero(use_hand=False)
         spik.restrict_elbow_range(self.robot)
         spik.restrict_leg_range(self.robot)
+        spik.restrict_waist_range(self.robot)
         spik.lock_fixed_joints(self.robot)
         spik.apply_collision_model(self.robot)
         # 手のリンクを指まで覆う箱にする (IK・軌道最適化で共通)。

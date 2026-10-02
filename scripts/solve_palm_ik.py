@@ -294,6 +294,13 @@ ELBOW_MIN_ANGLE_DEG = -120.0
 # この比率 (9 度) を削る (restrict_leg_range 参照)。
 LEG_LOW_SIDE_MARGIN_RATIO = 0.1
 
+# 腰ピッチ (waist_p_joint) の上限 [deg]。URDF 上は 34.95 度 (0.61 rad) だが、
+# 実機は 33 度より先を指令しても 32.96 度で止まる (腕を下ろした負荷の
+# ほぼ無い姿勢でも同じなのでハード側の上限)。押し込みで腰を URDF の端まで
+# 使うと手先が約 2 cm 下にずれたまま追いつかないため、届く範囲に
+# 少し余裕を持たせてこの値まで狭める (restrict_waist_range 参照)。
+WAIST_P_MAX_ANGLE_DEG = 32.5
+
 # 干渉回避付きバッチ IK (solve_person_ik) だけに適用する、関節可動域の
 # 上下マージン比率 (restrict_joint_range_margin 参照)。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
@@ -1094,6 +1101,22 @@ def restrict_leg_range(robot, margin_ratio=LEG_LOW_SIDE_MARGIN_RATIO):
             joint.min_angle = lo + margin
         joint.joint_angle(min(max(joint.joint_angle(), joint.min_angle),
                               joint.max_angle))
+
+
+def restrict_waist_range(robot, max_angle_deg=WAIST_P_MAX_ANGLE_DEG):
+    """``waist_p_joint`` の上限 (前傾側) を ``max_angle_deg`` まで狭める
+    (``WAIST_P_MAX_ANGLE_DEG`` 参照)。
+
+    ``restrict_leg_range`` と同様、``robot`` 側を書き換えれば
+    ``*_whole_body``・バッチ IK・軌道計画・押し込み IK のすべてに効く。
+    URDF の上限より広げることはしない。
+    """
+    joint = robot.waist_p_joint
+    if not hasattr(joint, '_urdf_range'):
+        joint._urdf_range = (joint.min_angle, joint.max_angle)
+    joint.max_angle = min(joint._urdf_range[1], math.radians(max_angle_deg))
+    joint.joint_angle(min(max(joint.joint_angle(), joint.min_angle),
+                          joint.max_angle))
 
 
 def lock_fixed_joints(robot):
@@ -4067,6 +4090,7 @@ def main():
     robot = Aero(use_hand=False)
     restrict_elbow_range(robot)
     restrict_leg_range(robot)
+    restrict_waist_range(robot)
     lock_fixed_joints(robot)
     apply_collision_model(robot)
     # 手のリンクを指まで覆う箱にする (IK・軌道最適化で共通)。

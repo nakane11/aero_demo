@@ -70,7 +70,7 @@ from solve_palm_ik import (  # noqa: E402
     collision_pair_distances, collision_pair_name, cylinder_surface_samples,
     human_body_obstacles, human_translation_offset, load_skeleton_json,
     lock_fixed_joints, restrict_elbow_range, restrict_leg_range,
-    translate_joint_positions)
+    restrict_waist_range, translate_joint_positions)
 
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
@@ -81,6 +81,7 @@ def build_robot():
     robot = Aero(use_hand=False)
     restrict_elbow_range(robot)
     restrict_leg_range(robot)
+    restrict_waist_range(robot)
     lock_fixed_joints(robot)
     apply_collision_model(robot)
     return robot
