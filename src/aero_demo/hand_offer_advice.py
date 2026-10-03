@@ -1,27 +1,10 @@
 # -*- coding:utf-8 -*-
 
-"""握手の IK に失敗したとき、人にどう手を差し出し直してほしいかを決める.
+"""握手の IK に失敗したとき、手の差し出し方の直し方を発話用に決める.
 
-差し出した手を ``tools/handshake_reachability_map.py`` と同じ定義の 6 つの
-量 (体の座標系での掌の中心の前方・外側・高さと、指先の左右・上下・指先
-まわりのひねり) で測り、map で IK が後処理まで解けた格子点 (``config/
-hand_offer_reachability.json``、``tools/build_hand_offer_reachability.py``
-が作る) のうち今の出し方に一番近いものを探して、その差を発話用の指示に
-する。
-
-- 近さは位置 [m] と角度 [度] を ``ANGLE_WEIGHT_M_PER_DEG`` で揃えた
-  重み付きの距離で測る。
-- 境目の点を選ぶと少しずれただけで失敗するので、周り
-  (``NEIGHBOR_RADIUS`` 以内、同じ向き) の格子点の解けた割合が
-  ``NEIGHBOR_OK_MIN`` 以上の点だけを候補にする。
-- 指示は差の大きい順に ``MAX_ADVICE`` 個まで。位置は 5 cm 単位の量
-  (「あと 10 センチ前に」)、向きは目標の向き (「手のひらを斜め下に」) で
-  伝える。
-
-骨格・掌は同じ座標系 (``base_link`` など、z が床からの高さ) なら平行移動
-されていてもよい。map は身長 1.70 m の合成骨格 (関節は体の中心) で作って
-いるので、実カメラの骨格 (体の表面の点、肩が数 cm 手前に出る) では前方
-距離が小さめに出て、前に出す量はやや多めに伝わる。
+差し出した手を reachability map (``config/hand_offer_reachability.json``) と
+同じ 6 つの量で測り、解ける格子点のうち一番近いものとの差を指示にする。
+骨格・掌は z が床からの高さの同じ座標系であること。
 """
 
 import json
@@ -62,11 +45,9 @@ def _wrap_deg(a):
 
 
 def body_frame(joint_positions):
-    """人の体の座標系 (原点、正面方向、左方向、方向はいずれも水平) を返す.
+    """人の体の座標系 (原点, 正面, 左; 方向は水平) を返す (無ければ None).
 
-    原点は両肩の中点 (無ければ両腰、``Neck``)、正面方向は右肩->左肩
-    (無ければ右腰->左腰) と鉛直上向きの外積 (``solve_palm_ik.
-    human_facing_direction`` と同じ)。求まらなければ ``None``。
+    原点は両肩 (無ければ両腰) の中点。
     """
     forward = None
     origin = None
@@ -88,15 +69,12 @@ def body_frame(joint_positions):
 
 
 def measure_offer(joint_positions, palm, hand):
-    """差し出した手 ``hand`` ('R'/'L') の掌 ``palm`` を、``tools/handshake_
-    reachability_map.py`` の格子と同じ定義で測る.
+    """掌 ``palm`` を reachability map と同じ定義で測る (求まらなければ None).
 
-    ``forward``/``lateral``/``height`` [m]: 掌の中心の、両肩の中点からの
-    前方・外側 (差し出す手の側が正) と床からの高さ。
-    ``yaw``/``pitch`` [度]: 指先 (``palm['x_axis']``) の外側・上への角度。
-    ``roll`` [度]: 指先まわりの回内 (0 = 親指が上・掌が内側、正で掌が
-    下を向き 90 で真下、-90 で真上)。
-    体の座標系や掌の軸が求まらなければ ``None``。
+    ``forward``/``lateral``/``height`` [m]: 両肩の中点からの前方・外側
+    (差し出す手の側が正) と床からの高さ。
+    ``yaw``/``pitch`` [度]: 指先の外側・上への角度。
+    ``roll`` [度]: 回内 (0 = 親指が上、90 で掌が真下、-90 で真上)。
     """
     frame = body_frame(joint_positions)
     if frame is None or palm is None or palm.get('x_axis') is None \
@@ -110,8 +88,7 @@ def measure_offer(joint_positions, palm, hand):
     n = _unit(palm['y_axis'])
     ux, uy, uz = float(np.dot(u, forward)), float(side * np.dot(u, left)), \
         float(u[2])
-    # handshake_reachability_map.hand_frame の逆: ひねり 0 と 90 度のときの
-    # 掌の法線を作り、実際の法線をその 2 軸に射影した角度をひねりとする。
+    # ひねり 0/90 度の法線へ射影した角度を roll とする。
     up = np.array([0.0, 0.0, 1.0])
     up_perp = up - np.dot(up, u) * u
     if np.linalg.norm(up_perp) < 1e-6:
@@ -147,8 +124,7 @@ class OfferAdvisor(object):
 
     @staticmethod
     def _robust(x, ok):
-        """各格子点について、同じ向きで ``NEIGHBOR_RADIUS`` 以内の点の
-        解けた割合が ``NEIGHBOR_OK_MIN`` 以上の解けた点か。"""
+        """周囲 (同じ向き) の解けた割合が十分な解けた格子点か."""
         robust = np.zeros(len(x), dtype=bool)
         for i in np.nonzero(ok)[0]:
             same = np.all(np.abs(x[:, 3:] - x[i, 3:]) < 1e-6, axis=1)
@@ -158,8 +134,7 @@ class OfferAdvisor(object):
         return robust
 
     def nearest(self, measure, hand):
-        """``measure`` (``measure_offer``) に一番近い解ける格子点を
-        (格子点の dict, 重み付き距離) で返す。"""
+        """一番近い解ける格子点を (dict, 重み付き距離) で返す."""
         x, _, robust = self.points[hand]
         cur = np.array([measure[k] for k in _KEYS])
         d = x - cur
@@ -172,8 +147,7 @@ class OfferAdvisor(object):
         return dict(zip(_KEYS, (float(v) for v in x[i]))), float(dist[i])
 
     def advise(self, measure, hand, max_items=MAX_ADVICE):
-        """直してほしい項目を差の大きい順に返す。各要素は
-        ``(key, 差 (m または度), 発話用の句 (て形))``。"""
+        """(key, 差 [m/度], 発話句) のリストを差の大きい順に返す (と目標点)."""
         if measure is None:
             return [], None
         target, _ = self.nearest(measure, hand)
@@ -233,8 +207,7 @@ def _angle_phrase(key, diff, target):
 
 
 def advice_speech(advice):
-    """``OfferAdvisor.advise`` の結果を 1 つの発話文にする (無ければ
-    空文字列)。"""
+    """``advise`` の結果を 1 つの発話文にする."""
     if not advice:
         return ''
     return '、'.join(phrase for _, _, phrase in advice) + 'ください。'

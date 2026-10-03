@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""掌の認識のずれを調べる検証スクリプト (``compare_hand_detectors.py``/
-``measure_palm_viewpoint.py``) の共通部分。
+"""掌の認識のずれを調べる検証スクリプトの共通部分。
 
-``run_camera_pipeline_test.py`` は、計画時の掌を Holistic (``estimate_3d``、
-体を検出してから手を切り出す) + One Euro Filter で、押し込み直前の再認識の
-掌を Hands (``estimate_hands_3d``、手を直接検出) で求めている。掌の平面
-フィット (``PalmPoseEstimator.estimate_palm``) と深度の取り方
-(``_sample_depth``) は同じだが、入力のランドマークの出どころが違う。ここ
-ではその両方を同じフレームに対して計算する (``PalmDetector.detect``)。
+同じフレームに対し Holistic (計画時) と Hands (押し込み直前の再認識) の
+両方で掌を求める (``PalmDetector.detect``)。
 """
 
 import math
@@ -44,8 +39,7 @@ import estimate_palm_poses as epp  # noqa: E402
 
 REPO_ROOT = _REPO_ROOT
 
-# 検出器の名前 (記録・集計のキー)。holistic_smoothed は計画時と同じ
-# (Holistic の骨格に One Euro Filter をかけてから掌を求める)。
+# holistic_smoothed は計画時と同じ (One Euro Filter 後に掌を求める)。
 SOURCES = ('holistic', 'holistic_smoothed', 'hands')
 
 
@@ -76,9 +70,7 @@ def add_camera_args(parser):
 
 
 class FrameSource(object):
-    """カラー・深度・camera_info を同期して受け、要求されたときに最新の
-    1 フレームを (base_link への変換つきで) 返す。重い推定はコールバック
-    ではなく呼び出し側のスレッドで行う。"""
+    """カラー・深度・camera_info を同期して受け、最新フレームを返す。"""
 
     def __init__(self, args):
         self.args = args
@@ -95,13 +87,11 @@ class FrameSource(object):
         self.sync.registerCallback(self._on_frame)
 
     def _on_frame(self, color_msg, depth_msg, info_msg):
-        # 受信時刻は PC の時計で持つ (ロボットと PC の時計がずれていても
-        # 「呼び出し以降に届いたフレーム」を判定できるように)。
+        # 受信時刻は PC の時計 (ロボットとの時計ずれの影響を避ける)。
         self._latest = (time.time(), color_msg, depth_msg, info_msg)
 
     def get_frame(self, after, timeout=2.0):
-        """``after`` (PC の時刻) より後に届いたフレームを待って返す。届か
-        ない・TF が引けなければ ``None``。"""
+        """``after`` (PC 時刻) 以降のフレーム。届かない・TF 失敗なら None。"""
         deadline = time.time() + timeout
         latest = None
         while not rospy.is_shutdown() and time.time() < deadline:
@@ -148,25 +138,16 @@ class PalmDetector(object):
             beta=args.joint_smoothing_beta,
             dcutoff=args.joint_smoothing_dcutoff)
         self.palm_estimator = epp.PalmPoseEstimator()
-        # Hands のモデル読み込みを先に済ませておく
-        # (run_camera_pipeline_test.py と同じ)。
+        # Hands のモデルを先に読み込む。
         self.estimator.estimate_hands_3d(
             np.zeros((240, 320, 3), dtype=np.uint8),
             np.zeros((240, 320), dtype=np.float32),
             CameraIntrinsics(fx=300.0, fy=300.0, cx=160.0, cy=120.0))
 
     def detect(self, frame, side):
-        """``side`` ('R'/'L') の掌を 3 通りで求める (座標系は base_link)。
+        """``side`` ('R'/'L') の掌を 3 通りで求める (base_link 系)。
 
-        Returns
-        -------
-        dict
-            ``holistic``/``holistic_smoothed`` (palm dict or None)、
-            ``hands`` (検出した手ごとの ``label``/``score``/``n_points``/
-            ``palm``/``pixels`` のリスト、掌は ``side`` として求める --
-            Hands の左右判定は誤りうるので ``_select_offered_hand`` と
-            同じくラベルは使わない)、``holistic_pixels`` (Holistic の
-            ``side`` の手の 2D 点)、``camera_position`` (base_link 系)。
+        Hands の手はラベル (左右判定は誤りうる) によらず ``side`` として掌を求める。
         """
         color, depth = frame['color'], frame['depth']
         intr, cam = frame['intrinsics'], frame['camera_to_base']
@@ -232,9 +213,7 @@ def normal_angle_deg(palm_a, palm_b):
 
 
 def decompose(diff, camera_position, point):
-    """ずれ ``diff`` を、カメラ -> ``point`` の視線方向の成分 (``along_ray``、
-    正ならカメラから遠い側)・視線に直交する成分の大きさ (``across_ray``)・
-    水平 (``horizontal``)・鉛直 (``vertical``、z) に分ける。"""
+    """``diff`` を視線方向 (正=奥)・視線直交・水平・鉛直の成分に分ける。"""
     diff = np.asarray(diff, dtype=np.float64)
     ray = np.asarray(point, dtype=np.float64) - np.asarray(camera_position)
     ray = ray / np.linalg.norm(ray)
@@ -278,8 +257,7 @@ def palm_record(palm):
 
 
 def draw_overlay(color, detection, chosen_hand, path):
-    """Holistic の手 (赤) と、採用した Hands の手 (緑) の 2D 点を重ねた
-    画像を保存する。"""
+    """Holistic の手 (赤) と採用した Hands の手 (緑) を重ね描きして保存する。"""
     import cv2
     img = color.copy()
     for u, v in detection['holistic_pixels'].values():

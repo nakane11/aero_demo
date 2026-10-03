@@ -2,50 +2,18 @@
 # -*- coding:utf-8 -*-
 
 """``scripts/collision_pairs.json`` (``solve_palm_ik.py --collision-pairs``
-に渡す、干渉回避で実際にチェックするリンクの組み合わせの JSON。本番の
-``scripts/`` 側が読む既定ファイルそのものを更新する、開発用ツール) を、
-以下の手順で自動的に作る。
+の既定ファイル) を作り直す。
 
-1. ``generate_random_human_poses.py`` で人物 (既定 100 人) を生成する。
-2. ``estimate_palm_poses.py`` で各人物の掌の位置姿勢を推定する。
-3. 干渉回避無し (``solve_palm_ik.py --collision-pairs`` に存在しない
-   パスを渡すことで自己干渉・人体との干渉の両方と、事後の干渉検証を
-   まとめて無効にする) で全員の IK を 1 回だけ解く。
-4. 3. の結果を ``analyze_handshake_dir`` で集計し、事後検証
-   (``solve_palm_ik.pick_verified_candidate``) と同じ組み合わせ・同じ
-   判定で貫通していた -- 事後検証なら棄却される -- 組み合わせを、干渉した
-   人数が多い順に並べたランキングを作る。自己干渉は ``self_collision_
-   depth`` の貫通の深さで測り、``self_collision_ignored`` の除外ルールで
-   絞った組だけを見る。
-5. このランキングの上位 ``--num-pairs`` 組 (``--include-pairs`` の組を
-   足したもの) を ``collision_pairs.json`` として書き出す。
-   ``--max-ik-seconds-per-person`` を指定した場合は、代わりにランキングの
-   先頭から 1・2・3... 組と増やしながら干渉回避ありで実際に IK を解き直し
-   (``solve_palm_ik.py`` の通常のフルパイプライン、事後検証・後処理を
-   含む)、1 人あたりの平均計算時間 (warmup を除く) が指定秒数を超えた
-   直前の組数を採用する。
-
-この手順は「干渉回避を全く行わない解に、実際にどのリンクの組み合わせが
-どれだけの頻度で干渉するか」という一度きりの統計だけでランキングを作る
-(1 組追加するたびに解き直して統計を取り直す反復はしない。干渉回避ありの
-解は事後検証を通ったものだけが採用されるため、採用された解の統計はすぐ
-「もう干渉していない」ように見えてしまう)。
-
-``solve_palm_ik.py`` は「``--collision-pairs`` に指定した JSON が存在
-しなければ、自己干渉・人体との干渉の両方と事後の干渉検証を無効にする」
-という仕様 (``solve_palm_ik.load_collision_pairs`` 呼び出し部分参照) を
-利用して、3. の「干渉回避無し」を実現している。
-
-組数・選び方の比較は ``tools/grid_search_collision_ik.py`` で行う
-(docs/ik_and_motion_constraints.md の 0 節)。
+人物生成 -> 掌推定 -> 干渉回避無しで IK を 1 回解き、事後検証と同じ組・
+判定で貫通した組を干渉人数の多い順にランキングして上位を採用する。
+``--max-ik-seconds-per-person`` 指定時は上位から組数を増やして解き直し、
+1 人あたりの平均 IK 時間が上限を超える直前の組数を採用する。
+干渉回避無しは、存在しない ``--collision-pairs`` を渡して実現している。
 
 Usage
 -----
     python3 tools/build_collision_pairs.py --num-samples 2000 --seed 10 \\
         --num-pairs 8 --ranking-output /tmp/ranking.json
-
-人物・掌・IK 結果は、``--human-poses-dir`` 等を指定しなければ一時
-ディレクトリに作り、終了時に削除する。
 """
 
 import argparse
@@ -89,8 +57,7 @@ def build_robot():
 
 
 def apply_result_pose(robot, result, angle_vector):
-    """``solve_palm_ik.py`` の結果 ``result`` の台車位置と関節角
-    ``angle_vector`` をロボットに反映する。"""
+    """IK 結果の台車位置と関節角 ``angle_vector`` をロボットに反映する。"""
     robot.reset_pose()
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
@@ -103,26 +70,16 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
                           human_front_distance=HUMAN_FRONT_DISTANCE,
                           dist_threshold=-DEFAULT_COLLISION_VERIFY_TOLERANCE,
                           robot=None):
-    """``handshake_dir`` (``solve_palm_ik.py`` の出力) と ``skeleton_dir``
-    (骨格 JSON) を読み、組み合わせごとの「全サンプル中の最小距離」と
-    「``dist_threshold`` [m] 未満だった (干渉した) サンプル数」を集計する。
+    """IK 結果と骨格から、組ごとの最小距離と干渉人数を集計する。
 
-    組み合わせと距離は事後検証 (``solve_palm_ik.pick_verified_candidate``)
-    と同じ。組み合わせは ``build_collision_verification_pairs`` (自己干渉は
-    ``self_collision_ignored`` の除外ルールで絞った組、人体との干渉は全
-    リンク × 人体 26 本)、距離は ``collision_pair_distances`` (自己干渉は
-    ``self_collision_depth`` による貫通の深さ、人体とは ``human_body_
-    obstacles`` の円柱への入り込みの深さ。貫通していれば負) で測る。
-    姿勢も事後検証に合わせ、hover 姿勢 (``joint_angle_vector``) は全組、
-    押し込み姿勢 (``post_process``) は自己干渉の組だけを見て、小さい方を
-    その人の距離とする。既定の ``dist_threshold`` は事後検証の棄却条件
-    (``DEFAULT_COLLISION_VERIFY_TOLERANCE`` より深い貫通) と同じ。
+    組・距離は事後検証と同じ (貫通なら負)。hover 姿勢は全組、押し込み姿勢は
+    自己干渉の組だけを見る。距離が ``dist_threshold`` [m] 未満で干渉とみなす。
 
     Returns
     -------
     dict
-        ``min_dist``/``collision_count`` (キーは ``(名前A, 名前B)`` の
-        タプル、値は最小距離 [m]/干渉した人数)、``n_samples`` を持つ dict。
+        ``min_dist``/``collision_count`` (キーは ``(名前A, 名前B)``) と
+        ``n_samples``。
     """
     if robot is None:
         robot = build_robot()
@@ -190,10 +147,7 @@ def save_pairs(pairs, path):
 
 
 def count_ik_targets(handshake_dir):
-    """``handshake_dir`` の IK 結果のうち、掌が見つからず (``offered_hand``
-    が null 等で) IK をスキップされた人物を除いた、実際に IK を解いた
-    人数を返す (``solve_palm_ik.not_target_result`` が保存する ``target:
-    false`` の人物を除外する)。"""
+    """実際に IK を解いた人数 (``target: false`` を除く) を返す。"""
     n_targets = 0
     for path in glob.glob(os.path.join(handshake_dir, '*.json')):
         with open(path) as f:
@@ -204,10 +158,7 @@ def count_ik_targets(handshake_dir):
 
 
 def rank_collision_candidates(stats, exclude=()):
-    """``analyze_handshake_dir`` の結果 ``stats`` のうち干渉した人数が 1 人
-    以上の組み合わせを、人数の多い順 (同数なら最小距離の小さい順、さらに
-    名前の辞書順) に並べた ``[(名前A, 名前B), ...]`` を返す (``exclude``
-    に含まれる組み合わせは除く)。"""
+    """干渉した組を人数の多い順 (同数なら最小距離・名前順) に並べる。"""
     counts = stats['collision_count']
     return sorted((pair for pair in counts if pair not in exclude),
                   key=lambda pair: (-counts[pair], stats['min_dist'][pair],
@@ -215,14 +166,11 @@ def rank_collision_candidates(stats, exclude=()):
 
 
 def select_pairs(ranking, num_pairs, include=()):
-    """ランキングの上位 ``num_pairs`` 組に、``include`` の組 (ランキング外
-    でもよい) を足した集合を返す (``include`` は ``num_pairs`` に数えない)。"""
+    """上位 ``num_pairs`` 組 + ``include`` (組数に数えない) を返す。"""
     return set(ranking[:num_pairs]) | set(include)
 
 
 def save_ranking(stats, ranking, path):
-    """ランキングを ``[{"pair": [A, B], "count": 人数, "min_dist": 距離},
-    ...]`` の JSON として保存する (``n_samples`` も持たせる)。"""
     with open(path, 'w') as f:
         json.dump(dict(
             n_samples=stats['n_samples'],
@@ -233,9 +181,7 @@ def save_ranking(stats, ranking, path):
 
 
 def mean_ik_time_per_person(handshake_dir):
-    """``solve_palm_ik.py`` の結果 JSON の ``collision_ik_time`` +
-    ``candidate_selection_time`` (warmup を含まない) の、IK 対象 1 人あたりの
-    平均 [秒]。"""
+    """IK 対象 1 人あたりの平均 IK 時間 [秒] (warmup を含まない)。"""
     times = []
     for path in glob.glob(os.path.join(handshake_dir, '*.json')):
         with open(path) as f:
@@ -247,10 +193,7 @@ def mean_ik_time_per_person(handshake_dir):
 
 
 def run(cmd):
-    """``cmd`` を実行する。呼び出し先 (generate_random_human_poses.py/
-    estimate_palm_poses.py/solve_palm_ik.py) が標準出力に print した文字列
-    は、このスクリプト自身の進捗表示と混ざらないよう表示しない。呼び出し
-    先がエラー終了した場合のみ、原因調査のためその出力を表示する。"""
+    """``cmd`` を実行する。出力はエラー終了時のみ表示する。"""
     print('+ {}'.format(' '.join(cmd)))
     result = subprocess.run(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
@@ -273,8 +216,7 @@ def solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
 
 def timed_solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
                    collision_pairs_path, robot_arm, extra_args):
-    """``solve_ik`` を実行し、IK 対象 1 人あたりの平均計算時間 [秒]
-    (``mean_ik_time_per_person``、warmup を含まない) を返す。"""
+    """``solve_ik`` を実行し、1 人あたりの平均 IK 時間 [秒] を返す。"""
     solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
              collision_pairs_path, robot_arm, extra_args)
     return mean_ik_time_per_person(handshake_dir)
@@ -282,106 +224,68 @@ def timed_solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='人物生成 -> 掌推定 -> 干渉回避無しの IK を 1 回解いて '
-                    '干渉したリンクの組み合わせを頻度順にランキング -> '
-                    '上位 --num-pairs 組 (または --max-ik-seconds-per-'
-                    'person を満たす組数) を採用、を自動で行い、'
-                    'collision_pairs.json (solve_palm_ik.py --collision-'
-                    'pairs 用) を作る。')
+        description='干渉回避無しの IK で干渉した組をランキングし、'
+                    'collision_pairs.json を作る。')
     parser.add_argument(
         '--num-samples', type=int, default=100,
-        help='生成する人物の数 (既定 100。README のパイプライン手順 1 '
-            'と同じ)。')
+        help='生成する人物の数。')
     parser.add_argument(
         '--human-poses-dir', type=str, default=None,
-        help='人物の骨格 JSON のディレクトリ (既定は一時ディレクトリを '
-            '自動作成し、プログラム終了時に削除する。既存のディレクトリを '
-            '再利用して --skip-generate で手順 1・2 を省略したい場合は '
-            'ここに明示的にパスを指定すること。その場合は終了時に削除 '
-            'されない)。')
+        help='骨格 JSON のディレクトリ (既定は一時ディレクトリ)。')
     parser.add_argument(
         '--palm-poses-dir', type=str, default=None,
-        help='掌の位置姿勢 JSON のディレクトリ (既定は一時ディレクトリを '
-            '自動作成し、プログラム終了時に削除する。明示的にパスを指定 '
-            'した場合は終了時に削除されない)。')
+        help='掌 JSON のディレクトリ (既定は一時ディレクトリ)。')
     parser.add_argument(
         '--handshake-dir', type=str, default=None,
-        help='solve_palm_ik.py の出力ディレクトリ (既定は一時ディレクトリ '
-            'を自動作成し、プログラム終了時に削除する。既定動作 (手順3) '
-            'の出力に使い、``--max-ik-seconds-per-person`` 指定時は組数を '
-            '変えて解き直すたびに上書きされる。明示的にパスを指定した '
-            '場合は終了時に削除されない)。')
+        help='solve_palm_ik.py の出力先 (既定は一時ディレクトリ)。')
     parser.add_argument(
         '--output', type=str,
         default=os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'),
-        help='書き出す干渉ペア JSON のパス (既定 scripts/collision_pairs.'
-            'json。solve_palm_ik.py --collision-pairs の既定パスと同じ、'
-            '本番が読む実体そのものを更新する)。')
+        help='書き出す干渉ペア JSON (既定は本番の scripts/collision_pairs.json)。')
     parser.add_argument(
         '--skip-generate', action='store_true',
-        help='手順 1・2 (人物生成・掌推定) を省略し、既存の --human-poses-'
-            'dir/--palm-poses-dir をそのまま使う。')
+        help='人物生成・掌推定を省略し既存ディレクトリを使う。')
     parser.add_argument(
         '--collision-dist-threshold', type=float,
         default=-DEFAULT_COLLISION_VERIFY_TOLERANCE,
-        help='距離 (貫通していれば負) がこの値 [m] 未満だった組み合わせを '
-            '「干渉した」とみなしてランキングに使う (既定 {} = 事後検証の '
-            '棄却条件と同じ)。'.format(-DEFAULT_COLLISION_VERIFY_TOLERANCE))
+        help='距離がこの値 [m] 未満なら干渉とみなす (既定は事後検証と同じ)。')
     parser.add_argument(
         '--skip-solve', action='store_true',
-        help='手順 3 (干渉回避無しの IK) を省略し、既存の --handshake-dir の '
-            '結果をそのまま集計する。')
+        help='干渉回避無しの IK を省略し既存の --handshake-dir を集計する。')
     parser.add_argument(
         '--ranking-output', type=str, default=None,
-        help='ランキング (組・干渉した人数・最小距離) を保存する JSON の '
-            'パス (既定は保存しない)。')
+        help='ランキングを保存する JSON のパス。')
     parser.add_argument(
         '--show-ranking', type=int, default=30,
-        help='ランキングの上位何組を表示するか (既定 30)。')
+        help='表示するランキングの件数。')
     parser.add_argument(
         '--include-pairs', type=str, default=None,
-        help='ランキングの順位によらず必ず採用する組の JSON (collision_'
-            'pairs.json と同じ形式)。--num-pairs には数えない。')
+        help='順位によらず必ず採用する組の JSON (--num-pairs に数えない)。')
     parser.add_argument(
         '--no-verify', action='store_true',
-        help='--num-pairs で採用した組で IK を解き直して時間を測る確認を '
-            '省略する。')
+        help='採用後に IK を解き直して時間を測る確認を省略する。')
     count_group = parser.add_mutually_exclusive_group(required=True)
     count_group.add_argument(
         '--num-pairs', type=int,
-        help='干渉頻度ランキングの上位何組を採用するか。')
+        help='ランキングの上位何組を採用するか。')
     count_group.add_argument(
         '--max-ik-seconds-per-person', type=float,
-        help='ランキングの上位から 1・2・3... 組と増やしながら干渉回避 '
-            'ありで実際に IK を解き直し (フルパイプライン、事後検証・'
-            '後処理を含む)、1 人あたりの平均計算時間がこの秒数を超えた '
-            '直前の組数を採用する (ランキングを使い切っても超えなければ '
-            '全組を採用する)。')
+        help='1 人あたりの平均 IK 時間がこの秒数を超える直前の組数を採用する。')
     parser.add_argument(
         '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
-        help='solve_palm_ik.py に渡す --robot-arm (既定 auto)。')
+        help='solve_palm_ik.py に渡す --robot-arm。')
     parser.add_argument(
         '--seed', type=int, default=None,
-        help='generate_random_human_poses.py に渡す --seed (既定は指定 '
-            'なし)。基準の合成データ (run_pipeline_test.py の seed 0/1) '
-            'とは別の seed にして、基準に合わせ込まないようにする。')
+        help='generate_random_human_poses.py に渡す --seed。')
     parser.add_argument(
         '--python', type=str, default=sys.executable,
-        help='generate_random_human_poses.py/estimate_palm_poses.py/'
-            'solve_palm_ik.py を呼び出す Python インタプリタ (既定は '
-            'このスクリプトと同じインタプリタ)。')
+        help='子プロセスを実行する Python インタプリタ。')
     parser.add_argument(
         '--solve-arg', dest='solve_args', action='append', default=[],
-        help='solve_palm_ik.py にそのまま追加で渡す引数 (例: --solve-arg '
-            '--attempts-per-pose --solve-arg 8)。複数回指定できる。')
+        help='solve_palm_ik.py に追加で渡す引数 (複数回指定可)。')
     args = parser.parse_args()
 
-    # collision_pairs.json (args.output) を除き、このプログラムが生成する
-    # JSON (人物・掌・IK 結果、および「干渉回避無し」用のダミーパス) は
-    # すべてここに作る一時ディレクトリの下に置き、終了時 (正常終了・
-    # エラー終了のいずれでも) に丸ごと削除する。--human-poses-dir 等を
-    # 明示的に指定した場合はそのディレクトリを削除しない (既存データの
-    # 再利用・--skip-generate との併用を想定)。
+    # 明示指定されなかった中間ファイルは一時ディレクトリに置き、終了時に削除する。
     temp_dir = tempfile.mkdtemp(prefix='build_collision_pairs_')
     try:
         if args.human_poses_dir is None:
@@ -423,8 +327,6 @@ def main():
                      args.handshake_dir, nonexistent_collision_pairs,
                      args.robot_arm, args.solve_args)
 
-        # 掌が見つからず (offered_hand が null 等で) IK をスキップされた
-        # 人物は、以降の「1 人あたりの IK 計算時間」の母数から除外する。
         n_ik_people = count_ik_targets(args.handshake_dir)
         if n_ik_people == 0:
             print('{} に IK 対象の人物 (掌が見つかった人物) が見つかりません。'

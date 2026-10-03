@@ -1,45 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``OfferedHandSelector`` (``estimate_palm_poses.py``) のパラメータを、
-人手ラベル付きサンプルから調整するツール。
+"""``OfferedHandSelector`` のパラメータ (判定軸のブレンド・ランプ上限・高さ方向の
+重み・分離度の重み) を人手ラベル (``human_label``) 付きサンプルから調整する。
 
-対象にするのは、斜め前に軽く手を挙げて体から離す、より一般的な差し出し
-方でも検出できるようにするための 4 つの改善案:
-
-1. ``finger_to_robot_axis_blend``
-   「指先がロボットを指しているか」ではなく「掌をロボットに見せている
-   か」を評価するよう、判定軸を指先方向 (x_axis) から掌の法線方向
-   (y_axis) へブレンドする。
-2. ``finger_to_robot_ramp``
-   1. の判定のランプ (下限, 上限)。上限を下げるほど、斜めに構えた姿勢
-   でも満点になりやすくなる。
-3. ``approach_height_scale``
-   「脱力位置 -> ロボット」「実際の掌 -> ロボット」の距離差 (approach)
-   を計算する際、高さ方向の寄与をどれだけ弱めるか (1.0=従来の 3 次元
-   距離、0.0=水平面のみ)。
-4. ``weights['separation']``
-   「体から離しているか」の重み。
-
-入力は ``estimate_palm_poses.py`` と同じ骨格 JSON (``--skeleton-dir``、
-``skeleton.joint_positions`` を持つ) と、対応する掌 JSON
-(``--palm-dir``、``draw_random_human_poses.py`` の判定ボタンが書き込む
-``human_label`` を正解ラベルとして持つ。無ければ ``offered_hand`` に
-フォールバックするが、これは推定値であって正解ではないので警告を出す)。
-
-やることはシンプルなランダムサーチ + 最良点周辺のグリッド微調整で、
-各パラメータ候補について:
-
-  - 全サンプルの左右スコアを (score_min を除く全パラメータで) 計算
-  - その候補でのスコア分布に対して最適な ``score_min`` を全探索
-    (候補点はサンプルのスコア値そのものなので、境界を総当たりできる)
-  - 正解ラベルとの一致率 (3 クラス: 'R'/'L'/None) を目的関数にする
-
-を行い、目的関数を最大化する組み合わせを探す。
+格子からランダムに選んだ候補ごとに、最適な ``score_min`` を全探索して
+3 クラス ('R'/'L'/None) の一致率を最大化する。
 
 Usage
 -----
-    python3 tools/tune_offer_selector.py \
+    python3 tools/tune_offer_selector.py \\
         --skeleton-dir /path/to/skeletons --palm-dir /path/to/palms
 """
 
@@ -68,7 +38,7 @@ load_skeleton_json = json_io.load_skeleton_json
 iter_skeleton_files = json_io.iter_json_files
 
 
-# --- 探索するパラメータの範囲 (1-4) ----------------------------------------
+# 探索するパラメータの候補
 AXIS_BLEND_CHOICES = [0.0, 0.25, 0.5, 0.75, 1.0]
 FINGER_RAMP_UPPER_CHOICES = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 APPROACH_HEIGHT_SCALE_CHOICES = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -78,20 +48,9 @@ SIDES = ('R', 'L')
 
 
 def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
-    """人手ラベル付きサンプルのリストを返す.
+    """``label_key`` を持つサンプルの ``(name, joints, label, robot_position)`` を返す.
 
-    ``label_key`` (既定 ``human_label``、人手の正解ラベル) が掌 JSON に
-    無いサンプルは、正解が無いので除外する (``offered_hand`` は自動推定値
-    であって正解ではないため、フォールバックには使わない)。
-
-    掌 JSON に ``robot_position`` (``extract_skeletons_from_bag.py`` が
-    保存する、判定の基準にしたロボット手先の base_link 座標) があれば
-    それも返す。無ければ ``None`` (合成骨格向けの仮のロボット位置、
-    ``OfferedHandSelector._robot_position`` 参照)。
-
-    Returns
-    -------
-    list of (name, joint_positions, label, robot_position)
+    ``robot_position`` は判定基準のロボット手先 (base_link)、無ければ ``None``。
     """
     samples = []
     n_unlabeled = 0
@@ -126,8 +85,7 @@ def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
 
 
 def precompute_palms(samples):
-    """各サンプルの掌位置姿勢 (パラメータに依存しないジオメトリ) を
-    事前計算してキャッシュする (探索中に毎回re計算しなくて済むように)。"""
+    """パラメータに依存しない掌位置姿勢を事前計算する。"""
     plain_estimator = epp.PalmPoseEstimator.__new__(epp.PalmPoseEstimator)
     cache = []
     for name, joint_positions, label, robot_position in samples:
@@ -159,18 +117,12 @@ def _selector_kwargs(params):
 
 
 def scores_for_params(cache, params):
-    """(true_side, side_scores) のリストを返す。
-
-    ``side_scores`` は ``{'R': float or None, 'L': float or None}``
-    (veto された側は ``None``)。``score_min`` を含まない生スコアなので、
-    ここから任意の閾値を後付けで評価できる。
-    """
+    """``(true_side, {'R': score, 'L': score})`` のリスト (閾値前の生スコア、veto は None)。"""
     kwargs = _selector_kwargs(params)
     selector = epp.OfferedHandSelector(**kwargs)
     out = []
     for name, joints, palms, label, robot_position in cache:
-        # サンプルごとに、抽出時に判定の基準にしたロボット手先の位置へ
-        # 差し替える (None なら合成骨格向けの仮の位置)。
+        # 抽出時の判定基準のロボット手先へ差し替える。
         selector.robot_position = robot_position
         body = epp._body_frame(joints)
         if body is None:
@@ -191,19 +143,14 @@ def scores_for_params(cache, params):
 
 
 def best_score_min(scored_samples):
-    """このパラメータ候補でのスコア分布に対し、正解率を最大化する
-    ``score_min`` を全探索する (候補点はサンプルのスコア値そのもの)。
+    """正解率を最大化する ``score_min`` を全探索する.
 
-    Returns
-    -------
-    (best_threshold, best_accuracy, confusion) : 最良の閾値と、その精度、
-        混同行列 (dict of dict, 行=正解, 列=予測)。
+    Returns ``(閾値, 正解率, 混同行列 [正解][予測])``。
     """
     all_scores = sorted(set(
         s for _, side_scores in scored_samples for s in side_scores.values()
         if s is not None))
-    # 全ての閾値候補 (各スコア値のすぐ下 = そのスコア以上を採用する境界、
-    # および「何も通さない」既定より高い値も 1 つ試す)。
+    # 各スコアのすぐ下と、何も通さない値。
     candidates = [s - 1e-6 for s in all_scores] + [
         (all_scores[-1] + 1.0) if all_scores else 1.0]
 
@@ -263,8 +210,7 @@ def main():
     parser.add_argument('--label-key', type=str, default='human_label')
     parser.add_argument(
         '--n-random', type=int, default=200,
-        help='グリッド全探索が多すぎる場合にランダムサンプルする候補数 '
-            '(既定 200、0 でグリッド全探索)。')
+        help='ランダムに選ぶ候補数 (0 で格子を全探索)。')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument(
         '--output', type=str,

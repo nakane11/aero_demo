@@ -1,37 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""実カメラ (color/depth/camera_info) と TF (``/tf``/``/tf_static``) を
-常時ローリング録画しておき、掌の差し出しを検出したら検出時刻の
-``--pre-seconds`` 秒前から ``--post-seconds`` 秒後までを 1 本の rosbag
-クリップとして ``--save-dir`` に切り出して保存するノード。差し出しを
-検出した瞬間のカラー画像に骨格を重ねた PNG も、クリップ 1 本につき
-1 枚あわせて保存する (人手での確認・データセットのサムネイル用)。
+"""カメラと TF を常時ローリング録画し、掌の差し出しを検出したら前後を rosbag に切り出す。
 
-``run_camera_pipeline_test.py`` が ARM ボタンを押した後だけ掌推定を行う
-のに対し、このノードは無人でバックグラウンドに常駐させることを想定し、
-ARM 操作なしで常時検出を行う (掌推定の判定基準 -- ``PeoplePoseEstimator``
-の各閾値・``--offer-score-min``・関節位置の時間方向平滑化
-(``aero_demo.skeleton_filters.OneEuroFilter``)・差し出し手判定の基準にする
-ロボット手先位置の TF 解決 (``aero_demo.ros_camera_utils.
-lookup_frame_position``) -- はすべて ``run_camera_pipeline_test.py`` と
-揃えてあるので、そちらの ARMED 中の判定と同じ基準でトリガーする)。IK・
-軌道計画・viser 表示は行わない (scikit-robot/jax に依存しない、録画専用の
-軽量なノード)。差し出し手判定の基準にするロボット手先の位置は、既定では
-実機の TF (``--robot-hand-frame``, 既定 ``r_eef_grasp_link``) を毎フレーム
-引いて使う (TF がまだ引けない間だけ概算値にフォールバックする、
-``_FALLBACK_ROBOT_HAND_POSITION`` 参照)。
-
-保存したクリップは ``/tf``・``/tf_static`` も含めて自己完結しているため、
-``run_camera_pipeline_test.py --bag <クリップ>.bag`` に渡せば、実カメラ・
-実ロボットの TF 配信なしにそのままパイプラインをテストできる (デフォルト
-のトピック名がこのノードの録画対象と一致しているため、``rosbag play`` が
-再生したトピックをそのまま subscribe できる)。
-
-今の判定器が差し出しを認識できたときにしか保存しないので、「差し出したのに
-認識されなかった」場面はこのノードでは集まらない。見逃しを調べるときは、
-判定器に依存しない ``rosbag record`` で連続録画し、``extract_skeletons_
-from_bag.py`` で抽出する (``docs/dev_tools.md`` 参照)。
+検出時刻の ``--pre-seconds`` 前から ``--post-seconds`` 後までを ``--save-dir``
+に保存し、検出瞬間の骨格重畳 PNG とメタデータ JSON も残す。判定基準は
+``run_camera_pipeline_test.py`` と同じ (ARM 操作なしで常時検出)。クリップは
+/tf・/tf_static を含み、``run_camera_pipeline_test.py --bag`` にそのまま渡せる。
+認識されなかった差し出しは集まらないので、見逃しの調査は
+``extract_skeletons_from_bag.py`` を使う。
 
 Usage
 -----
@@ -77,29 +54,16 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
 
 import estimate_palm_poses as epp  # noqa: E402
 
-# バッグに書き込む各トピック名 (self._buffers/self._writer_seq のキーにも使う)。
 _TF_TOPIC = '/tf'
 _TF_STATIC_TOPIC = '/tf_static'
 
-# 差し出し手判定の基準にするロボット手先の base_link 座標 [m] は、既定では
-# 実機の TF (--robot-hand-frame, 既定 r_eef_grasp_link) を毎フレーム引いて
-# 使う (aero-ros-pkg 側で /aero_state_publisher が r_hand_link の子として
-# 配信している、skrobot Aero モデルの rarm_end_coords に対応する実リンク)。
-# estimate_palm_poses.OfferedHandSelector 自身の既定動作 (robot_position=
-# None) は合成骨格向けの「人物より world +x 側にロボットがいる」という
-# 世界座標の仮定で、base_link 座標系の実カメラでは前提が食い違う (ロボット
-# 自身はおよそ原点付近 = 人物より -x 側にいることが多い) ため使わない。
-# TF がまだ引けない (ロボット未接続、/aero_state_publisher 未起動など) 間
-# だけ使うフォールバック値 (Aero の右腕初期姿勢の手先位置に近い概算値)。
+# 手先の TF が引けない間に使う base_link 座標 [m] (右腕初期姿勢の概算)。
+# OfferedHandSelector の robot_position=None は合成骨格向けの仮定なので使わない。
 _FALLBACK_ROBOT_HAND_POSITION = (0.32, -0.55, 0.93)
 
 class ClipWindowTracker(object):
-    """``offered_hand`` の ``None -> 'R'/'L'`` への遷移 (立ち上がり) を
-    検出時刻 ``t0`` として、録画すべき時間帯
-    ``[t0 - pre_seconds, t0 + post_seconds]`` を管理する状態機械。
-
-    ROS (rospy/rosbag) に一切依存しないので、実カメラ・roscore 無しで
-    素の Python の float 時刻列だけを使って単体テストできる。
+    """``offered_hand`` の None -> 'R'/'L' を検出時刻 t0 とし、
+    ``[t0 - pre_seconds, t0 + post_seconds]`` の録画区間を管理する (ROS 非依存)。
     """
 
     def __init__(self, pre_seconds, post_seconds, cooldown_seconds):
@@ -113,13 +77,7 @@ class ClipWindowTracker(object):
         self._last_close_t = -float('inf')
 
     def observe_detection(self, t, offered_hand):
-        """検出フレーム 1 つ分の結果を渡す。
-
-        このフレームで新しくウィンドウを開始した (= 直前まで None だった
-        ``offered_hand`` が非 None になり、クールダウンも空けている) なら
-        True を返す。呼び出し側はこの戻り値が True のときだけ、ローリング
-        バッファのうち ``[t - pre_seconds, t]`` をバッグへ書き出す。
-        """
+        """1 フレームの判定結果を渡し、新しく区間を開始したら True を返す。"""
         prev_side = self._prev_side
         self._prev_side = offered_hand
         triggered = (
@@ -137,14 +95,12 @@ class ClipWindowTracker(object):
         return self.window_end is not None and t <= self.window_end
 
     def in_cooldown(self, t):
-        """時刻 ``t`` が、直前のクリップを閉じた後のクールダウン中か
-        (録画中はクールダウンではない、``is_recording`` と排他)。"""
+        """クリップを閉じた後のクールダウン中か (録画中は False)。"""
         return (self.window_end is None
                and t - self._last_close_t < self.cooldown_seconds)
 
     def maybe_close(self, t):
-        """``t`` が ``window_end`` を過ぎていればウィンドウを閉じ、
-        ``(trigger_time, trigger_side)`` を返す。閉じなければ ``None``。"""
+        """区間を過ぎていれば閉じて ``(trigger_time, trigger_side)``、それ以外は None。"""
         if self.window_end is None or t <= self.window_end:
             return None
         result = (self.trigger_time, self.trigger_side)
@@ -164,18 +120,12 @@ class PalmOfferClipRecorder(object):
         self._seq = 0
         self._lock = threading.Lock()
 
-        # ローリングバッファ: トピック名 -> [(t, msg), ...] (t 昇順)。
-        # トリガー時に [t0 - pre_seconds, t0] の分をバッグへまとめて書く。
+        # ローリングバッファ: トピック名 -> deque[(t, msg)] (t 昇順)。
         self._buffer_seconds = args.pre_seconds + 0.5
         self._buffers = collections.defaultdict(collections.deque)
 
-        # /tf_static (URDF 固定オフセット、r_eef_grasp_link 等) はロボット
-        # 起動時に 1 度しか配信されない (latched) ため、他のトピックと同じ
-        # スライディングウィンドウ (_buffer_append) に乗せると、記録開始
-        # までに buffer_seconds 秒以上経ってしまい単に消えてしまう (この
-        # クラスがそれで r_eef_grasp_link 等を一切バッグに書けていなかった
-        # 不具合があった)。子フレーム名をキーに最新の変換を保持し続け、
-        # クリップ開始のたびに別途書き込む (_write_latest_tf_static)。
+        # /tf_static は latched で一度しか来ないのでバッファに乗せず、
+        # 子フレーム名 -> 最新変換で保持してクリップ開始時に書く。
         self._tf_static_transforms = {}
 
         self._active_bag = None
@@ -202,16 +152,12 @@ class PalmOfferClipRecorder(object):
             max_hand_reach=args.max_hand_reach,
             depth_patch_size=args.depth_patch_size)
 
-        # 深度ノイズによる関節位置の単発の飛びを抑える時間方向の平滑化
-        # (aero_demo.skeleton_filters.OneEuroFilter、run_camera_pipeline_
-        # test.py の self._joint_smoother と同じクラス・同じ既定値)。
         self._joint_smoother = skeleton_filters.OneEuroFilter(
             mincutoff=args.joint_smoothing_mincutoff,
             beta=args.joint_smoothing_beta,
             dcutoff=args.joint_smoothing_dcutoff)
 
-        # robot_position はここでは確定させない (毎フレーム _resolve_robot_
-        # position で TF から引き直して選定器に差し込む、_on_frame 参照)。
+        # robot_position は毎フレーム _on_frame で設定する。
         max_distance = (None if args.max_person_distance <= 0
                         else args.max_person_distance)
         offered_hand_selector = epp.OfferedHandSelector(
@@ -219,10 +165,8 @@ class PalmOfferClipRecorder(object):
             max_distance=max_distance)
         self.palm_estimator = epp.PalmPoseEstimator(offered_hand_selector)
 
-        # camera_info は同期に含めず最新の 1 つだけ持つ (run_camera_
-        # pipeline_test.py と同じ理由: 画像の転送が遅れると、同じ時刻の
-        # camera_info が queue_size 分の履歴から押し出されて組ができず、
-        # _on_frame がほとんど呼ばれなくなる)。
+        # camera_info は同期に含めず最新の 1 つを使う (画像遅延時に組が
+        # できなくなるため)。
         self._latest_camera_info = None
         rospy.Subscriber(args.camera_info_topic, CameraInfo,
                          self._on_camera_info, queue_size=1)
@@ -236,9 +180,7 @@ class PalmOfferClipRecorder(object):
         rospy.Subscriber(
             _TF_STATIC_TOPIC, TFMessage, self._on_tf_static, queue_size=50)
 
-        # デバッグ用: 骨格・掌の有無や録画中かどうかに関わらず、購読者が
-        # いれば毎フレーム publish する (クールダウン中だけ止める、
-        # _on_frame 末尾参照)。録画中に保存する PNG と同じ描画。
+        # デバッグ用の骨格重畳画像 (クールダウン中以外、購読者がいれば毎フレーム)。
         self.skeleton_image_pub = rospy.Publisher(
             '~skeleton_image', Image, queue_size=1)
 
@@ -256,9 +198,7 @@ class PalmOfferClipRecorder(object):
             buf.popleft()
 
     def _flush_pre_buffer(self, bag, t0):
-        """ローリングバッファのうち ``[t0 - pre_seconds, t0]`` を時刻順に
-        まとめてバッグへ書き出す (トリガー直後、クリップ開始時に 1 回だけ
-        呼ぶ)。"""
+        """バッファの ``[t0 - pre_seconds, t0]`` を時刻順にバッグへ書く。"""
         window_start = t0 - self.args.pre_seconds
         entries = []
         for topic, buf in self._buffers.items():
@@ -271,17 +211,7 @@ class PalmOfferClipRecorder(object):
         self._write_latest_tf_static(bag, window_start)
 
     def _write_latest_tf_static(self, bag, stamp):
-        """保持している最新の ``/tf_static`` (子フレーム名 -> 変換) を、
-        クリップ先頭の時刻でまとめて書き込む。
-
-        ``/tf_static`` はロボット起動時に 1 度だけ配信される (latched)
-        ため、他のトピックと同じスライディングウィンドウの
-        ``_buffers``/``_buffer_append`` には乗せていない (乗せると
-        記録開始までに ``_buffer_seconds`` 秒以上経ってバッファから
-        追い出され、``r_eef_grasp_link`` のような URDF 固定オフセットが
-        クリップに一切書き込まれなくなる)。ここで別途、その時点で
-        受信済みの全 ``/tf_static`` 変換をまとめて 1 メッセージとして
-        書き込む。"""
+        """受信済みの全 ``/tf_static`` を 1 メッセージにまとめて書く。"""
         if not self._tf_static_transforms:
             return
         msg = TFMessage(transforms=list(self._tf_static_transforms.values()))
@@ -339,18 +269,7 @@ class PalmOfferClipRecorder(object):
             self._close_clip(*closed)
 
     def _resolve_robot_position(self):
-        """差し出し手判定の基準にするロボット手先の base_link 座標を返す.
-
-        ``--robot-hand-position`` が明示されていればそれを固定で使う。
-        そうでなければ実機の TF (``--robot-hand-frame`` -> ``--base-
-        frame``、既定 ``r_eef_grasp_link`` -> ``base_link``) を毎回引き、
-        まだ引けなければ (ロボット未接続・/aero_state_publisher 未起動
-        など) ``_FALLBACK_ROBOT_HAND_POSITION`` に概算値でフォールバック
-        する (TF 解決自体は ``run_camera_pipeline_test.py`` と共通の
-        ``ros_camera_utils.lookup_frame_position`` を使う。フォールバック
-        値だけは、こちらは概算の固定値、``run_camera_pipeline_test.py`` は
-        右腕の「種の姿勢」から計算した値と別々に決めている)。
-        """
+        """判定基準のロボット手先位置 (base_link)。固定値 > TF > フォールバック。"""
         if self.args.robot_hand_position is not None:
             return np.asarray(self.args.robot_hand_position, dtype=np.float64)
         return lookup_frame_position(
@@ -396,10 +315,6 @@ class PalmOfferClipRecorder(object):
             joint_positions = people[0] if people else None
             person_joints_2d = joints_2d[0] if joints_2d else None
             if joint_positions is not None:
-                # 深度の単発の外れ値を時間方向に抑えてから掌推定に渡す
-                # (run_camera_pipeline_test.py の self._joint_smoother と
-                # 同じ、One Euro Filter はフレーム数ではなく実時間に基づく
-                # ためカメラ画像のタイムスタンプを渡す)。
                 joint_positions = self._joint_smoother.update(
                     joint_positions, t=color_msg.header.stamp.to_sec())
                 self.palm_estimator.offered_hand_selector.robot_position = \
@@ -407,12 +322,7 @@ class PalmOfferClipRecorder(object):
                 palms = self.palm_estimator.estimate(
                     joint_positions, t=color_msg.header.stamp.to_sec())
                 offered_hand = palms['offered_hand']
-                # run_camera_pipeline_test.py の ARMED 中と同じスコア内訳を
-                # スロットルして標準出力に出す (このノードには viser 画面が
-                # 無く、常時検出なので ARMED という区切りも無いため、閾値の
-                # 調整にはこれが唯一の手がかりになる。PalmPoseEstimator.
-                # estimate は offered_hand しか返さないので、同じ入力で
-                # select() を呼び直す)。
+                # 閾値調整用にスコア内訳を出す (estimate は内訳を返さないので再計算)。
                 selection = self.palm_estimator.offered_hand_selector.select(
                     joint_positions, palms, t=color_msg.header.stamp.to_sec())
                 rospy.loginfo_throttle(
@@ -424,8 +334,6 @@ class PalmOfferClipRecorder(object):
         with self._lock:
             triggered = self.tracker.observe_detection(t, offered_hand)
             if triggered:
-                # トリガーしたフレーム自身の画像・2D 関節位置を、差し出しを
-                # 検出した瞬間のスナップショット (PNG) として使う。
                 self._start_clip(self.tracker.trigger_time,
                                  self.tracker.trigger_side,
                                  color, person_joints_2d)
@@ -435,8 +343,6 @@ class PalmOfferClipRecorder(object):
             self._maybe_close_clip(t)
             in_cooldown_now = self.tracker.in_cooldown(t)
 
-        # 購読者がいれば、骨格・掌の有無やクリップを録画中かどうかに関わら
-        # ず毎フレーム publish する (クールダウン中だけ止める)。
         if (not in_cooldown_now and color is not None
                and self.skeleton_image_pub.get_num_connections() > 0):
             overlay = (skeleton_drawing.draw_skeleton_overlay(
@@ -449,9 +355,6 @@ class PalmOfferClipRecorder(object):
         self._on_tf_message(_TF_TOPIC, msg)
 
     def _on_tf_static(self, msg):
-        # スライディングウィンドウ (_buffer_append) には乗せず、子フレーム
-        # 名をキーに最新の変換を保持し続ける (_write_latest_tf_static
-        # 参照)。録画中ならそのまま生でも書き込んでおく (実害はない)。
         t = rospy.Time.now().to_sec()
         with self._lock:
             for tr in msg.transforms:
@@ -485,9 +388,8 @@ def main():
     parser.add_argument('--base-frame', type=str, default='base_link')
     parser.add_argument(
         '--tf-cache-time', type=float, default=30.0,
-        help='tf2 バッファの保持時間 [秒] (既定 30.0、run_camera_pipeline_'
-            'test.py の --tf-cache-time と同じ理由)。')
-    # --- PeoplePoseEstimator (run_camera_pipeline_test.py と同じ既定値) ---
+        help='tf2 バッファの保持時間 [s]。')
+    # --- PeoplePoseEstimator ---
     parser.add_argument('--min-detection-confidence', type=float, default=0.5)
     parser.add_argument('--min-tracking-confidence', type=float, default=0.5)
     parser.add_argument('--min-visibility', type=float, default=0.5)
@@ -499,75 +401,35 @@ def main():
     parser.add_argument('--max-hand-segment-length', type=float, default=0.12)
     parser.add_argument('--max-hand-reach', type=float, default=0.22)
     parser.add_argument('--depth-patch-size', type=int, default=3)
-    # --- 関節位置の時間方向平滑化 (aero_demo.skeleton_filters.
-    # OneEuroFilter、run_camera_pipeline_test.py と同じクラス・同じ既定値) ---
-    parser.add_argument(
-        '--joint-smoothing-mincutoff', type=float, default=0.5,
-        help='One Euro Filter の最小カットオフ周波数 [Hz] (既定 0.5、'
-            'run_camera_pipeline_test.py の既定値と揃えてある)。下げるほど '
-            '静止時のジッタが減るが追従が遅れる。')
-    parser.add_argument(
-        '--joint-smoothing-beta', type=float, default=0.3,
-        help='One Euro Filter の速度依存カットオフの係数 (既定 0.3、'
-            'run_camera_pipeline_test.py の既定値と揃えてある)。上げるほど '
-            '速い動きへの追従の遅れが減るが静止時のジッタが増える。')
-    parser.add_argument(
-        '--joint-smoothing-dcutoff', type=float, default=1.0,
-        help='One Euro Filter の速度推定のカットオフ周波数 [Hz] (既定 1.0、'
-            'run_camera_pipeline_test.py の既定値と揃えてある)。')
-    # --- 差し出し手判定 (estimate_palm_poses.OfferedHandSelector) ---
-    parser.add_argument(
-        '--offer-score-min', type=float, default=0.65,
-        help='差し出し手と判定するスコアの閾値 (既定 0.65、'
-            'run_camera_pipeline_test.py の既定値と揃えてある)。')
+    # --- 関節位置の平滑化 (One Euro Filter) ---
+    parser.add_argument('--joint-smoothing-mincutoff', type=float, default=0.5,
+                        help='最小カットオフ周波数 [Hz]。')
+    parser.add_argument('--joint-smoothing-beta', type=float, default=0.3,
+                        help='速度依存カットオフの係数。')
+    parser.add_argument('--joint-smoothing-dcutoff', type=float, default=1.0,
+                        help='速度推定のカットオフ周波数 [Hz]。')
+    # --- 差し出し手判定 ---
+    parser.add_argument('--offer-score-min', type=float, default=0.65,
+                        help='差し出し手と判定するスコアの閾値。')
     parser.add_argument(
         '--robot-hand-position', type=float, nargs=3, default=None,
         metavar=('X', 'Y', 'Z'),
-        help='差し出し手判定が基準にするロボット手先の base_link 座標 '
-            '[m] を固定値で指定する (既定 None)。指定すると --robot-hand-'
-            'frame での TF 解決より優先される。OfferedHandSelector 自体の '
-            '既定動作 (robot_position=None のときに人物の位置から world '
-            '+x に 3m・高さ 1.2m の点を使う) は合成骨格向けで、人物が常に '
-            'ロボットより +x 側にいることを前提にしている。実カメラは '
-            'base_link 座標系で推定するためロボット自身がおよそ原点付近 '
-            '(=人物より -x 側) にいることが多く前提と食い違い、差し出して '
-            'いない手が高スコアになる/差し出した手が高スコアにならない '
-            '原因になるため、この既定 (None) のときはその代わりに '
-            '--robot-hand-frame の TF を使う (下記参照)。')
+        help='判定基準のロボット手先位置 [m] (base_link) を固定する (既定は TF)。')
     parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
-        help='--robot-hand-position が未指定のとき、差し出し手判定の基準に '
-            '毎フレーム TF (--base-frame からのこのフレーム) を引いて使う '
-            '(既定 r_eef_grasp_link -- skrobot Aero モデルの rarm_end_'
-            'coords に対応する実リンクで、実機では /aero_state_publisher '
-            'が配信する)。ロボット未接続などでまだ TF が引けない間だけ '
-            '概算値 ({}) にフォールバックする。'.format(
-                _FALLBACK_ROBOT_HAND_POSITION))
+        help='判定基準のロボット手先の TF フレーム。')
     parser.add_argument(
         '--max-person-distance', type=float, default=3.0,
-        help='人物 (腰の中点) からロボット手先までの距離 [m] がこれを '
-            '超えたら、スコアを見るまでもなく両手とも差し出し候補から '
-            '外す (既定 3.0、run_camera_pipeline_test.py の既定値と揃えて '
-            'ある)。奥や画面の端に映り込んだだけの、手を差し出す気の無い '
-            '通行人を拾わないための足切り (estimate_palm_poses.'
-            'OfferedHandSelector の max_distance 引数、veto 理由は '
-            '"too_far")。0 以下を指定すると足切りを無効にする。')
+        help='人物とロボット手先がこれ [m] より遠ければ候補外 (0 以下で無効)。')
     # --- クリップ切り出し ---
-    parser.add_argument(
-        '--pre-seconds', type=float, default=2.0,
-        help='検出時刻の何秒前からクリップに含めるか (既定 2.0)。')
-    parser.add_argument(
-        '--post-seconds', type=float, default=2.0,
-        help='検出時刻の何秒後までクリップに含めるか (既定 2.0)。')
-    parser.add_argument(
-        '--cooldown-seconds', type=float, default=3.0,
-        help='1 つのクリップを保存し終えてから、次のトリガーを受け付ける '
-            'までの最短間隔 [秒] (既定 3.0)。同じ差し出し動作を複数回に '
-            '分けて録らないようにする。')
-    parser.add_argument(
-        '--save-dir', type=str, default='palm_offer_clips',
-        help='クリップ (.bag) とメタデータ (.json) の保存先ディレクトリ '
-            '(既定 palm_offer_clips/)。')
+    parser.add_argument('--pre-seconds', type=float, default=2.0,
+                        help='検出前に含める秒数。')
+    parser.add_argument('--post-seconds', type=float, default=2.0,
+                        help='検出後に含める秒数。')
+    parser.add_argument('--cooldown-seconds', type=float, default=3.0,
+                        help='保存後、次のトリガーを受け付けるまでの秒数。')
+    parser.add_argument('--save-dir', type=str, default='palm_offer_clips',
+                        help='クリップ (.bag/.json/.png) の保存先。')
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
     rospy.init_node('record_palm_offer_clips')

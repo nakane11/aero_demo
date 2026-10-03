@@ -1,45 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""rosbag (color/depth/camera_info/tf/tf_static を含む) を読み込み、
-``offered_hand`` の自動判定結果に関わらず骨格・掌位置姿勢・骨格重畳画像を
-保存するオフライン抽出ツール。
+"""rosbag から、差し出し判定によらず骨格・掌位置姿勢・骨格重畳画像を抽出する。
 
-``record_palm_offer_clips.py`` は現行の ``OfferedHandSelector`` (判定器
-そのもの) をトリガーにクリップを切り出すため、それで撮ったデータだけを
-使うと「今の判定基準では見逃されている、より自然な差し出し方 (斜め前に
-軽く、体から離す等)」のサンプルが原理的に集まらない。このツールは判定器
-に一切依存しない生の bag (``rosbag record`` で判定なしに連続録画したもの
-を想定) を入力にし、既定では ``--sample-interval`` 秒おきに全フレームを
-機械的にサンプリングして保存する (判定結果はあくまで参考情報として掌
-JSON に残すだけで、どのフレームを保存するかには使わない)。
+既定は ``--sample-interval`` 秒おきに機械的にサンプリング (判定結果は掌 JSON
+に参考として残すだけ)。``--single-sample`` では bag ごとに 1 フレーム
+(``<bag>.json`` の ``trigger_stamp`` に最も近いもの、無ければ中央) を保存する。
 
-``record_palm_offer_clips.py`` が切り出した 4 秒クリップ (判定器で既に
-選別済みのデータ) を混ぜたい場合は ``--single-sample`` を付ける。この
-場合は bag ごとに 1 フレームだけを代表として選ぶ -- 対応する
-``<bag>.json`` があれば、その ``trigger_stamp`` (差し出しを検出した瞬間
-の時刻) に最も近いフレーム、無ければ同期できたフレームの中央を使う (前後
-の過渡的なフレームまで保存すると、同じ差し出し動作からほぼ重複したサン
-プルが大量にできて後段の人手ラベル付けの手間が増えるだけなため)。
-
-保存先には 3 つのサブディレクトリができる:
-
-    <output-dir>/skeletons/<bag名>[_<連番>].json  (estimate_palm_poses.py
-        の --input-dir にそのまま渡せる骨格 JSON)
-    <output-dir>/palms/<bag名>[_<連番>].json      (掌位置姿勢 +
-        offered_hand の自動判定。label_offer_images.py がここに
-        human_label を書く)
-    <output-dir>/images/<bag名>[_<連番>].png       (骨格重畳画像。自動
-        判定で選ばれた手を赤で描く。label_offer_images.py の入力)
-
-(``--single-sample`` のときだけファイル名に連番が付かない。)
-
-roscore は不要 (``tf2_ros.BufferCore`` を使う、``record_palm_offer_
-clips.py``/``run_camera_pipeline_test.py`` のようにライブ購読はしない)。
+出力: ``<output-dir>/{skeletons,palms,images}/<bag名>[_<連番>].{json,png}``
+(palms には label_offer_images.py が human_label を書く)。roscore 不要。
 
 Usage
 -----
-    # 判定器なしで連続録画した bag から、0.5 秒おきにサンプリング (既定)
     python3 tools/ros/extract_skeletons_from_bag.py \
         --bag session1.bag --output-dir /tmp/offer_dataset
 
@@ -81,18 +53,12 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
     imgmsg_to_ndarray, transform_to_matrix)
 
 import estimate_palm_poses as epp  # noqa: E402
-# record_palm_offer_clips.py と同じフォールバック値を再利用する (判定基準を
-# 実カメラパイプラインと揃えるため、この抽出専用ファイルで再定義しない)。
 from record_palm_offer_clips import (  # noqa: E402
     _FALLBACK_ROBOT_HAND_POSITION)
 
 
 def load_tf_buffer(bag_path):
-    """bag 内の全 ``/tf``/``/tf_static`` を読み込んだ ``BufferCore`` を作る.
-
-    bag 全体をカバーできるよう、キャッシュ時間は bag の長さより十分長く
-    取る (``genpy.Duration(3600)``, 1 時間)。roscore 不要。
-    """
+    """bag 内の全 ``/tf``/``/tf_static`` を読み込んだ ``BufferCore`` (キャッシュ 1 時間)。"""
     buf = tf2_ros.BufferCore(genpy.Duration(3600))
     with rosbag.Bag(bag_path) as bag:
         for topic, msg, _t in bag.read_messages(topics=['/tf', '/tf_static']):
@@ -109,13 +75,9 @@ def load_tf_buffer(bag_path):
 
 def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
                           slop):
-    """color を基準に、depth を最も近い時刻でマッチさせる
-    (``message_filters.ApproximateTimeSynchronizer`` のオフライン再現)。
-    camera_info は最も近い時刻のものを添えるだけ (同期の条件にしない)。
+    """color 基準に最も近い depth を対応させた (color, depth, info) の時刻順リスト。
 
-    Returns
-    -------
-    list of (color_msg, depth_msg, info_msg), 時刻昇順。
+    camera_info は同期条件にせず、最も近い時刻のものを添える。
     """
     color_msgs, depth_msgs, info_msgs = [], [], []
     with rosbag.Bag(bag_path) as bag:
@@ -138,9 +100,6 @@ def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
                 best_idx, best_dt = i, dt
         return best_idx
 
-    # camera_info は同期に含めず、最も時刻の近いものを使い回す
-    # (run_camera_pipeline_test.py と同じ扱い。内部パラメータは変わらない
-    # ので、camera_info の配信周期が画像より粗くても画像を捨てない)。
     info_stamps = [m.header.stamp.to_sec() for m in info_msgs]
     used_depth = set()
     frames = []
@@ -159,8 +118,7 @@ def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
 
 def _lookup_robot_position(buf, base_frame, hand_frame, stamp,
                            fixed_position):
-    """``record_palm_offer_clips.py`` の ``_resolve_robot_position`` と
-    同じ優先順位 (固定値 > TF > フォールバック) をオフラインで再現する。"""
+    """ロボット手先位置 (優先順: 固定値 > TF > フォールバック)。"""
     if fixed_position is not None:
         return np.asarray(fixed_position, dtype=np.float64)
     try:
@@ -172,10 +130,7 @@ def _lookup_robot_position(buf, base_frame, hand_frame, stamp,
 
 
 def _load_trigger_stamp(bag_path):
-    """``record_palm_offer_clips.py`` が書き出したメタデータ
-    (``<bag_stem>.json``) から ``trigger_stamp`` (差し出しを検出した
-    瞬間の時刻) を読む。メタデータが無い/``trigger_stamp`` が無ければ
-    ``None``。"""
+    """``<bag_stem>.json`` の ``trigger_stamp`` (無ければ None)。"""
     meta_path = os.path.splitext(bag_path)[0] + '.json'
     if not os.path.exists(meta_path):
         return None
@@ -185,12 +140,7 @@ def _load_trigger_stamp(bag_path):
 
 
 def _pick_representative_index(frames, trigger_stamp):
-    """1 bag = 1 サンプルとして保存する代表フレームの index を選ぶ.
-
-    ``trigger_stamp`` (差し出しを検出した瞬間の時刻) が分かれば、それに
-    最も時刻が近い color フレームを選ぶ (その bag の中で最も代表的な
-    瞬間なので)。メタデータが無ければ同期できたフレームの中央で代用する。
-    """
+    """代表フレームの index (``trigger_stamp`` に最も近いもの、無ければ中央)。"""
     if not frames:
         return None
     if trigger_stamp is None:
@@ -202,12 +152,10 @@ def _pick_representative_index(frames, trigger_stamp):
 
 def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
                 buf, args, stamp, out_dirs, name):
-    """1 フレーム分の掌推定・骨格重畳画像を計算して保存する共通処理.
+    """1 フレーム分の骨格・掌・重畳画像を保存する。
 
-    判定の基準にしたロボット手先の位置 (base_link 座標) も掌 JSON の
-    ``robot_position`` に残す。``tune_offer_selector.py`` はこれを読んで
-    同じ基準でスコアを計算し直す (無いと合成骨格向けの仮のロボット位置に
-    なり、実カメラの base_link 座標とは向きが食い違う)。
+    判定に使ったロボット手先位置 (base_link) を ``robot_position`` に残す
+    (tune_offer_selector.py が再計算に使う)。
     """
     robot_position = _lookup_robot_position(
         buf, args.base_frame, args.robot_hand_frame, stamp,
@@ -222,7 +170,7 @@ def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
             joint_positions={k: list(v)
                              for k, v in joint_positions.items()},
             height=0.0)))
-    # 抽出し直しても label_offer_images.py が付けた human_label は残す。
+    # 既存の human_label は残る。
     epp.save_json(palms, os.path.join(out_dirs['palms'], name + '.json'))
     overlay = skeleton_drawing.draw_skeleton_overlay(
         color, person_joints_2d, offered_side=palms['offered_hand'])
@@ -231,23 +179,7 @@ def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
 
 def process_bag(bag_path, args, pose_estimator, joint_smoother,
                 palm_estimator, out_dirs):
-    """``bag_path`` の全フレームを走査し、保存対象のフレームを選んで保存
-    する。
-
-    ``args.single_sample`` が真なら、対応する ``<bag>.json`` の
-    ``trigger_stamp`` (無ければ同期フレームの中央) に最も近いフレーム 1 つ
-    だけを ``<bag名>.json``/``.png`` として保存する
-    (``record_palm_offer_clips.py`` が切り出した判定済みクリップ向け)。
-
-    既定 (偽) では、判定器に一切依存せず ``args.sample_interval`` 秒おきに
-    機械的にサンプリングして ``<bag名>_<連番>.json``/``.png`` として複数
-    保存する (``rosbag record`` で判定なしに連続録画した bag 向け)。
-
-    Returns
-    -------
-    int
-        保存できたフレーム数。
-    """
+    """``bag_path`` のフレームを選んで保存し、保存数を返す。"""
     buf = load_tf_buffer(bag_path)
     frames = collect_synced_frames(
         bag_path, args.color_topic, args.depth_topic,
@@ -294,9 +226,7 @@ def process_bag(bag_path, args, pose_estimator, joint_smoother,
             joint_positions = people[0] if people else None
             person_joints_2d = joints_2d[0] if joints_2d else None
             if joint_positions is not None:
-                # OneEuroFilter は時系列順に通し続けないと平滑化の意味が
-                # 無い (速度推定が飛ぶ) ため、保存対象でないフレームでも
-                # 検出できていればここまでは必ず行う。
+                # 保存しないフレームも平滑化には通す (速度推定が飛ばないように)。
                 joint_positions = joint_smoother.update(
                     joint_positions, t=stamp_sec)
 
@@ -328,11 +258,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--bag', type=str, nargs='+', required=True,
-        help='入力 bag ファイル (複数可、シェルの glob もそのまま渡せる)。')
+        help='入力 bag (複数・glob 可)。')
     parser.add_argument(
         '--output-dir', type=str, required=True,
-        help='skeletons/palms/images の 3 つのサブディレクトリを作る '
-            '保存先。')
+        help='出力先 (skeletons/palms/images を作る)。')
     parser.add_argument('--color-topic', type=str,
                         default='/camera/color/image_raw/decompressed')
     parser.add_argument('--depth-topic', type=str,
@@ -342,23 +271,14 @@ def main():
     parser.add_argument('--base-frame', type=str, default='base_link')
     parser.add_argument(
         '--sync-slop', type=float, default=0.1,
-        help='color/depth/camera_info を同期させる際の最大時刻差 [秒] '
-            '(既定 0.1、message_filters.ApproximateTimeSynchronizer の '
-            'slop と同じ意味)。')
+        help='color/depth 同期の最大時刻差 [s]。')
     parser.add_argument(
         '--sample-interval', type=float, default=0.5,
-        help='(--single-sample を付けないとき) 何秒おきにサンプリングして '
-            '保存するか (既定 0.5 秒)。判定器の結果には一切関係なく、'
-            '機械的にこの間隔でサンプリングする。差し出して止めている '
-            '時間は 1〜2 秒程度のことが多く、2.5 秒おきでは取りこぼす。')
+        help='サンプリング間隔 [s] (--single-sample なしのとき)。')
     parser.add_argument(
         '--single-sample', action='store_true',
-        help='bag ごとに 1 フレームだけを代表として保存する '
-            '(record_palm_offer_clips.py が切り出した判定済みクリップ '
-            '向け、モジュール docstring 参照)。既定 (指定なし) は '
-            '--sample-interval 秒おきに複数フレーム保存する '
-            '(判定器なしで連続録画した bag 向け)。')
-    # --- PeoplePoseEstimator (record_palm_offer_clips.py と同じ既定値) ---
+        help='bag ごとに代表 1 フレームだけ保存する (切り出し済みクリップ向け)。')
+    # --- PeoplePoseEstimator ---
     parser.add_argument('--min-detection-confidence', type=float, default=0.5)
     parser.add_argument('--min-tracking-confidence', type=float, default=0.5)
     parser.add_argument('--min-visibility', type=float, default=0.5)
@@ -370,7 +290,7 @@ def main():
     parser.add_argument('--max-hand-segment-length', type=float, default=0.12)
     parser.add_argument('--max-hand-reach', type=float, default=0.22)
     parser.add_argument('--depth-patch-size', type=int, default=3)
-    # --- 関節位置の時間方向平滑化 (record_palm_offer_clips.py と同じ) ---
+    # --- 関節位置の平滑化 ---
     parser.add_argument('--joint-smoothing-mincutoff', type=float, default=0.5)
     parser.add_argument('--joint-smoothing-beta', type=float, default=0.3)
     parser.add_argument('--joint-smoothing-dcutoff', type=float, default=1.0)
@@ -421,8 +341,7 @@ def main():
     total_saved = 0
     try:
         for bag_path in bag_paths:
-            # bag ごとに OneEuroFilter は独立させる (別クリップの時系列を
-            # 混ぜて平滑化しないため)。
+            # 平滑化は bag ごとに独立。
             joint_smoother = skeleton_filters.OneEuroFilter(
                 mincutoff=args.joint_smoothing_mincutoff,
                 beta=args.joint_smoothing_beta,

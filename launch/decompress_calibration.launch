@@ -1,5 +1,5 @@
 <launch>
-  <!-- 出力トピック名の引数（デフォルト値を設定していますが、必要に応じて変更可能です） -->
+  <!-- 出力トピック名 -->
   <arg name="color_out" default="/camera/color/image_raw/decompressed" />
   <arg name="depth_out" default="/camera/depth/image_raw/decompressed" />
   <arg name="color_camera_info" default="/camera/color/camera_info" />

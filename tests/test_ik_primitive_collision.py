@@ -1,8 +1,6 @@
 """バッチ IK の干渉ペナルティ (collision_geometry='primitive') の単体テスト。
 
-skrobot の ``_build_primitive_collision_setup`` / ``_make_primitive_collision_
-cost`` が計算するロボットのリンク (箱・円柱・球) と円柱障害物の符号付き距離
-を、``solve_palm_ik`` のリンク表面サンプルによる厳密値と比べる。
+プリミティブと円柱障害物の符号付き距離を、リンク表面サンプルによる値と比べる。
 
     python -m pytest tests/test_ik_primitive_collision.py -s
 """
@@ -25,11 +23,9 @@ from skrobot.backend import get_backend  # noqa: E402
 from skrobot.kinematics import differentiable as diff  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
 
-# 距離の比較の許容誤差 [m]。表面サンプルの最小値は真の距離より最大
-# spacing / sqrt(3) (約 6 mm) 大きく、human_obstacle_clearances はその分を
-# 引いた (真の距離以下の) 値なので、両者の間 ± この値に入ればよい。
+# 許容誤差 [m]。真の距離はサンプル最小値と spacing/sqrt(3) を引いた値の間。
 TOLERANCE = 0.003
-# 比べる距離の上限 [m] (遠い組は精度を見る意味がない)。
+# 比べる距離の上限 [m]。
 MAX_COMPARED_DISTANCE = 0.3
 
 
@@ -66,11 +62,9 @@ def _random_cylinders(rng, center, n=12, spread=0.35):
 
 
 def _set_random_pose(robot, rng, link_list, fraction=0.6):
-    """``link_list`` の関節を可動域の中央付近 (± fraction/2) のランダムな
-    角度にする。台車の仮想関節 (無限の可動域) は別に与える。
+    """関節を可動域中央 ± fraction/2 のランダムな角度にする (無限可動域は除く)。
 
-    脚の膝・足首は mimic 関節 (``*_mimic`` は親の関節に追従) なので、親より
-    先に子を動かし、親を動かしたときのフックで子を上書きさせる (逆順)。"""
+    mimic 関節を親で上書きさせるため逆順に設定する。"""
     for link in reversed(link_list):
         joint = link.joint
         lo, hi = joint.min_angle, joint.max_angle
@@ -81,8 +75,7 @@ def _set_random_pose(robot, rng, link_list, fraction=0.6):
 
 
 def _sample_distance(link, obstacle):
-    """リンク表面サンプルから円柱までの距離の最小値 (真の距離の上界) と、
-    サンプル間隔の分を引いた下界。"""
+    """表面サンプルから円柱までの距離の (下界, 上界)。"""
     points = (spik.link_surface_samples(link) @ link.worldrot().T
               + link.worldpos())
     upper = float(spik.points_cylinder_distance(points, obstacle).min())
@@ -91,8 +84,7 @@ def _sample_distance(link, obstacle):
 
 
 def _primitive_distances(setup, link_list, fk_params, obstacles):
-    """``setup`` のコストが計算する (リンクの添字, 障害物の添字) ごとの
-    符号付き距離 (現在の関節角で FK)。"""
+    """(リンク添字, 障害物添字) -> プリミティブの符号付き距離 (現在の関節角)。"""
     backend = get_backend('jax')
     cost = diff._make_primitive_collision_cost(setup, backend)
     _, obstacle_values = diff._collision_obstacle_types_and_values(
@@ -143,9 +135,7 @@ def _build(robot, link_list, move_target, collision_links, obstacles):
 
 @pytest.mark.parametrize('seed', [0, 1, 2])
 def test_distance_matches_samples_with_moving_base(robot, seed):
-    """台車 (仮想の平面 3 自由度) と全身の関節を動かした姿勢で、プリミティブ
-    の距離が表面サンプルの厳密値と一致する。ソルバーと同じく、定数は
-    台車原点・種の姿勢で作り、距離は別の姿勢の FK で計算する。"""
+    """台車 3 自由度と全身を動かした姿勢で距離が表面サンプルと一致する。"""
     rng = np.random.default_rng(seed)
     robot.reset_pose()
     whole_body = robot.rarm_whole_body
@@ -173,9 +163,7 @@ def test_distance_matches_samples_with_moving_base(robot, seed):
         for joint in state['chain_joints']:
             joint.joint_angle(0.0)
         robot._detach_batch_virtual_base_chain(state)
-    # 仮想の台車の関節は FK のパラメータにしか効かない (座標系の親子は
-    # つながっていない) ので、表面サンプル側のロボットは同じ台車姿勢へ
-    # 直接動かす。
+    # 仮想台車関節は FK にしか効かないので、サンプル側はロボットを直接動かす。
     robot.newcoords(base)
     try:
         n_compared, max_err = _compare(collision_links, obstacles, prim)
@@ -187,9 +175,7 @@ def test_distance_matches_samples_with_moving_base(robot, seed):
 
 
 def test_distance_matches_samples_for_links_fixed_to_base(robot):
-    """IK の鎖 (腕だけ) の外にある、台車・胴体に固定されたリンク
-    (``is_static``) も、ロボットをワールド原点から動かした状態で正しい位置に
-    置かれる (以前 jaxls 側にあった台車固定リンクの誤配置の回帰テスト)。"""
+    """鎖の外の台車固定リンク (``is_static``) もロボット移動後に正しく置かれる。"""
     rng = np.random.default_rng(10)
     robot.reset_pose()
     robot.newcoords(spik.Coordinates(pos=[0.7, -0.4, 0.0]).rotate(
@@ -215,8 +201,7 @@ def test_distance_matches_samples_for_links_fixed_to_base(robot):
 
 
 def test_human_obstacle_clearances_agree(robot):
-    """``human_obstacle_clearances`` (障害物ごとの最短距離、安全側) との
-    比較: プリミティブの最短距離はその値以上、サンプル間隔の分以内。"""
+    """プリミティブの最短距離が ``human_obstacle_clearances`` 以上、サンプル最小値以下。"""
     rng = np.random.default_rng(3)
     robot.reset_pose()
     link_list = robot.rarm_whole_body.link_list
@@ -236,8 +221,6 @@ def test_human_obstacle_clearances_agree(robot):
         if not (0.0 < prim_min < MAX_COMPARED_DISTANCE):
             continue
         n_compared += 1
-        # clearance はリンクごとのサンプル間隔 (大きいリンクほど粗い) の分
-        # だけ小さく見積もられるので、上限はサンプル点の最小距離で見る。
         sample_min = min(_sample_distance(link, obstacles[oi])[1]
                          for link in collision_links)
         assert clearance - TOLERANCE < prim_min < sample_min + TOLERANCE, \
@@ -246,9 +229,7 @@ def test_human_obstacle_clearances_agree(robot):
 
 
 def test_human_obstacle_clearances_match_brute_force(robot):
-    """``human_obstacle_clearances`` (塊の下限で点を省く) が、全サンプル点
-    と円柱の距離の最小値から間隔の分を引いた値と、``cull_distance`` 未満
-    では一致し、それ以上では ``cull_distance`` 未満にならない。"""
+    """``human_obstacle_clearances`` が ``cull_distance`` 未満では総当たりと一致する。"""
     rng = np.random.default_rng(5)
     link_list = robot.rarm_whole_body.link_list
     collision_links = _collision_links(robot)
@@ -326,9 +307,7 @@ def test_gradient_is_finite(robot):
 
 
 def test_constants_are_reproducible(robot):
-    """ロボット側の定数 (jit に埋め込まれる) が、姿勢を動かして戻した後でも
-    ビット単位で同じで、負のゼロを含まない (永続コンパイルキャッシュの
-    キーを安定させるため)。"""
+    """jit 定数が姿勢を戻した後もビット単位で同じで負のゼロを含まない (キャッシュ安定化)。"""
     def build():
         state = robot._attach_batch_virtual_base_chain(
             'planar', robot.rarm_whole_body.link_list)

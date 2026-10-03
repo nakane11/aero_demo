@@ -14,8 +14,7 @@ def unit(v, fallback=None):
 
 
 def rotate(v, axis, angle):
-    """Rodrigues' rotation formula: rotate ``v`` by ``angle`` [rad] around
-    the unit vector ``axis``."""
+    """Rotate ``v`` by ``angle`` [rad] around the unit vector ``axis``."""
     c, s = np.cos(angle), np.sin(angle)
     return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c)
 

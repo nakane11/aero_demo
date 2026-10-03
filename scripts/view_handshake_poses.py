@@ -1,78 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``solve_palm_ik.py`` が出力したロボットの位置姿勢・関節角度 JSON
-(``random_handshake_poses/human_xxx.json``) と、対応する
-SMPL モデル (``random_human_poses/human_xxx.json`` の
-``smpl.pose``/``betas``/``root_pos``/``gender``) をファイル名で突き合わせ
-て読み込み、scikit-robot の viser ビューアで並べて表示する。
+"""``solve_palm_ik.py`` の IK 結果 JSON と対応する SMPL モデルを
+ファイル名で突き合わせ、viser で並べて表示する。
 
-``draw_random_human_poses.py`` と違い、ビューアには SMPL メッシュとロボット
-モデルの 2 つだけを表示する (骨格線・掌 Axis・ランドマーク球・ワールド
-Axis・カメラは描かない)。ただし ``solve_palm_ik.py`` が干渉回避の障害物
-として使ったのと同じ人体の近似ジオメトリ (``solve_palm_ik.human_body_
-obstacles`` の Cylinder) は、SMPL メッシュに重ねて半透明
-(``COLLISION_OBSTACLE_COLOR``) で表示する -- 解けなかった/危なかった
-姿勢が体のどの部位のせいか目で見て確認できるようにするため。同様に、
-``solve_palm_ik.py`` が干渉回避に使ったのと同じロボット自身の近似ジオメトリ
-(box/cylinder/sphere のプリミティブ形状。``solve_palm_ik.apply_collision_
-model`` / ``tools/view_aero_collision_model.py`` と同じ ``aero_demo.
-collision_model.build_collision_model_urdf`` で生成・キャッシュした URDF)
-も、``tools/view_aero_collision_model.py`` と全く同じ方法でもう一体の
-``skrobot.model.RobotModel`` として読み込み、通常のロボットモデル (不透明)
-に重ねて半透明 (``ROBOT_COLLISION_LINK_COLOR``、``aero_demo.palm_plane_
-view.set_color`` を使い、viser でも alpha が effective になるように
-してある) で表示する
-(``build_robot_collision_overlay`` 参照)。viser 画面には
-Back/Next ボタンに加え Good/Bad ボタンも表示され、押すと表示中の IK 結果が
-正しいかどうかの判定結果 (``human_label``: ``true``: Good/``false``: Bad)
-が対応する handshakes ディレクトリの JSON に書き込まれる (Next と同様に
-次の人物へ進む)。書き込まれたラベルは viser 画面のテキストパネルにも表示
-される。共通の Back/Next/Good/Bad ボタンや判定結果の読み書きは
-``draw_random_human_poses.py`` と共有の ``aero_demo.viewer_nav`` を使う。
-
-人間は、握手のときに実際そうするように、ロボットが触れている手先を見て
-いる姿勢で描く。骨格 JSON の ``smpl.pose`` は顔の向きも乱数で決まって
-いるので、``look_at_pose`` が SMPL の首 (``NECK``) と頭 (``HEAD``) だけを
-回して、顔の正面がロボットの手先 (IK 結果 JSON の ``hand_position``。
-IK が解けなかった人物では触れようとしていた ``target_position``) を向く
-ようにしてから描画する。ロボットの首は ``solve_palm_ik.py`` が保存した
-関節角 (IK は首を動かさないので ``reset_pose`` の値) をそのまま反映する
-だけで、手先を見るようには動かさない。
-
-``solve_palm_ik.py`` は、骨格 JSON の人物 (生成時は骨盤がほぼワールド原点)
-を、常にワールド原点で IK を開始する Aero の前方 ``--human-front-distance``
-(既定は ``solve_palm_ik.HUMAN_FRONT_DISTANCE``) になるよう平行移動してから
-IK を解いている (``solve_palm_ik.human_translation_offset`` 参照)。この
-ビューアは骨格 JSON を IK 結果と並べて表示するため、SMPL メッシュ・干渉
-回避ジオメトリの元になる骨格の関節位置にも同じ平行移動を適用してから
-描画する (``--human-front-distance`` はこの値を ``solve_palm_ik.py`` 実行時
-と揃えるためのオプション)。
-
-``solve_palm_ik.py`` が IK の対象外にした人物 (掌推定の ``offered_hand``
-が ``null``、つまりどちらの手も差し出していないと判定された人物。JSON の
-``target`` が ``false``) は IK の結果が無いので、ビューアには表示せず
-読み飛ばす。
-
-IK が失敗した人物 (``solved`` が ``false``) では、どちらの手に合わせよう
-としていたのかを確認できるように、人間の差し出した手 (``offered_hand``)
-とロボットが使った腕 (``robot_arm``) をテキストパネルと標準出力に出す。
-さらに、どれくらい届いていないのかが目で見て分かるように、IK の目標姿勢
-(JSON の ``target_position``/``target_rot``) と、解けなかったときの手先
-姿勢 (``hand_position``/``hand_rot``。``solve_palm_ik.unsolved_result``
-が種の姿勢で読んだもの) を Axis としてビューアに描く (目標のほうが長い
-Axis)。IK が成功した人物では手先が目標に一致しているので描かない。
+人体・ロボットの干渉用近似ジオメトリと台車の可動範囲を半透明で重ね、
+IK 失敗時は目標 (長い Axis) と手先 (短い Axis) を描く。人間の顔は
+ロボットの手先を向くよう首/頭だけ回して描く。IK 対象外 (``target``
+が false) の人物は読み飛ばす。Back/Next/Good/Bad ボタンで切り替え・
+判定 (``human_label`` を handshake JSON に書き込む)。
 
 Usage
 -----
     rosrun aero_demo generate_random_human_poses.py --num-samples 100
     rosrun aero_demo solve_palm_ik.py
     rosrun aero_demo view_handshake_poses.py
-
-viser はブラウザで表示するビューアなので、実行するとブラウザが開く
-(WSLg 環境などでは自動で開く)。ブラウザが自動で開かない場合は、標準出力
-に表示される URL を手動で開くこと。画面下の Back/Next/Good/Bad ボタンで
-人物の切り替えと判定を行う。
 """
 
 import argparse
@@ -120,62 +62,34 @@ from skrobot.model import Link  # noqa: E402
 from skrobot.model.primitives import Box  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
-# SMPL メッシュの肌色 (RGBA, 0-255)。draw_random_human_poses.py と違い
-# 人物ごとにランダムにはしない (このビューアは IK 結果の確認が目的で、
-# 見た目のバリエーションは不要なため)。
 SKIN_COLOR = [180, 130, 110, 255]
 
-# solve_palm_ik.human_body_obstacles が作る干渉回避ジオメトリ (Cylinder)
-# を表示する色、ロボット自身の近似ジオメトリを表示する色は
-# handshake_viewer_common.HUMAN_COLLISION_OBSTACLE_COLOR/
-# ROBOT_COLLISION_LINK_COLOR に一本化してある (view_handshake_motion.py/
-# scripts/ros/run_camera_pipeline_test.py と共通)。
-
-# solve_palm_ik.base_movable_region が JSON に書き出す台車の可動範囲
-# (x_range/y_range, ワールド座標の平面矩形) を表示する色 (RGBA, 0-255)。
-# 薄い赤の半透明平面にする (alpha が小さいのでグリッド・ロボット越しでも
-# 範囲が見える)。
+# 台車の可動範囲 (薄い赤の半透明平面)。z は z-fighting 回避のため少し浮かす。
 BASE_MOVABLE_REGION_COLOR = [220, 40, 40, 60]
-
-# 台車の可動範囲を表す平面 (Box) の厚み [m]。ごく薄くして床面のグリッドの
-# 少し上に置く (z-fighting を避けるため 0 ちょうどにはしない)。
 BASE_MOVABLE_REGION_HEIGHT = 0.005
 BASE_MOVABLE_REGION_Z = 0.005
 
-# IK が失敗したときに描く Axis の大きさ [m]。Axis の色は 3 軸の RGB で
-# 固定なので目標と手先を色では区別できない。代わりに長さで区別する
-# (長いほうが目標、短いほうが実際の手先)。
+# IK 失敗時の Axis [m]。色では区別できないので長さで区別 (長い方が目標)。
 TARGET_AXIS_LENGTH = 0.12
 TARGET_AXIS_RADIUS = 0.005
 HAND_AXIS_LENGTH = 0.06
 HAND_AXIS_RADIUS = 0.005
 
-# 視線 (顔の正面) の回転を SMPL の首 (NECK) と頭 (HEAD) に分ける割合。
-# 首だけを回すと顔だけでなく肩の付け根近くから大きく曲がって見えるので、
-# 首と頭で半分ずつ持つ。
+# 視線の回転のうち首 (NECK) に持たせる割合 (残りは頭)。
 GAZE_NECK_RATIO = 0.5
 
-# 胸 (SMPL の首の親関節) の正面から顔の正面を離せる最大角度 [deg]。人間の
-# 首がありえない角度までねじれて見えるのを防ぐ (実際の人間の首の可動域は
-# 左右 70-80 度、下 60 度ほど)。生成された人物はほぼ全員この範囲内に手を
-# 差し出しているので、普通は効かない安全弁。届かない向きでは顔が手先を
-# 向ききらないだけで、それ以上は回さない。
+# 胸の正面から顔の正面を離せる最大角度 [deg]。
 GAZE_MAX_ANGLE_DEG = 80.0
 
-# 視線合わせを何回繰り返すか。首を回すと頭 (視線の始点) 自身も動くので、
-# 1 回では手先の方向から少しずれる。動いた頭の位置で解き直すことで、
-# 2 回でほぼ収束する (残差は 1 度以下)。
+# 首を回すと頭も動くので解き直す回数。
 GAZE_ITERATIONS = 2
 
-# SMPL の関節はすべて静止姿勢で回転が単位行列なので、頭の「正面」は
-# 静止姿勢の体の正面と同じ (ロボット座標系の +x, smpl_body の PERM に
-# よる軸対応で SMPL ローカルの +z)。
+# 静止姿勢での顔の正面 (ロボット座標系の +x)。
 GAZE_FORWARD_AXIS = np.array([1.0, 0.0, 0.0])
 
 
 def load_skeleton_json(path):
-    """``generate_random_human_poses.build_person_json`` が保存した骨格
-    JSON から SMPL のパラメータだけを読む."""
+    """骨格 JSON から SMPL のパラメータだけを読む."""
     with open(path) as f:
         data = json.load(f)
     smpl = data['smpl']
@@ -195,12 +109,7 @@ def load_handshake_json(path):
 def smpl_world_rots(model, pose):
     """SMPL の各関節のワールド (ロボット座標系) 回転行列 ``(24, 3, 3)``.
 
-    ``smpl_body.forward_world`` は頂点と関節位置しか返さないので、視線を
-    合わせるのに要る「頭が今どちらを向いているか」をここで計算する。
-    ``pose`` の各要素は SMPL ローカル座標系の親関節相対 axis-angle なので、
-    ロボット座標系の回転に直して (``smpl_body.PERM`` による軸の対応、
-    ``to_smpl_rotation`` の逆) 根元から掛けていく。root_rot は
-    ``build_smpl_mesh`` (``forward_world`` の既定) と同じく単位行列。
+    root_rot は単位行列 (``forward_world`` の既定と同じ)。
     """
     pose = np.asarray(pose, dtype=np.float64).reshape(24, 3)
     world_rots = np.zeros((24, 3, 3))
@@ -216,9 +125,7 @@ def smpl_world_rots(model, pose):
 def limit_direction(base, direction, max_angle):
     """``direction`` を ``base`` から ``max_angle`` [rad] 以内に丸める.
 
-    視線の回転量ではなく目標の「方向」を丸めるので、``look_at_pose`` の
-    繰り返しは丸めた向きに収束する (回転量を毎回クリップすると、次の
-    繰り返しが残差を足してクリップを打ち消してしまう)。
+    回転量でなく方向を丸めるので ``look_at_pose`` の反復が収束する。
     """
     angle = np.arccos(np.clip(float(np.dot(base, direction)), -1.0, 1.0))
     if angle <= max_angle:
@@ -226,7 +133,7 @@ def limit_direction(base, direction, max_angle):
     axis = np.cross(base, direction)
     norm = np.linalg.norm(axis)
     if norm < 1e-9:
-        # 真後ろ (180 度): 回す軸が決まらないので諦めて元の向きのまま。
+        # 真後ろ: 回転軸が決まらないので base のまま。
         return base
     return smpl_body.rodrigues(axis / norm * max_angle).dot(base)
 
@@ -234,39 +141,9 @@ def limit_direction(base, direction, max_angle):
 def look_at_pose(model, person, target_position,
                  neck_ratio=GAZE_NECK_RATIO,
                  max_angle_deg=GAZE_MAX_ANGLE_DEG):
-    """人間が ``target_position`` を見るように首/頭を回した pose を返す.
+    """人間が ``target_position`` を見るよう首/頭だけ回した pose (24, 3) を返す.
 
-    握手のように手を触れ合わせる動作では、人間は触れている手先を見ている
-    のが自然なので、``generate_random_human_poses.py`` が乱数で決めた顔の
-    向き (骨格 JSON の ``smpl.pose``) を、ロボットの手先 (触れている手先)
-    を向くように上書きして描画する。動かすのは人間の首/頭だけで、ロボット
-    の首は ``solve_palm_ik.py`` が保存した関節角のまま。
-
-    顔の正面 (``GAZE_FORWARD_AXIS``) を頭の関節位置から
-    ``target_position`` へ向ける最小回転を求め、それを首 (``NECK``) と
-    頭 (``HEAD``) に ``neck_ratio`` : ``1 - neck_ratio`` で分けて入れる
-    (2 関節は同じ軸まわりに回すので、合成すると狙った回転になる)。首から
-    上以外の関節は触らないので、体の姿勢は乱数生成されたまま。首を回すと
-    視線の始点である頭の関節自身も動くので、``GAZE_ITERATIONS`` 回だけ
-    解き直して残差を詰める (実測 0.1 度以下まで収束する)。
-
-    Parameters
-    ----------
-    model : smpl_body.SmplModel
-    person : dict
-        ``load_skeleton_json`` の戻り値 (``pose``/``betas``/``root_pos``)。
-    target_position : array_like
-        見てほしい点 (ロボット座標系)。ロボットの手先位置を渡す想定。
-    neck_ratio : float, optional
-        視線の回転を首と頭に分ける割合 (既定 ``GAZE_NECK_RATIO``)。
-    max_angle_deg : float, optional
-        胸の正面から顔の正面を離せる最大角度 [deg]
-        (既定 ``GAZE_MAX_ANGLE_DEG``)。
-
-    Returns
-    -------
-    pose : ndarray(24, 3)
-        首/頭だけ差し替えた新しい pose (``person['pose']`` は変更しない)。
+    ``person['pose']`` は変更しない。
     """
     pose = np.array(person['pose'], dtype=np.float64).reshape(24, 3)
     target_position = np.asarray(target_position, dtype=np.float64)
@@ -277,8 +154,7 @@ def look_at_pose(model, person, target_position,
             model, pose, person['betas'], person['root_pos'])
         world_rots = smpl_world_rots(model, pose)
         forward = world_rots[smpl_body.HEAD].dot(GAZE_FORWARD_AXIS)
-        # 首をひねれる限界は胸 (首の親関節) の正面から測る -- 首/頭より
-        # 下は動かさないので、この向きは繰り返しても変わらない。
+        # 首をひねれる限界は胸 (首の親) の正面から測る。
         chest_forward = world_rots[model.parent[smpl_body.NECK]].dot(
             GAZE_FORWARD_AXIS)
 
@@ -293,9 +169,8 @@ def look_at_pose(model, person, target_position,
         if np.linalg.norm(axis_angle) < 1e-9:
             break
 
-        # 首 -> 頭の順に、ワールドでの回転を親の座標系に移して入れる。
-        # 首を回すと頭の親 (首) のワールド回転も変わるので、頭の分は
-        # 「首を回した後」の首のワールド回転を親として計算する。
+        # 首 -> 頭の順に、ワールド回転を親の座標系に移して入れる
+        # (頭の親は回した後の首)。
         parent_world = world_rots[model.parent[smpl_body.NECK]]
         accumulated = np.eye(3)
         for joint_index, ratio in ((smpl_body.NECK, neck_ratio),
@@ -311,13 +186,7 @@ def look_at_pose(model, person, target_position,
 
 
 def build_smpl_mesh(model, person, pose=None):
-    """保存済みの SMPL pose/betas/root_pos からメッシュを作る
-    (``smpl_body.forward_world`` を使うのは draw_random_human_poses.py と
-    同じ)。
-
-    ``pose`` を渡すと ``person['pose']`` の代わりにそれを使う
-    (``look_at_pose`` が首/頭を差し替えた pose を描くため)。
-    """
+    """SMPL のメッシュを作る (``pose`` を渡すと ``person['pose']`` の代わりに使う)."""
     if pose is None:
         pose = person['pose']
     vertices, _joints = smpl_body.forward_world(
@@ -328,25 +197,12 @@ def build_smpl_mesh(model, person, pose=None):
 
 
 def is_target(handshake):
-    """``solve_palm_ik.py`` が IK の対象にした人物かどうか.
-
-    対象外 (掌推定の ``offered_hand`` が ``null`` で、どちらの手も差し
-    出していないと判定された人物) の JSON は ``target`` が ``false`` で、
-    IK の結果 (関節角・台車位置) を持たない (``solve_palm_ik.
-    not_target_result``)。このビューアは対象外の人物を表示しない。
-    ``target`` キーを持たない JSON は、キーが無かった頃の
-    solve_palm_ik.py が IK を解いた結果なので対象として扱う。
-    """
+    """IK の対象にした人物か (``target`` キーが無い古い JSON は対象扱い)."""
     return bool(handshake.get('target', True))
 
 
 def hand_text(handshake):
-    """どちらの手に合わせようとしたかを viser の画面に出すための文字列.
-
-    IK が失敗したときに、人間のどちらの手 (掌推定の ``offered_hand``:
-    ``'L'``/``'R'``) を握手の相手として狙い、ロボットのどちらの腕
-    (``robot_arm``: ``'l'``/``'r'``) で解こうとしていたのかを示す。
-    """
+    """狙った人間の手とロボットの腕を表す文字列."""
     offered = handshake.get('offered_hand')
     robot_arm = handshake.get('robot_arm')
     return '人間の {} 手 -> ロボットの {}arm'.format(
@@ -355,10 +211,7 @@ def hand_text(handshake):
 
 
 def pose_coords(handshake, pos_key, rot_key):
-    """IK 結果 JSON の位置 (``pos_key``) と回転行列 (``rot_key``) から
-    ``Coordinates`` を作る。どちらかが無ければ ``None`` を返す
-    (``target`` が ``false`` の JSON や、これらのキーを持たなかった頃の
-    solve_palm_ik.py の出力のため)。"""
+    """JSON の位置と回転行列から ``Coordinates`` を作る (無ければ ``None``)."""
     position = handshake.get(pos_key)
     rot = handshake.get(rot_key)
     if position is None or rot is None:
@@ -368,13 +221,7 @@ def pose_coords(handshake, pos_key, rot_key):
 
 
 def build_base_movable_region_link(handshake):
-    """``solve_palm_ik.base_movable_region`` が JSON に保存した台車の可動
-    範囲 (``base_movable_region`` の ``x_range``/``y_range``, ワールド座標)
-    から、薄い半透明の赤い平面 (``Box``) を作る。``base_movable_region``
-    キーを持たない JSON (これを保存する前の solve_palm_ik.py の出力) では
-    ``None`` を返す。yaw の可動範囲 (``yaw_range``) は平面では表せないので
-    可視化しない。
-    """
+    """``base_movable_region`` の x/y 範囲から半透明の平面を作る (無ければ ``None``)."""
     region = handshake.get('base_movable_region')
     if region is None:
         return None
@@ -389,16 +236,7 @@ def build_base_movable_region_link(handshake):
 
 
 def gaze_target_position(handshake):
-    """人間に見せる点 (``look_at_pose`` に渡す注視点) を IK 結果から選ぶ.
-
-    IK が解けた人物では、実際にロボットが触れている手先
-    (``hand_position``) を見る。解けなかった人物の手先は種の姿勢のまま
-    (ロボットの体の近く) でどこにも触れていないので、代わりに触れよう
-    としていた点 (``target_position``、人間の掌の少し手前) を見る --
-    どちらの手を狙っていたのかを目で追えるようにするため。どちらのキーも
-    無い JSON (これらのキーを持たなかった頃の solve_palm_ik.py の出力) は
-    ``None`` を返し、乱数生成された顔の向きをそのまま使う。
-    """
+    """人間の注視点。成功時は手先、失敗時は目標位置 (無ければ ``None``)."""
     key = 'hand_position' if handshake.get('solved') else 'target_position'
     position = handshake.get(key)
     if position is None:
@@ -407,32 +245,16 @@ def gaze_target_position(handshake):
 
 
 def pose_error_text(target_coords, hand_coords):
-    """目標姿勢と手先姿勢のずれ (位置 [m] と向き [deg]) の文字列.
-
-    向きのずれは相対回転 ``target^-1 * hand`` の回転角 (軸は問わない)。
-    """
+    """目標姿勢と手先姿勢のずれ (位置 [m] と向き [deg]) の文字列."""
     diff = hand_coords.worldpos() - target_coords.worldpos()
     rel = np.dot(target_coords.worldrot().T, hand_coords.worldrot())
-    # 数値誤差で arccos の定義域を外れることがあるのでクリップする。
     angle = np.arccos(np.clip((np.trace(rel) - 1.0) / 2.0, -1.0, 1.0))
     return '位置ずれ {:.3f} m, 向きずれ {:.1f} deg'.format(
         float(np.linalg.norm(diff)), float(np.rad2deg(angle)))
 
 
-# apply_robot_pose/build_robot_collision_overlay/colliding_link_pairs/
-# collision_pairs_text/sync_robot_collision_overlay は
-# view_handshake_motion.py/scripts/ros/run_camera_pipeline_test.py と
-# 共通なので handshake_viewer_common.py に一本化してある (モジュール先頭で
-# import 済み)。
-
-
 def iter_common_names(skeleton_dir, handshake_dir):
-    """``skeleton_dir``/``handshake_dir`` の両方に存在するファイル名
-    (basename) をファイル名順に列挙する.
-
-    IK の対象外だった人物 (``is_target`` が ``False``) はビューアに表示
-    しないので、ここで読み飛ばす。
-    """
+    """両ディレクトリにある IK 対象の JSON のファイル名をソートして返す."""
     skeleton_names = {os.path.basename(p) for p in
                       glob.glob(os.path.join(skeleton_dir, '*.json'))}
     handshake_names = {os.path.basename(p) for p in
@@ -444,23 +266,15 @@ def iter_common_names(skeleton_dir, handshake_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='solve_palm_ik.py が出力したロボットの位置姿勢・関節'
-                    '角度と、対応する SMPL モデルを viser で表示する '
-                    '(ビューアに表示するのは SMPL モデルとロボットモデル'
-                    'だけ)。')
+        description='solve_palm_ik.py の IK 結果と SMPL モデルを viser で表示する。')
     parser.add_argument(
         '--skeleton-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_human_poses'),
-        help='SMPL pose/betas/root_pos を持つ骨格 JSON のディレクトリ '
-            '(既定は generate_random_human_poses.py の既定の出力先と '
-            '同じ random_human_poses/)。')
+        help='SMPL パラメータを持つ骨格 JSON のディレクトリ。')
     parser.add_argument(
         '--handshake-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
-        help='solve_palm_ik.py が出力した JSON のディレクトリ (既定は '
-            'solve_palm_ik.py の既定の出力先と同じ '
-            'random_handshake_poses/。skeleton-dir と同じファイル名で '
-            '対応させる)。')
+        help='solve_palm_ik.py の出力 JSON のディレクトリ。')
     parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
@@ -472,19 +286,15 @@ def main():
         default=os.path.expanduser(
             '~/SMPL_python_v.1.0.0/smpl/models/'
             'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
-        help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ使う)。')
+        help='SMPL (女性) モデル .pkl のパス (無ければ男性のみ)。')
     parser.add_argument(
         '--no-hand', dest='use_hand', action='store_false',
-        help='指関節なしの URDF (solve_palm_ik.py と同じ手なしモデル) を '
-            '使う。既定では指関節ありの URDF (aero_with_feetech_hand) を '
-            '使い、手先にハンドを表示する。')
+        help='指関節なしの URDF で表示する。')
     parser.set_defaults(use_hand=True)
     parser.add_argument('--client-wait-timeout', type=float, default=30.0,
-                        help='ブラウザクライアント接続を待つ 1 回あたりの'
-                             '秒数 (繰り返し待つ)。')
+                        help='ブラウザ接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true',
-                        help='ブラウザの自動起動を無効にする '
-                             '(URL を自分で開く場合)。')
+                        help='ブラウザを自動で開かない。')
     args = parser.parse_args()
 
     names = iter_common_names(args.skeleton_dir, args.handshake_dir)
@@ -497,60 +307,30 @@ def main():
     models_by_gender = dict(
         load_smpl_models(args.model_path, args.female_model_path))
 
-    # r/l_eef_grasp_link (solve_palm_ik.py が使う手先フレーム) は手あり/
-    # なし両方の URDF にあるので、IK 結果自体は --no-hand でも変わらない。
-    # 既定では見た目のために手ありモデルを使う。
     robot = load_aero(use_hand=args.use_hand)
 
     viewer = ViserViewer(draw_grid=True)
-    # Back/Next/Good/Bad ボタンは、ロボットモデルを追加するより前に作る。
-    # ViserViewer は RobotModel を add() すると "Joint Angles" フォルダ
-    # (関節ごとのスライダー) を自動で GUI パネルに追加してしまい
-    # (skrobot.viewers._viser.ViserViewer._ensure_gui_initialized/_add_
-    # joint_sliders)、Aero は関節数が多いためこのボタン群を先に追加
-    # しないと大量のスライダーの下に埋もれて見えなくなる
-    # (draw_random_human_poses.py はロボットモデルを表示しないため
-    # この問題が起きない)。
+    # ボタンはロボットを add する前に作る (関節スライダーの下に埋もれるため)。
     nav = viewer_nav.ManualNav(viewer)
     label_text = viewer._server.gui.add_markdown('')
 
-    # 干渉回避用の半透明モデル (人体の障害物 Cylinder ``current_obstacle_
-    # links`` とロボットの干渉モデル overlay ``robot_collision_overlay``)
-    # の表示/非表示をまとめて切り替えるチェックボックス。viser の
-    # SceneNodeHandle は ``.visible`` を持つので、delete/add をやり直さず
-    # 既に追加済みのオブジェクトの表示だけを切り替えられる
-    # (``ViserViewer.add`` はハンドルを返さないので
-    # ``viewer._linkid_to_handle`` から引く)。
     show_collision_models_checkbox = viewer._server.gui.add_checkbox(
         '干渉回避用モデルの表示', initial_value=True)
 
-    # 台車の可動範囲 (赤い半透明平面, base_movable_region_link) の表示/
-    # 非表示を切り替えるチェックボックス。干渉回避用モデルとは別の情報
-    # なので、上のチェックボックスとは独立させてある。
     show_base_region_checkbox = viewer._server.gui.add_checkbox(
         '台車の可動範囲の表示', initial_value=True)
 
-    # ロボットの描画姿勢を、solve_palm_ik.py の後処理判定
-    # (solve_post_process) 前/後で切り替えるチェックボックス。既定
-    # (オフ) では従来通り後処理前の姿勢を表示し、オンにすると
-    # apply_robot_pose が handshake['post_process'] (掌に押し付ける位置
-    # まで詰め、自分の手を見るよう首も向けた姿勢) を反映する。
-    # ``current_handshake`` は表示中の人物の handshake dict を保持する
-    # (人物を切り替えるたびに while ループ側で更新する) 1 要素リスト --
-    # チェックボックスのハンドラは while ループの外で定義するクロージャ
-    # なので、素の変数への再代入では捕捉できない値をここに入れておく。
     show_post_process_checkbox = viewer._server.gui.add_checkbox(
         '後処理後の姿勢を表示 (掌に押し付け/自分の手を注視)',
         initial_value=False)
+    # 表示中の handshake (クロージャから更新するため 1 要素リスト)。
     current_handshake = [None]
 
     def set_link_visible(link, visible):
         common_set_link_visible(viewer, link, visible)
 
     def refresh_robot_pose():
-        """``current_handshake`` の内容を、``show_post_process_checkbox``
-        の状態に応じた姿勢でロボットに反映し直す (人物切り替え時、および
-        チェックボックスの切り替え時の両方から呼ぶ)。"""
+        """表示中の handshake をチェックボックスに応じた姿勢で反映する."""
         handshake = current_handshake[0]
         if handshake is None:
             return
@@ -577,41 +357,19 @@ def main():
                              show_base_region_checkbox.value)
 
     viewer.add(robot)
-    # solve_palm_ik.py の IK が干渉回避に使ったのと同じプリミティブ近似
-    # ジオメトリ (tools/view_aero_collision_model.py と同じもの) を、人物を
-    # またいで一度だけ作って重ねて表示する (毎フレーム作り直す必要はなく、
-    # sync_robot_collision_overlay で robot の姿勢に追従させるだけでよい)。
     robot_collision_overlay = build_robot_collision_overlay(robot)
     viewer.add(robot_collision_overlay)
-    # solve_palm_ik.py の事後検証 (pick_verified_candidate) と全く同じ
-    # 総当たりの組み合わせ (自己干渉のロボットリンク同士、および人体との
-    # 干渉のロボットリンク×人体セグメント)。ロボットの構造だけで決まり
-    # 人物ごとの姿勢には依存しないので、人物ループの外で 1 回だけ作る
-    # (build_collision_verification_pairs の robot_arm 引数はプレース
-    # ホルダで結果に影響しない)。干渉ジオメトリは robot_collision_overlay
-    # (solve_palm_ik.apply_collision_model と同じプリミティブ近似済み) の
-    # ものを使う。
+    # 事後検証と同じ干渉ペア (人物に依存しない。'r' はプレースホルダ)。
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
-    # ロボットを add し終えたので、自動で付いてくる関節スライダーを消す
-    # (触ると robot と robot_collision_overlay の一方だけが動いて姿勢が
-    # 食い違ったまま残るため、remove_joint_angle_gui 参照)。
+    # 関節スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
-    # 同様に、任意の障害物を画面から手動で追加・編集する GUI (Obstacles
-    # フォルダ) も、人体の障害物は骨格から自動生成するこのビューアでは
-    # 使わないので消す (remove_obstacles_gui 参照)。
     remove_obstacles_gui(viewer)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
-    # 人物は常に原点で +x 方向を向いて生成されるので、+x 側から -x 方向を
-    # 見るカメラ (draw_random_human_poses.py と同じ視点) で人物を正面から
-    # 見ることになる (ロボットは人物の正面に立つので、カメラと人物の間に
-    # 入る)。
     viewer_nav.set_front_view(viewer)
 
-    # IK が失敗した人物のときだけ表示する目標姿勢/手先姿勢の Axis。
-    # draw_random_human_poses.py の掌 Axis と同じく、あらかじめ 1 組だけ
-    # 作っておいて座標を更新して viewer に足す/外す (毎回作り直さない)。
+    # IK 失敗時だけ表示する Axis (1 組を使い回す)。
     target_axis = Axis(axis_length=TARGET_AXIS_LENGTH,
                        axis_radius=TARGET_AXIS_RADIUS)
     hand_axis = Axis(axis_length=HAND_AXIS_LENGTH,
@@ -629,12 +387,7 @@ def main():
         person = load_skeleton_json(skeleton_path)
         handshake = load_handshake_json(handshake_path)
 
-        # solve_palm_ik.py は、骨格 JSON の人物を Aero (常にワールド原点で
-        # IK を開始する) の前方 --human-front-distance になるよう平行
-        # 移動してから IK を解いている (human_translation_offset 参照)。
-        # ここで読む骨格 JSON (SMPL の root_pos, 干渉回避ジオメトリの元の
-        # joint_positions) は平行移動前のものなので、IK 結果 (ロボットの
-        # 位置姿勢) と揃えるために同じ平行移動を適用する。
+        # solve_palm_ik.py と同じく人物をロボットの前方へ平行移動する。
         joint_positions = load_joint_positions(skeleton_path)
         offset = human_translation_offset(
             joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
@@ -648,9 +401,6 @@ def main():
 
         model = models_by_gender.get(
             person['gender'], models_by_gender['male'])
-        # 触れている手先を人間も見ているように、乱数生成された顔の向きを
-        # 上書きして描く (ロボットの首は apply_robot_pose が保存された
-        # 関節角をそのまま反映するだけ)。
         gaze_target = gaze_target_position(handshake)
         pose = None if gaze_target is None \
             else look_at_pose(model, person, gaze_target)
@@ -661,26 +411,15 @@ def main():
         viewer.add(link)
         current_mesh_link = link
 
-        # solve_palm_ik.py が干渉回避の障害物として使ったのと同じ人体の
-        # 近似ジオメトリ (体幹・頭部・四肢・掌・指すべて Cylinder) を、
-        # SMPL メッシュに重ねて半透明で表示する
-        # (COLLISION_OBSTACLE_COLOR)。解けなかった/危なかった姿勢が
-        # どの部位のせいか目で見て確認できるようにするため。
         for obstacle_link in current_obstacle_links:
             viewer.delete(obstacle_link)
         current_obstacle_links = human_body_obstacles(joint_positions)
         for obstacle_link in current_obstacle_links:
             set_translucent_color(obstacle_link, COLLISION_OBSTACLE_COLOR)
             viewer.add(obstacle_link)
-            # 新しく追加した障害物は既定で表示状態になるので、チェック
-            # ボックスで非表示にされていたら合わせる。
             set_link_visible(obstacle_link,
                              show_collision_models_checkbox.value)
 
-        # solve_palm_ik.py がこの人物の IK で使った台車の可動範囲
-        # (base_movable_region) を、薄い赤の半透明平面として表示する。
-        # 人物ごとに範囲が変わる (台車の IK 開始位置に依存する) ので、
-        # 障害物と同じく人物を切り替えるたびに作り直す。
         if current_base_region_link is not None:
             viewer.delete(current_base_region_link)
             current_base_region_link = None
@@ -690,28 +429,17 @@ def main():
             set_link_visible(current_base_region_link,
                              show_base_region_checkbox.value)
 
-        # 人物を切り替えるたびに、まず後処理前の姿勢で表示する
-        # (show_post_process_checkbox は人物間で状態を保持しない --
-        # 新しい人物に切り替えたら毎回後処理前から見せたいため)。
+        # 人物を切り替えたら後処理前の姿勢から表示する。
         current_handshake[0] = handshake
         show_post_process_checkbox.value = False
         refresh_robot_pose()
 
-        # solve_palm_ik.py の事後検証 (collision_pairs_min_distance) と
-        # 同じ厳密な形状・同じ許容誤差で、現在表示中の姿勢で実際に貫通して
-        # いる組み合わせ (人間とロボットの干渉・ロボットの自己干渉) を
-        # すべて求める。人体側は画面に表示中の current_obstacle_links
-        # (半透明 Cylinder) をそのまま使うので、見た目のメッシュと判定に
-        # 使うメッシュが常に一致する。
+        # 表示中の姿勢で貫通している組 (事後検証と同じ形状・許容誤差)。
         colliding_pairs = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
             current_obstacle_links,
             tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
 
-        # IK が失敗したときは、どちらの手に合わせようとしていたのかが
-        # 分かるように人間の手とロボットの腕もあわせて出す。
-        # 失敗したときは、どこに届かなかったのかが目で見て分かるように
-        # 目標姿勢 (長い Axis) と手先姿勢 (短い Axis) も描く。
         target_coords = pose_coords(
             handshake, 'target_position', 'target_rot')
         hand_coords = pose_coords(handshake, 'hand_position', 'hand_rot')
@@ -741,8 +469,6 @@ def main():
         else:
             post_status = 'NOT solved'
         status = '後処理前 {} / 後処理後 {}'.format(pre_status, post_status)
-        # ずれの数値は 1 行に収まらないので、標準出力の 1 行 (status) には
-        # 入れずテキストパネルにだけ出す。
         detail = ''
         if show_axes:
             detail = '\n\n目標 Axis (長い方, 長さ {:.2f} m) と手先 Axis ' \

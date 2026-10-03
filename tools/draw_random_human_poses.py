@@ -1,53 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``generate_random_human_poses.py`` が出力した JSON (SMPL の人モデルと、
-そこから作った骨格の両方を持つ) を読み込み、SMPL の人体メッシュと骨格を
-scikit-robot の viser ビューアで重ねて表示する。``estimate_palm_poses.py``
-が出力した対応する掌の位置姿勢 JSON (``--palm-dir``、既定では骨格と同じ
-ファイル名で ``random_palm_poses/`` に入っているもの) があれば、左右の掌
-の位置姿勢を Axis として併せて描画する (無ければ黙ってスキップする)。
-その JSON の ``offered_hand`` (手繋ぎに使うと判定された手, ``estimate_
-palm_poses.OfferedHandSelector``) も読み、選ばれた手の骨格・ランドマーク
-を赤 (``palm_plane_view.COLOR_BONES['rhand']``)、選ばれなかった手を白で
-描き分ける -- どちらの手も差し出していないと判定された (``offered_hand``
-が ``null``) 人物は両手とも白になる。掌 JSON 自体が無い人物だけは、
-判定結果が存在しないので従来どおりの配色 (右手=赤, 左手=青) で描く。
-``--advance-mode manual`` (既定) では viser 画面に Right/Left/Null ボタンも
-表示され、押すと「実際にはどちらの手を差し出しているか」の人手判定結果
-(``human_label``: ``'R'``/``'L'``/``null``, ``estimate_palm_poses.
-PalmPoseEstimator.estimate`` が返す ``offered_hand`` と同じ値) が対応する
-掌 JSON に書き込まれる (Next と同様に次の人物へ進む)。書き込まれたラベル
-は viser 画面のテキストパネルにも表示される。
+"""``generate_random_human_poses.py`` の人物 JSON (SMPL メッシュ + 骨格) と
+``estimate_palm_poses.py`` の掌 JSON を viser で重ねて表示する。
 
-SMPL メッシュは JSON に保存済みの ``smpl.pose``/``smpl.betas``/``smpl.
-root_pos``/``smpl.gender`` から ``aero_demo.smpl_body.forward_world`` で
-直接組み立てる。骨格 (``generate_random_human_poses.RandomSkeletonGen
-erator`` が作ったもの、既に SMPL と同じ関節位置から作られているので手の
-位置もメッシュの手と一致する) は、``aero_demo.skeleton_drawing`` で
-部位ごとに色分けした線として重ねて描く。
-
-SMPL のモデルファイル自体はライセンス上リポジトリに同梱されていないので、
-呼び出し側がローカルパスを渡す (既定値は smpl_body.py と同じ
-``~/SMPL_python_v.1.0.0/smpl/models/`` 以下)。
+``offered_hand`` で選ばれた手を赤、他方を白で描く (掌 JSON が無ければ左右で
+色分け)。manual モードでは Right/Left/Null ボタンで人手判定 ``human_label``
+を掌 JSON に書き込む。SMPL モデルは同梱されないので ``--model-path`` 等で渡す。
 
 Usage
 -----
-    python3 scripts/generate_random_human_poses.py \
-        --num-samples 100 --output-dir /tmp/random_human_poses
-    python3 scripts/estimate_palm_poses.py \
-        --input-dir /tmp/random_human_poses \
-        --output-dir /tmp/random_palm_poses
-    python3 tools/draw_random_human_poses.py \
-        --input-dir /tmp/random_human_poses \
+    python3 tools/draw_random_human_poses.py \\
+        --input-dir /tmp/random_human_poses \\
         --palm-dir /tmp/random_palm_poses
-
-viser はブラウザで表示するビューアなので、実行するとブラウザが開く
-(WSLg 環境などでは自動で開く)。ブラウザが自動で開かない場合は、標準出力
-に表示される URL を手動で開くこと。画像は viser に接続したブラウザ
-クライアントの画面をそのまま ``get_render`` で読み出して保存するので、
-最初の 1 クライアントが接続するまで待つ (``--output-dir`` を指定した
-ときだけ保存する)。
 """
 
 import argparse
@@ -81,40 +46,20 @@ from skrobot.model import Link  # noqa: E402
 from skrobot.model import Sphere  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
-# 掌の平面フィットに使ったランドマーク (手首 + 知節/MCP) を示す点の色。
-# palm_plane_view.py の rhand/lhand の配色 (COLOR_BONES) に合わせ、左右を
-# 見分けられるようにする。掌 JSON がある人物では、この左右の色分けの
-# 代わりに下の COLOR_OFFERED_HAND / COLOR_NOT_OFFERED_HAND を使う。
+# 掌フィットに使ったランドマーク (手首 + MCP) の点。掌 JSON が無いときの左右の色。
 HAND_POINT_RADIUS = 0.006
 HAND_POINT_COLOR = {'R': [255, 60, 60, 255], 'L': [60, 120, 255, 255]}
 
-# 手繋ぎに使うと判定された手 (掌 JSON の ``offered_hand``) を見分けるための
-# 色。選ばれた手は palm_plane_view の右手の色 (赤) のまま、選ばれなかった
-# 手は白にする。``offered_hand`` が null (どちらの手も差し出していないと
-# 判定された) なら両手とも白。掌 JSON 自体が無い人物は判定結果が存在
-# しないので、この色分けは使わず従来どおりの左右の色分けで描く。
+# offered_hand に選ばれた手 / 選ばれなかった手の色。
 COLOR_OFFERED_HAND = palm_plane_view.COLOR_BONES['rhand']
 COLOR_NOT_OFFERED_HAND = [255, 255, 255, 255]
 
-# 人手判定 (Right/Left/Null ボタン) の値と表示名。``estimate_palm_poses.
-# PalmPoseEstimator.estimate`` が返す ``offered_hand`` と同じ値
-# (``'R'``/``'L'``/``None``) を使うので、人手判定と自動判定をそのまま
-# 突き合わせられる。
+# 人手判定ボタン。値は offered_hand と同じ ('R'/'L'/None)。
 OFFERED_HAND_BUTTONS = [('Right', 'R'), ('Left', 'L'), ('Null', None)]
 OFFERED_HAND_LABEL_NAMES = {'R': 'Right', 'L': 'Left', None: 'Null'}
 
 def load_person_json(path):
-    """``generate_random_human_poses.build_person_json`` が保存した 1 人分
-    の JSON を読む.
-
-    Returns
-    -------
-    dict
-        ``joint_positions`` (関節名 -> ``np.ndarray([x, y, z])``, ロボット
-        座標系), ``height`` (身長 [m]), ``gender`` (str), ``betas``
-        ((10,) ndarray), ``pose`` ((24, 3) ndarray), ``root_pos``
-        ((3,) ndarray) を持つ dict。
-    """
+    """1 人分の人物 JSON を読む (``joint_positions`` はロボット座標系、身長 [m])."""
     with open(path) as f:
         data = json.load(f)
     skeleton = data['skeleton']
@@ -133,24 +78,9 @@ iter_pose_files = json_io.iter_json_files
 
 
 def load_palm_json(path):
-    """``estimate_palm_poses.py`` が保存した 1 人分の掌 JSON を読む.
+    """1 人分の掌 JSON を読む (無ければ ``None``).
 
-    Parameters
-    ----------
-    path : str
-        ``estimate_palm_poses.PalmPoseEstimator.estimate`` の戻り値を
-        そのまま保存した JSON のパス。ファイルが無ければ ``None``。
-
-    Returns
-    -------
-    dict or None
-        ``{'R': (position, rot) or None, 'L': (position, rot) or None,
-        'offered_hand': 'R'/'L'/None}``。``position`` は
-        ``np.ndarray(3,)``、``rot`` は ``np.ndarray(3,3)`` (skrobot の
-        ``Coordinates(rot=...)`` にそのまま渡せる)。``offered_hand`` は
-        手繋ぎに使うと判定された手 (``estimate_palm_poses.
-        OfferedHandSelector``)、どちらの手も差し出していなければ
-        ``None``。
+    Returns ``{'R': (position, rot) or None, 'L': ..., 'offered_hand': ...}``。
     """
     if not os.path.exists(path):
         return None
@@ -168,22 +98,7 @@ def load_palm_json(path):
 
 
 def offered_hand_colors(palms):
-    """掌 JSON の ``offered_hand`` から、左右の手を描く色を決める.
-
-    Parameters
-    ----------
-    palms : dict or None
-        ``load_palm_json`` の戻り値。
-
-    Returns
-    -------
-    dict or None
-        ``{'R': rgba, 'L': rgba}``。手繋ぎに使うと判定された側が
-        :data:`COLOR_OFFERED_HAND` (赤)、もう一方が
-        :data:`COLOR_NOT_OFFERED_HAND` (白) になる。``palms`` が ``None``
-        (掌 JSON が無い = 判定結果が存在しない) のときは ``None`` を返し、
-        呼び出し側は従来どおりの左右の色分けで描く。
-    """
+    """``offered_hand`` から ``{'R': rgba, 'L': rgba}`` を返す (``palms`` が None なら None)."""
     if palms is None:
         return None
     offered = palms.get('offered_hand')
@@ -196,11 +111,7 @@ SKIN_ALPHA = 150  # SMPL メッシュを半透明にするための alpha (0-255
 
 
 def random_skin_color(rng):
-    """人物ごとに見た目を変えるためのランダムな肌色 (RGBA, 0-255).
-
-    SMPL メッシュ自体を半透明にしたいので、alpha は ``SKIN_ALPHA`` 固定に
-    する (色 (RGB) だけ人物ごとにランダムにする)。
-    """
+    """ランダムな肌色 (RGBA, 0-255、alpha は ``SKIN_ALPHA`` 固定)."""
     base = np.array([0.55, 0.40, 0.32])
     variation = rng.uniform(-0.18, 0.20, size=3)
     rgb = np.clip(base + variation, 0.05, 0.95)
@@ -209,38 +120,13 @@ def random_skin_color(rng):
 
 
 def build_mesh(model, person, skin_color):
-    """保存済みの SMPL pose/betas/root_pos から SMPL メッシュを作る.
-
-    ``generate_random_human_poses.RandomSmplHumanGenerator`` が生成した
-    ときと同じ ``aero_demo.smpl_body.forward_world`` (root の向きは常に
-    単位行列, scale は SMPL 自身の betas が表す実寸のまま) を使うので、
-    骨格 (``person['joint_positions']``) とメッシュは常に同じ関節位置を
-    共有する。
-
-    Parameters
-    ----------
-    model : smpl_body.SmplModel
-        ``person['gender']`` に対応するモデル。
-    person : dict
-        ``load_person_json`` の戻り値。
-    skin_color : list of int
-        ``random_skin_color`` が返す RGBA (0-255)。呼び出し側で 1 人に
-        つき 1 回だけ引いて使い回す (Back で戻ったときに毎回見た目が
-        変わらないようにするため)。
-
-    Returns
-    -------
-    trimesh.Trimesh
-    """
+    """保存済みの SMPL pose/betas/root_pos から ``trimesh.Trimesh`` を作る."""
     vertices, _joints = smpl_body.forward_world(
         model, person['pose'], person['betas'], person['root_pos'])
     mesh = trimesh.Trimesh(vertices=vertices, faces=model.f, process=False)
     mesh.visual.face_colors = skin_color
     if len(skin_color) >= 4 and skin_color[3] < 255:
-        # face_colors だけでは viser (glTF エクスポートが既定で
-        # alphaMode: OPAQUE になる) 側で不透明に見えてしまうので、
-        # palm_plane_view.set_color と同様に alphaMode='BLEND' の
-        # PBRMaterial を明示的に付ける。
+        # face_colors だけでは viser で不透明になるので BLEND を明示する。
         mesh.visual = trimesh.visual.TextureVisuals(
             material=trimesh.visual.material.PBRMaterial(
                 baseColorFactor=[c / 255.0 for c in skin_color],
@@ -259,9 +145,7 @@ def main():
     parser.add_argument(
         '--palm-dir', type=str,
         default=os.path.join(_SCRIPTS_DIR, 'random_palm_poses'),
-        help='estimate_palm_poses.py が出力した掌の位置姿勢 JSON の入力 '
-             'ディレクトリ (骨格 JSON と同じファイル名で対応させる)。存在 '
-             'しないファイルは黙ってスキップする (掌の描画なし)。')
+        help='掌 JSON のディレクトリ (骨格と同じファイル名、無ければ省略)。')
     parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
@@ -282,20 +166,14 @@ def main():
     parser.add_argument('--seed', type=int, default=None,
                         help='肌色などの見た目に使う乱数シード。')
     parser.add_argument('--client-wait-timeout', type=float, default=30.0,
-                        help='ブラウザクライアント接続を待つ 1 回あたりの'
-                             '秒数 (繰り返し待つ)。')
+                        help='クライアント接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true',
-                        help='ブラウザの自動起動を無効にする '
-                             '(URL を自分で開く場合)。')
+                        help='ブラウザを自動で開かない。')
     parser.add_argument('--pause', type=float, default=0.15,
-                        help='姿勢を切り替えてから撮影するまでの待機秒数 '
-                             '(ブラウザ側の描画が反映されるのを待つ、'
-                             '--advance-mode auto のときだけ使う)。')
+                        help='auto モードで次の人物へ進むまでの秒数。')
     parser.add_argument(
         '--advance-mode', choices=['auto', 'manual'], default='manual',
-        help='manual (既定): viser 画面の Back/Next ボタンを押すまで '
-             '切り替えずに待つ。auto: --pause 秒ごとに自動で次の人物に '
-             '切り替える (Back はできない)。')
+        help='manual: Back/Next ボタンで送る。auto: --pause 秒ごとに送る。')
     args = parser.parse_args()
 
     pose_files = iter_pose_files(args.input_dir)
@@ -311,27 +189,15 @@ def main():
     rng = np.random.RandomState(args.seed)
     models_by_gender = dict(
         load_smpl_models(args.model_path, args.female_model_path))
-    # 見た目 (肌色) だけあらかじめ 1 回だけ引いておく。Back で同じ人物に
-    # 戻ったときに毎回見た目が変わらないようにするため (build_mesh をその
-    # 都度呼んでも、この選択済みの値を使い回す)。SMPL のモデル (男性/女性)
-    # は人物ごとの JSON に保存済みの ``gender`` で決まるので、ここでは
-    # 引かない。
+    # Back で戻っても見た目が変わらないよう肌色は先に引いておく。
     skin_colors = [random_skin_color(rng) for _ in pose_files]
 
     viewer = ViserViewer(draw_grid=True)
     viewer.add(Axis(axis_length=0.1, axis_radius=0.004))
-    # 左右の掌の Axis はあらかじめ 1 組だけ作っておき、掌 JSON が見つかった
-    # 人物のときだけ座標を更新して viewer に足す/居なければ外す (毎回作り
-    # 直さない)。
     palm_axes = {'R': Axis(axis_length=0.05, axis_radius=0.003),
                 'L': Axis(axis_length=0.05, axis_radius=0.003)}
     palm_axes_added = {'R': False, 'L': False}
-    # 推定に使った手のランドマーク (wrist + MCP) を色付きの球で表示する。
-    # 骨格 JSON に含まれる関節そのものなので、掌 JSON の有無によらず
-    # (推定が None になった側でも) 見えている点はそのまま描く。色は人物
-    # ごとに変わりうる (offered_hand の判定結果) ので、いま viewer に
-    # 入れてある色を hand_point_color_shown で覚えておき、変わったときだけ
-    # 塗り直す (下のループ参照)。
+    # 手のランドマーク (wrist + MCP) の球。表示中の色を覚えて変化時だけ塗り直す。
     hand_point_spheres = {
         (side, i): Sphere(radius=HAND_POINT_RADIUS,
                           color=HAND_POINT_COLOR[side])
@@ -346,10 +212,7 @@ def main():
     nav = None
     if args.advance_mode == 'manual':
         nav = viewer_nav.ManualNav(viewer, buttons=OFFERED_HAND_BUTTONS)
-    # 表示中の人物の Right/Left/Null 判定結果 (掌 JSON の human_label) を
-    # 出すテキストパネル。押されたら palm_path 側の JSON にも書き込まれる
-    # ので (viewer_nav.save_label)、次に表示するときにここで読み直して
-    # 見た目にも反映する。
+    # 表示中の人物の human_label。
     label_text = viewer._server.gui.add_markdown('')
 
     image_module = None
@@ -377,9 +240,6 @@ def main():
 
         palm_path = os.path.join(args.palm_dir, os.path.basename(path))
         palms = load_palm_json(palm_path)
-        # 手繋ぎに使うと判定された手 (offered_hand) を赤、選ばれなかった
-        # 手を白で描くための色。掌 JSON が無い人物は None (判定結果が無い
-        # ので、従来どおり palm_plane_view の左右の色分けのまま)。
         hand_colors = offered_hand_colors(palms)
 
         for old_link in current_skeleton_links:
@@ -412,12 +272,7 @@ def main():
                      else hand_colors[side])
             if present:
                 sphere.newcoords(Coordinates(pos=joints[key]))
-            # ViserViewer は Sphere の色を viewer.add したときの
-            # ``visual_mesh.visual.face_colors`` から読む (skrobot.viewers.
-            # _viser.ViserViewer._add_link, palm_plane_view.set_color の
-            # docstring 参照) ので、入れっぱなしのまま塗り直しても画面には
-            # 反映されない。人物が変わって色も変わるときは、いったん外して
-            # から塗り直して足し直す。
+            # 色は add 時にしか反映されないので、変わるときは外して足し直す。
             if hand_point_added[(side, idx)] and (
                     not present
                     or hand_point_color_shown[(side, idx)] != color):
@@ -450,9 +305,7 @@ def main():
             viewer_nav.save_label(palm_path, label)
             print('  -> {} として {} に記録しました。'.format(
                 OFFERED_HAND_LABEL_NAMES[label], palm_path))
-        # 先頭で Back を押しても終了しない (0 未満にはしない) よう下限を
-        # クランプする。末尾で Next を押した場合は (auto で最後まで
-        # 表示し終わったときと同じく) そのままループを抜けて終了する。
+        # 先頭での Back は終了しない。末尾での Next は終了。
         i = max(0, i + direction)
 
     print('{} / {} 体を表示しました。'.format(len(visited), len(pose_files)))

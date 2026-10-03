@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""3 次元関節位置の時系列を平滑化する、ROS 非依存のフィルタ群.
-
-``run_camera_pipeline_test.py`` は ``OneEuroFilter`` をオンライン
-(フレームごとに ``update`` を呼ぶ) で使っている。
+"""3 次元関節位置の時系列を平滑化するフィルタ群.
 
 Examples
 --------
@@ -32,9 +29,7 @@ class MedianFilter(object):
         self._frame_key = None
 
     def update(self, joint_positions, t=None, frame_key=None):
-        """``t`` は他フィルタとインタフェースを揃えるためだけの引数で、
-        このフィルタ自体は使わない (フレーム数だけで window を数える)。
-        """
+        """``t`` はインタフェースを揃えるためだけで使わない."""
         if frame_key != self._frame_key:
             self._history = {}
             self._frame_key = frame_key
@@ -52,12 +47,7 @@ class MedianFilter(object):
 
 
 class MovingAverageFilter(object):
-    """関節名・成分ごとに、直近 ``window`` フレームの平均を返す.
-
-    ``MedianFilter`` と違い単発の外れ値にも引かれるが、その分位相ずれ
-    (追従の遅れ) が小さく素直な平滑化になる。外れ値混入が少ないデータで
-    ジッタだけを抑えたい場合に向く。
-    """
+    """関節名・成分ごとに、直近 ``window`` フレームの平均を返す."""
 
     def __init__(self, window=5):
         self.window = max(1, int(window))
@@ -126,14 +116,9 @@ class _OneEuroScalar(object):
 
 
 class OneEuroFilter(object):
-    """関節名・軸 (x, y, z) ごとに独立な One Euro Filter を持つフィルタ.
+    """関節名・軸ごとの One Euro Filter (``update`` に時刻 t [s] が必要).
 
-    ``MedianFilter``/``MovingAverageFilter`` の window (フレーム数) と違い、
-    実時間 (``t``, 秒) に基づいて減衰するため、フレームレートが変動しても
-    同じ設定で使える。``mincutoff`` を下げると静止時のジッタが減り、
-    ``beta`` を上げると速い動きへの追従の遅れが減る (Casiez et al. 2012 の
-    推奨どおり、まず beta=0 で mincutoff を決め、次に動き出しのラグを見ながら
-    beta を上げるとよい)。
+    mincutoff を下げると静止時のジッタが減り、beta を上げると追従遅れが減る。
     """
 
     def __init__(self, mincutoff=1.0, beta=0.0, dcutoff=1.0):

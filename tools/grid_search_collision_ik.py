@@ -3,28 +3,10 @@
 
 """``solve_palm_ik.py`` の速度・成功率のトレードオフを調べるグリッドサーチ。
 
-干渉ペア (``--collision-pairs``)・初期値の数 (``--attempts-per-pose``)・
-バッチ IK の反復回数 (``--collision-ik-stop``)・干渉回避の重み/マージン・
-台車の y の可動域・向きの候補数・後処理 IK の反復回数/収束閾値・候補数の
-上限の全組み合わせについて、``solve_palm_ik.py`` をそのままサブプロセスで
-実行し (本番と同じコードで測るため、1 人分のループをここに複製しない)、
-結果 JSON と標準出力を集計する。
-
-各組み合わせは同じデータで ``--repeat`` 回 (既定 2) 実行し、最後の回を
-使う。干渉ペアの組数・内容や反復回数を変えると初回は jax の再コンパイルに
-なるため (docs/jax_compilation_cache.md)。時間は warmup を含まない
-``collision_ik_time`` (1 段目) / ``candidate_selection_time`` (2 段目)。
-
-集計する値:
-
-- IK 対象の人数、解けた人数 (``solved``)、後処理まで成功した人数。
-- 1 段目・2 段目・IK 全体の 1 人あたりの平均と最大、最も遅い人。
-- 事後検証で棄却された候補の数と、その原因の組 (``solve_palm_ik.
-  pick_verified_candidate`` の ``[collision-verify]`` の行) の内訳。
-
-データセットは ``--dataset`` に ``skeletons/``・``palms/`` を持つ
-ディレクトリ (``run_pipeline_test.py`` の作業ディレクトリと同じ構成) を
-1 つ以上渡す。表は全データセットの合計。
+各軸の全組み合わせで ``solve_palm_ik.py`` をサブプロセス実行し、成功人数・
+1 人あたりの時間 (warmup 除く)・事後検証の棄却内訳を集計する。初回は jax の
+再コンパイルになるので各組を ``--repeat`` 回実行し最後の回を使う。
+``--dataset`` には ``skeletons/``・``palms/`` を持つディレクトリを渡す。
 
 Usage
 -----
@@ -55,8 +37,7 @@ _REJECT_RE = re.compile(r'^\s*\[collision-verify\] .*?(貫通|自己干渉) '
                         r'\((\S+) x (\S+)\)')
 _WARMUP_RE = re.compile(r'^\[warmup\] .* ([0-9.]+) 秒')
 
-# solve_palm_ik.py に渡すグリッドの軸: (引数名, 型, 既定値)。既定値 None は
-# solve_palm_ik.py の既定のまま (引数を渡さない)。
+# グリッドの軸: (引数名, 型, 既定値)。None は solve_palm_ik.py の既定のまま。
 AXES = (
     ('collision-pairs', str, None),
     ('attempts-per-pose', int, None),
@@ -75,9 +56,7 @@ AXES = (
 
 
 def pair_category(name_a, name_b):
-    """棄却の原因の組を大まかな種類に分ける (表の見出し用)。人体側の名前は
-    ``solve_palm_ik.human_obstacle_names`` の形 (骨は ``Neck-RShoulder``、
-    手は ``R_palm``/``R_thumb`` など)。"""
+    """棄却の原因の組を self/human_body/human_hand に分ける。"""
     if name_b.startswith(('R_', 'L_')):
         return 'human_hand'
     if '-' in name_b:
@@ -86,8 +65,7 @@ def pair_category(name_a, name_b):
 
 
 def parse_stdout(stdout):
-    """``solve_palm_ik.py`` の標準出力から、人ごとの棄却の原因の組と
-    warmup の時間を取り出す。"""
+    """標準出力から人ごとの棄却の組と warmup 時間を取り出す。"""
     rejects_by_person = {}
     current = collections.Counter()
     warmup = 0.0
@@ -201,18 +179,16 @@ def main():
     for name, type_, default in AXES:
         parser.add_argument(
             '--' + name, type=type_, nargs='+', default=[default],
-            help='solve_palm_ik.py の --{} に渡す値 (複数指定で振る。'
-                 '省略時は solve_palm_ik.py の既定)。'.format(name))
+            help='solve_palm_ik.py の --{} に渡す値 (複数可)。'.format(name))
     parser.add_argument(
         '--repeat', type=int, default=2,
-        help='同じ組み合わせを実行する回数 (最後の回を使う。既定 2)。')
+        help='同じ組み合わせを実行する回数 (最後の回を使う)。')
     parser.add_argument(
         '--work-dir', type=str, default=None,
-        help='solve_palm_ik.py の出力先の親ディレクトリ (既定は /tmp 以下に '
-             '作る)。組み合わせごとの結果 JSON と標準出力を残す。')
+        help='組み合わせごとの結果・ログの出力先 (既定は /tmp 以下)。')
     parser.add_argument(
         '--output', type=str, default=None,
-        help='集計結果を追記する JSON Lines ファイル (既定は保存しない)。')
+        help='集計結果を追記する JSON Lines ファイル。')
     parser.add_argument('--python', type=str, default=sys.executable)
     args = parser.parse_args()
 

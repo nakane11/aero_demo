@@ -4,30 +4,16 @@
 """``run_pipeline_test.py --plan-motion`` を実行し、軌道計画の結果を人物
 ごとに真上から見た 2 次元の図 (PNG) にする。
 
-図に描くもの (座標は IK・軌道計画と同じ、人物を Aero の前方へ平行移動した
-座標系 [m]。``plan_handshake_motion.py`` の main と同じ変換):
-
-* 点: 人間の立ち位置 (``solve_palm_ik.human_standing_xy``)、ロボットの
-  初期位置 (lead-in の始点)、目標位置 (最終台車位置)
-* 線: ロボットの初期位置から目標位置までの台車の軌道。初期位置から接近
-  開始位置までの直進 (lead-in) を破線、その先の経路計画した軌道
-  (``waypoints``) を実線で描く
-* 矢印: ロボットの初期位置と目標位置での台車の向き、および軌道上を経路長で
-  等分した途中の ``N_HEADING_SAMPLES`` 点での台車の向き (灰色)
-
-参考として、人間の正面方向 (``solve_palm_ik.human_facing_yaw``) の矢印と
-差し出した手 (IK の目標位置、公転の中心) の点も描く。
+台車の軌道 (lead-in は破線)・途中の向き、人の立ち位置・正面方向、差し出した
+手を描く。座標は人物を Aero の前方へ平行移動した IK・軌道計画の座標系 [m]。
 
 Usage
 -----
-    # パイプラインを実行してから描く (位置引数とオプションは
-    # run_pipeline_test.py にそのまま渡す)
-    python3 tools/plot_handshake_motion_2d.py 20 --seed 3 \
+    # 位置引数とオプションは run_pipeline_test.py にそのまま渡す
+    python3 tools/plot_handshake_motion_2d.py 20 --seed 3 \\
         --initial-base-pose 5 0 3.14
-
-    # 既存の作業ディレクトリ (run_pipeline_test.py が表示する
-    # 「作業ディレクトリ: ...」) の結果を描き直すだけ
-    python3 tools/plot_handshake_motion_2d.py \
+    # 既存の作業ディレクトリを描き直す
+    python3 tools/plot_handshake_motion_2d.py \\
         --work-dir /tmp/aero_demo_pipeline_xxx
 """
 
@@ -59,15 +45,12 @@ WORK_DIR_PREFIX = '作業ディレクトリ: '
 # 向きを表す矢印の長さ [m]。
 ARROW_LENGTH = 0.35
 
-# 初期位置・目標位置の間で、台車の向きの矢印を描く軌道上の点の数 (経路長で
-# 等間隔に取る)。
+# 台車の向きの矢印を描く軌道上の点の数 (経路長で等間隔)。
 N_HEADING_SAMPLES = 4
 
 
 def sample_by_arc_length(points, n):
-    """折れ線 ``points`` (``(N, 2)``) 上を経路長で等分した内側の ``n`` 点
-    (両端を除く) について、``(位置, 直前の頂点の index, 区間内の割合)``
-    を返す。"""
+    """折れ線を経路長で等分した内側 ``n`` 点の ``(位置, 頂点 index, 区間内の割合)``。"""
     seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
     cumulative = np.concatenate([[0.0], np.cumsum(seg)])
     total = cumulative[-1]
@@ -84,8 +67,7 @@ def sample_by_arc_length(points, n):
 
 
 def run_pipeline(pipeline_args):
-    """``run_pipeline_test.py --plan-motion`` を実行し、出力をそのまま流し
-    ながら作業ディレクトリのパスを返す。"""
+    """``run_pipeline_test.py --plan-motion`` を実行し作業ディレクトリを返す。"""
     command = [sys.executable,
               os.path.join(_SCRIPTS_DIR, 'run_pipeline_test.py')]
     command += pipeline_args
@@ -127,7 +109,7 @@ def plot_person(motion, handshake, joint_positions, out_path, title):
 
     fig, ax = plt.subplots(figsize=(7, 7))
 
-    # 軌道線 (lead-in は接近開始位置 waypoints[0] まで破線でつなぐ)。
+    # lead-in は waypoints[0] まで破線。
     if lead_in:
         line = np.array([xy(wp) for wp in lead_in + waypoints[:1]])
         ax.plot(line[:, 0], line[:, 1], '--', color='tab:blue', lw=1.5,
@@ -138,8 +120,7 @@ def plot_person(motion, handshake, joint_positions, out_path, title):
     ax.plot(*xy(waypoints[0]), 'o', color='tab:blue', ms=4, zorder=3,
             label='approach start')
 
-    # 軌道上の途中の点での台車の向き (経路長で等間隔、yaw は前後の
-    # waypoint の間で線形補間)。
+    # 途中の台車の向き (yaw は線形補間)。
     points = np.array([xy(wp) for wp in path])
     for k, (point, i, t) in enumerate(
             sample_by_arc_length(points, N_HEADING_SAMPLES)):
@@ -186,19 +167,14 @@ def plot_person(motion, handshake, joint_positions, out_path, title):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='run_pipeline_test.py --plan-motion を実行し、軌道計画の '
-                    '結果を人物ごとに 2 次元の図 (PNG) にする。--work-dir '
-                    '以外の引数は run_pipeline_test.py にそのまま渡す。')
+        description='軌道計画の結果を人物ごとに 2 次元の図にする。未知の引数は '
+                    'run_pipeline_test.py に渡す。')
     parser.add_argument(
         '--work-dir', default=None,
-        help='パイプラインを実行せず、既存の run_pipeline_test.py の作業 '
-            'ディレクトリ (skeletons/handshakes/motions を含む) を描く。')
+        help='パイプラインを実行せず既存の作業ディレクトリを描く。')
     parser.add_argument(
         '--motion-dir', default=None,
-        help='軌道計画の結果 JSON を読むディレクトリ (既定は <作業ディレク'
-            'トリ>/motions)。同じ作業ディレクトリの IK 結果に対して '
-            'plan_handshake_motion.py を条件を変えて実行し直した結果を '
-            '描くとき用。')
+        help='軌道計画の結果 JSON のディレクトリ (既定は <作業ディレクトリ>/motions)。')
     parser.add_argument(
         '--output-dir', default=None,
         help='PNG の保存先 (既定は <作業ディレクトリ>/plots)。')
@@ -227,8 +203,7 @@ def main():
             continue
         with open(os.path.join(work_dir, 'handshakes', name)) as f:
             handshake = json.load(f)
-        # plan_handshake_motion.py の main と同じく、人物を Aero の前方へ
-        # 平行移動した座標系 (軌道・目標位置と同じ座標系) に直す。
+        # 軌道と同じ座標系 (人物を Aero の前方へ平行移動) に直す。
         joint_positions = spik.load_skeleton_json(
             os.path.join(work_dir, 'skeletons', name))
         joint_positions = spik.translate_joint_positions(

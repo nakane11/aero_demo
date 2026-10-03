@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""人物骨格を skrobot の viewer 向けの線分 (``LineString``) にする部品.
-
-``tools/draw_random_human_poses.py`` 等が使う。
-
-rospy は import しない。描けなかったことは例外ではなく戻り値で返すので、
-ログをどう出すかは呼び出し側が決める。
-"""
+"""人物骨格を skrobot の viewer 向けの線分 (``LineString``) にする部品."""
 
 import numpy as np
 import trimesh
@@ -15,8 +9,7 @@ import trimesh
 from skrobot.model.primitives import LineString
 from skrobot.model.primitives import Sphere
 
-# 骨格の線は部位ごとに色を変える。ボーン名 ("Neck->RShoulder" 形式) から
-# 下の bone_color で引く。
+# 部位ごとの骨格の色
 COLOR_BONES = {
     'torso': [220, 220, 220, 255],
     'head': [255, 220, 150, 255],
@@ -28,8 +21,7 @@ COLOR_BONES = {
     'lhand': [60, 120, 255, 255],
 }
 
-# どの関節が出てきたらその部位、という判定 (先に一致したものを採る)。
-# ここに無い関節 (Neck, RShoulder, LShoulder, RHip, LHip) は torso 扱い。
+# 関節 -> 部位 (先に一致したもの。無ければ torso)
 _BONE_GROUPS = (
     ('head', ('Nose', 'REye', 'LEye', 'REar', 'LEar')),
     ('rarm', ('RElbow', 'RWrist')),
@@ -40,30 +32,12 @@ _BONE_GROUPS = (
 
 
 def set_color(link, rgba):
-    """primitive の色を塗る (skrobot のバージョン差を吸収する).
+    """primitive の色を塗る.
 
-    ``Sphere`` 以外の面付き primitive (Box/Cylinder/Capsule/MeshLink) は
-    ``link.visual_mesh`` ではなく ``link.concatenated_visual_mesh`` を塗る。
-    ``skrobot.model.link.Link.__init__`` は ``visual_mesh`` を
-    ``trimesh.util.concatenate`` に通した*複製*を ``_concatenated_visual_
-    mesh`` としてキャッシュし、trimesh/viser/pyrender のどの viewer も
-    描画時にはそのキャッシュだけを読む (``concatenated_visual_mesh``
-    プロパティ経由)。元の ``visual_mesh`` は Link 構築後の複製の元に
-    なるだけで、以後は描画に使われない -- なので Link を作ってから (この
-    関数のように) 色を塗っても ``visual_mesh`` を塗るだけでは viewer に
-    反映されない。
-
-    半透明 (``rgba[3] < 255``) なときは ``face_colors`` に加えて
-    ``alphaMode='BLEND'`` の ``PBRMaterial`` も付ける。ViserViewer は
-    メッシュを glTF (.glb) に変換して送るが (``skrobot.viewers._viser
-    .ViserViewer._add_link`` の ``add_mesh_trimesh``)、trimesh の頂点色
-    エクスポートは既定で ``alphaMode: OPAQUE`` になりアルファ値を無視する
-    -- ``face_colors`` だけでは viser 側で不透明に見えてしまう。
-
-    ``Sphere`` だけは例外で、従来どおり ``link.visual_mesh`` を塗る。
-    ViserViewer は Sphere を icosphere として特別扱いする際、concatenated
-    ではなく ``link.visual_mesh.visual.face_colors`` を直接読むため
-    (``_add_link``) -- こちらは Link 構築後に塗っても効く。
+    viewer は ``concatenated_visual_mesh`` (構築時の複製) を描くのでそちらを
+    塗る。ただし Sphere は ViserViewer が ``visual_mesh`` を直接読むので
+    そちらを塗る。半透明なら viser (glTF) でアルファが効くよう
+    ``alphaMode='BLEND'`` の PBRMaterial にする。
     """
     if isinstance(link, Sphere):
         meshes = getattr(link, 'visual_mesh', None)
@@ -85,9 +59,7 @@ def set_color(link, rgba):
         return link
     meshes = mesh if isinstance(mesh, (list, tuple)) else [mesh]
     for m in meshes:
-        # 面を持つ primitive は face_colors、点群は vertex_colors。点群に
-        # face_colors を入れても例外にはならず、色が付かないまま無視される
-        # (trimesh.PointCloud.colors が空のままになる) ので型で振り分ける。
+        # 点群は face_colors を黙って無視するので vertex_colors を使う。
         has_faces = getattr(m, 'faces', None) is not None
         attr = 'face_colors' if has_faces else 'vertex_colors'
         try:
@@ -106,10 +78,7 @@ def set_color(link, rgba):
 
 
 def bone_group(name):
-    """ボーン名 ("Neck->RShoulder" 形式) から部位 (``COLOR_BONES`` のキー) を返す.
-
-    手のランドマークのボーン ("RHand0->RHand1" など) は手の部位にまとめる。
-    """
+    """ボーン名 ("Neck->RShoulder" 形式) から部位 (``COLOR_BONES`` のキー) を返す."""
     if 'RHand' in name:
         return 'rhand'
     if 'LHand' in name:

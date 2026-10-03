@@ -1,16 +1,6 @@
 <launch>
-  <!-- tools/ros/print_palm_positions.py (開発用) が publish する骨格
-       (skeleton_markers) を、ロボットモデル・decompress.launch が作る
-       点群と一緒に rviz で見るための launch。
-
-       ロボット本体の bringup (robot_description の読み込み・
-       robot_state_publisher・joint_states の TF) は実機操作を伴うため
-       ここには含めない。aero-ros-pkg 側の aero_startup/aero_bringup.launch
-       を別途起動しておくこと (RobotModel/TF が出ないときはまずこれが
-       起動しているか確認する)。同様に tools/ros/print_palm_positions.py
-       (骨格 publish) もこの launch では起動しないので、別途実行しておく
-       こと。
-  -->
+  <!-- print_palm_positions.py の骨格 (skeleton_markers) を点群と一緒に rviz で見る。
+       aero_bringup.launch と print_palm_positions.py は別途起動すること。 -->
   <include file="$(find aero_demo)/launch/decompress.launch" />
 
   <node name="rviz" pkg="rviz" type="rviz"

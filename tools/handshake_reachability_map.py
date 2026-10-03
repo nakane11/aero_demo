@@ -4,28 +4,11 @@
 """人が手をどこに・どの向きで差し出せば、差し出しと判定され IK が解けるかを
 格子状に調べる (reachability map)。
 
-体格を固定した人の骨格を作り、差し出す手の掌の位置 (人の前方・外側・高さ)
-と向き (指先の向き・ロール) だけを変えて、格子点ごとに次の 2 つを評価する。
-
-1. 差し出し判定: ``run_camera_pipeline_test.py`` と同じ ``OfferedHandSelector``
-   (閾値 ``--offer-score-min``、既定 0.65) のスコア。人はロボットの正面
-   ``--person-distance`` [m] にロボットの方を向いて立ち、ロボットは腕を
-   下ろした初期姿勢 (判定の基準にする右手先の位置) とする。静止判定は
-   単発の骨格なので効かない。
-2. IK: ``run_camera_pipeline_test.py`` の ``_solve_handshake`` と同じ手順
-   (人物の平行移動・台車の可動域の制限・``solve_person_ik_side_by_side``)
-   で、干渉の事後検証と後処理 (押し込み・視線) まで解く。軌道計画は
-   行わない。標準出力に出る棄却理由から失敗の原因を分類する。
-
-骨格は MediaPipe 形式の関節名で、手のランドマークは
-``generate_random_human_poses.RandomSkeletonGenerator`` と同じ手の局所座標
-(``people_pose_types.HAND_LOCAL_LANDMARKS``) から作るので、掌の推定も
-本番と同じ ``PalmPoseEstimator`` を通る。肘の位置は肩と手首から 2 リンクの
-IK で決める (肘は下・やや外に張る)。腕の長さで届かない格子点は
-``human_unreachable`` として IK を解かない。
-
-結果は 1 格子点 1 行の JSON Lines で ``--output`` に追記する (途中で止めても
-同じ ``--output`` で再実行すれば続きから解く)。
+体格を固定した骨格で掌の位置 (前方・外側・高さ) と向きを振り、格子点ごとに
+差し出し判定 (``OfferedHandSelector``、人はロボット正面 ``--person-distances``
+[m]) と IK (事後検証・後処理まで、軌道計画なし) を評価する。人の腕が届かない
+点は IK を解かない。結果は JSON Lines で ``--output`` に追記し、再実行すると
+続きから解く。
 
 Usage
 -----
@@ -62,7 +45,7 @@ import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 
-# --- 人の体格 (身長 1.70 m 程度、人の座標系: x=前, y=左, z=上, 足元が原点) ---
+# 人の体格 (身長約 1.70 m、人の座標系: x=前, y=左, z=上, 足元が原点)
 NECK = (0.0, 0.0, 1.40)
 SHOULDER_HALF_WIDTH = 0.18
 SHOULDER_Z = 1.36
@@ -75,8 +58,7 @@ UPPER_ARM_LENGTH = 0.29
 FOREARM_LENGTH = 0.26
 # generate_random_human_poses._HAND_LENGTH_HEIGHT_RATIO * 身長。
 HAND_LENGTH = 0.108 * 1.70
-# 腕を伸ばしきった姿勢は不自然なので、肩-手首の距離がこの割合を超える
-# 格子点は「人が届かない」扱いにする。
+# 肩-手首の距離が腕の長さのこの割合を超えたら人が届かない扱い。
 MAX_REACH_RATIO = 0.98
 
 # 失敗理由の分類に使う solve_palm_ik の標準出力のパターン。
@@ -99,10 +81,8 @@ def _side_sign(hand):
 def hand_frame(hand, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     """差し出す手の局所座標系 (u=指先, v=親指側, n=掌の向き) を返す.
 
-    基準 (全て 0) は握手の向き: 指先が真っ直ぐ前、親指が真上、掌が体の
-    内側を向く。``yaw_deg`` は指先を外側へ、``pitch_deg`` は上へ向ける角度。
-    ``roll_deg`` は指先まわりの回内 (正で掌が下を向く、90 で掌が真下、
-    -90 で掌が真上)。
+    全て 0 で握手の向き (指先が前、親指が上)。yaw は外側、pitch は上が正。
+    roll は回内で 90 で掌が真下、-90 で真上。
     """
     sign = _side_sign(hand)
     yaw = math.radians(yaw_deg)
@@ -115,8 +95,7 @@ def hand_frame(hand, yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
     up_perp = _unit(up - np.dot(up, u) * u)
     medial = np.cross(up_perp, u) if hand == 'R' else np.cross(u, up_perp)
     v = math.cos(roll) * up_perp + math.sin(roll) * medial
-    # RandomSkeletonGenerator._hand_frame と同じ手の向きの約束
-    # (右手は n = v x u、左手は n = u x v)。
+    # RandomSkeletonGenerator._hand_frame と同じ約束。
     n = np.cross(v, u) if hand == 'R' else np.cross(u, v)
     return u, v, n
 
@@ -128,8 +107,7 @@ def hand_landmarks(hand, wrist, u, v, n):
 
 
 def _elbow_position(shoulder, wrist, hand):
-    """肩と手首から肘の位置を決める (2 リンクの IK、肘は下・やや外・後ろ)。
-    届かなければ ``None``。"""
+    """肩と手首から肘の位置を 2 リンク IK で決める (届かなければ ``None``)。"""
     d_vec = wrist - shoulder
     d = float(np.linalg.norm(d_vec))
     l1, l2 = UPPER_ARM_LENGTH, FOREARM_LENGTH
@@ -138,7 +116,7 @@ def _elbow_position(shoulder, wrist, hand):
     axis = d_vec / d
     a = (l1 * l1 - l2 * l2 + d * d) / (2.0 * d)
     r = math.sqrt(max(l1 * l1 - a * a, 0.0))
-    # 肘はできるだけ真下に垂らす (脇の開き = 肩の外転を最小限にする)。
+    # 肘はできるだけ真下に垂らす。
     prefer = np.array([-0.2, 0.0, -1.0])
     perp = prefer - np.dot(prefer, axis) * axis
     if np.linalg.norm(perp) < 1e-6:
@@ -149,9 +127,7 @@ def _elbow_position(shoulder, wrist, hand):
 
 def build_skeleton(hand, palm_position, yaw_deg=0.0, pitch_deg=0.0,
                    roll_deg=0.0):
-    """掌の中心が ``palm_position`` (人の座標系) に来るように ``hand`` を
-    差し出した骨格 (関節名 -> np.array) を返す。人が腕の長さで届かなければ
-    ``None``。"""
+    """掌の中心が ``palm_position`` (人の座標系) に来る骨格を返す (届かなければ None)。"""
     joints = {}
     joints['Neck'] = np.array(NECK)
     for side in ('R', 'L'):
@@ -162,14 +138,13 @@ def build_skeleton(hand, palm_position, yaw_deg=0.0, pitch_deg=0.0,
         joints['{}Knee'.format(side)] = np.array([0.0, s * HIP_HALF_WIDTH, KNEE_Z])
         joints['{}Ankle'.format(side)] = np.array(
             [0.0, s * HIP_HALF_WIDTH, ANKLE_Z])
-        # 顔は generate_random_human_poses と同じオフセット (正面 +x)。
         joints['{}Eye'.format(side)] = joints['Neck'] + np.array(
             [0.05, s * 0.03, 0.16])
         joints['{}Ear'.format(side)] = joints['Neck'] + np.array(
             [0.0, s * 0.08, 0.15])
     joints['Nose'] = joints['Neck'] + np.array([0.06, 0.0, 0.14])
 
-    # 差し出さない手は体の横に下ろす (指先が下、掌が体の側、親指が前)。
+    # 差し出さない手は体の横に下ろす。
     other = 'L' if hand == 'R' else 'R'
     s = _side_sign(other)
     shoulder = joints['{}Shoulder'.format(other)]
@@ -183,8 +158,7 @@ def build_skeleton(hand, palm_position, yaw_deg=0.0, pitch_deg=0.0,
     joints['{}Wrist'.format(other)] = wrist
     joints.update(hand_landmarks(other, wrist, u, v, n))
 
-    # 差し出す手: 掌の中心 (palm_plane が求める中心) が palm_position に
-    # 来るよう手首の位置を逆算する。
+    # 掌の中心が palm_position に来るよう手首の位置を逆算する。
     u, v, n = hand_frame(hand, yaw_deg, pitch_deg, roll_deg)
     local = hand_landmarks(hand, np.zeros(3), u, v, n)
     center0 = np.asarray(epp.PalmPoseEstimator().estimate_palm(
@@ -201,13 +175,10 @@ def build_skeleton(hand, palm_position, yaw_deg=0.0, pitch_deg=0.0,
 
 
 def shoulder_angles(joints, hand):
-    """差し出した腕の肩の角度 [度] (上腕 = 肩->肘)。
+    """差し出した上腕の肩の角度 [度]。
 
-    ``abduction``: 脇の開き。上腕を正面から見た (y-z 平面に射影した) ときの
-        真下からの角度で、外側に開くと正、体の前を横切ると負。
-    ``flexion``: 上腕を横から見た (x-z 平面に射影した) ときの真下からの
-        角度で、前に上げると正。
-    ``elevation``: 上腕と真下のなす角 (向きによらない腕の上げ具合)。
+    abduction: 正面から見た真下からの角度 (外側が正)。flexion: 横から見た
+    真下からの角度 (前が正)。elevation: 真下とのなす角。
     """
     upper = joints['{}Elbow'.format(hand)] - joints['{}Shoulder'.format(hand)]
     outward = _side_sign(hand) * upper[1]
@@ -219,10 +190,7 @@ def shoulder_angles(joints, hand):
 
 
 def robot_hand_position_initial():
-    """ロボットが腕を下ろした初期姿勢 (plan_handshake_motion.arms_down_angles
-    と同じ) のときの右手先 (r_eef_grasp_link) の base_link 座標。
-    ``run_camera_pipeline_test.py`` は実機の TF からこの点を引いて差し出し
-    判定の基準にする。"""
+    """腕を下ろした初期姿勢での右手先の base_link 座標 (差し出し判定の基準)。"""
     robot = Aero(use_hand=False)
     robot.reset_pose()
     for side in ('r', 'l'):
@@ -231,12 +199,9 @@ def robot_hand_position_initial():
 
 
 def offer_scores(joints, robot_hand, distances, score_min):
-    """人がロボットの正面 ``distances`` [m] の各距離に、ロボットの方を
-    向いて立っているときの差し出し判定 (左右のスコアと判定結果)。
+    """人がロボット正面 ``distances`` [m] に向かい合って立つときの差し出し判定。
 
-    人の座標系 (人が原点で +x を向く) で、ロボットは (d, 0) に人の方
-    (-x) を向いて立つので、ロボットの base_link での手先 (hx, hy, hz) は
-    人の座標系で (d - hx, -hy, hz)。
+    base_link での手先 (hx, hy, hz) は人の座標系で (d - hx, -hy, hz)。
     """
     estimator = epp.PalmPoseEstimator(epp.OfferedHandSelector())
     palms = {side: estimator.estimate_palm(joints, side) for side in ('R', 'L')}
@@ -257,8 +222,7 @@ def offer_scores(joints, robot_hand, distances, score_min):
 
 
 class IkEvaluator(object):
-    """``run_camera_pipeline_test.py`` の ``_solve_handshake`` と同じ設定で
-    1 人分の IK (干渉の事後検証・後処理まで) を解く。"""
+    """``run_camera_pipeline_test.py`` と同じ設定で 1 人分の IK を解く。"""
 
     def __init__(self, args):
         self.args = args
@@ -271,8 +235,6 @@ class IkEvaluator(object):
         spik.apply_collision_model(robot)
         spik.apply_hand_box(robot)
         spik.other_hand_points('r')
-        # 実機ではカメラ光軸を TF から設定するが、無ければ既定値 (solve_palm_ik
-        # と同じ) を使う。
         spik.attach_camera_optical_coords(robot)
         self.robot = robot
         self.verification_pairs = spik.build_verification_pairs_for_model(
@@ -285,15 +247,9 @@ class IkEvaluator(object):
         self._warmup()
 
     def _warmup(self):
-        """``run_camera_pipeline_test.py`` の ``_warmup_ik`` と同じく、
-        最初のバッチ IK を全可動域 (``self.base_limits``) のダミー目標で
-        解いておく。
+        """全可動域のダミー目標で最初のバッチ IK を解いておく。
 
-        これを省いて最初の呼び出しを人物ごとに絞った可動域 (x の窓など)
-        で行うと、以後のバッチ IK の結果がおかしくなる (台車が可動域の端に
-        張り付き、手先が目標から 3 m 近く離れたまま収束扱いになる、
-        2026-10-02 に確認)。本番はどちらのスクリプトも全可動域で
-        ウォームアップしているので影響を受けない。
+        最初の呼び出しを狭い可動域で行うと以後のバッチ IK が壊れるため必須。
         """
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -345,7 +301,7 @@ class IkEvaluator(object):
                 verification_pairs=self.verification_pairs)
         elapsed = time.time() - t0
         log = buf.getvalue()
-        # 姿勢を表示・保存したい呼び出し側向けに、平行移動後の人物と解を残す。
+        # 呼び出し側向けに平行移動後の人物と解を残す。
         self.last_solution = dict(
             picked=picked, joints=translated_joints, palm=translated_palm,
             robot_arm=robot_arm, base_limits=person_base_limits)
@@ -355,12 +311,8 @@ class IkEvaluator(object):
 def classify(picked, log, elapsed, x_margin, robot_arm):
     """IK の結果と標準出力から結果の種類を決める.
 
-    ``ok``: 後処理 (押し込み・視線) まで解けた。
-    ``no_press``: 干渉検証は通ったが後処理が全候補で失敗 (実機では押し
-        込みなしの hover 姿勢で実行される)。
-    ``human_clearance``: 解は出たが hover 姿勢で人体に近すぎて全て棄却。
-    ``self_collision``: 解は出たが自己干渉で全て棄却。
-    ``no_converge``: バッチ IK が 1 つも収束しない (届かない)。
+    ok: 後処理まで成功。no_press: 後処理が全候補で失敗。human_clearance /
+    self_collision: 人体距離 / 自己干渉で全て棄却。no_converge: 収束せず。
     """
     clearance = collections_counter(
         m.group(1) for m in _HOVER_CLEARANCE_RE.finditer(log))
@@ -424,25 +376,20 @@ def main():
     parser.add_argument('--forward', type=float, nargs=3,
                         default=[0.10, 0.70, 0.05],
                         metavar=('MIN', 'MAX', 'STEP'),
-                        help='掌の中心の前方距離 [m] (人の体の前面ではなく'
-                             '肩・腰を結ぶ面から、既定 0.10 0.70 0.05)。')
+                        help='掌の中心の前方距離 [m] (肩・腰を結ぶ面から)。')
     parser.add_argument('--lateral', type=float, nargs=3,
                         default=[-0.10, 0.50, 0.05],
                         metavar=('MIN', 'MAX', 'STEP'),
-                        help='掌の中心の体の中心線からの外側距離 [m] (差し出す'
-                             '手の側が正、既定 -0.10 0.50 0.05)。')
+                        help='体の中心線からの外側距離 [m] (差し出す手の側が正)。')
     parser.add_argument('--height', type=float, nargs=3,
                         default=[0.70, 1.50, 0.10],
                         metavar=('MIN', 'MAX', 'STEP'),
-                        help='掌の中心の床からの高さ [m] (既定 0.70 1.50 0.10)。')
+                        help='掌の中心の床からの高さ [m]。')
     parser.add_argument('--position-roll', type=float, default=0.0,
-                        help='--mode position で使う指先まわりの回内 [度] '
-                             '(--roll-values と同じ定義、既定 0 = 握手の向き)。')
+                        help='--mode position での回内 [度] (--roll-values と同じ定義)。')
     parser.add_argument('--orientation-position', type=float, nargs='+',
                         default=[0.35, 0.20, 1.00],
-                        help='--mode orientation で掌を置く位置 (前方 外側 '
-                             '高さ) [m]。3 つ組を並べると複数の位置で調べる '
-                             '(既定 0.35 0.20 1.00)。')
+                        help='--mode orientation で掌を置く (前方 外側 高さ) [m]、3 つ組を複数可。')
     parser.add_argument('--yaw-values', type=float, nargs='+',
                         default=[-30, 0, 30],
                         help='指先の向き (外側が正) [度]。')
@@ -451,14 +398,12 @@ def main():
                         help='指先の上下 (上が正) [度]。')
     parser.add_argument('--roll-values', type=float, nargs='+',
                         default=[-180, -135, -90, -45, 0, 45, 90, 135],
-                        help='指先まわりの回内 [度] (0=親指が上・掌が内側、'
-                             '90=掌が下、-90=掌が上、±180=親指が下・掌が外側)。')
+                        help='回内 [度] (0=親指が上、90=掌が下、-90=掌が上)。')
     parser.add_argument('--person-distances', type=float, nargs='+',
                         default=[1.0, 1.5, 2.0],
                         help='差し出し判定で人がロボットから立つ距離 [m]。')
     parser.add_argument('--offer-score-min', type=float, default=0.65,
-                        help='差し出し判定の閾値 (run_camera_pipeline_test.py '
-                             'の既定と同じ 0.65)。')
+                        help='差し出し判定の閾値。')
     parser.add_argument('--attempts-per-pose', type=int,
                         default=spik.DEFAULT_ATTEMPTS_PER_POSE)
     parser.add_argument('--collision-pairs', type=str,

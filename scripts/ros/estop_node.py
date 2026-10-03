@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""AtomS3 (マイコン) のボタン押下をWiFi経由 (UDP) で受け取り、ロボットの
-全コントローラ (base/rarm/larm/rhand/lhand/head/waist/lifter) の
-``follow_joint_trajectory`` ゴールを cancel し、あわせて ``move_base`` の
-現在ゴールも cancel する、独立した非常停止ノード。
+"""AtomS3 のボタンを UDP で受け、全コントローラの follow_joint_trajectory と
+move_base のゴールを cancel する非常停止ノード。
 
-AtomS3 側はこの PC の ``--listen-port`` (既定 UDP 5555) へ、改行区切りの
-テキストを 1 パケットとして送るだけの単純なプロトコルを想定する。
-
-    STOP\n      ボタン押下 (停止要求)
-    RESUME\n    解除要求 (長押し等、ファーム側の実装は別途)
-
-停止するとこのノードは ``/estop`` (std_msgs/Bool, latch) を True にして
-publish し続ける。デモ側のスクリプトはこのトピックを subscribe し、True の
-間は新しい動作 (angle_vector_sequence/move_trajectory 等) を発行しない
-ようにすること -- cancel だけでは、cancel 直後にデモ側が次のゴールを送る
-競合を防げない (詳細は本パッケージの CLAUDE.md 等の運用メモを参照)。
-
-UDP は到達保証がないので、AtomS3 側はボタンを押している間 (または押した
-直後の一定時間) STOP を連続で複数回送ることを推奨する。このノード自身も
-STOP を 1 回受信するごとに cancel を複数回 publish するので、途中の
-パケットが多少落ちても問題ない。
+プロトコル: ``--listen-port`` へ改行区切りの ``STOP`` / ``RESUME``。
+停止中は ``/estop`` (Bool, latch) が True。cancel だけでは直後に送られる
+次のゴールを防げないので、デモ側は True の間は新しい動作を送らないこと。
+UDP は到達保証が無いため、送信側は STOP を複数回送り、こちらも cancel を
+複数回 publish する。
 
 Usage
 -----
@@ -37,19 +24,13 @@ import rospy
 from actionlib_msgs.msg import GoalID
 from std_msgs.msg import Bool
 
-# cancel の取りこぼし対策として、STOP 検知のたびに同じ内容を複数回 publish
-# する (actionlib の cancel トピックは QoS が保証されないベストエフォート
-# の通常トピックなので、1 回だけだと購読側の接続確立タイミング次第で
-# 届かないことがある)。
+# cancel の取りこぼし対策で STOP ごとに複数回 publish する。
 CANCEL_REPEAT_COUNT = 3
 CANCEL_REPEAT_INTERVAL = 0.05  # [sec]
 
-# UDP ソケットの受信待ちタイムアウト。rospy.is_shutdown() を定期的に
-# チェックするために短い値にしてポーリングする。
+# rospy.is_shutdown() を確認するための受信タイムアウト。
 SOCKET_POLL_TIMEOUT = 0.5  # [sec]
 
-# follow_joint_trajectory の cancel を送る対象コントローラ名前空間
-# (rostopic list で確認できたもの一式)。
 DEFAULT_CONTROLLERS = [
     'base_controller',
     'rarm_controller',
@@ -81,8 +62,7 @@ class EstopNode(object):
         self._lock = threading.Lock()
         self._stopped = False
 
-        # 起動直後は購読側の接続が間に合っていないことがあるので、まず
-        # False を publish して latch の初期値を確定させておく。
+        # latch の初期値を False にしておく。
         self._estop_pub.publish(Bool(data=False))
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -99,21 +79,11 @@ class EstopNode(object):
         if not already_stopped:
             rospy.logwarn('[estop_node] STOP を受信、全ゴールを cancel します')
         self._estop_pub.publish(Bool(data=True))
-        # _publish_cancels は sleep を挟みながら複数回 publish するため
-        # (最大 CANCEL_REPEAT_COUNT * CANCEL_REPEAT_INTERVAL 秒ブロックする)、
-        # ここで同期的に呼ぶと UDP 受信ループ (シングルスレッド) がその間
-        # 次のパケットを受信できなくなる。AtomS3 は 1 回の押下で同じコマンド
-        # を連続送信してくる (取りこぼし対策) ため、同期呼び出しのままだと
-        # 1 回の押下の処理だけで最大数百ms〜1秒近くブロックし、直後に来る
-        # 反対方向のコマンド (例: STOP 連投の直後の RESUME) の処理が遅れて
-        # 「ボタンを押しても反応が変わらない/遅れて切り替わる」ように見える
-        # 原因になっていた。バックグラウンドスレッドにして受信ループを
-        # 塞がないようにする。
+        # 受信ループを塞がないよう別スレッドで publish する。
         threading.Thread(target=self._publish_cancels, daemon=True).start()
 
     def _publish_cancels(self):
-        empty_goal_id = GoalID()  # id="", stamp=0 -> 対象アクションの
-                                  # 全ゴールを cancel する意味になる
+        empty_goal_id = GoalID()  # 空の GoalID = 全ゴールを cancel
         for _ in range(CANCEL_REPEAT_COUNT):
             for pub in self._cancel_pubs.values():
                 pub.publish(empty_goal_id)
@@ -124,12 +94,6 @@ class EstopNode(object):
         with self._lock:
             was_stopped = self._stopped
             self._stopped = False
-        # trigger_stop の already_stopped と対称に、実際に状態が変わった
-        # ときだけ警告ログを出す。AtomS3 は 1 回の押下で RESUME を連続
-        # 送信してくるため、ここにガードが無いと重複パケットのたびに
-        # 警告ログが連続で出て「チャタリングしている」ように見えていた
-        # (実際には /estop の値自体は毎回 False で一貫しており、振動は
-        # していなかった)。
         if was_stopped:
             rospy.logwarn('[estop_node] RESUME を受信、停止を解除します')
         self._estop_pub.publish(Bool(data=False))
@@ -146,13 +110,7 @@ class EstopNode(object):
         line = line.strip()
         if not line:
             return
-        # 診断用に受信した生コマンドをログに残すが、AtomS3 は 1 回の押下で
-        # 同じコマンドを連続送信してくる (取りこぼし対策) ため、既定の
-        # loginfo のままだと 1 回の押下で毎回 5 行ずつ表示されてしまう。
-        # 通常はここは無表示にし、状態が実際に変わったときの WARN
-        # (trigger_stop/trigger_resume 側) だけを見せる。必要なときは
-        # `rosrun aero_demo estop_node.py _log_level:=debug` 等で
-        # DEBUG ログを有効にすれば、全パケットの受信タイミングを確認できる。
+        # 同じコマンドが連続で届くので debug レベルで記録する。
         rospy.logdebug('[estop_node] %s から受信: %r', addr, line)
         if line == 'STOP':
             self.trigger_stop()

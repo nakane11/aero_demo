@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
-"""``run_pipeline_test.py`` の作業ディレクトリ (skeletons/ と handshakes/)
-を読み、IK が決めた最終の台車位置と人の位置関係・IK の計算時間を集計する
-(docs/handshake_base_placement.md の比較に使った開発用ツール)。
-
-複数の作業ディレクトリを渡すと、まとめて 1 つの集計にする (例えば
-``--seed 0`` と ``--seed 1`` の 2 回分)。
-
-集計する指標:
-
-- 方位: ロボットの台車 (base_link) の中心から人の立ち位置 (左右の腰の
-  中点) を見た方向を、ロボットの正面を 0 度、左回りを正として測った角度。
-  ±90 度が真横で、|方位| が 90 度より大きいほど人がロボットの斜め後ろに
-  いる。
-- 前方ずれ: 台車の位置が人の立ち位置から人の正面方向にどれだけ前 [m]
-  にあるか (後ろなら負)。
-- 向きのずれ: 台車の向きの人の正面方向からのずれ [度]。人のいる側へ
-  回っている (人の方を向いている) 向きを正にする。
-
-指標の計算は ``solve_palm_ik.base_placement_metrics`` (実ノードの
-デバッグログと共通)。
+"""``run_pipeline_test.py`` の作業ディレクトリ (複数可) を読み、IK が決めた
+最終の台車位置と人の位置関係 (方位・前方ずれ・向きのずれ)・IK の計算時間を
+集計する。指標の定義は docs/handshake_base_placement.md。
 
 usage::
 
@@ -59,8 +42,7 @@ def load_rows(work_dir):
             time=(data['collision_ik_time']
                   + data['candidate_selection_time']))
         if row['solved']:
-            # solve_palm_ik.py と同じく人物を (HUMAN_FRONT_DISTANCE, 0) へ
-            # 平行移動した座標系で比べる (結果 JSON はこの座標系)。
+            # 結果 JSON と同じ、人物を平行移動した座標系で比べる。
             joints = spik.load_skeleton_json(
                 os.path.join(work_dir, 'skeletons', name + '.json'))
             joints = spik.translate_joint_positions(

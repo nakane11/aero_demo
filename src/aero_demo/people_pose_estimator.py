@@ -3,9 +3,7 @@
 
 """ROS non-dependent people pose estimation with MediaPipe.
 
-MediaPipe による姿勢推定処理を、ROS の publish/subscribe から切り離して
-クラス化したもの。画像 (numpy BGR) を渡すと素の Python オブジェクトで
-結果が返る。
+BGR 画像 (と深度) から人物の 2D/3D 関節位置を求める。
 """
 
 import logging
@@ -46,15 +44,7 @@ class PeoplePoseEstimator(object):
     index2handname = INDEX2HANDNAME
     hand_sequence = HAND_SEQUENCE
 
-    # 腕・脚の「近位 -> 遠位」の関節ペア。深度が単発でおかしくなったとき
-    # 症状が出やすいのは、体幹から離れた末端側の関節 (肘/手首、膝/足首) が
-    # 輪郭付近の細い部位で背景の深度を拾ってしまう場合 (腕が不自然に伸びて
-    # 見える現象、_prune_implausible_limbs 参照)。近位側 (肩/腰) は胴体に
-    # 近く輪郭も太いため相対的に信頼できるという前提で、超過時は常に遠位
-    # 側を落とす。同じ考え方を手のランドマークにも適用したものが
-    # ``hand_sequence`` (``HAND_SEQUENCE``、既に手首 -> 各指先の近位 ->
-    # 遠位順で並んでいるのでそのまま使える、``_prune_implausible_hand_
-    # landmarks`` 参照)。
+    # 腕・脚の (近位, 遠位) 関節ペア。長すぎる区間は遠位側を落とす。
     _LIMB_CHAINS = [
         ('RShoulder', 'RElbow'), ('RElbow', 'RWrist'),
         ('LShoulder', 'LElbow'), ('LElbow', 'LWrist'),
@@ -108,71 +98,20 @@ class PeoplePoseEstimator(object):
         ----------
         use_hand : bool
             True なら Holistic を使い手のランドマークも推定する。
-        model_complexity : int
-            Pose モデルの複雑さ。0 が最速、1 が既定、2 が最も高精度。
         min_visibility : float
-            この値以下の visibility の関節は score=-1 として無効化する。
-        min_joints : int
-            3 次元姿勢としてこれ未満の関節数しか取れなければ棄却する。
-        max_z_diff : float
-            関節の奥行きのばらつきがこれを超えたら人でないとみなす [m]。
-        min_body_size : float
-            検出できた関節のバウンディングボックス対角線長がこれ未満なら
-            (物の一部を人物と誤検出した等) 人でないとみなす [m]。
-        max_body_size : float
-            検出できた関節のバウンディングボックス対角線長がこれを超えたら
-            (深度ノイズで関節が実際より大きく散らばった等) 人でないとみなす
-            [m]。
-        max_limb_length : float
-            肩-肘/肘-手首/腰-膝/膝-足首の各区間がこれを超えて長ければ、
-            遠位側の関節 (肘/手首/膝/足首) を検出できなかった扱いにして
-            捨てる [m] (``_prune_implausible_limbs`` 参照)。深度が単発で
-            背景側に飛んで腕や脚が不自然に伸びて見える現象への対策。
-        max_hand_segment_length : float
-            手のランドマーク (手首 - 各指の関節間、``HAND_SEQUENCE`` の
-            各区間) がこれを超えて長ければ、遠位側のランドマークを検出
-            できなかった扱いにして捨てる [m] (``_prune_implausible_hand_
-            landmarks`` 参照)。指は輪郭が細く深度パッチが背景を拾い
-            やすいため、``max_limb_length`` と同じ考え方で手専用に別の
-            閾値を用意してある (実際の指の区間はどれも数 cm 程度なので、
-            既定の 0.12m は明らかにおかしい跳びだけを弾く緩めの値)。
-            ただしこれは隣接する関節同士の距離しか見ないため、各区間が
-            閾値ギリギリで同じ方向に連鎖すると手首から指先までの累積では
-            大きく伸びうる (実際の指の骨は 1 区間あたり数 cm 程度)。
-            ``max_hand_reach`` はこれを補うためのもの。
-        max_hand_reach : float
-            手首 (``{side}Hand0``) から各指のランドマークまでの直線距離が
-            これを超えたら、``max_hand_segment_length`` と同様に遠位側の
-            ランドマークを検出できなかった扱いにして捨てる [m]。成人の
-            手首-指先の最大到達距離はおよそ 0.18-0.20m 程度なので、既定の
-            0.22m は多少の余裕を見た値 (``_prune_implausible_hand_
-            landmarks`` 参照)。指が実際より大きく開いたブーケ状/花火状に
-            見える現象 (区間ごとの伸びが連鎖して蓄積したもの) への対策。
+            この値以下の visibility の関節は無効 (score=-1)。
+        max_z_diff, min_body_size, max_body_size : float
+            人物判定に使う奥行きのばらつき・関節 bbox 対角線長の範囲 [m]。
+        max_limb_length, max_hand_segment_length, max_hand_reach : float
+            これより長い四肢/指の区間・手首からの距離は遠位側を捨てる [m]。
         max_hand_wrist_offset : float
-            Pose モデルの手首 (RWrist/LWrist) と Hand モデルの手首
-            (RHand0/LHand0) は別々に検出された 2D 点であり、素の 3D 化
-            処理では両者を一致させる制約が無い。速い動きやオクルージョン
-            などでこの 2 点の距離がこれを超えたら、掌側の推定 (RHand0
-            など) が信頼できないとみなしてその手のランドマーク全体を
-            検出できなかった扱いにして捨てる [m] (``_prune_implausible_
-            hand_wrist_offset`` 参照)。これを入れないと、掌の当たり判定
-            (掌ランドマークから平面フィット) と前腕の当たり判定 (RElbow-
-            RWrist の円柱) が大きく離れて見える。
+            Pose の手首と Hand の手首 (Hand0) がこれ以上ずれたら手全体を捨てる [m]。
         depth_patch_size : int
-            関節の深度を取るときに参照する近傍の一辺 [px]。奇数。3 なら
-            3x3 の有効画素の中央値を使う。1 にすると 1 画素だけを見る
-            (従来の挙動)。
-        enable_neck_height_filter : bool
-            True かつ camera_to_base_transform が与えられている場合のみ、
-            首の高さによるフィルタを行う。
+            深度を取る近傍の一辺 [px] (有効画素の中央値)。
         camera_to_base_transform : numpy.ndarray or callable or None
-            カメラ座標系の点を基準座標系へ変換するもの。4x4 の同次変換行列か、
-            (x, y, z) を受け取って (x, y, z) を返す callable を渡す。
-            TF の代わりに呼び出し側から与える。
-        history_duration : float
-            直近の検出位置を人物として信頼し続ける秒数。
-        history_distance : float
-            直近の検出位置とみなす距離 [m]。
+            首の高さフィルタ用。4x4 行列か (x, y, z) -> (x, y, z)。
+        history_duration, history_distance : float
+            直近の検出位置付近 [m] を一定時間 [s] 人物として信頼する。
         """
         self.use_hand = use_hand
         self.min_detection_confidence = min_detection_confidence
@@ -344,32 +283,15 @@ class PeoplePoseEstimator(object):
 
     def estimate_3d(self, bgr_img, depth_img, intrinsics,
                     people_joint_positions=None, output_transform=None):
-        """深度画像とカメラ内部パラメータから 3 次元姿勢を求める.
+        """深度画像 [m] とカメラ内部パラメータから 3 次元姿勢を求める.
 
-        Parameters
-        ----------
-        depth_img : numpy.ndarray
-            メートル単位の深度画像。単位が異なる場合は ``depth_to_meters`` で
-            変換してから渡す。
-        intrinsics : CameraIntrinsics
-            カメラ内部パラメータ。``CameraIntrinsics.from_matrix(K)`` でも作れる。
-        people_joint_positions : list or None
-            ``estimate`` の結果を再利用したい場合に渡す。None なら内部で推定する。
-        output_transform : numpy.ndarray or callable or None
-            None ならカメラ座標系のまま返す。4x4 の同次変換行列か
-            (x, y, z) -> (x, y, z) の callable を渡すと、返す関節点を
-            その座標系 (base_link など) へ変換してから返す。
-            フィルタ自体はカメラ座標系のまま行う (``max_z_diff`` は奥行きの
-            ばらつきを見る指標なので、高さ方向を含む座標系では意味が変わる)。
+        output_transform (4x4 行列か callable) を渡すと返す点をその座標系へ
+        変換する。フィルタはカメラ座標系のまま行う。
 
         Returns
         -------
         (list of dict, list of list of dict)
-            フィルタを通過した人物ごとの 3 次元関節位置 (関節名 ->
-            [x, y, z] の dict, 検出できた関節だけを持つ -- ``estimate_
-            palm_poses.py``/``solve_palm_ik.py`` が読む骨格 JSON の
-            ``skeleton.joint_positions`` と同じ形) のリストと、描画などに
-            使う 2 次元関節位置。
+            人物ごとの {関節名: [x, y, z]} (検出できた関節のみ) と 2D 関節位置。
         """
         if people_joint_positions is None:
             people_joint_positions = self.estimate(bgr_img)
@@ -402,22 +324,14 @@ class PeoplePoseEstimator(object):
 
     def estimate_hands_3d(self, bgr_img, depth_img, intrinsics,
                           output_transform=None, max_num_hands=2):
-        """体 (pose) を使わず、手だけを検出して 3 次元のランドマークを返す.
-
-        Holistic は体を検出してからその結果で手の領域を切り出すため、体が
-        画角に入らない距離 (ロボットが人の手の目の前まで近づいたとき等)
-        では手も返さない。MediaPipe Hands は画像から直接手を検出するので
-        その場合にも使える。
+        """体を使わず MediaPipe Hands で手だけを検出する (体が画角外でも使える).
 
         Returns
         -------
         list of dict
-            検出した手ごとに ``side`` ('R'/'L'、MediaPipe の handedness
-            を人物自身の左右に直したもの。見た目だけで決まるため誤りうる)、
-            ``score`` (handedness の確信度)、``positions`` (``{side}Hand0``..
-            ``{side}Hand20`` -> [x, y, z]、深度が取れた点だけ。
-            ``estimate_3d`` と同じ除去処理を通したもの)、``pixels``
-            (同じ名前 -> 画像上の [u, v]、深度に関係なく全 21 点)。
+            手ごとに ``side`` ('R'/'L'、人物自身の左右)、``score``、
+            ``positions`` ({side}Hand0..20 -> [x, y, z]、深度が取れた点のみ)、
+            ``pixels`` (同じ名前 -> [u, v]、全 21 点)。
         """
         if self.hands is None:
             self.hands = mp.solutions.hands.Hands(
@@ -432,8 +346,7 @@ class PeoplePoseEstimator(object):
         for landmarks, handedness in zip(results.multi_hand_landmarks,
                                          results.multi_handedness):
             classification = handedness.classification[0]
-            # Hands の handedness は左右反転した (自撮り) 画像を前提にして
-            # いるため、反転していないカメラ画像では人物自身の左右と逆になる。
+            # handedness は自撮り (左右反転) 前提なので逆にする。
             side = 'R' if classification.label == 'Left' else 'L'
             joints_2d = self._hand_joint_positions(
                 '{}Hand'.format(side), landmarks, w, h)
@@ -462,11 +375,7 @@ class PeoplePoseEstimator(object):
         return hands
 
     def _sample_depth(self, depth_img, u, v):
-        """(u, v) の近傍から有効な深度の中央値を返す (無ければ None).
-
-        深度画像は関節の輪郭付近で欠測 (0) や外れ値が出やすいので、
-        1 画素ではなく ``depth_patch_size`` 四方の有効画素だけを見る。
-        """
+        """(u, v) 近傍の有効な深度の中央値を返す (無ければ None)."""
         half = self.depth_patch_size // 2
         top = max(0, v - half)
         bottom = min(depth_img.shape[0], v + half + 1)
@@ -500,13 +409,7 @@ class PeoplePoseEstimator(object):
         return positions
 
     def _prune_implausible_limbs(self, positions):
-        """深度エラーで腕/脚が不自然に伸びて見える関節を取り除く.
-
-        ``_LIMB_CHAINS`` の各区間 (近位 -> 遠位) の長さが ``max_limb_length``
-        を超えたら、遠位側の関節を検出できなかった扱いにして落とす (肘が
-        既に落ちていれば、それに連なる手首の区間はそもそも判定できず自然に
-        素通りする)。
-        """
+        """``max_limb_length`` を超える区間の遠位側の関節を落とす."""
         positions = dict(positions)
         for parent_name, child_name in self._LIMB_CHAINS:
             if parent_name not in positions or child_name not in positions:
@@ -522,31 +425,10 @@ class PeoplePoseEstimator(object):
         return positions
 
     def _prune_implausible_hand_landmarks(self, positions):
-        """深度エラーで指のランドマークが一瞬だけ全く違う場所に飛ぶ現象を
-        取り除く (``_prune_implausible_limbs`` の手版).
+        """指の区間長・手首からの距離が閾値を超えたランドマークを落とす.
 
-        指は輪郭が細く、``_sample_depth`` のパッチが背景側の画素を拾い
-        やすい。``hand_sequence`` (``HAND_SEQUENCE``、手首から各指先まで
-        近位 -> 遠位の順に並んだ関節ペア) の各区間の長さが ``max_hand_
-        segment_length`` を超えたら、遠位側のランドマークを検出できなかった
-        扱いにして落とす。あわせて、手首 (``{prefix}0``) から各ランド
-        マークまでの直線距離が ``max_hand_reach`` を超えた場合も同様に
-        落とす。区間ごとの判定だけでは、各区間が ``max_hand_segment_
-        length`` ギリギリで同じ方向に連鎖したときに、手首-指先の累積では
-        大きく伸びてしまう (実際の指の骨は 1 区間あたり数 cm 程度しかない
-        ため、指全体が花束状/花火状に開いて見える現象になる) のを防げない
-        ための追加チェック。
-
-        腕/脚 (``_prune_implausible_limbs``) はチェーンが 2 区間 (肩-肘-
-        手首) しかないため「親が落ちれば子は自然に判定されず残る」で
-        十分だったが、指は 4 関節 (MCP-PIP-DIP-tip) と深く、実際のデータ
-        では指全体が背景の深度をまとめて拾って一塊で浮く現象がよく起きる
-        (根元の MCP だけ手首から離れて浮き、それより先の PIP/PIP 間の
-        距離自体は正常に見えてしまうため、素通り版では先が残ってしまう)。
-        そのため、この関数の中でこの呼び出し中に自分で落とした関節は
-        ``removed`` に記録しておき、その関節を親とする区間は距離を見ずに
-        連鎖的に落とす。use_hand=False のときは RHand*/LHand* が存在しない
-        ため何もしない。
+        指は根元ごと浮くことがあるので、落とした関節の先は距離を見ずに
+        連鎖的に落とす。
         """
         if not self.use_hand:
             return positions
@@ -590,21 +472,7 @@ class PeoplePoseEstimator(object):
         return positions
 
     def _prune_implausible_hand_wrist_offset(self, positions):
-        """Pose モデルの手首と Hand モデルの手首が食い違う手を丸ごと捨てる.
-
-        ``RWrist``/``LWrist`` (body-pose モデル) と ``RHand0``/``LHand0``
-        (hand モデル、クロップした手の領域に対して独立に推定される) は
-        同じ物理的な手首を指すはずだが、別々のモデル出力の 2D 点をそれぞれ
-        独立に深度サンプリングして 3D 化しているため (``_to_joint_
-        positions``)、両者を一致させる制約が存在しない。速い動きや
-        オクルージョンで乖離すると、掌のランドマーク (``RHand0`` 等から
-        平面フィットする掌の当たり判定) が前腕 (``RElbow``-``RWrist`` の
-        円柱) から大きく離れて見える。ここで両手首間の距離が
-        ``max_hand_wrist_offset`` を超えたら、掌側のランドマーク
-        (``RHand*``/``LHand*``) を検出できなかった扱いにして全て捨てる
-        (手首だけずらして残りの指を維持しても、平面フィットの基準点が
-        誤っているままなので意味がない)。
-        """
+        """Pose の手首と Hand0 が ``max_hand_wrist_offset`` 以上ずれた手を丸ごと捨てる."""
         if not self.use_hand:
             return positions
         positions = dict(positions)
@@ -665,12 +533,7 @@ class PeoplePoseEstimator(object):
 
     @staticmethod
     def _compute_body_size(positions):
-        """検出できた関節のバウンディングボックスの対角線長を返す [m].
-
-        特定の骨 (肩幅など) だけを見ると体の向きによって短く見えることが
-        あるため、検出できた全関節の広がりを見る方が「人物ひとり分の
-        大きさ」として頑健。関節が 2 点未満なら判定できないので None。
-        """
+        """関節のバウンディングボックスの対角線長 [m] (2 点未満なら None)."""
         if len(positions) < 2:
             return None
         pts = np.array(list(positions.values()), dtype=np.float64)

@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``extract_skeletons_from_bag.py`` (または ``record_palm_offer_clips.
-py``) が保存した骨格重畳画像を 1 枚ずつブラウザ (viser の GUI パネル) に
-表示し、Right/Left/Null ボタンで「実際にはどちらの手を差し出しているか」
-の人手ラベル (``human_label``) を対応する掌 JSON に書き込む。
-
-``draw_random_human_poses.py`` と同じ ``aero_demo.viewer_nav`` の
-ナビゲーション (Back/Next/判定ボタン、``human_label`` の読み書き) を使う
-が、あちらが SMPL メッシュ + 3D 骨格を viser のシーンに描くのに対し、
-こちらは 2D の骨格重畳 PNG (``extract_skeletons_from_bag.py`` の
-``images/``、または ``record_palm_offer_clips.py`` のスナップショット)
-をそのまま GUI パネルの画像として表示するだけの軽量版 (3D シーンは使わ
-ない)。自動判定 (掌 JSON の ``offered_hand``) もテキストパネルに表示する
-ので、人手判定との一致/不一致がその場で分かる。
+"""骨格重畳画像を viser の GUI パネルに 1 枚ずつ表示し、Right/Left/Null ボタンで
+人手ラベル (``human_label``) を対応する掌 JSON に書き込む。自動判定
+(``offered_hand``) も併せて表示する。
 
 Usage
 -----
-    python3 tools/label_offer_images.py \
-        --image-dir /tmp/offer_dataset/images \
+    python3 tools/label_offer_images.py \\
+        --image-dir /tmp/offer_dataset/images \\
         --palm-dir /tmp/offer_dataset/palms
-
-ラベル付けが終わったら、そのまま ``tune_offer_selector.py`` の
-``--skeleton-dir``/``--palm-dir`` に対応する ``skeletons/``/``palms/`` を
-渡せる。
 """
 
 import argparse
@@ -47,9 +33,7 @@ OFFERED_HAND_LABEL_NAMES = {'R': 'Right', 'L': 'Left', None: 'Null'}
 
 
 def load_image_rgb(path):
-    """PNG を RGB の ndarray として読む (``viser`` の ``add_image`` は
-    RGB を期待する。骨格重畳画像は cv2 (BGR) で保存されているので変換
-    する)。"""
+    """PNG を RGB の ndarray として読む。"""
     import cv2
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)
     if bgr is None:
@@ -61,15 +45,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--image-dir', type=str, required=True,
-        help='骨格重畳 PNG のディレクトリ (extract_skeletons_from_bag.py '
-            'の images/ 相当)。')
+        help='骨格重畳 PNG のディレクトリ。')
     parser.add_argument(
         '--palm-dir', type=str, required=True,
-        help='対応する掌 JSON のディレクトリ (画像と同じファイル名 (拡張子'
-            '違い) で対応させる、human_label をここに書き込む)。')
+        help='掌 JSON のディレクトリ (画像と同じ basename、human_label を書き込む)。')
     parser.add_argument(
         '--pattern', type=str, default='*.png',
-        help='画像ファイルの glob パターン (既定 *.png)。')
+        help='画像ファイルの glob パターン。')
     parser.add_argument('--client-wait-timeout', type=float, default=30.0)
     parser.add_argument('--no-open-browser', action='store_true')
     args = parser.parse_args()

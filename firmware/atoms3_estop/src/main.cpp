@@ -1,19 +1,10 @@
 // AtomS3 非常停止ボタン ファームウェア (PlatformIO)
 //
-// ボタン (G41, M5Unified では M5.BtnA) を押すたびに STOP <-> RESUME の
-// 状態をトグルし、対応するコマンド (改行区切りのテキスト) を PC 上の
-// estop_node.py (scripts/ros/estop_node.py) へ UDP で送る。
-// あわせて画面全体の色を状態に応じて変える
-// (STOP = 赤、RESUME = 緑、WiFi接続待ち = 黄)。
-//
-// UDP は到達保証がないので、状態が変わるたびに同じパケットを複数回連続
-// 送信する (estop_node.py 側は 1 回受信すれば cancel を送るが、パケット
-// 自体が 1 つも届かないと意味が無いため)。
-//
-// ビルド/書き込み: platformio.ini 参照 (`pio run -t upload`)。
-// WiFi の SSID/パスワードと PC 側 (estop_node.py) の IP/ポートは
-// include/wifi_secrets.h (git 管理外、wifi_secrets.h.example を参照) で
-// 設定する。
+// ボタンを押すたびに STOP <-> RESUME をトグルし、estop_node.py へ UDP で送る
+// (画面: STOP=赤、RESUME=緑、WiFi 接続待ち=黄)。UDP は到達保証が無いので
+// 同じコマンドを複数回送る。
+// 書き込み: `pio run -t upload`。WiFi と送信先は include/wifi_secrets.h
+// (git 管理外、wifi_secrets.h.example 参照) で設定する。
 
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -22,14 +13,12 @@
 
 #include "wifi_secrets.h"
 
-// estop_node.py 側の既定ポート (scripts/ros/estop_node.py の
-// --listen-port 既定値) と合わせる。
+// estop_node.py の --listen-port 既定値と合わせる。
 #ifndef ESTOP_PORT
 #define ESTOP_PORT 5555
 #endif
 
-// UDP パケットの取りこぼし対策で、状態が変わるたびに同じコマンドを
-// この回数だけ連続送信する。
+// 取りこぼし対策の連続送信回数。
 static const int SEND_REPEAT_COUNT = 5;
 static const int SEND_REPEAT_INTERVAL_MS = 30;
 
@@ -37,10 +26,8 @@ static const uint32_t COLOR_STOPPED = 0xFF0000;      // 赤
 static const uint32_t COLOR_RUNNING = 0x00FF00;      // 緑
 static const uint32_t COLOR_CONNECTING = 0xFFFF00;   // 黄 (WiFi接続待ち)
 
-// ボタンの機械的なチャタリング対策。M5Unified 内部の debounce だけでは
-// 実機で wasPressed() が 1 回の押下で複数回発火することがあり (STOP から
-// RESUME に戻す際、奇数/偶数回トグルされて画面がバタつく形で顕在化した)、
-// ここで最後にトグルしてからこの時間内の再トグルは無視する。
+// チャタリング対策: 前回のトグルからこの時間内の再トグルは無視する
+// (M5Unified の debounce だけでは 1 回の押下で複数回発火することがある)。
 static const uint32_t DEBOUNCE_MS = 300;
 
 void fillScreen(uint32_t color);
@@ -64,8 +51,7 @@ void connectWiFi() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(200);
     M5.update();
-    // 接続待ち中でもボタン長押しでリセットできるように、ここでは
-    // ボタン監視はしない (単純化のため)。
+    // 接続待ち中はボタンを監視しない。
   }
   Serial.printf("[atoms3_estop] WiFi connected. IP=%s\n",
                 WiFi.localIP().toString().c_str());
@@ -112,7 +98,7 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
-    // 再接続後は現在の状態を再送しておく (再接続中に取りこぼした場合の保険)。
+    // 再接続後は現在の状態を再送する。
     applyState();
   }
 

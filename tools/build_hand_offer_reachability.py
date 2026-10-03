@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``tools/handshake_reachability_map.py`` の結果 (JSON Lines) から、IK に
-失敗したときの手の出し方の助言 (``aero_demo.hand_offer_advice``) が使う
-表 ``config/hand_offer_reachability.json`` を作る.
+"""``tools/handshake_reachability_map.py`` の結果 (JSON Lines) から、手の出し方の
+助言 (``aero_demo.hand_offer_advice``) が使う ``config/hand_offer_reachability.json`` を作る.
 
-格子点ごとに ``[前方, 外側, 高さ, yaw, pitch, roll, ok]`` を手 (R/L) 別に
-並べる。``ok`` は IK が後処理 (押し込み・視線) まで解け (``status ==
-'ok'``)、かつ人がロボットから ``--offer-distance`` [m] に立ったときに
-差し出しと判定される (助言どおりに出し直したときに、また差し出しと判定
-される必要がある) こと。人の腕が届かない格子点は含めない。
+格子点ごとに ``[前方, 外側, 高さ, yaw, pitch, roll, ok]`` を手 (R/L) 別に並べる。
+``ok`` は IK が後処理まで解け、かつ ``--offer-distance`` [m] で差し出しと判定されること。
+人の腕が届かない格子点は含めない。
 
 Usage
 -----
@@ -33,8 +30,7 @@ def main():
     parser.add_argument('inputs', nargs='+')
     parser.add_argument('--output', default=_DEFAULT_OUTPUT)
     parser.add_argument('--offer-distance', default='1.50',
-                        help='差し出し判定を見る距離 (map の --person-'
-                             'distances のどれか、既定 1.50)。')
+                        help='差し出し判定を見る距離 (map の --person-distances のどれか)。')
     args = parser.parse_args()
 
     points = {'R': {}, 'L': {}}

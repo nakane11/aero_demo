@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""SMPL (Skinned Multi-Person Linear model) を chumpy 無しで動かす.
+"""SMPL 人体モデルを chumpy 無しで読み込み・順運動学する.
 
-``generate_random_human_poses.py``/``draw_random_human_poses.py`` が
-SMPL の人体メッシュを組み立てるのに使う。skrobot / rospy には依存しない
-(``palm_plane.py`` と同じ方針)。
+公式 ``.pkl`` は ``chumpy.ch.Ch`` を含むが、chumpy は新しい numpy と非互換
+なので unpickle 用の shim で読む。モデルファイルは同梱しないので
+呼び出し側がパスを渡す。
 
-公式配布の SMPL v1.0.0 ``.pkl`` は ``shapedirs`` フィールドが
-``chumpy.ch.Ch`` として pickle されているため、素の ``pickle.load`` は
-``ModuleNotFoundError: chumpy`` で失敗する。chumpy は numpy と非互換
-(numpy>=1.24 で削除された別名に依存) なのでインストールせず、代わりに
-``chumpy.ch.Ch`` の pickle プロトコルを模した最小限の shim を使う。
-
-SMPL のモデルファイル自体はライセンス上リポジトリに同梱できないので、
-呼び出し側がローカルパスを渡す (例:
-``~/SMPL_python_v.1.0.0/smpl/models/basicmodel_m_lbs_10_207_0_v1.0.0.pkl``)。
-
-軸規約 (実測して決定): SMPL のローカル座標系は
-axis0=左(+)/右(-), axis1=上(+)/下(-), axis2=前(+)/後(-) の右手系。
-ロボット座標系 (x=前, y=左, z=上) との対応は
-``robot_x=smpl_z, robot_y=smpl_x, robot_z=smpl_y`` (``PERM`` 参照)。
+軸規約: SMPL は axis0=左, axis1=上, axis2=前。ロボット座標系 (x=前, y=左,
+z=上) へは ``PERM`` で並べ替える。
 """
 
 import os
@@ -47,20 +35,14 @@ class SmplModel:
 
 
 class _ChumpyChShim(object):
-    """``chumpy.ch.Ch`` の unpickle だけを肩代わりする最小限のダミー.
-
-    本物の ``Ch`` は演算グラフ (自動微分) のノードだが、ここで欲しいのは
-    leaf に入っている定数配列だけなので、``__setstate__`` で状態を
-    ``self.__dict__`` にそのまま溜め込む以上のことはしない。
-    """
+    """``chumpy.ch.Ch`` の unpickle だけを肩代わりするダミー."""
 
     def __setstate__(self, state):
         self.__dict__.update(state)
 
 
 def _unpickle_with_chumpy_shim(path):
-    """``chumpy`` をインストールせずに、pickle 内の ``chumpy.ch.Ch``
-    参照だけ ``_ChumpyChShim`` に差し替えて読む."""
+    """``chumpy.ch.Ch`` を ``_ChumpyChShim`` に差し替えて pickle を読む."""
     saved = {name: sys.modules.get(name) for name in ('chumpy', 'chumpy.ch')}
     chumpy_pkg = types.ModuleType('chumpy')
     chumpy_ch = types.ModuleType('chumpy.ch')
@@ -89,10 +71,7 @@ def _as_array(value):
 
 
 def load_smpl_model(pkl_path):
-    """SMPL v1.0.0 の ``.pkl`` を読んで ``SmplModel`` を返す.
-
-    ファイルが無い/読めないときは例外を送出する。
-    """
+    """SMPL v1.0.0 の ``.pkl`` を読んで ``SmplModel`` を返す."""
     path = os.path.expanduser(pkl_path)
     dd = _unpickle_with_chumpy_shim(path)
 
@@ -135,23 +114,15 @@ def smpl_forward(model, pose, betas, trans, bone_scale=None):
 
     Parameters
     ----------
-    model : SmplModel
     pose : (24, 3) array_like
         各関節の axis-angle (親関節相対)。
-    betas : (10,) array_like
-    trans : (3,) array_like
     bone_scale : dict, optional
-        関節 index -> その関節と親関節を結ぶボーンの伸縮率。``retarget_
-        and_pose`` が実測の関節間距離に SMPL テンプレートのボーン長を
-        合わせるために使う (既定では全ボーン 1.0 = テンプレートのまま)。
-        skinning weight は変えないため見た目の皮膚変形は近似だが、
-        四肢の先端 (肘・手首など) の位置を実測に合わせられる。
+        関節 index -> 親とのボーンの伸縮率。
 
     Returns
     -------
     vertices : (6890, 3) ndarray
     joints : (24, 3) ndarray
-        姿勢を反映した後の関節位置。
     """
     pose = np.asarray(pose, dtype=np.float64).reshape(24, 3)
     betas = np.asarray(betas, dtype=np.float64).reshape(-1)
@@ -193,20 +164,15 @@ def smpl_forward(model, pose, betas, trans, bone_scale=None):
 
 
 # ----------------------------------------------------------------------
-# retargeting: Person3D の関節位置 -> SMPL の pose
+# 座標変換・関節定数・回転ユーティリティ
 # ----------------------------------------------------------------------
 
-# ロボット座標系 (x=前, y=左, z=上) <- SMPL ローカル座標系
-# (axis0=左, axis1=上, axis2=前) への変換 (実測して決定, モジュール
-# docstring 参照)。``generate_random_human_poses.py`` の SMPL 姿勢生成
-# クラスも同じ変換を使うので公開名にしてある。
+# v_robot = PERM @ v_smpl
 PERM = np.array([[0.0, 0.0, 1.0],
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0]])
 
-# SMPL 標準の 24 関節順序 (kintree_table の親子関係と一致することを
-# 確認済み)。``generate_random_human_poses.py`` からも参照するので公開名
-# にしてある。
+# SMPL 標準の 24 関節 index
 PELVIS = 0
 L_HIP, R_HIP = 1, 2
 L_KNEE, R_KNEE = 4, 5
@@ -218,9 +184,7 @@ L_ELBOW, R_ELBOW = 18, 19
 L_WRIST, R_WRIST = 20, 21
 L_HAND, R_HAND = 22, 23
 
-# SMPL の T-pose (pose=0, 腕を横に伸ばした姿勢) は掌が下 (ロボット座標系
-# の -Z) を向く。``generate_random_human_poses.py`` が手首の捻りを推定
-# するときの「0 捻り」の基準として使う。
+# T-pose (pose=0) の掌の向き (ロボット座標系)
 _REST_PALM_NORMAL = np.array([0.0, 0.0, -1.0])
 
 
@@ -263,38 +227,15 @@ def mat_to_axis_angle(R):
 
 
 def to_smpl_rotation(R_robot):
-    """ロボット座標系の回転行列を SMPL ローカル座標系の回転行列に直す.
-
-    ``PERM`` は座標成分の並べ替えでしかない (関節ごとの回転ではない)
-    ので、ロボット座標系の成分で計算した回転 ``R_robot`` をそのまま
-    ``smpl_forward`` (SMPL 自身の座標系で ``pose`` を解釈する) に渡すと
-    座標系がずれる。``v_robot = PERM @ v_smpl`` なので、共役
-    ``R_smpl = PERM.T @ R_robot @ PERM`` を取って渡す必要がある。
-    """
+    """ロボット座標系の回転行列を SMPL 座標系に直す (PERM.T @ R @ PERM)."""
     return PERM.T.dot(R_robot).dot(PERM)
 
 
 def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0,
                   bone_scale=None):
-    """SMPL の ``pose``/``betas`` から、ワールド (ロボット座標系) に配置
-    した頂点・関節位置を返す.
+    """pelvis を root_pos/root_rot (ロボット座標系) に置いた頂点・関節位置を返す.
 
-    Parameters
-    ----------
-    model : SmplModel
-    pose : (24, 3) array_like
-    betas : (10,) array_like
-    root_pos : (3,) array_like
-        pelvis をロボット座標系のどこに置くか。
-    root_rot : (3, 3) array_like, optional
-        pelvis の向き (ロボット座標系)。``None`` (既定) なら単位行列
-        (体は常に +x を向く, ``generate_random_human_poses.py`` と同じ
-        既定の置き方)。
-    scale : float, optional
-        SMPL の頂点・関節をこの倍率で拡大縮小する。既定 1.0 (SMPL 自身の
-        betas が表す実寸のまま使う)。
-    bone_scale : dict, optional
-        ``smpl_forward`` にそのまま渡す、関節ごとのボーン伸縮率。
+    root_rot が None なら体は +x を向く。
 
     Returns
     -------

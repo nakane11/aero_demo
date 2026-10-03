@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""people pose 推定結果を保持する ROS 非依存のデータ型.
-
-  Person3D / Bone / CameraIntrinsics … 1 人分の姿勢とカメラ内部パラメータ
-  EstimationResult                   … 1 フレーム分の推定結果
-  LIMB_SEQUENCE / INDEX2LIMBNAME /
-  INDEX2HANDNAME / HAND_SEQUENCE /
-  HAND_LOCAL_LANDMARKS                … MediaPipe の関節レイアウト定数
-"""
+"""姿勢推定結果のデータ型と MediaPipe の関節レイアウト定数."""
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-# MediaPipe の身体関節 (limb_sequence) の接続関係。両端の index は
-# INDEX2LIMBNAME を参照。
+# 身体関節の接続 (INDEX2LIMBNAME の 1 始まり index)
 LIMB_SEQUENCE = [[2, 1], [1, 16], [1, 15], [6, 18], [3, 17],
                  [2, 3], [2, 6], [3, 4], [4, 5], [6, 7],
                  [7, 8], [2, 9], [9, 10], [10, 11], [2, 12],
@@ -29,17 +21,15 @@ INDEX2LIMBNAME = ["Nose", "Neck", "RShoulder", "RElbow", "RWrist",
 INDEX2HANDNAME = ["RHand{}".format(i) for i in range(21)] + \
                  ["LHand{}".format(i) for i in range(21)]
 
-# MediaPipe の手の関節 (0 wrist, 1-4 thumb, 5-8 index, 9-12 middle,
-# 13-16 ring, 17-20 pinky) の接続関係。
+# 手の関節の接続 (0 wrist, 1-4 thumb, 5-8 index, 9-12 middle, 13-16 ring,
+# 17-20 pinky)。近位 -> 遠位の順。
 HAND_SEQUENCE = [[0, 1],   [1, 2],   [2, 3],   [3, 4],
                  [0, 5],   [5, 6],   [6, 7],   [7, 8],
                  [0, 9],   [9, 10],  [10, 11], [11, 12],
                  [0, 13],  [13, 14], [14, 15], [15, 16],
                  [0, 17],  [17, 18], [18, 19], [19, 20]]
 
-# 手のランドマークの局所座標 (手の長さを単位とする), MediaPipe の並び
-# (0 wrist, 1-4 thumb, 5-8 index, 9-12 middle, 13-16 ring, 17-20 pinky)。
-# 軸: u=手首->指先, v=親指側, n=掌の向き。
+# 手のランドマークの局所座標 (手の長さ単位)。u=手首->指先, v=親指側, n=掌の向き。
 HAND_LOCAL_LANDMARKS = np.array([
     [0.00,  0.00, 0.00],   # 0  wrist
     [0.11,  0.13, 0.02],   # 1  thumb CMC
@@ -110,10 +100,7 @@ class EstimationResult:
     image: np.ndarray = None                    # BGR 画像
     joint_positions: list = field(default_factory=list)  # 2D 関節 (dict のリスト)
     people: list = field(default_factory=list)           # Person3D
-    # カメラの内部パラメータ・画像サイズ・frame_id 相対のカメラ姿勢。
-    # CameraInfo + TF から埋める。TF が引けず people がカメラ座標系の
-    # まま返ってきた場合や、まだ CameraInfo を受け取っていない場合は
-    # camera_pose / camera_intrinsics が None のままのことがある。
+    # CameraInfo/TF が無ければ None のことがある。
     camera_intrinsics: object = None             # CameraIntrinsics or None
     camera_width: int = 0
     camera_height: int = 0

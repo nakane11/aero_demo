@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``draw_random_human_poses.py``/``view_handshake_poses.py`` など、viser
-ビューアで人物 (姿勢) を 1 つずつ切り替えて表示するスクリプトが共通で使う
-GUI ナビゲーション (Back/Next ボタンと、用途ごとに異なる判定ボタン) と、
-判定結果を JSON に読み書きする処理をまとめたもの。判定ボタンは
-``ManualNav`` の ``buttons`` で差し替えられる (``view_handshake_poses.py``
-の Good/Bad (``True``/``False``), ``draw_random_human_poses.py`` の
-Right/Left/Null (``'R'``/``'L'``/``None``, ``estimate_palm_poses.
-PalmPoseEstimator.estimate`` の ``offered_hand`` と同じ値) など)。
+"""viser ビューアで人物を 1 つずつ切り替えて表示するための GUI ナビゲーション
+(Back/Next と判定ボタン) と、判定結果の JSON 読み書き.
 """
 
 import json
@@ -20,26 +14,16 @@ import time
 import numpy as np
 
 
-# ワールド座標系 (x=前, y=左, z=上) の -x 方向を向くカメラの姿勢
-# (骨格生成側で人物は常に原点・+x 方向を向いて配置されるので、これで
-# 人物を正面から見ることになる)。わずかに見下ろすよう、少し高い位置から
-# 下向きに傾ける。
+# 原点で +x を向く人物を正面からやや見下ろすカメラ
 CAMERA_DISTANCE = 2.5
 CAMERA_HEIGHT = 1.6
 CAMERA_TILT_DOWN_DEG = 15.0
 
 
-# ``ManualNav.wait()``/``wait_for_advance`` が Back/Next (判定なし) を
-# 表したいときに使うセンチネル。判定ボタンの値には ``True``/``False``
-# だけでなく ``None`` (Null 判定, offered_hand の「差し出していない」に
-# 対応) もあり得るので、「判定ボタンが押されていない」を ``None`` では
-# 表せない。
+# 判定ボタンが押されていない (Back/Next)。判定値に None があり得るため別に用意。
 NOT_PRESSED = object()
 
-# ``load_label`` が「JSON にまだ判定結果が無い」ことを表すために使える
-# センチネル (``default`` に渡す)。判定値そのものに ``None`` (Null 判定)
-# があり得る場合、既定の ``default=None`` では「未判定」と「Null 判定
-# 済み」を区別できないため。
+# ``load_label`` の default 用: 未判定 (None 判定と区別するため)。
 UNLABELED = object()
 
 
@@ -61,13 +45,7 @@ def wait_for_client(viewer, timeout):
 def front_view_camera_transform(distance=CAMERA_DISTANCE,
                                 height=CAMERA_HEIGHT,
                                 tilt_down_deg=CAMERA_TILT_DOWN_DEG):
-    """人物を原点から +x 方向 (正面) に、わずかに見下ろして見るカメラの
-    世界姿勢 (4x4) を作る.
-
-    ``skrobot.viewers.ViserViewer.set_camera`` の
-    ``coords_or_transform`` にそのまま渡せる形 (列が右/上/後ろ、平行移動が
-    カメラ位置) で返す。
-    """
+    """人物を正面からやや見下ろすカメラの世界姿勢 (4x4, 列が右/上/後ろ)."""
     tilt = math.radians(tilt_down_deg)
     forward = np.array([-math.cos(tilt), 0.0, -math.sin(tilt)])
     up_world = np.array([0.0, 0.0, 1.0])
@@ -83,39 +61,19 @@ def front_view_camera_transform(distance=CAMERA_DISTANCE,
 
 
 def set_front_view(viewer, **kwargs):
-    """``viewer`` のカメラを人物の正面 (-x 方向を見る向き) に合わせる.
-
-    ``kwargs`` は :func:`front_view_camera_transform` にそのまま渡す
-    (``distance``/``height``/``tilt_down_deg``)。
-    """
+    """``viewer`` のカメラを人物の正面に合わせる."""
     viewer.set_camera(
         coords_or_transform=front_view_camera_transform(**kwargs))
 
 
 class ManualNav(object):
-    """viser の GUI に Back/Next ボタンと判定ボタンを追加し、押された結果を
-    ``wait()`` で受け取れるようにする。
+    """viser の GUI に Back/Next と判定ボタンを追加し、``wait()`` で結果を返す.
 
-    Back/Next はどちらも同じ ``threading.Event`` を立てて向きだけを伝える
-    (直近に押されたボタンの向きだけを覚える。連打しても最後の 1 回分しか
-    進まない/戻らない)。判定ボタン (``buttons``) は表示中の姿勢についての
-    人手 judgment を表し、押すと (Next と同様に) 次の人物へ進みつつ、判定
-    結果 (対応する値) も一緒に伝える。
+    判定ボタンを押すと Next と同様に進み、その値も返す。
     """
 
     def __init__(self, viewer, buttons=None):
-        """
-        Parameters
-        ----------
-        buttons : list of (str, object) or None
-            判定ボタンの ``(表示テキスト, 値)`` のリスト。既定
-            (``None``) は ``[('Good', True), ('Bad', False)]``
-            (``view_handshake_poses.py`` の IK 判定)。
-            ``draw_random_human_poses.py`` は差し出している手の人手判定
-            用に ``[('Right', 'R'), ('Left', 'L'), ('Null', None)]``
-            (``estimate_palm_poses.py`` の ``offered_hand`` と同じ値)
-            を渡す。
-        """
+        """``buttons``: 判定ボタンの (表示テキスト, 値) のリスト (既定 Good/Bad)."""
         if buttons is None:
             buttons = [('Good', True), ('Bad', False)]
         self._event = threading.Event()
@@ -146,12 +104,9 @@ class ManualNav(object):
                 self._event.set()
 
     def wait(self, viewer):
-        """Back/Next/判定ボタンのいずれかが押されるまで待つ.
+        """ボタンが押されるまで待ち ``(direction (-1/+1), label)`` を返す.
 
-        ``(direction, label)`` を返す。``direction`` は ``-1``/``+1``、
-        ``label`` は判定ボタンが押されたときだけそのボタンの値 (Back/Next
-        のときは :data:`NOT_PRESSED`)。ブラウザクライアントが切断されたら
-        ``(0, NOT_PRESSED)`` を返す。
+        切断されたら ``(0, NOT_PRESSED)``。
         """
         self._event.clear()
         while not self._event.is_set():
@@ -162,14 +117,9 @@ class ManualNav(object):
 
 
 def wait_for_advance(viewer, nav, pause):
-    """次に表示する人物への向きと、判定ボタンの結果を決める.
+    """``(direction, label)`` を返す. nav が None なら pause 秒待って自動送り.
 
-    ``nav`` (``ManualNav``) が渡されていれば、Back/Next/判定ボタンが押さ
-    れるまで待って ``(direction, label)`` を返す (``label`` は判定ボタンが
-    押されたときだけその値、Back/Next のときは :data:`NOT_PRESSED`)。
-    渡されていなければ ``pause`` 秒だけ待って常に ``(1, NOT_PRESSED)`` を
-    返す (自動送り)。ブラウザクライアントが切断されていれば
-    ``(None, NOT_PRESSED)`` を返す。
+    切断されていれば ``(None, NOT_PRESSED)``。
     """
     if nav is None:
         time.sleep(pause)
@@ -183,12 +133,7 @@ def wait_for_advance(viewer, nav, pause):
 
 
 def save_label(json_path, label, key='human_label'):
-    """判定ボタンで判定した結果を JSON に書き込む.
-
-    既存の JSON があればその内容を保ったまま ``key`` (既定
-    ``human_label``) を追記する。JSON が無ければ、判定結果だけを持つ
-    JSON を新規に作る。
-    """
+    """判定結果を JSON の ``key`` に書き込む (既存の内容は保つ)."""
     if os.path.exists(json_path):
         with open(json_path) as f:
             data = json.load(f)
@@ -200,12 +145,9 @@ def save_label(json_path, label, key='human_label'):
 
 
 def load_label(json_path, key='human_label', default=None):
-    """``save_label`` が書き込んだ判定結果を読む.
+    """``save_label`` の結果を読む (無ければ ``default``).
 
-    JSON が無い、もしくは ``key`` が無ければ (まだ判定ボタンが押されて
-    いなければ) ``default`` を返す。判定値そのものに ``None`` (Null 判定)
-    があり得る呼び出し元は、「未判定」と区別できるよう
-    ``default=UNLABELED`` を渡すこと。
+    判定値に None があり得るなら ``default=UNLABELED`` を渡すこと。
     """
     if not os.path.exists(json_path):
         return default
@@ -215,15 +157,7 @@ def load_label(json_path, key='human_label', default=None):
 
 
 def format_label_text(label, title='ラベル', value_names=None):
-    """``load_label``/判定ボタンの結果を GUI 表示用の文字列にする.
-
-    Parameters
-    ----------
-    value_names : dict or None
-        判定値 -> 表示テキスト。既定 (``None``) は
-        ``{True: 'Good', False: 'Bad'}``。``label`` がここに無ければ
-        (``NOT_PRESSED``/``UNLABELED`` を含め) 「未判定」と表示する。
-    """
+    """判定結果を GUI 表示用の文字列にする (value_names に無ければ未判定)."""
     if value_names is None:
         value_names = {True: 'Good', False: 'Bad'}
     if label in value_names:

@@ -1,38 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``view_handshake_poses.py``/``view_handshake_motion.py``/``scripts/ros/
-run_camera_pipeline_test.py`` の 3 つの viser ビューアが、それぞれ独立に
-(ほぼ同一のコードで) 持っていた次の処理をまとめる共通モジュール。
+"""握手の viser ビューア (``view_handshake_poses.py``/``view_handshake_
+motion.py``/``scripts/ros/run_camera_pipeline_test.py``) の共通処理。
 
-* ``solve_palm_ik.py``/``plan_handshake_motion.py`` が干渉回避に使ったのと
-  同じロボット自身の近似ジオメトリ (box/cylinder/sphere) を、表示用の
-  ロボットモデルに重ねて半透明で表示する overlay の構築・追従
-  (``build_robot_collision_overlay``/``sync_robot_collision_overlay``)
-* ``solve_palm_ik.collision_pairs_min_distance`` と同じ厳密な形状・許容
-  誤差で、実際に貫通しているリンクの組み合わせをすべて列挙する事後検証
-  (``colliding_link_pairs``) と、その結果をテキストパネル用の文字列にする
-  (``collision_pairs_text``)
-* ``solve_palm_ik.py``/``plan_handshake_motion.py`` が出力した関節角・
-  台車位置姿勢を表示用ロボットに反映する (``apply_robot_pose``/
-  ``apply_waypoint_pose``)
-* 経路の最後に、後処理判定 (``post_process`` = 掌へのわずかな押し込み) まで
-  の補間フレームを表示専用で追加する (``build_display_waypoints``)
-* viser の ``SceneNodeHandle`` の表示/非表示を切り替える
-  (``set_link_visible``)
-
-3 つのビューアはいずれも表示専用の派生 (IK/軌道計画そのものではない) で、
-差分は「SMPL メッシュを描くかどうか」「waypoint スライダーがあるかどうか」
-「合成骨格か実カメラの骨格か」といった上位の構成だけなので、上記の下請け
-処理はこのモジュールに一本化する。
-
-``colliding_link_pairs`` は ``solve_palm_ik.py`` (``scripts/`` 直下) の
-``human_obstacle_names`` に依存するため、``scripts/`` を ``sys.path`` に
-含めた状態で import すること
-(``view_handshake_poses.py``/``view_handshake_motion.py`` は自分自身が
-``scripts/`` にあるため素の import で足りる。``scripts/ros/`` 以下からは
-``run_camera_pipeline_test.py`` が既に行っている ``scripts/`` の sys.path
-追加で足りる)。
+干渉ジオメトリの overlay 表示、貫通しているリンクの組の列挙、IK 結果・
+waypoint の反映、押し込み区間の表示用 waypoint の生成など。
+``solve_palm_ik`` に依存するので ``scripts/`` を ``sys.path`` に含めて
+import すること。
 """
 
 import os
@@ -54,83 +29,40 @@ from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 
-# ロボット自身の干渉回避用近似ジオメトリ (box/cylinder/sphere のプリミティブ
-# 形状。build_robot_collision_overlay 参照) を、通常のロボットモデル
-# (不透明) に重ねて表示する色 (RGBA, 0-255)。
+# 干渉ジオメトリの表示色 (RGBA, 0-255): ロボットは橙、人体は青。
 ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
-
-# solve_palm_ik.human_body_obstacles が作る人体側の干渉回避用近似ジオメトリ
-# (Cylinder) を表示する色 (RGBA, 0-255)。ロボット側の
-# ROBOT_COLLISION_LINK_COLOR (橙系) と見分けられるよう青系にしてある。
 HUMAN_COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
 
-# 経路の最後に表示専用で追加する、後処理判定 (post_process = 掌への
-# 押し込み) までの補間フレーム数 (build_display_waypoints 参照)。
-# plan_handshake_motion.py はこの区間を経路として計画・検証しない (接触
-# そのものが目的の動きで、経路上の干渉検証にはなじまないため)。
+# hover から押し込み姿勢までの補間フレーム数。
 PRESS_IN_DISPLAY_WAYPOINTS = 5
 
 
 def set_link_visible(viewer, link, visible):
-    """``viewer.add`` 済みの ``link`` の表示/非表示を切り替える.
-
-    人物切り替え/RESET によるリンクの削除・再作成と、チェックボックスの
-    ``on_update`` (viser の GUI コールバックは別スレッドで実行される) が
-    競合すると、既に削除されて ``viewer._linkid_to_handle`` に存在しない
-    リンクを渡されることがある。その場合は何もしない (どうせ表示すべき
-    対象ではない)。
-    """
+    """``link`` の表示/非表示を切り替える (GUI スレッドとの競合で既に
+    削除されたリンクなら何もしない)。"""
     handle = viewer._linkid_to_handle.get(str(id(link)))
     if handle is not None:
         handle.visible = visible
 
 
 def remove_joint_angle_gui(viewer):
-    """``ViserViewer.add(RobotModel)`` が自動で追加する "Joint Angles"
-    フォルダ (関節ごとのスライダー) と "Export Joint Angles" フォルダを
-    GUI から取り除く.
+    """``ViserViewer`` の関節スライダー GUI を取り除く。
 
-    これらのスライダーは触ると表示用ロボットと ``build_robot_collision_
-    overlay`` の overlay の**一方だけ**を動かしてしまい、両者の姿勢が
-    食い違ったまま残る (次に waypoint/IK 結果を反映するまで戻らない)。
-    しかも ``skrobot`` の ``ViserViewer`` はスライダーを関節名だけで
-    管理している (``_joint_sliders[joint.name]``) ため、同じ関節名を持つ
-    ロボットを 2 体 ``add`` すると後から add した方のスライダーで上書き
-    され、表示用ロボット側のスライダーを動かすと overlay 側のスライダー
-    値が適用されるという取り違えも起きる。
-
-    このモジュールを使う 3 つのビューアはいずれもロボットの姿勢を
-    waypoint や IK 結果からしか動かさない表示専用の派生なので、関節
-    スライダーは不要。``viewer.add`` で全てのロボットを追加し終えた後に
-    呼ぶこと (``add`` のたびにスライダーが作り直されるため)。
+    スライダーは関節名で管理され、ロボットと overlay の片方だけを動かして
+    しまうため。全てのロボットを ``viewer.add`` した後に呼ぶこと。
     """
-    # フォルダを remove するとその中身 (スライダー・グループごとの
-    # サブフォルダ) も再帰的に消える。_joint_sliders は上書きの結果
-    # 2 体目のスライダーしか持たないので、個別に remove するのではなく
-    # 親フォルダごと消す必要がある。
+    # 親フォルダごと消す (_joint_sliders は 2 体目のものしか持たない)。
     for attr in ('_joint_angles_folder', '_export_folder'):
         folder = getattr(viewer, attr, None)
         if folder is not None:
             folder.remove()
             setattr(viewer, attr, None)
-    # 消したハンドルを skrobot 側が後から参照しないようにしておく
-    # (Export の "Generate Code" は _joint_sliders に無い関節を読み飛ばす)。
     viewer._joint_sliders.clear()
 
 
 def remove_obstacles_gui(viewer):
-    """``ViserViewer`` が自動で追加する "Obstacles" フォルダ (Add/Delete
-    Obstacle・Show Collisions 等、任意の障害物を画面上で追加・編集する
-    機能) を GUI から取り除く.
-
-    この障害物管理 GUI は skrobot 側の汎用機能で、人体を障害物にした干渉
-    回避を検証する 3 つのビューア (``view_handshake_poses.py``/``view_
-    handshake_motion.py``/``scripts/ros/run_camera_pipeline_test.py``) では
-    使わない (人体の障害物は ``solve_palm_ik.human_body_obstacles`` が骨格
-    から自動生成するもので、画面から手動で追加するものではない)。
-    ``remove_joint_angle_gui`` と同様、``viewer.add`` で全てのロボットを
-    追加し終えた後に呼ぶこと。
-    """
+    """``ViserViewer`` の "Obstacles" GUI を取り除く (全てのロボットを
+    ``viewer.add`` した後に呼ぶこと)。"""
     folder = getattr(viewer, '_obstacles_folder', None)
     if folder is not None:
         folder.remove()
@@ -140,30 +72,9 @@ def remove_obstacles_gui(viewer):
 
 def build_robot_collision_overlay(robot, primitive_type=None,
                                   force_convert=False):
-    """``solve_palm_ik.py``/``plan_handshake_motion.py`` が干渉回避に
-    使ったのと同じロボット自身の近似ジオメトリを、``tools/view_aero_
-    collision_model.py`` と全く同じ方法でもう一体の ``skrobot.model.
-    RobotModel`` として読み込む。
-
-    ``build_collision_model_urdf`` (``aero_demo.collision_model``、
-    ``solve_palm_ik.apply_collision_model``/``tools/view_aero_collision_
-    model.py`` と共通) が ``robot.urdf_path``
-    から生成した box/cylinder/sphere のプリミティブ近似 URDF をキャッシュ
-    する (既に生成済みならそれを再利用し、``force_convert`` を指定した
-    ときだけ作り直す) ので、``skr convert-urdf-to-primitives`` で見えるの
-    と同じ形状がそのまま overlay になる。``robot`` 自体は変更しない。
-
-    読み込んだ overlay は ``robot`` と全く同じ URDF (ジオメトリ以外) から
-    作られるため、リンク・関節の構成は ``robot`` と同一になる
-    (``use_hand`` の値によらず ``robot.urdf_path`` を使うので、指ありなし
-    どちらのモデルでも動く)。呼び出し側は毎フレーム
-    ``sync_robot_collision_overlay`` で ``robot`` の現在の姿勢に追従させる。
-
-    Returns
-    -------
-    skrobot.model.RobotModel
-        半透明 (``ROBOT_COLLISION_LINK_COLOR``) に色付け済みの overlay。
-    """
+    """``robot`` のプリミティブ近似ジオメトリを半透明の別 ``RobotModel``
+    (overlay) として読み込む。姿勢は ``sync_robot_collision_overlay`` で
+    追従させる。"""
     collision_urdf_path = build_collision_model_urdf(
         robot.urdf_path, primitive_type=primitive_type, force=force_convert)
     collision_robot = RobotModel()
@@ -175,17 +86,7 @@ def build_robot_collision_overlay(robot, primitive_type=None,
 
 
 def sync_robot_collision_overlay(collision_robot, robot):
-    """``build_robot_collision_overlay`` が返した overlay を ``robot`` の
-    現在の姿勢 (関節角・台車位置姿勢) に追従させる.
-
-    関節名で突き合わせて反映するので、``collision_robot`` と ``robot`` の
-    関節構成 (要素数・並び) が完全に一致していなくても動作する (例:
-    指なしの ``self.robot`` で解いた IK 結果を、指ありの表示用ロボットの
-    overlay に反映する場合。一致していなくても余分な関節は無視されるだけ)。
-    台車の位置姿勢は ``robot.base_link.copy_worldcoords()`` を
-    ``collision_robot`` に反映する (Aero は ``root_link`` が ``base_link``
-    そのものなので、``newcoords`` で台車の移動も含めて反映される)。
-    """
+    """overlay を ``robot`` の関節角 (関節名で対応) と台車姿勢に合わせる。"""
     name_to_angle = {joint.name: joint.joint_angle()
                      for joint in robot.joint_list}
     for joint in collision_robot.joint_list:
@@ -196,67 +97,18 @@ def sync_robot_collision_overlay(collision_robot, robot):
 
 def colliding_link_pairs(robot, pairs, obstacle_links,
                          tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
-    """``solve_palm_ik.collision_pairs_min_distance`` (``solve_palm_ik.py``
-    の事後検証。IK の収束判定が見ない干渉ペナルティの残差を、厳密な形状
-    (``collision_mesh`` の頂点そのもの。勾配降下法内部が使う粗い球近似では
-    ない) で採用前にチェックする処理) と同じ考え方 (``collision_mesh`` の
-    頂点同士の最短距離) で、``pairs`` (``solve_palm_ik.build_collision_
-    verification_pairs`` が作る自己干渉・人体との干渉の総当たりの組み合わせ)
-    の中から実際に貫通している組み合わせを**すべて**列挙する
-    (``collision_pairs_min_distance`` は最小距離しか返さないため、表示用に
-    ここで作り直す)。
+    """``pairs`` のうち ``tolerance`` を超えて貫通している組をすべて列挙する。
 
-    人体側は ``solve_palm_ik.human_capsules`` の解析的な (線分, 半径) では
-    なく、画面に表示している ``obstacle_links`` (``solve_palm_ik.human_body_
-    obstacles`` が返す ``Cylinder`` そのもの) をそのまま使う。掌
-    (``R_palm``/``L_palm``) のように解析的な捉え方 (球近似) と実際の表示
-    形状 (掌面に沿った平たい円柱) が一致しない部位があり、見た目は貫通して
-    いるのに数値上は貫通していないと判定される (またはその逆の) 食い違いが
-    起きうるため、「画面に見えている半透明メッシュ」を判定にもそのまま使う
-    ことでこの食い違いを無くす。
-
-    ロボット側リンクの各頂点が、その ``obstacle_links[other]`` (常に
-    ``skrobot.model.primitives.Cylinder``、``solve_palm_ik.human_body_
-    obstacles`` 参照) の中にどれだけ入り込んでいるかを、円柱自身の
-    ``radius``/``height`` から解析的に求める (単純な頂点同士の最短距離だと、
-    指のように細いリンクが障害物の「表面」にかすらず内部深くへ潜り込んだ
-    場合に、頂点同士は互いの表面近くまで来ないため貫通を見逃してしまう。
-    ``trimesh.proximity.signed_distance`` でも同じことは求まるが、この
-    ペア数 (ロボットの全リンク × 人体セグメント数) でリアルタイムに使うには
-    汎用メッシュのレイキャストは遅すぎるため、円柱に特化した解析式にする)。
-    これだけだと逆向き (円柱がリンクの頂点から離れた面の途中を貫通して
-    いる場合) を見逃すので、円柱側の表面からの判定
-    (``solve_palm_ik.obstacle_into_link_depth``) も併せて行う。
-    ロボットの自己干渉 (``other`` が ``Link``) は、表面サンプルが相手の
-    凸形状に入り込んだ深さで判定する (``solve_palm_ik.self_collision_
-    depth``。頂点同士の最短距離は常に 0 以上で貫通を検出できないため)。
-
-    Parameters
-    ----------
-    robot : skrobot.model.RobotModel
-        干渉ジオメトリ (プリミティブ近似済みの ``collision_mesh``) を持つ、
-        現在の姿勢のロボット (通常は ``build_robot_collision_overlay`` が
-        返した overlay を ``sync_robot_collision_overlay`` で同期した後の
-        もの)。
-    pairs : list of (Link, Link) or (Link, int)
-        ``build_collision_verification_pairs`` の戻り値。2 要素目が ``int``
-        なら ``human_obstacle_names()`` の人体セグメントとの組み合わせ、
-        ``Link`` ならロボット自身の自己干渉の組み合わせ。
-    obstacle_links : list of Link or empty
-        ``solve_palm_ik.human_body_obstacles(joint_positions)`` の戻り値
-        (``human_obstacle_names()`` と同じ順序の ``Cylinder`` のリスト。
-        画面に表示中のものをそのまま渡す想定)。空 (``[]``) なら人体との
-        干渉ペア (``other`` が ``int``) は判定できないので読み飛ばす
-        (自己干渉ペアは判定する)。
+    人体は表示中の円柱 ``obstacle_links`` で、頂点の入り込みと円柱表面
+    からの入り込みの両方向を見る (片方向だと面の途中の貫通を見逃す)。
+    自己干渉は ``solve_palm_ik.self_collision_depth`` で判定する。
+    ``obstacle_links`` が空なら人体との組は読み飛ばす。
 
     Returns
     -------
-    list of (str, str, str, float)
-        ``(種別, リンク A の名前, リンク B の名前 (人体セグメントなら
-        human_obstacle_names() の名前), 距離 [m])`` のリスト。種別は
-        ``'self'`` (自己干渉) / ``'human'`` (人体との干渉)。距離が負なほど
-        深く貫通している。貫通していない (``dist >= -tolerance``) 組み合わせ
-        は含めない。貫通が深い順に並べる。
+    list of (kind, link_a_name, name_b, dist)
+        ``kind`` は ``'self'``/``'human'``、``dist`` [m] は負なほど深い。
+        深い順。
     """
     if not pairs:
         return []
@@ -290,10 +142,7 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             if not obstacle_links:
                 continue
             obstacle = obstacle_links[other]
-            # obstacle は常に Cylinder (ローカル Z 軸が円柱の高さ方向、
-            # 原点中心) なので、verts_a をローカル座標系へ変換した上で
-            # 円柱の radius/height から直接、中に入り込んだ深さ (内側なら
-            # 正) を求める。
+            # 円柱のローカル座標 (Z が軸、原点中心) で入り込んだ深さ (内側で正)。
             local_pts = ((verts_a - obstacle.worldpos())
                         @ obstacle.worldrot())
             radial = np.linalg.norm(local_pts[:, :2], axis=1)
@@ -301,18 +150,13 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             depth = float(np.minimum(
                 obstacle.radius - radial,
                 obstacle.height / 2.0 - axial).max())
-            # 上だけだと逆向き (円柱がリンクの頂点から離れた面の途中を
-            # 貫通している場合) を見逃すため、円柱側の表面からの判定も
-            # 併せて行う (spik.obstacle_into_link_depth 参照)。
+            # 逆向き (円柱がリンクの面の途中を貫通) も見る。
             depth = max(depth, spik.obstacle_into_link_depth(
                 _samples(other), link_a, _shape(link_a)))
             dist = -depth
             kind, name_b = 'human', obstacle_names[other]
         else:
-            # 自己干渉は spik.collision_pairs_min_distance と同じく、表面
-            # サンプルが相手の凸形状に入り込んだ深さで判定する (頂点同士の
-            # 最短距離は常に 0 以上で、貫通を検出できないため)。包含球が
-            # 重ならない組は貫通し得ないので省略する。
+            # 包含球が重ならない組は省略する。
             kind, name_b = 'self', other.name
             center_gap = (np.linalg.norm(other.worldpos() - link_a.worldpos())
                           - _shape(link_a)[3] - _shape(other)[3])
@@ -326,14 +170,8 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
 
 
 def collision_pairs_text(colliding, label='干渉'):
-    """``colliding_link_pairs`` の戻り値を、viser のテキストパネルに出す
-    ための文字列にする (自己干渉/人体との干渉を分けて列挙する)。
-
-    ``label`` は見出しに使う語句 (既定 ``'干渉'``)。``run_camera_pipeline_
-    test.py`` のように、IK 自体は指なしで解いていて画面表示の事後検証だけ
-    指先まで含めている場合など、見出しでその旨を区別したいときに使う
-    (例: ``label='指先まで含めた事後検証'``)。
-    """
+    """``colliding_link_pairs`` の結果をテキストパネル用の文字列にする
+    (``label`` は見出し)。"""
     self_pairs = [c for c in colliding if c[0] == 'self']
     human_pairs = [c for c in colliding if c[0] == 'human']
     if not colliding:
@@ -351,32 +189,11 @@ def collision_pairs_text(colliding, label='干渉'):
 
 
 def apply_robot_pose(robot, result, use_post_process=False):
-    """``solve_palm_ik`` の戻り値 (関節角・台車位置姿勢) を ``robot`` に
-    反映する.
+    """IK 結果の関節角 (関節名で対応、指は初期姿勢のまま) と台車姿勢を
+    ``robot`` に反映する。
 
-    ``result['joint_names']``/``joint_angle_vector`` は ``solve_palm_ik.py``
-    が ``use_hand=False`` (指関節なし) のロボットで解いた際の
-    ``robot.joint_list`` の角度なので、指関節ありのロボット (見た目のための
-    表示用モデル) とは ``joint_list`` の要素数・並びが異なりうる。そのため
-    ``robot.angle_vector`` にそのまま渡さず、``joint_names`` で名前を突き
-    合わせて該当する関節だけ角度を反映する (指関節は初期姿勢のまま)。台車の
-    位置・向きは ``base_position``/``base_yaw`` に別で保存されているので、
-    あわせて反映する (``solve_palm_ik.solve_palm_ik`` 参照)。
-
-    Parameters
-    ----------
-    result : dict
-        ``solve_palm_ik.py`` が保存した IK 結果 (``joint_names``/
-        ``joint_angle_vector``/``base_position``/``base_yaw``/
-        ``post_process`` を持つ dict)。
-    use_post_process : bool, optional
-        ``True`` のとき、``solve_palm_ik.solve_post_process`` が解いた
-        後処理後の姿勢 (``result['post_process']`` -- 掌に押し付ける位置
-        まで詰め、自分の手を見るよう首も向けた姿勢) を反映する。既定
-        (``False``) は従来通り後処理前の姿勢。``post_process`` が無い
-        (後処理判定に失敗した/この機能追加前の solve_palm_ik.py が書き
-        出した/IK 自体が解けなかった) 結果では、``use_post_process`` が
-        ``True`` でも後処理前の姿勢にフォールバックする。
+    ``use_post_process`` なら押し込み姿勢 (``post_process``、無ければ
+    hover 姿勢) を反映する。
     """
     source = result
     if use_post_process and result.get('post_process') is not None:
@@ -393,14 +210,7 @@ def apply_robot_pose(robot, result, use_post_process=False):
 
 
 def apply_waypoint_pose(robot, joint_names, waypoints, index):
-    """``waypoints[index]`` (台車位置姿勢・全身の関節角) を ``robot`` に
-    反映する.
-
-    ``apply_robot_pose`` と同じパターン -- ``joint_names``/
-    ``waypoints[...]['joint_angle_vector']`` は ``plan_handshake_motion.py``
-    が指なしロボットで計画した際の関節角なので、名前で突き合わせて該当
-    する関節だけ反映する (指関節は ``reset_pose`` の初期姿勢のまま)。
-    """
+    """``waypoints[index]`` を ``robot`` に反映する (関節名で対応)。"""
     wp = waypoints[index]
     robot.reset_pose()
     name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
@@ -412,26 +222,13 @@ def apply_waypoint_pose(robot, joint_names, waypoints, index):
 
 
 def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINTS):
-    """``motion['waypoints']`` (``plan_handshake_motion.py`` が計画・検証
-    した経路) に、``result['post_process']`` (``solve_palm_ik.py`` の後処理
-    判定: 実際に掌へわずかにめり込む位置まで腕を詰め、首を人間の手へ向ける)
-    までの補間フレームを表示用に追加する。
-
-    ``plan_handshake_motion.py`` はこの区間を経路として計画・検証しない
-    (接触そのものが目的の動きで、経路上の干渉検証にはなじまないため) ので、
-    あくまで見た目のための表示専用フレームであり、
-    ``waypoint_min_distances`` による検証の対象ではない。
-
-    ``post_process`` が無い (後処理判定が全ての候補で失敗し、後処理前の
-    まま採用された/IK 自体が解けなかった) 場合は ``motion['waypoints']``
-    をそのまま返す。
+    """接近経路の後ろに押し込み区間と横並び移動の waypoint を足す。
 
     Returns
     -------
     (waypoints, n_approach)
-        ``waypoints`` は表示用の waypoint リスト。``n_approach`` は
-        ``motion['waypoints']`` の個数 (この添字以降が表示専用の後処理
-        フレーム、``waypoint_min_distances`` による検証の対象外)。
+        ``n_approach`` は ``motion['waypoints']`` の個数 (以降は未検証の
+        押し込み・横並び区間)。
     """
     waypoints = list(motion['waypoints'])
     n_approach = len(waypoints)
@@ -445,11 +242,9 @@ def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINT
 
 
 def transition_waypoints(motion):
-    """``motion['transition']`` (``plan_handshake_motion.py --side-by-side-
-    transition`` が計画した、掌を合わせたまま台車を動かして横並びへ移る
-    区間) の waypoint を、関節角を ``motion['joint_names']`` の並びに
-    直して返す (横並び移動をしないなら空)。押し込み区間の後に続けて
-    表示・実行する。表示で区別できるよう ``transition: True`` を付ける。"""
+    """横並び移動 (``motion['transition']``) の waypoint を
+    ``motion['joint_names']`` の並びに直して返す (``transition: True`` 付き。
+    無い・未検証なら空)。"""
     transition = motion.get('transition')
     if not transition or not transition.get('verified'):
         return []
@@ -467,11 +262,8 @@ def transition_waypoints(motion):
 
 def build_press_in_waypoints(last_wp, joint_names, post,
                              n_press_in=PRESS_IN_DISPLAY_WAYPOINTS):
-    """hover 目標の waypoint ``last_wp`` (関節角は ``joint_names`` の並び)
-    から押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict) までを
-    ``n_press_in`` 等分した補間 waypoint のリスト (``last_wp`` 自身は含ま
-    ない) を返す (``build_display_waypoints`` と、実機で押し込み直前に
-    押し込み姿勢を解き直したときの差し替えに使う)。"""
+    """hover の waypoint ``last_wp`` から押し込み姿勢 ``post`` までを
+    ``n_press_in`` 等分した waypoint のリスト (``last_wp`` は含まない)。"""
     waypoints = []
     start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
     post_name_to_angle = dict(zip(post['joint_names'],

@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""README.md のパイプラインのうち 1 (generate_random_human_poses.py) ->
-2 (estimate_palm_poses.py) -> 4 (solve_palm_ik.py) -> 5 (view_handshake_
-poses.py または --plan-motion 指定時は view_handshake_motion.py、いずれも
---viewer 指定時のみ) を順に実行する。
-
-各ステップの入出力 JSON は /tmp 以下に作る一時ディレクトリに保存・
-読み出しし、各スクリプトの (人物ごとの) 生の画面出力はそのまま流さず、
-ステップごとの結果だけを簡潔に表示する。実装を変更するたびにこのパイプ
-ラインが最後まで通ることを確認する回帰テストを兼ねており、最後に
-「後処理まで含めて成功した人数」を表示する。
+"""合成データのパイプライン (骨格生成 → 掌推定 → IK → [軌道計画] →
+[ビューア]) を /tmp の一時ディレクトリで順に実行し、ステップごとの結果を
+要約表示する回帰テスト。
 
 Usage
 -----
@@ -37,12 +30,8 @@ from aero_demo import json_io  # noqa: E402  (パス追加後に import)
 
 
 def run_step(label, script_name, extra_args):
-    """``script_name`` を子プロセスで実行し、``(壁時計時間 [秒], 標準出力)``
-    を返す。
-
-    人物ごとの進捗行など生の標準出力はそのまま流さず捕捉するだけにし、
-    失敗したとき (exit code != 0) だけ末尾を表示してから中断する。
-    """
+    """``script_name`` を子プロセスで実行し ``(経過秒, 標準出力)`` を返す
+    (失敗したら出力の末尾を表示して終了)。"""
     print('[{}] 実行中...'.format(label))
     script_path = os.path.join(_THIS_DIR, script_name)
     t0 = time.time()
@@ -59,10 +48,7 @@ def run_step(label, script_name, extra_args):
 
 
 def extract_warmup_lines(stdout):
-    """``solve_palm_ik.py`` の標準出力から ``_warmup_batch_ik`` が出す
-    ``[warmup] ...`` 行を抜き出し、``(行のリスト, 合計秒数)`` を返す。
-    ``--no-warmup`` 指定時など該当行が無ければ ``([], 0.0)``。
-    """
+    """標準出力の ``[warmup]`` 行と合計秒数 ``(lines, total)`` を返す。"""
     lines = [line for line in stdout.splitlines()
             if line.startswith('[warmup]')]
     total = 0.0
@@ -90,17 +76,9 @@ def summarize_palms(palm_dir):
 
 
 def summarize_handshakes(handshake_dir):
-    """``solve_palm_ik.py`` の出力 JSON を集計する。
-
-    ``collision_ik_time``/``candidate_selection_time`` は IK 対象になった
-    人物 (``target: true``) なら solved/unsolved を問わず必ず記録される
-    (``solve_palm_ik.solved_result``/``unsolved_result`` 参照)。
-    ``candidate_selection_time`` は事後の干渉検証と、棄却された候補も
-    含めた全ての後処理判定 (``solve_post_process``) 呼び出しの合計であり、
-    これが「実質的な IK 2 段階目」の時間になる -- ``post_process``
-    キー配下の ``compute_time`` (採用された最後の 1 回分だけ) は棄却
-    された候補の分を含まず過小評価になるため、ここでは集計しない。
-    """
+    """``solve_palm_ik.py`` の出力 JSON を集計する (IK 2 段階目の時間は
+    ``candidate_selection_time``。``post_process.compute_time`` は棄却候補を
+    含まないので使わない)。"""
     n_total = n_target = n_solved = n_post_process = 0
     collision_ik_times = []
     candidate_selection_times = []
@@ -133,13 +111,8 @@ def summarize_handshakes(handshake_dir):
 
 
 def summarize_final_corrections(handshake_dir):
-    """``solve_palm_ik.py --final-correction-trials`` が記録した
-    ``final_correction`` (押し込み直前の最終補正の試行結果) を集計する。
-
-    比較用に、計画時の押し込み姿勢 (``post_process``) を解いたときの
-    ``compute_time`` の平均も返す (最終補正は同じ IK を hover 姿勢から
-    もう 1 回解くだけなので、これと同程度になるはず)。
-    """
+    """``final_correction`` (押し込み直前の最終補正の試行) を集計する
+    (比較用に計画時の押し込み IK の平均時間も返す)。無ければ ``None``。"""
     times = []
     reasons = {}
     position_changes = []
@@ -168,12 +141,7 @@ def summarize_final_corrections(handshake_dir):
 
 
 def summarize_motions(motion_dir):
-    """``plan_handshake_motion.py`` の出力 JSON を集計する。
-
-    ``planned`` が ``false`` (IK 対象外/IK 失敗) の人物は集計から除く。
-    ``kind`` は採用した軌道の作り方 (``pretouch``/``linear``/
-    ``optimized``、``plan_handshake_motion.KIND_LABELS`` 参照)。
-    """
+    """``plan_handshake_motion.py`` の出力 JSON を集計する (``planned`` の人のみ)。"""
     n_planned = n_verified = n_lead_in_verified = n_both_verified = 0
     n_head_blended = 0
     kinds = {}
@@ -197,12 +165,7 @@ def summarize_motions(motion_dir):
         if data.get('compute_time') is not None:
             compute_times.append(data['compute_time'])
 
-    # 軌道最適化 (jaxls) を要した人だけの平均は、その人数・顔ぶれが実行の
-    # たびに変わる (pre-touch/線形補間の候補が厳密検証を通るかどうかは
-    # GPU 上の jax 計算の非決定性の影響を受けうる境界ケースがあるため) 母
-    # 集団に依存する指標になってしまい安定した比較に向かない。そのため
-    # ここでは最適化が不要だった人も含めた全 planned 人物の compute_time
-    # の平均だけを返す。
+    # 最適化を要した人だけの平均は母集団が実行ごとに変わるので、全員の平均。
     avg_compute_time = (sum(compute_times) / len(compute_times)
                         if compute_times else None)
     return dict(n_planned=n_planned, n_verified=n_verified,
@@ -215,85 +178,52 @@ def summarize_motions(motion_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='README.md のパイプライン 1/2/4/5 を順に実行する '
-                    '回帰テスト。/tmp 以下に一時ディレクトリを作って '
-                    'JSON を保存・読み出しし、各ステップの結果だけを '
-                    '簡潔に表示する。')
+        description='合成データのパイプラインを順に実行する回帰テスト。')
     parser.add_argument(
-        'num_people', type=int,
-        help='generate_random_human_poses.py (ステップ 1) で生成する人数。')
+        'num_people', type=int, help='生成する人数。')
     parser.add_argument(
         '--viewer', action='store_true',
-        help='ステップ 5 (view_handshake_poses.py、--plan-motion 指定時は '
-            'view_handshake_motion.py) の viser ビューアを実際に起動する。'
-            '既定ではブラウザ接続を待ち続けて自動実行が止まってしまうため '
-            '起動しない。')
+        help='最後に viser ビューアを起動する (ブラウザ接続を待つ)。')
     parser.add_argument(
         '--seed', type=int, default=None,
-        help='generate_random_human_poses.py (ステップ 1) に渡す乱数 '
-            'シード (既定は指定なし)。')
+        help='generate_random_human_poses.py の乱数シード。')
     parser.add_argument(
         '--plan-motion', action='store_true',
-        help='ステップ 4.5 (plan_handshake_motion.py) を実行し、握手の '
-            '最終姿勢だけでなくロボットの初期姿勢からそこへ至る干渉回避 '
-            '付きの軌道も生成する。jaxls (pip install "git+https://'
-            'github.com/brentyi/jaxls.git") が別途必要で、1 人あたり '
-            '数十秒かかるため既定では実行しない。')
+        help='plan_handshake_motion.py も実行する (jaxls が必要)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
-        help='--plan-motion 指定時、plan_handshake_motion.py に '
-            '--force-optimize を渡す (pre-touch/線形補間の候補が事後検証 '
-            'に通っていても必ず jaxls の軌道最適化まで実行させ、全員分の '
-            '軌道最適化の計算時間を計測できるようにする)。')
+        help='plan_handshake_motion.py に --force-optimize を渡す。')
     parser.add_argument(
         '--initial-base-pose', type=float, nargs=3, default=None,
         metavar=('X', 'Y', 'YAW'),
-        help='--plan-motion 指定時、plan_handshake_motion.py に '
-            '--initial-base-pose として渡すロボットの初期台車姿勢 '
-            '(既定は指定なし = 原点。人物は (3, 0) 付近に置かれるので、'
-            '例えば 5 0 3.14 で人の向こう側から回り込む経路を試せる)。')
+        help='plan_handshake_motion.py に渡す初期台車姿勢 (例: 5 0 3.14)。')
     parser.add_argument(
         '--approach-distance', type=float, default=None,
-        help='--plan-motion 指定時、plan_handshake_motion.py に '
-            '--approach-distance として渡す (既定は指定なし)。')
+        help='plan_handshake_motion.py に --approach-distance を渡す。')
     parser.add_argument(
         '--final-correction-trials', type=int, default=0,
-        help='solve_palm_ik.py に --final-correction-trials として渡し、'
-            '押し込み直前の最終補正 (hover 到達後に掌を検出し直して押し込み '
-            '姿勢を解き直す) の計算時間を、台車のスリップを乱数で与えて '
-            '1 人あたりこの回数ずつ見積もる (既定 0 = 行わない)。')
+        help='solve_palm_ik.py に渡す、1 人あたりの最終補正の試行回数 '
+            '(既定 0 = 行わない)。')
     parser.add_argument(
         '--final-correction-slip', type=float, nargs=2, default=None,
         metavar=('XY', 'YAW_DEG'),
-        help='solve_palm_ik.py に --final-correction-slip として渡す '
-            'スリップの範囲 (既定は指定なし = ±0.03m/±3度)。')
+        help='solve_palm_ik.py に --final-correction-slip を渡す。')
     parser.add_argument(
         '--base-x-standing-margins', type=float, nargs='+', default=None,
-        help='solve_palm_ik.py に --base-x-standing-margins として渡す '
-            '(台車の前後位置を人の立ち位置 ± この幅 [m] に絞り、解けなければ '
-            '次の幅で解き直す。負の値で絞らない。既定は指定なし = '
-            'solve_palm_ik.py の既定値)。')
+        help='solve_palm_ik.py に --base-x-standing-margins を渡す。')
     parser.add_argument(
         '--front-offset-weight', type=float, default=None,
-        help='solve_palm_ik.py に --front-offset-weight として渡す (既定は '
-            '指定なし = solve_palm_ik.py の既定値)。')
+        help='solve_palm_ik.py に --front-offset-weight を渡す。')
     parser.add_argument(
         '--facing-yaw-weight', type=float, default=None,
-        help='solve_palm_ik.py に --facing-yaw-weight として渡す (既定は '
-            '指定なし = solve_palm_ik.py の既定値)。')
+        help='solve_palm_ik.py に --facing-yaw-weight を渡す。')
     parser.add_argument(
         '--collision-verify-model', choices=('mixed', 'nohand', 'hand'),
         default=None,
-        help='solve_palm_ik.py と (--plan-motion 指定時) plan_handshake_'
-            'motion.py に --collision-verify-model として渡す (既定は指定なし '
-            '= 各スクリプトの既定値)。')
+        help='solve_palm_ik.py と plan_handshake_motion.py に渡す。')
     parser.add_argument(
         '--side-by-side-transition', action='store_true',
-        help='--plan-motion 指定時、plan_handshake_motion.py に '
-            '--side-by-side-transition を渡し、押し込んだ後につないだ手を '
-            '人の体の横へ下ろしながら横並びへ移る区間も計画する (ビューア '
-            'では押し込みの後に続けて再生され、人の腕もロボットの手に '
-            '追従する)。')
+        help='plan_handshake_motion.py に --side-by-side-transition を渡す。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -455,13 +385,8 @@ def main():
             and palm_time_per_person is not None):
         print('  掌推定込みの全体 (掌推定 + IK 1+2段階目): {:.3f} 秒/人'
               .format(palm_time_per_person + summary['avg_total_ik_time']))
-    print('  (上記の IK 1/2段階目は solve_palm_ik.py が出力する JSON の '
-          'collision_ik_time/candidate_selection_time の平均であり、'
-          'warmup (jax の JIT トレース/コンパイル、人物ループに入る前に '
-          '1 回だけ払う) の時間は含まない。warmup 自体の実測は '
-          '[4/5] 実行直後の行を参照。IK 1段階目が warmup 後も長い場合は '
-          'warmup 漏れではなく、人物ごとに再コンパイルが起きている '
-          '(docs/jax_compilation_cache.md 参照) 可能性を疑うこと。)')
+    print('  (IK 1/2段階目は warmup を含まない。1段階目が長い場合は人物ごとの '
+          '再コンパイルを疑うこと: docs/jax_compilation_cache.md)')
 
     if args.final_correction_trials > 0:
         fc = summarize_final_corrections(handshake_dir)
@@ -482,10 +407,7 @@ def main():
                           for k, v in sorted(fc['reasons'].items())),
                 fc['avg_position_change'] * 1e3))
 
-    # 5. view_handshake_poses.py / view_handshake_motion.py
-    #    (--viewer のときだけ実際に起動する。--plan-motion も指定されて
-    #    いれば軌道再生付きの view_handshake_motion.py を、そうでなければ
-    #    最終姿勢のみの view_handshake_poses.py を開く)
+    # 5. view_handshake_poses.py / view_handshake_motion.py (--viewer 時のみ)
     if args.viewer:
         if args.plan_motion:
             print('[5/5] view_handshake_motion.py の viser ビューアを起動 '

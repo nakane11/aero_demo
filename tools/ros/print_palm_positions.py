@@ -1,38 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``run_camera_pipeline_test.py`` から ARM/RESET/IK/軌道計画を取り除き、
-ボタン操作なしでカメラ画像から掌推定だけを常時実行し続け、検出できた人物の
-掌の位置 (base_link 座標系) を標準出力に print し続けるだけの、検証用の
-最小限のスクリプト。
+"""カメラから掌推定だけを常時行い、掌位置 (base_link) を print する検証用スクリプト。
 
-IK (``solve_palm_ik.solve_person_ik``) が実際に狙う目標位置は掌の位置その
-ものではなく ``solve_palm_ik.palm_target_position`` (掌の法線方向に
-``TARGET_HOVER_OFFSET`` だけ浮かせた位置) なので、掌の生の位置に加えて
-差し出し手についてはこの IK 目標位置も print する。あわせて実機の現在の
-手先位置 (``--robot-hand-frame`` の TF) も print するので、
-「IK の目標がロボットの現在の手先位置や実際の人間の掌の位置と比べて
-どれだけずれているか (特に高さ z)」をこのスクリプトの出力だけで確認できる。
-
-viser 画面には ``run_camera_pipeline_test.py`` と同じ骨格線に加えて、
-ロボットモデル (両腕を下ろした初期姿勢, IK では動かさない) と、検出できた
-左右の掌の位置に矢印 (Axis) を重ねて表示する。
-
-あわせて骨格 (関節点・ボーン線) を ``visualization_msgs/MarkerArray``
-として ``skeleton_markers`` トピック (ノードを名前空間なしで動かす通常
-の使い方では ``/skeleton_markers``) に publish するので、rviz からも
-確認できる。骨格の座標は ``--base-frame`` (既定 ``base_link``) 座標系
-なので、Marker の ``header.frame_id`` は必ず ``--base-frame`` にする
-(カメラ座標系のままではない)。``header.stamp`` は骨格推定に使った
-カラー画像の timestamp を使う -- これは camera->base の TF 変換に
-実際に使った時刻と同じなので、rviz 側の TF 表示ともずれない。
-
-rviz でロボットモデル・``launch/decompress.launch`` が作る点群と一緒に
-見るための rviz 設定・launch ファイルは ``rviz/skeleton_demo.rviz``/
-``launch/view_skeleton.launch`` を参照 (ロボット本体の bringup
-(``robot_description``/``robot_state_publisher``/joint_states の TF) は
-aero-ros-pkg 側の ``aero_startup/aero_bringup.launch`` が担っており、実機
-操作を伴うためこの launch には含めていない -- 別途起動しておくこと)。
+差し出し手については IK 目標 (``palm_target_position``) とロボット現在手先
+(``--robot-hand-frame`` の TF) も出す。viser に骨格・ロボット・掌の Axis を
+表示し、骨格を ``skeleton_markers`` (MarkerArray, frame_id=``--base-frame``)
+に publish する (rviz は ``launch/view_skeleton.launch``)。
 
 Usage
 -----
@@ -84,31 +58,23 @@ from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.model import Axis  # noqa: E402
 from skrobot.viewers import ViserViewer  # noqa: E402
 
-# 掌の位置に重ねて表示する矢印 (Axis) の大きさ [m]。掌自体は小さいので、
-# ロボットの初期位置マーカー (run_camera_pipeline_test.INITIAL_POSE_AXIS_
-# LENGTH = 0.2) より一回り小さくしてある。
+# 掌の Axis の大きさ [m]。
 PALM_AXIS_LENGTH = 0.1
 PALM_AXIS_RADIUS = 0.005
 
-# 骨格が一瞬未検出になるたびに表示を消して描き直すとちらつくので、検出が
-# 途切れてもこの秒数の間は直前に検出できた骨格をそのまま表示し続ける
-# (run_camera_pipeline_test.SKELETON_HOLD_TIMEOUT と同じ考え方)。
+# 検出が途切れてもこの秒数は直前の骨格を表示し続ける (ちらつき防止)。
 SKELETON_HOLD_TIMEOUT = 1.0
 
 
 def _arms_down_pose(robot):
-    """両腕を体の横に自然に下ろした姿勢にする
-    (``plan_handshake_motion.arms_down_angles`` と同じ、viewer 表示専用の
-    初期姿勢を作るだけなので jaxls 依存の ``plan_handshake_motion`` 自体は
-    import しない)。"""
+    """両腕を下ろした表示用の姿勢 (jaxls 依存を避けて自前で作る)。"""
     robot.reset_pose()
     for side in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(side)).joint_angle(0.0)
 
 
 class PrintPalmPositionsNode(object):
-    """カメラ入力 -> 骨格推定 -> 掌推定を常時繰り返し、掌の base_link 座標を
-    print し続けるノード (IK・軌道計画・実機操作は一切行わない)。"""
+    """骨格推定 -> 掌推定を繰り返し掌位置を print するノード (実機は動かさない)。"""
 
     def __init__(self, args):
         self.args = args
@@ -135,9 +101,7 @@ class PrintPalmPositionsNode(object):
             beta=args.joint_smoothing_beta,
             dcutoff=args.joint_smoothing_dcutoff)
 
-        # 差し出し手判定の基準にするロボット手先位置 (run_camera_pipeline_
-        # test.py の _resolve_robot_position と同じ、TF が引けなければ
-        # 右腕の「種の姿勢」の手先位置にフォールバックする)。
+        # TF が引けないときの手先位置 (右腕の種の姿勢)。
         robot_for_fallback = spik.Aero(use_hand=False)
         spik.seed_arm_pose(robot_for_fallback, 'r')
         self._robot_hand_position_fallback = np.asarray(
@@ -150,9 +114,6 @@ class PrintPalmPositionsNode(object):
                          else args.max_person_distance))
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
-        # rviz で見られるように骨格を publish するトピック
-        # (座標系は self.args.base_frame -- 下の _publish_skeleton_markers
-        # 参照)。
         self.skeleton_marker_pub = rospy.Publisher(
             'skeleton_markers', MarkerArray, queue_size=1)
 
@@ -201,8 +162,6 @@ class PrintPalmPositionsNode(object):
     def _on_frame(self, color_msg, depth_msg, info_msg):
         transform = self._lookup_camera_to_base(color_msg.header)
         if transform is None:
-            # base_link 座標系に変換できないフレームは掌推定に使えない
-            # (run_camera_pipeline_test.py と同じ)。
             return
         camera_to_base = transform_to_matrix(transform.transform)
 
@@ -238,8 +197,6 @@ class PrintPalmPositionsNode(object):
         if joint_positions is None:
             return
 
-        # ロボット手先位置は毎フレーム TF から引き直す
-        # (run_camera_pipeline_test.py の _resolve_robot_position と同じ)。
         robot_hand_position = self._resolve_robot_hand_position()
         self.offered_hand_selector.robot_position = robot_hand_position
         palms = self.palm_estimator.estimate(
@@ -259,18 +216,10 @@ class PrintPalmPositionsNode(object):
             self.viewer.redraw()
 
     def _publish_skeleton_markers(self, joint_positions, header):
-        """骨格 (関節点・ボーン線) を ``MarkerArray`` として rviz 向けに
-        publish する。
+        """骨格を MarkerArray で publish する。
 
-        骨格の座標はカメラ座標系ではなく ``self.args.base_frame``
-        (camera_to_base で変換済み) なので、Marker の ``header.frame_id``
-        は必ず ``self.args.base_frame`` にする (カメラの frame_id をそ
-        のまま使うと rviz 側で位置がずれる)。``header.stamp`` は
-        ``camera_to_base`` の TF 変換に実際に使った時刻 (このフレームの
-        カラー画像の timestamp) をそのまま使う。
-
-        検出が途切れた (``joint_positions is None``) フレームでは
-        ``DELETEALL`` だけを publish して、rviz 側に古い骨格を残さない。
+        frame_id は ``--base-frame`` (骨格は変換済み)、stamp はカラー画像の時刻。
+        未検出時は DELETEALL のみ。
         """
         marker_array = MarkerArray()
 
@@ -342,14 +291,7 @@ class PrintPalmPositionsNode(object):
             self.viewer.redraw()
 
     def _print_palms(self, palms, robot_hand_position):
-        """検出できた左右の掌の base_link 座標と、差し出し手についての IK
-        目標位置 (``solve_palm_ik.palm_target_position``) を print する。
-        左右とも未推定 (``palm`` が ``None``) のフレームは何も print しない。
-
-        ``--print-interval`` 秒間隔でのみ実際に print する
-        (``_on_frame`` はカメラの frame rate のまま呼ばれるため、そのまま
-        print すると流れて読めなくなる)。
-        """
+        """掌位置と差し出し手の IK 目標を ``--print-interval`` 秒ごとに print する。"""
         if palms['R'] is None and palms['L'] is None:
             return
         now = time.time()
@@ -408,11 +350,10 @@ def main():
     parser.add_argument('--base-frame', type=str, default='base_link')
     parser.add_argument(
         '--tf-cache-time', type=float, default=30.0,
-        help='tf2 バッファの保持時間 [秒] (既定 30.0)。')
+        help='tf2 バッファの保持時間 [s]。')
     parser.add_argument(
         '--client-wait-timeout', type=float, default=30.0,
-        help='viser のブラウザクライアント接続を待つ 1 回あたりの秒数 '
-            '(繰り返し待つ、既定 30.0)。')
+        help='viser クライアント接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true')
     parser.add_argument('--no-wait-for-client', action='store_true')
     parser.add_argument('--min-detection-confidence', type=float, default=0.5)
@@ -433,11 +374,10 @@ def main():
     parser.add_argument('--max-person-distance', type=float, default=3.0)
     parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
-        help='ロボットの現在の手先位置として TF を引くフレーム (既定 '
-            'r_eef_grasp_link、run_camera_pipeline_test.py と同じ)。')
+        help='ロボット現在手先の TF フレーム。')
     parser.add_argument(
         '--print-interval', type=float, default=0.5,
-        help='掌位置を print する間隔 [秒] (既定 0.5)。')
+        help='print 間隔 [s]。')
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
     rospy.init_node('print_palm_positions')

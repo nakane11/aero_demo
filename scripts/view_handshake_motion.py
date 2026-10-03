@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``plan_handshake_motion.py`` が出力した軌道 (waypoint 列) JSON と、
-対応する骨格 JSON・``solve_palm_ik.py`` の握手姿勢 JSON を読み込み、
-scikit-robot の viser ビューアでロボットの接近動作を再生する。
+"""``plan_handshake_motion.py`` の軌道 JSON を、対応する骨格・握手姿勢
+JSON と合わせて viser で再生する (waypoint スライダー/Play)。
 
-``view_handshake_poses.py`` (最終姿勢 1 点だけを表示) と違い、こちらは
-waypoint スライダーと Play ボタンで経路全体をコマ送り/自動再生できる。
-表示するのは SMPL メッシュ・ロボットモデルに加え、``view_handshake_
-poses.py`` と同じ干渉回避用の半透明ジオメトリ (人体のカプセル近似・
-ロボット自身のプリミティブ近似) で、waypoint を切り替えるたびに
-``solve_palm_ik.collision_pairs_min_distance`` と全く同じ厳密検証
-(``plan_handshake_motion.py`` が保存した ``waypoint_min_distances``、
-および実際に貫通しているリンクの組み合わせ) をテキストパネルに出す。
-
-``planned`` が ``false`` (IK 対象外/IK 失敗で軌道が無い) の人物は
-読み飛ばす。
-
-握手姿勢 JSON に ``post_process`` (``solve_palm_ik.py`` の後処理判定:
-実際に掌へわずかにめり込む位置まで腕を詰め、首を人間の手へ向ける) が
-あれば、経路の最後にそこまでの補間フレームを追加で表示する
-(``build_display_waypoints``)。``plan_handshake_motion.py`` はこの区間を
-経路として計画・検証しない (接触そのものが目的の動きで、経路上の干渉
-検証にはなじまないため) ので、あくまで見た目のための表示専用フレームで
-あり、``waypoint_min_distances`` による検証の対象ではない。
+各 waypoint の干渉余裕と貫通しているリンクの組を表示する。``planned``
+が false の人物は読み飛ばす。経路末尾の押し込み (``post_process``) と
+横並び移動は表示専用で、経路の検証対象ではない。
 
 Usage
 -----
@@ -31,10 +14,6 @@ Usage
     rosrun aero_demo solve_palm_ik.py
     rosrun aero_demo plan_handshake_motion.py
     rosrun aero_demo view_handshake_motion.py
-
-viser はブラウザで表示するビューアなので、実行するとブラウザが開く。
-画面下の Back/Next で人物の切り替え、waypoint スライダーで経路上の
-姿勢を切り替え、Play で自動再生する。
 """
 
 import argparse
@@ -88,19 +67,10 @@ from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa:
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
-
-# 干渉回避用モデル (人体障害物・ロボット自身のプリミティブ近似) の色、
-# apply_waypoint_pose/build_display_waypoints/build_robot_collision_
-# overlay/colliding_link_pairs/collision_pairs_text/sync_robot_collision_
-# overlay は view_handshake_poses.py/scripts/ros/run_camera_pipeline_
-# test.py と共通なので handshake_viewer_common.py に一本化してある。
-
 # waypoint 自動再生の既定の速さ [waypoint/秒]。
 DEFAULT_PLAYBACK_FPS = 40.0
 
-# 採用した軌道の作り方 (plan_handshake_motion.KIND_LABELS と同じ内容を
-# ここでも持つ -- plan_handshake_motion は jaxls 依存で import が重い
-# ため、表示用の対応表だけこちらにも複製する)。
+# plan_handshake_motion.KIND_LABELS の複製 (向こうは import が重い)。
 KIND_LABELS = {
     'pretouch': 'pre-touch 経由 (最適化なし)',
     'linear': '線形補間のみ (最適化なし)',
@@ -119,8 +89,7 @@ def load_motion_json(path):
 
 
 def iter_common_names(skeleton_dir, handshake_dir, motion_dir):
-    """3 つのディレクトリ全てに存在し、かつ軌道が計画済み (``planned:
-    true``) のファイル名 (basename) をファイル名順に列挙する。"""
+    """3 ディレクトリ全てにあり ``planned`` が true のファイル名 (ソート済み)."""
     skeleton_names = {os.path.basename(p) for p in
                       glob.glob(os.path.join(skeleton_dir, '*.json'))}
     handshake_names = {os.path.basename(p) for p in
@@ -133,20 +102,11 @@ def iter_common_names(skeleton_dir, handshake_dir, motion_dir):
         if load_motion_json(os.path.join(motion_dir, name)).get('planned'))
 
 
-# apply_waypoint_pose/build_display_waypoints/sync_robot_collision_overlay
-# は view_handshake_poses.py/scripts/ros/run_camera_pipeline_test.py と
-# 共通なので handshake_viewer_common.py に一本化してある (モジュール先頭で
-# import 済み)。
-
-
 class PlaybackControls(object):
-    """waypoint スライダー・Play チェックボックス・Back/Next ボタンを
-    まとめて GUI に追加し、waypoint/人物切り替えのたびに ``on_change``
-    (引数無しのコールバック) を呼ぶ。
+    """waypoint スライダー・Play・Back/Next の GUI.
 
-    Play 中は別スレッドが ``--fps`` の周期で waypoint を進め、最後まで
-    行ったら停止する (人物を跨いでループはしない -- 経路の最後の姿勢を
-    確認するのが目的のため)。
+    切り替えのたびに ``on_person_change``/``on_waypoint_change`` を呼ぶ。
+    Play は ``fps`` 周期で進め、最後の waypoint で止まる。
     """
 
     def __init__(self, viewer, fps):
@@ -159,15 +119,10 @@ class PlaybackControls(object):
         self.on_person_change = None
         self.on_waypoint_change = None
         self._closed = False
-        # viser の GUI コールバック (on_click/on_update) はスレッドプールで
-        # 実行される (スライダーを素早く操作すると複数のコールバックが
-        # 同時に走る)。シーングラフの追加/削除は非スレッドセーフなので、
-        # 実際に描画するコード (on_person_change/on_waypoint_change) は
-        # 必ず ``_render_lock`` を握った状態でだけ呼ぶ。
+        # viser のコールバックは並行に走り、シーングラフ操作は非スレッド
+        # セーフなので、描画は必ずこのロックを握って行う。
         self._render_lock = threading.RLock()
-        # 描画中に次のリクエストが来たら、今のリクエストは古いとみなして
-        # 描画をスキップする (溜まった分だけ描き直すと点滅・二重表示の
-        # 原因になる。世代カウンタで「自分がまだ最新か」を判定する)。
+        # 古い描画リクエストを捨てるための世代カウンタ。
         self._generation = 0
 
         self.back_button = viewer._server.gui.add_button('Back (人物)')
@@ -194,11 +149,8 @@ class PlaybackControls(object):
         threading.Thread(target=self._play_loop, daemon=True).start()
 
     def _render(self, callback):
-        """``callback`` (``on_person_change``/``on_waypoint_change``) を
-        排他制御しつつ呼ぶ。呼び出し側は先に ``self.person_index``/
-        ``self.waypoint_index`` を更新してから渡すこと -- ロック取得後に
-        世代が進んでいたら (別の新しいリクエストに追い越されていたら)
-        自分の描画はもう不要なのでスキップする。"""
+        """``callback`` を排他制御して呼ぶ。新しいリクエストに追い越されたら
+        スキップする (index は呼ぶ前に更新しておくこと)。"""
         if callback is None:
             return
         with self._lock:
@@ -243,22 +195,16 @@ class PlaybackControls(object):
                     continue
                 self.waypoint_index += 1
                 idx = self.waypoint_index
-            # サーバー側で .value を代入すると on_update が同じスレッドで
-            # 同期的に呼ばれる (実測で確認済み) ので、これだけで
-            # _on_waypoint 経由の描画が起きる (直接 _render を呼ぶと
-            # 二重に描画してしまう)。
+            # 代入で on_update が同期的に呼ばれ描画される (_render を直接
+            # 呼ぶと二重描画になる)。
             self.waypoint_slider.value = idx
 
 
 def follow_arm_pose(model, person, pose, human_arm, arm):
-    """SMPL の ``pose`` の差し出した腕を、計画した人の腕 ``arm``
-    (``sbs.HumanArm.pose``) に合わせた pose を返す。
+    """SMPL の差し出した腕を計画した人の腕 ``arm`` に合わせた pose を返す.
 
-    手首から先は押し込み時の手に対して剛体のまま (``arm`` の掌の位置姿勢に
-    合わせて) 動かし、肩・肘は SMPL 自身の上腕・前腕の長さで 2 リンクの
-    IK を解いて (肘は ``arm`` の肘の側)、肩 -> 肘 -> 手首の順に骨の向きを
-    合わせる (肩より体幹側は
-    触らない)。"""
+    手首から先は剛体で掌に合わせ、肩・肘は 2 リンク IK で決める。
+    """
     if human_arm.hand == 'R':
         joints_ix = (smpl_body.R_SHOULDER, smpl_body.R_ELBOW,
                      smpl_body.R_WRIST)
@@ -278,11 +224,9 @@ def follow_arm_pose(model, person, pose, human_arm, arm):
     palm_pos = np.asarray(arm['palm_position'])
     hand_rot = palm_rot @ human_arm.palm_rot0.T
     wrist_target = palm_pos + hand_rot @ (joints0[w] - human_arm.palm_pos0)
-    # 肘は計画した腕の肘と同じ側 (肩から見た向き) に置く。
     elbow_target = sbs.two_link_elbow(
         joints0[s], wrist_target, np.linalg.norm(joints0[e] - joints0[s]),
-        np.linalg.norm(joints0[w] - joints0[e]), human_arm.outward,
-        prefer=np.asarray(arm['elbow']) - human_arm.shoulder)
+        np.linalg.norm(joints0[w] - joints0[e]), human_arm.outward)
 
     def set_world(index, world_rot, rots):
         parent_world = rots[model.parent[index]]
@@ -309,13 +253,11 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
     header = '**{}** ({}/{})  waypoint {}/{}\n\n経路: {}  検証: {}\n\n'.format(
         name, person_i + 1, n_people, waypoint_index,
         n_display_waypoints - 1, kind, verified_text)
-    # 検証の OK は接近経路の干渉だけで、掌を合わせられるかは別 (押し込み
-    # 姿勢の IK が解けなかった人は hover で終わり、実機でも動かさない)。
+    # 検証 OK は接近経路の干渉だけ。押し込みの可否は別。
     if not has_post_process:
         header += ('**押し込み: なし** (solve_palm_ik.py の後処理判定が解けず、'
                    '経路は hover で終わる -- 掌は合わない。実機では動かさない)'
                    '\n\n')
-    # 押し込み後の横並び移動ができるかは、どの waypoint でも先頭に出す。
     transition = motion.get('transition')
     if transition is None:
         header += '**横並び移動:** 計画していない\n\n'
@@ -340,24 +282,19 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='plan_handshake_motion.py が出力した軌道 (waypoint '
-                    '列) を、対応する骨格・握手姿勢 JSON と合わせて '
-                    'viser で再生する。')
+        description='plan_handshake_motion.py の軌道を viser で再生する。')
     parser.add_argument(
         '--skeleton-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_human_poses'),
-        help='SMPL pose/betas/root_pos と全身関節位置を持つ骨格 JSON の '
-            'ディレクトリ (既定 random_human_poses/)。')
+        help='骨格 JSON のディレクトリ。')
     parser.add_argument(
         '--handshake-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
-        help='solve_palm_ik.py が出力した握手姿勢 JSON のディレクトリ '
-            '(既定 random_handshake_poses/)。')
+        help='solve_palm_ik.py の握手姿勢 JSON のディレクトリ。')
     parser.add_argument(
         '--motion-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_motion_poses'),
-        help='plan_handshake_motion.py が出力した軌道 JSON のディレクトリ '
-            '(既定 random_motion_poses/)。')
+        help='plan_handshake_motion.py の軌道 JSON のディレクトリ。')
     parser.add_argument(
         '--model-path', type=str,
         default=os.path.expanduser(
@@ -369,20 +306,18 @@ def main():
         default=os.path.expanduser(
             '~/SMPL_python_v.1.0.0/smpl/models/'
             'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
-        help='SMPL (女性) モデル .pkl のパス (無ければ男性モデルのみ)。')
+        help='SMPL (女性) モデル .pkl のパス (無ければ男性のみ)。')
     parser.add_argument(
         '--no-hand', dest='use_hand', action='store_false',
-        help='指関節なしの URDF を使う (既定は指関節ありの URDF)。')
+        help='指関節なしの URDF で表示する。')
     parser.set_defaults(use_hand=True)
     parser.add_argument(
         '--fps', type=float, default=DEFAULT_PLAYBACK_FPS,
-        help='Play チェックボックスをオンにしたときの自動再生の速さ '
-            '[waypoint/秒] (既定 {})。'.format(DEFAULT_PLAYBACK_FPS))
+        help='自動再生の速さ [waypoint/秒]。')
     parser.add_argument('--client-wait-timeout', type=float, default=30.0,
-                        help='ブラウザクライアント接続を待つ 1 回あたりの '
-                             '秒数 (繰り返し待つ)。')
+                        help='ブラウザ接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true',
-                        help='ブラウザの自動起動を無効にする。')
+                        help='ブラウザを自動で開かない。')
     args = parser.parse_args()
 
     names = iter_common_names(
@@ -412,13 +347,8 @@ def main():
     viewer.add(robot_collision_overlay)
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
-    # ロボットを add し終えたので、自動で付いてくる関節スライダーを消す
-    # (触ると robot と robot_collision_overlay の一方だけが動いて姿勢が
-    # 食い違ったまま残るため、remove_joint_angle_gui 参照)。
+    # 関節スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
-    # 同様に、任意の障害物を画面から手動で追加・編集する GUI (Obstacles
-    # フォルダ) も、人体の障害物は骨格から自動生成するこのビューアでは
-    # 使わないので消す (remove_obstacles_gui 参照)。
     remove_obstacles_gui(viewer)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
@@ -494,12 +424,8 @@ def main():
                       human_arm=human_arm, obstacle_arm=None)
         set_obstacles(joint_positions)
 
-        # set_waypoint_count は waypoint スライダーの value を 0 に戻す
-        # ため、前の値が 0 でなければ on_update (_on_waypoint) がこの場で
-        # 同期的に発火し、_render 経由で refresh_waypoint が呼ばれ得る
-        # (RLock なので再入自体は安全)。current/obstacle をすべて更新し
-        # 終えた後でここに置くのはそのため -- 先に呼ぶと、古い人物の
-        # 障害物のまま新しい人物を描いてしまう瞬間ができる。
+        # set_waypoint_count は同期的に refresh_waypoint を呼び得るので、
+        # current/障害物を更新し終えてから呼ぶ。
         controls.set_waypoint_count(len(display_waypoints))
         refresh_waypoint()
 
@@ -512,14 +438,13 @@ def main():
             robot, motion['joint_names'], current['display_waypoints'], idx)
         sync_robot_collision_overlay(robot_collision_overlay, robot)
 
-        # ロボットの手先 (この waypoint の実際の位置) を人間に見させる。
+        # 人間にロボットの手先を見させる。
         hand_move_target = getattr(
             robot, '{}arm_end_coords'.format(current['handshake']
                                              ['robot_arm']))
         gaze_target = hand_move_target.worldpos()
         pose = look_at_pose(current['model'], current['person'], gaze_target)
-        # 横並び移動の waypoint では、人の腕 (SMPL と干渉判定の円柱) を
-        # 計画した人の腕 (wp['human_arm']) に合わせる。
+        # 横並び移動では人の腕 (SMPL と干渉円柱) を計画した腕に合わせる。
         arm = current['display_waypoints'][idx].get('human_arm')
         if arm is not None and current['human_arm'] is not None:
             pose = follow_arm_pose(
@@ -530,10 +455,8 @@ def main():
                           else current['human_arm'].skeleton(arm))
             current['obstacle_arm'] = arm
         mesh = build_smpl_mesh(current['model'], current['person'], pose)
-        # 毎フレーム viewer.delete -> viewer.add で作り直すと、ブラウザ側で
-        # GLB を読み込み終えるまで人が消えて (半透明の干渉ジオメトリも
-        # 巻き込んで) Play 中に点滅する。viser のメッシュを 1 つだけ作り、
-        # 以後は頂点を書き換えるだけにする (SMPL は男女とも同じ面構成)。
+        # 作り直すと Play 中に点滅するので、メッシュは 1 つだけ作り頂点を
+        # 書き換える (SMPL は男女とも同じ面構成)。
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.uint32)
         handle = human_mesh_handle[0]

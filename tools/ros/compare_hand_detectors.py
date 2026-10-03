@@ -1,32 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""検証 A: 同じカメラフレームに Holistic と Hands の両方をかけ、求まる掌の
-位置・向きがどれだけ違うか (検出器そのものの差) を測る。
+"""同じフレームに Holistic と Hands をかけ、掌の位置・向きの差 (検出器の差) を測る。
 
-``run_camera_pipeline_test.py`` は計画時の掌を Holistic (+ One Euro
-Filter)、押し込み直前の再認識の掌を Hands で求めている。距離・視点・
-時刻の違いを除いて検出器の差だけを見るため、ロボット (台車・首) は
-動かさず、同じフレームの結果どうしを比べる。
-
-計測のしかた
-------------
-* 起動するとまず首を計画時と同じ下向き (neck_p=25deg、``--head-pitch-deg``)
-  にする (``--no-head-move`` で動かさない)。その後は台車・首とも動かさない。
-* 人は体全体 (少なくとも肩〜手) がカメラに映る
-  距離 (0.8〜1.5m 程度) に立ち、手を差し出して静止する (Holistic は体が
-  映らないと手も返さない)。
-* 手はできるだけ動かさない (動いても同じフレームどうしの比較なので差には
-  効きにくいが、各検出器の時間方向のばらつきが大きく見える)。
-* 距離を変えて何回か測ると、検出器の差が距離に依存するかも分かる。
-
-出力
-----
-* 標準出力: ずれ (Hands - Holistic) の成分ごとの平均±標準偏差・中央値・
-  最大、各検出器の時間方向のばらつき、検出率。
-* ``--out-dir`` (既定 ``data/palm_detector_compare/<日時>/``) に
-  ``frames.jsonl`` (フレームごとの値)、``summary.json``、
-  ``overlay_*.png`` (Holistic の手=赤、Hands の手=緑)。
+首を計画時と同じ下向きにした後は台車・首とも動かさない。人は肩〜手が
+映る距離 (0.8〜1.5m) で手を差し出して静止する (Holistic は体が映らないと
+手を返さない)。結果は ``--out-dir`` (既定 ``data/palm_detector_compare/<日時>/``)
+に frames.jsonl / summary.json / overlay_*.png (Holistic=赤、Hands=緑)。
 
 Usage
 -----
@@ -46,15 +26,12 @@ import rospy
 
 import palm_check_common as common
 
-# 計画時 (run_camera_pipeline_test.py の ARM 時の初期姿勢、うなずき後も
-# この角度に戻る) の首の下げ角 [deg] (``Aero.reset_pose`` の neck_p)。
+# 計画時の首の下げ角 [deg]。
 PLANNING_HEAD_PITCH_DEG = 25.0
 
 
 def look_down(args):
-    """実機の首を、計画時 (run_camera_pipeline_test.py の ARM 時の
-    ``_move_to_initial_pose``) と同じ下向き (neck_p = ``--head-pitch-deg``、
-    neck_y/neck_r = 0) にする。首以外の関節は実機の現在値のまま送る。"""
+    """首を計画時と同じ下向きにする (他の関節は現在値のまま)。"""
     from aero_demo.aero_urdf_setup import load_aero
     from skrobot.interfaces.ros import AeroROSRobotInterface
 
@@ -180,7 +157,6 @@ def summarize(records, n_seen, n_holistic, n_hands, args):
             horizontal=common.stats([d['horizontal'] for d in rows]),
             rotation_deg=common.stats([d['rotation_deg'] for d in rows]),
             normal_deg=common.stats([d['normal_deg'] for d in rows]))
-    # 各検出器の時間方向のばらつき (静止した手なら計測の雑音の目安)。
     jitter = {}
     for name in common.SOURCES:
         pos = np.array([r[name]['position'] for r in records
@@ -235,25 +211,18 @@ def main():
     parser.add_argument('--side', choices=('R', 'L'), required=True,
                         help='比較する手 (人物自身の左右)。')
     parser.add_argument('--frames', type=int, default=60,
-                        help='比較できたフレームをこの数だけ集める (既定 60)。')
+                        help='集める比較フレーム数。')
     parser.add_argument('--timeout', type=float, default=120.0,
-                        help='この秒数で集まらなければそこまでで集計する。')
+                        help='集計までの最大待ち時間 [s]。')
     parser.add_argument('--max-pair-distance', type=float, default=0.15,
-                        help='Holistic の掌からこれ [m] 以内の Hands の手を'
-                             '同じ手とみなす (既定 0.15、'
-                             'PRESS_IN_REFINE_MAX_HAND_DISTANCE と同じ)。')
+                        help='Holistic の掌とこの距離 [m] 以内の Hands の手を同じ手とみなす。')
     parser.add_argument('--save-image-every', type=int, default=10,
-                        help='比較できたフレームのこの数ごとに重ね描き画像を'
-                             '保存する (0 で保存しない、既定 10)。')
+                        help='重ね描き画像を保存する間隔 (0 で保存しない)。')
     parser.add_argument('--head-pitch-deg', type=float,
                         default=PLANNING_HEAD_PITCH_DEG,
-                        help='最初に首を下げる neck_p の角度 [deg] (既定 {:.0f}、'
-                             '計画時の首の角度と同じ)。'.format(
-                                 PLANNING_HEAD_PITCH_DEG))
+                        help='最初に首を下げる neck_p [deg]。')
     parser.add_argument('--head-move-time', type=float, default=5.0,
-                        help='首を動かす時間 [s] (既定 5.0、run_camera_'
-                             'pipeline_test.ARM_INITIAL_POSE_MOVE_TIME と'
-                             '同じ)。')
+                        help='首を動かす時間 [s]。')
     parser.add_argument('--no-head-move', action='store_true',
                         help='首を動かさない (実機に接続しない)。')
     parser.add_argument('--out-dir', type=str, default=None)

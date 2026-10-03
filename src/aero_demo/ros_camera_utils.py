@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""``sensor_msgs/Image`` <-> numpy 変換、TF <-> 4x4 行列変換、camera->base/
-任意フレームの TF 解決といった、``scripts/ros/`` 配下の複数のノード
-(``run_camera_pipeline_test.py``/``record_palm_offer_clips.py``) が共通で
-使うヘルパー。
+"""ROS ノード共通のヘルパー: Image <-> numpy 変換、TF の行列化・解決.
 
-``imgmsg_to_ndarray``/``ndarray_to_imgmsg`` は cv_bridge の代替 (cv_bridge は
-システム (apt) 由来のバイナリで、ビルド時の NumPy 1.x の C-API を静的に
-埋め込んでいるため NumPy 2.x 実行時に ImportError/AttributeError
-(``_ARRAY_API not found``) を起こす。ここで使うのは bgr8/rgb8/mono8/16UC1/
-32FC1 だけなので、cv_bridge に頼らず ``Image.data`` を直接 numpy 配列に
-変換する)。
-
-``lookup_frame_position`` は、差し出し手判定 (``estimate_palm_poses.
-OfferedHandSelector.robot_position``) の基準にするロボット手先位置を実機の
-TF から引く処理を両ノードで共通化したもの (``run_camera_pipeline_test.py``/
-``record_palm_offer_clips.py`` のどちらも、ロボット未接続などでまだ TF が
-引けない間だけそれぞれのフォールバック値を使う)。
+Image の変換は cv_bridge の代替 (apt の cv_bridge は NumPy 2.x で動かない)。
 """
 
 import numpy as np
@@ -57,8 +43,7 @@ def imgmsg_to_ndarray(msg, desired_encoding=None):
 
 
 def ndarray_to_imgmsg(arr, encoding, header):
-    """numpy 配列を ``sensor_msgs/Image`` に変換する
-    (``imgmsg_to_ndarray`` の逆、cv_bridge の代替)."""
+    """numpy 配列を ``sensor_msgs/Image`` に変換する."""
     dtype, channels = IMGMSG_DTYPE_CHANNELS[encoding]
     arr = np.ascontiguousarray(arr, dtype=dtype)
     msg = Image()
@@ -90,14 +75,7 @@ def transform_to_matrix(transform):
 def lookup_camera_to_base(tf_buffer, base_frame, header):
     """``header`` (画像の frame_id/stamp) から base_frame への TF を引く.
 
-    まず画像の stamp ちょうどの TF を試み、それが (バッファに無い/
-    extrapolation エラー等で) 引けなければ最新の TF (``rospy.Time(0)``)
-    にフォールバックする。後者は画像とTFの時刻が厳密には一致しない
-    (カメラ画像を出しているマシンと TF を配信しているマシンの間で
-    システムクロックがズレていると、``ExtrapolationException`` が
-    毎回発生してこの経路に入り続ける -- その場合は根本的には NTP 等で
-    クロックを同期するべきだが、応急的にこのフォールバックでテストを
-    続けられるようにしてある)。
+    stamp で引けなければ (マシン間の時計ずれ等) 現在時刻で引き直す。
     """
     try:
         return tf_buffer.lookup_transform(
@@ -105,13 +83,8 @@ def lookup_camera_to_base(tf_buffer, base_frame, header):
             rospy.Duration(0.2))
     except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
            tf2_ros.ExtrapolationException):
-        # マシン間の時刻ズレで毎フレーム発生しうる想定内のフォールバック
-        # なので、警告は出さず黙って最新の TF にフォールバックする
-        # (それでも引けない場合だけ下の except で警告する)。
-        pass
+        pass  # 想定内なので警告しない
     try:
-        # tf2 では Time(0) は「時刻 0」であり tf とは違って「最新」を
-        # 意味しない。最新を取得するには現在時刻を渡す必要がある。
         return tf_buffer.lookup_transform(
             base_frame, header.frame_id, rospy.Time.now(),
             rospy.Duration(0.2))
@@ -125,24 +98,10 @@ def lookup_camera_to_base(tf_buffer, base_frame, header):
 
 def lookup_frame_position(tf_buffer, base_frame, frame_id, fallback_position,
                           warn_label=''):
-    """``base_frame`` から見た ``frame_id`` 原点の並進成分 ``[x, y, z]`` を
-    最新の TF (``rospy.Time(0)``) から引いて返す。
+    """``base_frame`` から見た ``frame_id`` 原点の位置 [x, y, z] を最新の TF で返す.
 
-    ``run_camera_pipeline_test.py``/``record_palm_offer_clips.py`` が
-    差し出し手判定 (``estimate_palm_poses.OfferedHandSelector.
-    robot_position``) の基準にするロボット手先位置を、実機の TF
-    (既定 ``r_eef_grasp_link`` -> ``base_link``) から毎フレーム引く処理を
-    共通化したもの。TF がまだ引けなければ (``LookupException`` 等、ロボット
-    未接続・対象ノード未起動など) throttled warning を出し、呼び出し側が
-    用意した ``fallback_position`` (array-like ``[m]``) を返す (2 ノードとも
-    フォールバック値の中身自体は別々に決めてよい -- 呼び出し側の docstring
-    参照)。
-
-    Parameters
-    ----------
-    warn_label : str
-        フォールバック時の警告ログの先頭に付ける、呼び出し元を示す文字列
-        (例 ``'[record-palm-offer-clips] '``)。
+    引けなければ警告して ``fallback_position`` を返す。``warn_label`` は
+    警告ログの接頭辞。
     """
     try:
         transform = tf_buffer.lookup_transform(

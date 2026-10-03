@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""台車 (``base_controller``) へ超低速の x 方向速度指令を一定時間送るだけの
-動作確認用スクリプト。
+"""台車を超低速で x 方向に動かし、``estop_node.py`` で止まるかを確認するスクリプト。
 
-``estop_node.py`` (STOP 送信で ``/base_controller/follow_joint_trajectory/
-cancel`` を publish する非常停止ノード) の動作確認用に作成した -- この
-スクリプトで台車をゆっくり前進させている最中に AtomS3 のボタン (または
-``estop_node.py`` への UDP STOP パケット) で実際に台車が止まるかを確認する
-想定。低速指令なので、途中で止め損なっても被害を最小限にできる。
-
-内部的には ``skrobot`` の ``AeroROSRobotInterface.go_velocity`` を使う。
-これは指定した速度 [m/s] で ``--duration`` 秒だけ動く軌道を 1 つの
-``FollowJointTrajectoryAction`` ゴールとして ``base_controller`` に送る
-(cmd_vel を継続 publish するのではなく、事前に軌道全体を計算して送る
-点に注意 -- estop の cancel が効けば軌道の途中で止まる)。
+``go_velocity`` は軌道全体を 1 つの FollowJointTrajectory ゴールとして送る
+(cmd_vel ではない) ので、estop の cancel が効けば途中で止まる。
 
 Usage
 -----
@@ -37,7 +27,6 @@ if _PKG_SRC_DIR not in sys.path:
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from skrobot.interfaces.ros import AeroROSRobotInterface  # noqa: E402
 
-# 「超低速」の既定値 [m/s]。5 秒間で 10cm しか進まない速さ。
 DEFAULT_VELOCITY = 0.02
 DEFAULT_DURATION = 20.0
 
@@ -46,16 +35,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--velocity', type=float, default=DEFAULT_VELOCITY,
-        help='x軸方向の速度 [m/s] (既定 {:.3f}、正で前進)。'.format(
-            DEFAULT_VELOCITY))
+        help='x 方向の速度 [m/s] (正で前進)。')
     parser.add_argument(
         '--duration', type=float, default=DEFAULT_DURATION,
-        help='指令を送る時間 [sec] (既定 {:.1f})。'.format(DEFAULT_DURATION))
+        help='動かす時間 [s]。')
     parser.add_argument(
         '--odom-topic', type=str, default='/odom',
-        help='odom トピック名 (既定 /odom、実機の aero_ros_controller に'
-            '合わせた値。skrobot 既定の /base_odometry/odom ではない '
-            '点に注意)。')
+        help='odom トピック (skrobot 既定の /base_odometry/odom ではない)。')
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
     rospy.init_node('test_base_velocity')

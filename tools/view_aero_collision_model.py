@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""Aeroの干渉(コリジョン)モデルをviser viewerで可視化する (デバッグ用).
-
-``aero_demo.collision_model.build_collision_model_urdf`` (本番の
-``solve_palm_ik.py``/``handshake_viewer_common.py`` も使う、プリミティブ
-近似 URDF を作る処理そのもの) が生成したURDFをもう一体のロボットとして
-読み込み、元のAero(不透明)に重ねて半透明で表示することで、干渉モデルの
-形状を確認できる。この可視化そのものは本番パイプラインでは使わない
-デバッグ用ツール。
+"""Aero の干渉モデル (``build_collision_model_urdf`` のプリミティブ近似) を
+元の Aero に半透明で重ねて viser で表示する (デバッグ用).
 """
 import argparse
 import os
@@ -39,21 +33,18 @@ def main():
 
     use_hand = not args.no_hand
 
-    # 元のAero(見た目そのままの通常モデル)
     robot = load_aero(use_hand=use_hand)
     robot.reset_pose()
 
-    # 元のURDFファイルパスを取得し、干渉モデル(プリミティブ近似)URDFを生成
     urdf_path = robot.urdf_path
     collision_urdf_path = build_collision_model_urdf(urdf_path)
 
-    # 干渉モデルを別ロボットとして読み込み、姿勢をAeroに同期させる
+    # 干渉モデルを別ロボットとして読み込み、姿勢を同期させる
     collision_robot = RobotModel()
     collision_robot.load_urdf_file(
         str(collision_urdf_path), include_mimic_joints=False)
     collision_robot.angle_vector(robot.angle_vector())
 
-    # 干渉モデルの各リンクを青色・半透明にする
     for link in collision_robot.link_list:
         link.set_color((80, 160, 255, 255))
         link.set_alpha(args.alpha)
