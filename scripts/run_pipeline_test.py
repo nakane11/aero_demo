@@ -290,9 +290,10 @@ def main():
     parser.add_argument(
         '--side-by-side-transition', action='store_true',
         help='--plan-motion 指定時、plan_handshake_motion.py に '
-            '--side-by-side-transition を渡し、押し込んだ後に掌を合わせた '
-            'まま台車を動かして横並びへ移る区間も計画する (ビューアでは '
-            '押し込みの後に続けて再生される)。')
+            '--side-by-side-transition を渡し、押し込んだ後につないだ手を '
+            '人の体の横へ下ろしながら横並びへ移る区間も計画する (ビューア '
+            'では押し込みの後に続けて再生され、人の腕もロボットの手に '
+            '追従する)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')

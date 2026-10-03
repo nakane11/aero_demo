@@ -1684,7 +1684,7 @@ def main():
             .format(spik.DEFAULT_TORSO_SURFACE_OFFSET))
     parser.add_argument(
         '--side-by-side-transition', action='store_true',
-        help='押し込んだ後、掌を合わせたまま台車を動かして人とさらに横並び '
+        help='押し込んだ後、つないだ手を人の体の横へ下ろしながら人と横並び '
             'になる区間も計画し、軌道 JSON の transition に保存する '
             '(side_by_side_transition.plan_transition)。')
     parser.add_argument(
@@ -1742,12 +1742,18 @@ def main():
         # 最初のバッチ IK は台車の全可動域で解いておく (人ごとに絞った
         # 可動域で最初に呼ぶと以後の結果が壊れる、solve_palm_ik.py の
         # _warmup_batch_ik と同じ)。
+        # 握りの向きを自由にした横並び移動のバッチ IK は別のソルバーなので、
+        # それも全可動域で 1 回解いておく (sbs.warmup_batch_ik)。
         for robot_arm, hand in (('l', 'R'), ('r', 'L')):
-            spik.solve_person_ik(
+            picked, _, _ = spik.solve_person_ik(
                 robot, spik._WARMUP_PALM, hand, robot_arm,
                 spik.human_body_obstacles({}), base_limits=base_limits,
                 collision_pairs=transition_pairs, joint_positions={},
                 verification_pairs=verification_pairs)
+            sbs.warmup_batch_ik(
+                robot, robot_arm, hand,
+                picked[1] if picked is not None else robot.angle_vector(),
+                transition_pairs, base_limits)
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     n_transition = n_transition_verified = 0
@@ -1799,8 +1805,9 @@ def main():
         if args.side_by_side_transition and post is not None:
             transition = sbs.plan_transition(
                 robot, handshake['robot_arm'], handshake['offered_hand'],
-                post, joint_positions, collision_joints, verification_pairs,
-                transition_pairs, base_limits)
+                post, handshake['turn_deg'], joint_positions,
+                collision_joints, verification_pairs, transition_pairs,
+                base_limits)
             result['transition'] = transition
             n_transition += 1
             n_transition_verified += int(transition['verified'])

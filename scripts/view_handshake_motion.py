@@ -54,6 +54,7 @@ if _PKG_SRC_DIR not in sys.path:
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+from aero_demo import smpl_body  # noqa: E402
 from aero_demo import viewer_nav  # noqa: E402
 
 from generate_random_human_poses import load_smpl_models  # noqa: E402
@@ -81,6 +82,7 @@ from skrobot.viewers import ViserViewer  # noqa: E402
 from view_handshake_poses import SKIN_COLOR  # noqa: E402
 from view_handshake_poses import build_smpl_mesh  # noqa: E402
 from view_handshake_poses import look_at_pose  # noqa: E402
+from view_handshake_poses import smpl_world_rots  # noqa: E402
 from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa: E402,E501
 
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
@@ -248,6 +250,53 @@ class PlaybackControls(object):
             self.waypoint_slider.value = idx
 
 
+def follow_arm_pose(model, person, pose, human_arm, arm):
+    """SMPL の ``pose`` の差し出した腕を、計画した人の腕 ``arm``
+    (``sbs.HumanArm.pose``) に合わせた pose を返す。
+
+    手首から先は押し込み時の手に対して剛体のまま (``arm`` の掌の位置姿勢に
+    合わせて) 動かし、肩・肘は SMPL 自身の上腕・前腕の長さで 2 リンクの
+    IK を解いて、肩 -> 肘 -> 手首の順に骨の向きを合わせる (肩より体幹側は
+    触らない)。"""
+    if human_arm.hand == 'R':
+        joints_ix = (smpl_body.R_SHOULDER, smpl_body.R_ELBOW,
+                     smpl_body.R_WRIST)
+    else:
+        joints_ix = (smpl_body.L_SHOULDER, smpl_body.L_ELBOW,
+                     smpl_body.L_WRIST)
+    s, e, w = joints_ix
+    pose = np.array(pose, dtype=np.float64).reshape(24, 3)
+
+    def forward(p):
+        _, joints = smpl_body.forward_world(
+            model, p, person['betas'], person['root_pos'])
+        return joints, smpl_world_rots(model, p)
+
+    joints0, rots0 = forward(pose)
+    palm_rot = np.asarray(arm['palm_rot'])
+    palm_pos = np.asarray(arm['palm_position'])
+    hand_rot = palm_rot @ human_arm.palm_rot0.T
+    wrist_target = palm_pos + hand_rot @ (joints0[w] - human_arm.palm_pos0)
+    elbow_target = sbs.two_link_elbow(
+        joints0[s], wrist_target, np.linalg.norm(joints0[e] - joints0[s]),
+        np.linalg.norm(joints0[w] - joints0[e]), human_arm.outward)
+
+    def set_world(index, world_rot, rots):
+        parent_world = rots[model.parent[index]]
+        pose[index] = smpl_body.mat_to_axis_angle(
+            smpl_body.to_smpl_rotation(parent_world.T.dot(world_rot)))
+
+    joints, rots = joints0, rots0
+    for joint, child, target in ((s, e, elbow_target), (e, w, wrist_target)):
+        turn = smpl_body.rotation_between(
+            sbs._unit(joints[child] - joints[joint]),
+            sbs._unit(target - joints[joint]))
+        set_world(joint, turn.dot(rots[joint]), rots)
+        joints, rots = forward(pose)
+    set_world(w, hand_rot.dot(rots0[w]), rots)
+    return pose
+
+
 def status_text(name, person_i, n_people, motion, display_waypoints,
                 n_approach, waypoint_index, collision_text, has_post_process):
     n_display_waypoints = len(display_waypoints)
@@ -263,20 +312,26 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
         header += ('**押し込み: なし** (solve_palm_ik.py の後処理判定が解けず、'
                    '経路は hover で終わる -- 掌は合わない。実機では動かさない)'
                    '\n\n')
+    # 押し込み後の横並び移動ができるかは、どの waypoint でも先頭に出す。
+    transition = motion.get('transition')
+    if transition is None:
+        header += '**横並び移動:** 計画していない\n\n'
+    else:
+        header += '**横並び移動: {}** {}\n\n'.format(
+            'できる' if transition['verified'] else 'できない',
+            sbs.transition_summary(transition))
     if waypoint_index < n_approach:
         dist = motion['waypoint_min_distances'][waypoint_index]
         body = 'この waypoint の干渉余裕: {:+.4f} m ({})\n\n'.format(
             dist, '貫通' if dist < 0 else '干渉なし')
     elif display_waypoints[waypoint_index].get('transition'):
-        body = ('横並び移動 (掌を合わせたまま台車を動かす): {}\n\n'.format(
-            sbs.transition_summary(motion['transition'])))
+        wp = display_waypoints[waypoint_index]
+        body = ('横並び移動 (つないだ手を体の横へ下ろしながら横並びへ)、'
+                '握りの向き {:.0f} 度\n\nこの waypoint の人の腕: {}\n\n'.format(
+                    wp['turn_deg'], sbs.human_arm_text(wp['human_arm'])))
     else:
         body = ('掌への押し込み (solve_palm_ik.py の後処理判定, 表示のみ '
                 '-- 経路の検証対象ではない)\n\n')
-        transition = motion.get('transition')
-        if transition is not None:
-            body += '横並び移動: {}\n\n'.format(
-                sbs.transition_summary(transition))
     return header + body + collision_text
 
 
@@ -382,6 +437,16 @@ def main():
     current = {'name': None, 'motion': None,
               'person': None, 'model': None}
 
+    def set_obstacles(joint_positions):
+        for obstacle_link in current_obstacle_links:
+            viewer.delete(obstacle_link)
+        current_obstacle_links[:] = human_body_obstacles(joint_positions)
+        for obstacle_link in current_obstacle_links:
+            set_translucent_color(obstacle_link, COLLISION_OBSTACLE_COLOR)
+            viewer.add(obstacle_link)
+            set_link_visible(obstacle_link,
+                             show_collision_models_checkbox.value)
+
     def refresh_person():
         name = names[controls.person_index]
         skeleton_path = os.path.join(args.skeleton_dir, name)
@@ -408,20 +473,23 @@ def main():
 
         display_waypoints, n_approach = build_display_waypoints(
             motion, handshake)
+        # 横並び移動では人の腕をロボットの手に追従させる (sbs.HumanArm)。
+        transition = motion.get('transition') or {}
+        human_arm = None
+        if transition.get('verified'):
+            press_arm = transition['press_arm']
+            human_arm = sbs.HumanArm(
+                joint_positions, transition['hand'], sbs.palm_from_frame(
+                    np.asarray(press_arm['palm_position']),
+                    np.asarray(press_arm['palm_rot'])))
         current.update(name=name, motion=motion,
                       person=person,
                       model=model, handshake=handshake,
                       display_waypoints=display_waypoints,
-                      n_approach=n_approach)
-
-        for obstacle_link in current_obstacle_links:
-            viewer.delete(obstacle_link)
-        current_obstacle_links[:] = human_body_obstacles(joint_positions)
-        for obstacle_link in current_obstacle_links:
-            set_translucent_color(obstacle_link, COLLISION_OBSTACLE_COLOR)
-            viewer.add(obstacle_link)
-            set_link_visible(obstacle_link,
-                             show_collision_models_checkbox.value)
+                      n_approach=n_approach,
+                      joint_positions=joint_positions,
+                      human_arm=human_arm, obstacle_arm=None)
+        set_obstacles(joint_positions)
 
         # set_waypoint_count は waypoint スライダーの value を 0 に戻す
         # ため、前の値が 0 でなければ on_update (_on_waypoint) がこの場で
@@ -447,6 +515,17 @@ def main():
                                              ['robot_arm']))
         gaze_target = hand_move_target.worldpos()
         pose = look_at_pose(current['model'], current['person'], gaze_target)
+        # 横並び移動の waypoint では、人の腕 (SMPL と干渉判定の円柱) を
+        # 計画した人の腕 (wp['human_arm']) に合わせる。
+        arm = current['display_waypoints'][idx].get('human_arm')
+        if arm is not None and current['human_arm'] is not None:
+            pose = follow_arm_pose(
+                current['model'], current['person'], pose,
+                current['human_arm'], arm)
+        if arm is not current['obstacle_arm']:
+            set_obstacles(current['joint_positions'] if arm is None
+                          else current['human_arm'].skeleton(arm))
+            current['obstacle_arm'] = arm
         mesh = build_smpl_mesh(current['model'], current['person'], pose)
         # 毎フレーム viewer.delete -> viewer.add で作り直すと、ブラウザ側で
         # GLB を読み込み終えるまで人が消えて (半透明の干渉ジオメトリも

@@ -875,6 +875,16 @@ class HandshakePipelineNode(object):
                 motion_args, self.motion_verification_pairs, self.solver)
             log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
                 label, time.time() - t0))
+            if args.side_by_side_transition:
+                # 横並び移動の移動先のバッチ IK (握りの向きを自由にすると
+                # 回転の拘束が違い、別にコンパイルされる。_solve_handshake
+                # の plan_transition と同じく attempts_per_pose は既定値)。
+                t0 = time.time()
+                sbs.warmup_batch_ik(
+                    self.robot, robot_arm, hand, angle_vector,
+                    self.collision_pairs, self.base_limits)
+                log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
+                          .format(label, time.time() - t0))
         print('[warmup] 完了しました ({:.1f} 秒)。'.format(
             time.time() - warmup_t0))
 
@@ -1512,7 +1522,7 @@ class HandshakePipelineNode(object):
                     float(d) for d in motion['waypoint_min_distances']],
                 kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                 compute_time=motion['compute_time']))
-            # 押し込んだ後、掌を合わせたまま台車を動かして人とさらに横並び
+            # 押し込んだ後、つないだ手を人の体の横へ下ろしながら人と横並び
             # になる区間 (sbs.plan_transition)。押し込み姿勢 (post_process)
             # が無い・接近の軌道が検証に通らないなら実機は動かさないので
             # 計画しない。
@@ -1521,8 +1531,9 @@ class HandshakePipelineNode(object):
                     and self._motion_verified(motion)):
                 transition = sbs.plan_transition(
                     self.robot, robot_arm, offered_hand,
-                    result['post_process'], translated_joints,
-                    collision_joints, self.verification_pairs,
+                    result['post_process'], result['turn_deg'],
+                    translated_joints, collision_joints,
+                    self.verification_pairs,
                     self.collision_pairs, self.base_limits)
                 motion['transition'] = transition
                 print('[transition] 試行{}: 横並び移動 {}'.format(
@@ -2133,13 +2144,24 @@ class HandshakePipelineNode(object):
                 robot_arm)
 
         self._say(self.args.speech_done_text)
+        press_end_time = time.time()
+        do_transition = (transition_waypoints_
+                         and reach_boundary < len(display_waypoints))
 
         if (self.args.grasp_capture_duration > 0
                 and reach_boundary < len(display_waypoints)):
+            # 横並び移動をするときは、動き出すまで (--side-by-side-delay)
+            # の画像だけを集める。
+            duration = self.args.grasp_capture_duration
+            if do_transition:
+                duration = min(duration, self.args.side_by_side_delay)
             self._capture_grasp_images(
-                press_waypoints[-1], joint_names, result)
+                press_waypoints[-1], joint_names, result, duration)
 
-        if transition_waypoints_ and reach_boundary < len(display_waypoints):
+        if do_transition:
+            wait = press_end_time + self.args.side_by_side_delay - time.time()
+            if wait > 0:
+                rospy.sleep(wait)
             self._execute_transition(
                 press_waypoints[-1], display_waypoints[-1],
                 transition_waypoints_, joint_names, robot_arm)
@@ -2148,8 +2170,8 @@ class HandshakePipelineNode(object):
 
     def _execute_transition(self, press_wp, planned_press_wp, waypoints,
                             joint_names, robot_arm):
-        """押し込み後の横並び移動 (掌を合わせたまま台車を動かす、
-        ``sbs.plan_transition``) を実行する。
+        """押し込み後の横並び移動 (つないだ手を人の体の横へ下ろしながら
+        横並びへ移る、``sbs.plan_transition``) を実行する。
 
         押し込みを解き直した (``_refine_press_in``) ときは、実際の押し込み
         姿勢 ``press_wp`` と計画時の押し込み姿勢 ``planned_press_wp`` の
@@ -2166,7 +2188,7 @@ class HandshakePipelineNode(object):
                 + delta])
             for wp in waypoints]
         self._say(self.args.speech_transition_text)
-        print('[execute] 掌を合わせたまま横並びの位置へ移動します '
+        print('[execute] 手を下ろしながら横並びの位置へ移動します '
               '(waypoint {} 個)。'.format(len(waypoints)))
         self._execute_waypoint_segment(
             segment, joint_names,
@@ -2329,10 +2351,12 @@ class HandshakePipelineNode(object):
             print('[execute][refine][WARN] 画像の保存に失敗しました ({})。'
                   .format(exc))
 
-    def _capture_grasp_images(self, press_wp, joint_names, result):
-        """押し込み終了 (「どうぞ」の発話) 後、``--grasp-capture-duration``
-        秒の間に届いたカメラフレームを、人が握ったかどうかの判定を作る
-        ための資料として保存する (一時的なデータ収集用)。
+    def _capture_grasp_images(self, press_wp, joint_names, result, duration):
+        """押し込み終了 (「どうぞ」の発話) 後、``duration`` 秒 (既定は
+        ``--grasp-capture-duration``、横並び移動をするときは
+        ``--side-by-side-delay`` までに縮める) の間に届いたカメラフレームを、
+        人が握ったかどうかの判定を作るための資料として保存する (一時的な
+        データ収集用)。
 
         保存 (PNG の書き出し) は数秒かかるので別スレッドで行う。画像の
         注釈・``record.json`` に使う計画時の掌とロボットの手先の位置は、
@@ -2360,8 +2384,7 @@ class HandshakePipelineNode(object):
             record['expected_palm_normal'] = [float(v) for v in base_rot.T @
                                               np.asarray(planned_palm['y_axis'])]
         t0 = time.time()
-        hand_frames = self._collect_hand_frames(
-            None, self.args.grasp_capture_duration)
+        hand_frames = self._collect_hand_frames(None, duration)
         log_debug('[execute][grasp] 押し込み後の画像を {} フレーム取得しました '
                   '({:.2f}s)。'.format(len(hand_frames), time.time() - t0))
         if hand_frames:
@@ -3774,13 +3797,18 @@ def main():
     parser.add_argument(
         '--no-side-by-side-transition', dest='side_by_side_transition',
         action='store_false',
-        help='押し込んだ後に、掌を合わせたまま台車を動かして人とさらに横並び '
+        help='押し込んだ後に、つないだ手を人の体の横へ下ろしながら人と横並び '
             'になる移動 (side_by_side_transition.plan_transition) を行わない '
-            '(既定では、移動先が押し込み時より横並びに近くなるときに行う)。')
+            '(既定では、計画が移動先の 3 割以上まで進めたときに行う)。')
     parser.add_argument(
         '--side-by-side-segment-time', type=float, default=0.5,
         help='横並び移動の waypoint (台車 5 cm/5 度ごと) 1 区間にかける最短 '
             '時間 [秒] (既定 0.5、人を連れて動くのでゆっくりにする)。')
+    parser.add_argument(
+        '--side-by-side-delay', type=float, default=2.0,
+        help='押し込み終了 (--speech-done-text の発話) から横並び移動を始める '
+            'までの時間 [秒] (既定 2.0)。押し込み後の画像の保存 '
+            '(--grasp-capture-duration) はこの時間までで打ち切る。')
     parser.add_argument(
         '--speech-transition-text', type=str,
         default='一緒に横に並びますね',

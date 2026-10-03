@@ -45,6 +45,15 @@ MediaPipe 形式の骨格・掌の
    参照。`--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
    (`run_pipeline_test.py` にも同名のオプション)。
 
+   `--side-by-side-transition` を付けると、押し込み (掌を合わせた姿勢) の後に、
+   つないだ手を人の体の横へ下ろしながらロボットも人と横並びになる区間も計画し、
+   軌道 JSON の `transition` に保存する (`scripts/side_by_side_transition.py`)。
+   押し込みまでは握りの向きを決めて合わせ、そこから手を下ろしやすい向きへ少しずつ
+   回す。移動先の決め方・棄却条件・合成データでの結果は
+   [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md) の 5 節
+   参照。`run_pipeline_test.py --plan-motion --side-by-side-transition --viewer` で
+   見ると、押し込みに続けて再生され、人の腕もロボットの手に追従する。
+
    `--force-optimize` (既定 False) を付けると、pre-touch/線形補間の
    候補が事後検証に通っていても early return せず、必ず jaxls の軌道
    最適化まで実行する。通常運用では最適化を経ずに済むケースがほとんど
@@ -332,6 +341,14 @@ python3 scripts/ros/run_camera_pipeline_test.py \
   速度の平均) で付け直して送る (`_send_base_trajectory`)。skrobot の
   `move_trajectory_sequence` のままだと、静止状態から最初の区間の速度へ
   いきなり跳ぶため。
+
+押し込みの後は、既定で横並び移動 (つないだ手を人の体の横へ下ろしながら
+横並びへ移る) を続けて行う。計画が移動先の 3 割以上まで進めた人だけで、
+押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 2.0) 後に
+「一緒に横に並びますね」(`--speech-transition-text`) と発話して動き出す。
+人の手を引いて動くので、各区間は `--side-by-side-segment-time` 秒 (既定 0.5)
+以上かける。押し込み後の画像の保存 (`--grasp-capture-duration`) は動き出す
+までで打ち切る。`--no-side-by-side-transition` で行わない。
 
 `[debug]` などの詳細なログは画面には出さず、
 `/tmp/run_camera_pipeline_test_logs/` 以下に起動時 (`startup.log`) と
