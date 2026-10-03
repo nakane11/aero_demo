@@ -77,6 +77,7 @@ import math
 import os
 import sys
 import time
+import zlib
 
 import numpy as np
 
@@ -4192,6 +4193,10 @@ def main():
     n_total = 0
     n_not_target = 0
     for i, path in enumerate(files):
+        # バッチ IK の初期値 (attempt 1 以降) は共有の np.random から引く。
+        # 人物ごとにファイル名からシードを決め直し、前の人物で解き直した
+        # 回数 (x の窓の数) によって以降の人物の初期値が変わらないようにする。
+        np.random.seed(zlib.crc32(os.path.basename(path).encode()))
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         palms = load_palm_json(path)
         human_hand = palms.get('offered_hand')
