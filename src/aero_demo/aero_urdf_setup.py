@@ -59,10 +59,10 @@ def ensure_feetech_hand_urdf_cached():
     return target_urdf
 
 
-def load_aero(use_hand=True, *args, **kwargs):
+def load_aero(use_hand=True, **kwargs):
     """``skrobot.models.Aero`` を、手ありの場合は事前準備をしてから作る。"""
     from skrobot.models import Aero
 
     if use_hand:
         ensure_feetech_hand_urdf_cached()
-    return Aero(use_hand=use_hand, *args, **kwargs)
+    return Aero(use_hand=use_hand, **kwargs)

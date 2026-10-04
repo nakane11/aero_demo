@@ -43,6 +43,9 @@ from solve_palm_ik import (  # noqa: E402
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 
+# 表示するランキングの件数。
+SHOW_RANKING = 30
+
 
 def build_robot():
     """``solve_palm_ik.main`` と同じ手順でロボット (指なし) を作る。"""
@@ -67,9 +70,7 @@ def apply_result_pose(robot, result, angle_vector):
 
 
 def analyze_handshake_dir(handshake_dir, skeleton_dir,
-                          human_front_distance=HUMAN_FRONT_DISTANCE,
-                          dist_threshold=-DEFAULT_COLLISION_VERIFY_TOLERANCE,
-                          robot=None):
+                          dist_threshold=-DEFAULT_COLLISION_VERIFY_TOLERANCE):
     """IK 結果と骨格から、組ごとの最小距離と干渉人数を集計する。
 
     組・距離は事後検証と同じ (貫通なら負)。hover 姿勢は全組、押し込み姿勢は
@@ -81,8 +82,7 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
         ``min_dist``/``collision_count`` (キーは ``(名前A, 名前B)``) と
         ``n_samples``。
     """
-    if robot is None:
-        robot = build_robot()
+    robot = build_robot()
     pairs = build_collision_verification_pairs(robot, 'r')
     names = [collision_pair_name(pair) for pair in pairs]
     is_self = np.array([not isinstance(other, int) for _, other in pairs])
@@ -103,7 +103,7 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
 
         joint_positions = load_skeleton_json(skeleton_path)
         offset = human_translation_offset(
-            joint_positions, front_distance=human_front_distance)
+            joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
         joint_positions = translate_joint_positions(joint_positions, offset)
         obstacles = human_body_obstacles(joint_positions)
         samples = [cylinder_surface_samples(o) for o in obstacles]
@@ -132,14 +132,6 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
                 n_samples=n_samples)
 
 
-def load_pairs(path):
-    if not os.path.exists(path):
-        return set()
-    with open(path) as f:
-        pair_names = json.load(f)
-    return {tuple(pair) for pair in pair_names}
-
-
 def save_pairs(pairs, path):
     with open(path, 'w') as f:
         json.dump([list(pair) for pair in sorted(pairs)], f,
@@ -157,17 +149,17 @@ def count_ik_targets(handshake_dir):
     return n_targets
 
 
-def rank_collision_candidates(stats, exclude=()):
+def rank_collision_candidates(stats):
     """干渉した組を人数の多い順 (同数なら最小距離・名前順) に並べる。"""
     counts = stats['collision_count']
-    return sorted((pair for pair in counts if pair not in exclude),
+    return sorted(counts,
                   key=lambda pair: (-counts[pair], stats['min_dist'][pair],
                                     pair))
 
 
-def select_pairs(ranking, num_pairs, include=()):
-    """上位 ``num_pairs`` 組 + ``include`` (組数に数えない) を返す。"""
-    return set(ranking[:num_pairs]) | set(include)
+def select_pairs(ranking, num_pairs):
+    """上位 ``num_pairs`` 組を返す。"""
+    return set(ranking[:num_pairs])
 
 
 def save_ranking(stats, ranking, path):
@@ -202,23 +194,22 @@ def run(cmd):
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
-def solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
-            collision_pairs_path, robot_arm, extra_args):
-    cmd = [python, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
-          '--input-dir', palm_poses_dir,
-          '--output-dir', handshake_dir,
-          '--skeleton-dir', human_poses_dir,
-          '--collision-pairs', collision_pairs_path,
-          '--robot-arm', robot_arm]
+def solve_ik(human_poses_dir, palm_poses_dir, handshake_dir,
+             collision_pairs_path, extra_args):
+    cmd = [sys.executable, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
+           '--input-dir', palm_poses_dir,
+           '--output-dir', handshake_dir,
+           '--skeleton-dir', human_poses_dir,
+           '--collision-pairs', collision_pairs_path]
     cmd += extra_args
     run(cmd)
 
 
-def timed_solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
-                   collision_pairs_path, robot_arm, extra_args):
+def timed_solve_ik(human_poses_dir, palm_poses_dir, handshake_dir,
+                   collision_pairs_path, extra_args):
     """``solve_ik`` を実行し、1 人あたりの平均 IK 時間 [秒] を返す。"""
-    solve_ik(python, human_poses_dir, palm_poses_dir, handshake_dir,
-             collision_pairs_path, robot_arm, extra_args)
+    solve_ik(human_poses_dir, palm_poses_dir, handshake_dir,
+             collision_pairs_path, extra_args)
     return mean_ik_time_per_person(handshake_dir)
 
 
@@ -256,12 +247,6 @@ def main():
         '--ranking-output', type=str, default=None,
         help='ランキングを保存する JSON のパス。')
     parser.add_argument(
-        '--show-ranking', type=int, default=30,
-        help='表示するランキングの件数。')
-    parser.add_argument(
-        '--include-pairs', type=str, default=None,
-        help='順位によらず必ず採用する組の JSON (--num-pairs に数えない)。')
-    parser.add_argument(
         '--no-verify', action='store_true',
         help='採用後に IK を解き直して時間を測る確認を省略する。')
     count_group = parser.add_mutually_exclusive_group(required=True)
@@ -272,14 +257,8 @@ def main():
         '--max-ik-seconds-per-person', type=float,
         help='1 人あたりの平均 IK 時間がこの秒数を超える直前の組数を採用する。')
     parser.add_argument(
-        '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
-        help='solve_palm_ik.py に渡す --robot-arm。')
-    parser.add_argument(
         '--seed', type=int, default=None,
         help='generate_random_human_poses.py に渡す --seed。')
-    parser.add_argument(
-        '--python', type=str, default=sys.executable,
-        help='子プロセスを実行する Python インタプリタ。')
     parser.add_argument(
         '--solve-arg', dest='solve_args', action='append', default=[],
         help='solve_palm_ik.py に追加で渡す引数 (複数回指定可)。')
@@ -302,7 +281,7 @@ def main():
         candidate_output = os.path.join(temp_dir, 'candidate_pairs.json')
 
         if not args.skip_generate:
-            gen_cmd = [args.python,
+            gen_cmd = [sys.executable,
                        os.path.join(_SCRIPTS_DIR,
                                     'generate_random_human_poses.py'),
                        '--num-samples', str(args.num_samples),
@@ -310,7 +289,7 @@ def main():
             if args.seed is not None:
                 gen_cmd += ['--seed', str(args.seed)]
             run(gen_cmd)
-            run([args.python,
+            run([sys.executable,
                 os.path.join(_SCRIPTS_DIR, 'estimate_palm_poses.py'),
                 '--input-dir', args.human_poses_dir,
                 '--output-dir', args.palm_poses_dir])
@@ -323,9 +302,9 @@ def main():
 
         if not args.skip_solve:
             print('\n=== 手順 3: 干渉回避無しで IK を解く ===')
-            solve_ik(args.python, args.human_poses_dir, args.palm_poses_dir,
+            solve_ik(args.human_poses_dir, args.palm_poses_dir,
                      args.handshake_dir, nonexistent_collision_pairs,
-                     args.robot_arm, args.solve_args)
+                     args.solve_args)
 
         n_ik_people = count_ik_targets(args.handshake_dir)
         if n_ik_people == 0:
@@ -340,7 +319,6 @@ def main():
         print('\n=== 手順 4: 干渉頻度をランキング ===')
         stats = analyze_handshake_dir(
             args.handshake_dir, args.human_poses_dir,
-            human_front_distance=HUMAN_FRONT_DISTANCE,
             dist_threshold=args.collision_dist_threshold)
         ranking = rank_collision_candidates(stats)
         if args.ranking_output is not None:
@@ -351,13 +329,11 @@ def main():
             sys.exit(1)
         print('干渉頻度の高い順に {} 組の候補が見つかりました (解けた {} 人中、'
               '上位 {} 件):'.format(len(ranking), stats['n_samples'],
-                                   args.show_ranking))
-        for rank, pair in enumerate(ranking[:args.show_ranking], start=1):
+                                   SHOW_RANKING))
+        for rank, pair in enumerate(ranking[:SHOW_RANKING], start=1):
             print('  {:3d}. {} x {}: {} 人 (最小 {:.3f} m)'.format(
                 rank, pair[0], pair[1], stats['collision_count'][pair],
                 stats['min_dist'][pair]))
-        include = load_pairs(args.include_pairs) if args.include_pairs \
-            else set()
 
         print('\n=== 手順 5: 採用する組数を決定 ===')
         if args.num_pairs is not None:
@@ -365,29 +341,25 @@ def main():
                 print('警告: --num-pairs ({}) がランキングの候補数 ({}) を '
                       '超えているため、候補数だけ採用します。'.format(
                           args.num_pairs, len(ranking)))
-            pairs = select_pairs(ranking, args.num_pairs, include)
+            pairs = select_pairs(ranking, args.num_pairs)
             save_pairs(pairs, args.output)
-            print('上位 {} 組{}を採用しました -> {}'.format(
-                min(args.num_pairs, len(ranking)),
-                ' + 指定の {} 組'.format(len(include)) if include else '',
-                args.output))
+            print('上位 {} 組を採用しました -> {}'.format(
+                min(args.num_pairs, len(ranking)), args.output))
             if not args.no_verify:
                 print('検証のため、この組で干渉回避ありの IK を解き直します。')
                 per_person = timed_solve_ik(
-                    args.python, args.human_poses_dir, args.palm_poses_dir,
-                    args.handshake_dir, args.output, args.robot_arm,
-                    args.solve_args)
+                    args.human_poses_dir, args.palm_poses_dir,
+                    args.handshake_dir, args.output, args.solve_args)
                 print('IK 計算時間: {:.3f} 秒/人 (IK 対象 {} 人の平均、'
                       'warmup を除く)。'.format(per_person, n_ik_people))
         else:
             n_pairs = 0
             for n_pairs in range(1, len(ranking) + 1):
-                pairs = select_pairs(ranking, n_pairs, include)
+                pairs = select_pairs(ranking, n_pairs)
                 save_pairs(pairs, candidate_output)
                 per_person = timed_solve_ik(
-                    args.python, args.human_poses_dir, args.palm_poses_dir,
-                    args.handshake_dir, candidate_output, args.robot_arm,
-                    args.solve_args)
+                    args.human_poses_dir, args.palm_poses_dir,
+                    args.handshake_dir, candidate_output, args.solve_args)
                 print('{} 組: {:.3f} 秒/人 (IK 対象 {} 人の平均)。'.format(
                     len(pairs), per_person, n_ik_people))
                 if per_person > args.max_ik_seconds_per_person:
@@ -399,7 +371,7 @@ def main():
             else:
                 print('ランキングを全て試しても上限を超えませんでした。'
                      '全 {} 組を採用します。'.format(n_pairs))
-            pairs = select_pairs(ranking, n_pairs, include)
+            pairs = select_pairs(ranking, n_pairs)
             save_pairs(pairs, args.output)
             print('{} 組を採用しました -> {}'.format(len(pairs), args.output))
 

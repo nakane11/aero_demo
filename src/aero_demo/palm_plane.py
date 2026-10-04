@@ -28,10 +28,6 @@ MIN_SPAN_RATIO = 0.15
 # Palm centre position between wrist (0.0) and knuckle row (1.0).
 PALM_CENTER_MCP_WEIGHT = 0.5
 
-# Approach offset in front of the palm (+normal) and press depth (-normal) [m].
-CONTACT_OFFSET = 0.02
-EMBED_DEPTH = 0.01
-
 
 PalmPlane = namedtuple('PalmPlane', [
     'center',       # (3,) mid-palm point
@@ -46,31 +42,11 @@ PalmPlane = namedtuple('PalmPlane', [
 ])
 
 
-def collect_palm_points(person, hand='R', min_score=0.1,
-                        indices=PLANE_LANDMARKS):
-    """Return ``{landmark_index: (3,) ndarray}`` of confident palm landmarks.
-
-    ``person`` is a ``Person3D``; no frame conversion is done.
-    """
-    names = list(person.limb_names)
-    points = {}
-    for i in indices:
-        key = '{}Hand{}'.format(hand, i)
-        if key not in names:
-            continue
-        j = names.index(key)
-        if person.scores[j] <= min_score:
-            continue
-        points[i] = np.asarray(person.positions[j], dtype=np.float64)
-    return points
-
-
-def fit_palm_plane(points, hand='R', viewpoint=None):
+def fit_palm_plane(points, hand='R'):
     """Fit a plane to the palm landmarks by SVD.
 
     ``hand`` ('R'/'L') is needed to resolve the normal sign from the knuckle
-    layout. ``viewpoint`` (default: origin) is a fallback sign reference used
-    only when fewer than 2 knuckles are present.
+    layout. With fewer than 2 knuckles the palm is assumed to face the origin.
 
     Returns
     -------
@@ -141,11 +117,8 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
         if float(np.dot(normal, anatomical_normal)) < 0.0:
             normal = -normal
     else:
-        # Fallback: assume the palm faces the viewpoint.
-        if viewpoint is None:
-            viewpoint = np.zeros(3)
-        viewpoint = np.asarray(viewpoint, dtype=np.float64)
-        if float(np.dot(normal, viewpoint - center)) < 0.0:
+        # Fallback: assume the palm faces the origin.
+        if float(np.dot(normal, -center)) < 0.0:
             normal = -normal
 
     # Robot palm (+Y of eef_grasp_link) faces the human's: +Y = -normal.
@@ -156,13 +129,3 @@ def fit_palm_plane(points, hand='R', viewpoint=None):
     return PalmPlane(center=center, normal=normal, rot=rot,
                      finger_dir=x_axis, used=idxs, rms=rms,
                      span=float(s[1]), span_ratio=span_ratio)
-
-
-def contact_target(plane, offset=CONTACT_OFFSET):
-    """Approach point: just off the palm surface, along +normal."""
-    return plane.center + plane.normal * offset
-
-
-def embed_target(plane, depth=EMBED_DEPTH):
-    """Press point: inside the palm, along -normal."""
-    return plane.center - plane.normal * depth

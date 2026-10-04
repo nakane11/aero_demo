@@ -17,18 +17,3 @@ def rotate(v, axis, angle):
     """Rotate ``v`` by ``angle`` [rad] around the unit vector ``axis``."""
     c, s = np.cos(angle), np.sin(angle)
     return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c)
-
-
-def rotation_from_z(z_axis):
-    """Rotation matrix whose +Z column points along ``z_axis``."""
-    z = unit(z_axis)
-    if z is None:
-        return np.eye(3)
-    ref = np.array([0.0, 0.0, 1.0])
-    if abs(float(z[2])) > 0.9:
-        ref = np.array([1.0, 0.0, 0.0])
-    x = unit(np.cross(ref, z))
-    if x is None:
-        return np.eye(3)
-    y = np.cross(z, x)
-    return np.column_stack([x, y, z])

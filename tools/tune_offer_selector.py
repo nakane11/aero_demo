@@ -47,8 +47,8 @@ SEPARATION_WEIGHT_CHOICES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
 SIDES = ('R', 'L')
 
 
-def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
-    """``label_key`` を持つサンプルの ``(name, joints, label, robot_position)`` を返す.
+def load_samples(skeleton_dir, palm_dir):
+    """``human_label`` を持つサンプルの ``(name, joints, label, robot_position)`` を返す.
 
     ``robot_position`` は判定基準のロボット手先 (base_link)、無ければ ``None``。
     """
@@ -62,18 +62,19 @@ def load_samples(skeleton_dir, palm_dir, label_key='human_label'):
             continue
         with open(palm_path) as f:
             palm_data = json.load(f)
-        if label_key not in palm_data:
+        if 'human_label' not in palm_data:
             n_unlabeled += 1
             continue
         joint_positions = load_skeleton_json(skeleton_path)
         robot_position = palm_data.get('robot_position')
         if robot_position is None:
             n_no_robot += 1
-        samples.append((name, joint_positions, palm_data[label_key],
+        samples.append((name, joint_positions, palm_data['human_label'],
                         robot_position))
     if n_unlabeled:
-        print('{} 件は "{}" が無いため除外しました (label_offer_images.py '
-              'で人手ラベルを付けてください)。'.format(n_unlabeled, label_key))
+        print('{} 件は "human_label" が無いため除外しました '
+              '(label_offer_images.py で人手ラベルを付けてください)。'.format(
+                  n_unlabeled))
     if n_no_robot:
         print('{} 件は掌 JSON に robot_position が無いため、合成骨格向けの '
               '仮のロボット位置 (人物の +x {} m・高さ {} m) で評価します '
@@ -137,7 +138,7 @@ def scores_for_params(cache, params):
             feats = selector._features(joints, body, side, palm)
             side_scores[side] = sum(
                 w * feats[key] for key, w in selector.weights.items()) \
-                - selector.face_away_penalty * (1.0 - feats['face_to_robot'])
+                - epp.FACE_AWAY_PENALTY * (1.0 - feats['face_to_robot'])
         out.append((label, side_scores))
     return out
 
@@ -207,7 +208,6 @@ def main():
     parser.add_argument(
         '--palm-dir', type=str,
         default=os.path.join(_SCRIPTS_DIR, 'random_palm_poses'))
-    parser.add_argument('--label-key', type=str, default='human_label')
     parser.add_argument(
         '--n-random', type=int, default=200,
         help='ランダムに選ぶ候補数 (0 で格子を全探索)。')
@@ -217,7 +217,7 @@ def main():
         default=os.path.join(_THIS_DIR, 'tuned_offer_selector_params.json'))
     args = parser.parse_args()
 
-    samples = load_samples(args.skeleton_dir, args.palm_dir, args.label_key)
+    samples = load_samples(args.skeleton_dir, args.palm_dir)
     if not samples:
         print('{} / {} にサンプルが見つかりません。'.format(
             args.skeleton_dir, args.palm_dir))

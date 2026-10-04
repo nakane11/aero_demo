@@ -42,11 +42,9 @@ def wait_for_client(viewer, timeout):
               'URL を手動で開いてください (Ctrl-C で中断できます)。')
 
 
-def front_view_camera_transform(distance=CAMERA_DISTANCE,
-                                height=CAMERA_HEIGHT,
-                                tilt_down_deg=CAMERA_TILT_DOWN_DEG):
+def front_view_camera_transform():
     """人物を正面からやや見下ろすカメラの世界姿勢 (4x4, 列が右/上/後ろ)."""
-    tilt = math.radians(tilt_down_deg)
+    tilt = math.radians(CAMERA_TILT_DOWN_DEG)
     forward = np.array([-math.cos(tilt), 0.0, -math.sin(tilt)])
     up_world = np.array([0.0, 0.0, 1.0])
     right = np.cross(forward, up_world)
@@ -56,14 +54,13 @@ def front_view_camera_transform(distance=CAMERA_DISTANCE,
     transform[:3, 0] = right
     transform[:3, 1] = up
     transform[:3, 2] = -forward
-    transform[:3, 3] = [distance, 0.0, height]
+    transform[:3, 3] = [CAMERA_DISTANCE, 0.0, CAMERA_HEIGHT]
     return transform
 
 
-def set_front_view(viewer, **kwargs):
+def set_front_view(viewer):
     """``viewer`` のカメラを人物の正面に合わせる."""
-    viewer.set_camera(
-        coords_or_transform=front_view_camera_transform(**kwargs))
+    viewer.set_camera(coords_or_transform=front_view_camera_transform())
 
 
 class ManualNav(object):
@@ -132,19 +129,19 @@ def wait_for_advance(viewer, nav, pause):
     return direction, label
 
 
-def save_label(json_path, label, key='human_label'):
-    """判定結果を JSON の ``key`` に書き込む (既存の内容は保つ)."""
+def save_label(json_path, label):
+    """判定結果を JSON の ``human_label`` に書き込む (既存の内容は保つ)."""
     if os.path.exists(json_path):
         with open(json_path) as f:
             data = json.load(f)
     else:
         data = {}
-    data[key] = label
+    data['human_label'] = label
     with open(json_path, 'w') as f:
         json.dump(data, f, indent=2)
 
 
-def load_label(json_path, key='human_label', default=None):
+def load_label(json_path, default=None):
     """``save_label`` の結果を読む (無ければ ``default``).
 
     判定値に None があり得るなら ``default=UNLABELED`` を渡すこと。
@@ -153,7 +150,7 @@ def load_label(json_path, key='human_label', default=None):
         return default
     with open(json_path) as f:
         data = json.load(f)
-    return data.get(key, default)
+    return data.get('human_label', default)
 
 
 def format_label_text(label, title='ラベル', value_names=None):

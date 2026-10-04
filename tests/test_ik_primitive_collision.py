@@ -61,8 +61,8 @@ def _random_cylinders(rng, center, n=12, spread=0.35):
     return obstacles
 
 
-def _set_random_pose(robot, rng, link_list, fraction=0.6):
-    """関節を可動域中央 ± fraction/2 のランダムな角度にする (無限可動域は除く)。
+def _set_random_pose(robot, rng, link_list):
+    """関節を可動域の中央 60% のランダムな角度にする (無限可動域は除く)。
 
     mimic 関節を親で上書きさせるため逆順に設定する。"""
     for link in reversed(link_list):
@@ -70,7 +70,7 @@ def _set_random_pose(robot, rng, link_list, fraction=0.6):
         lo, hi = joint.min_angle, joint.max_angle
         if not (np.isfinite(lo) and np.isfinite(hi)):
             continue
-        mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * fraction
+        mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * 0.6
         joint.joint_angle(float(rng.uniform(mid - half, mid + half)))
 
 

@@ -138,8 +138,8 @@ def aggregate(people):
                  for p in slowest])
 
 
-def run_solve(python, dataset, output_dir, options):
-    cmd = [python, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
+def run_solve(dataset, output_dir, options):
+    cmd = [sys.executable, os.path.join(_SCRIPTS_DIR, 'solve_palm_ik.py'),
            '--input-dir', os.path.join(dataset, 'palms'),
            '--skeleton-dir', os.path.join(dataset, 'skeletons'),
            '--output-dir', output_dir]
@@ -189,7 +189,6 @@ def main():
     parser.add_argument(
         '--output', type=str, default=None,
         help='集計結果を追記する JSON Lines ファイル。')
-    parser.add_argument('--python', type=str, default=sys.executable)
     args = parser.parse_args()
 
     work_dir = args.work_dir or tempfile.mkdtemp(
@@ -216,7 +215,7 @@ def main():
             out_dir = os.path.join(work_dir, '{:03d}'.format(index),
                                    os.path.basename(dataset.rstrip('/')))
             for _ in range(args.repeat):
-                stdout = run_solve(args.python, dataset, out_dir, options)
+                stdout = run_solve(dataset, out_dir, options)
             with open(out_dir + '.log', 'w') as f:
                 f.write(stdout)
             rejects_by_person, dataset_warmup = parse_stdout(stdout)

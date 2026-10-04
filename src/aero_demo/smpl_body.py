@@ -109,15 +109,13 @@ def rodrigues(r):
     return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * K.dot(K)
 
 
-def smpl_forward(model, pose, betas, trans, bone_scale=None):
+def smpl_forward(model, pose, betas, trans):
     """SMPL の順運動学 (Linear Blend Skinning).
 
     Parameters
     ----------
     pose : (24, 3) array_like
         各関節の axis-angle (親関節相対)。
-    bone_scale : dict, optional
-        関節 index -> 親とのボーンの伸縮率。
 
     Returns
     -------
@@ -144,10 +142,7 @@ def smpl_forward(model, pose, betas, trans, bone_scale=None):
         p = model.parent[i]
         local = np.eye(4)
         local[:3, :3] = R[i]
-        offset = J[i] - J[p]
-        if bone_scale is not None and i in bone_scale:
-            offset = offset * bone_scale[i]
-        local[:3, 3] = offset
+        local[:3, 3] = J[i] - J[p]
         G[i] = G[p].dot(local)
 
     # rest-pose の関節位置の寄与を抜く (標準の SMPL のトリック)
@@ -231,22 +226,18 @@ def to_smpl_rotation(R_robot):
     return PERM.T.dot(R_robot).dot(PERM)
 
 
-def forward_world(model, pose, betas, root_pos, root_rot=None, scale=1.0,
-                  bone_scale=None):
-    """pelvis を root_pos/root_rot (ロボット座標系) に置いた頂点・関節位置を返す.
+def forward_world(model, pose, betas, root_pos):
+    """pelvis を root_pos (ロボット座標系) に置いた頂点・関節位置を返す.
 
-    root_rot が None なら体は +x を向く。
+    体は +x を向く。
 
     Returns
     -------
     (vertices_world, joints_world) : (ndarray(6890, 3), ndarray(24, 3))
     """
-    if root_rot is None:
-        root_rot = np.eye(3)
-    v_local, joints_local = smpl_forward(
-        model, pose, betas, np.zeros(3), bone_scale=bone_scale)
+    v_local, joints_local = smpl_forward(model, pose, betas, np.zeros(3))
     v_robot_local = (v_local - model.J[PELVIS]).dot(PERM.T)
     joints_robot_local = (joints_local - model.J[PELVIS]).dot(PERM.T)
-    vertices_world = root_pos + scale * v_robot_local.dot(root_rot.T)
-    joints_world = root_pos + scale * joints_robot_local.dot(root_rot.T)
+    vertices_world = root_pos + v_robot_local
+    joints_world = root_pos + joints_robot_local
     return vertices_world, joints_world

@@ -70,13 +70,11 @@ def remove_obstacles_gui(viewer):
     viewer._joint_folders.clear()
 
 
-def build_robot_collision_overlay(robot, primitive_type=None,
-                                  force_convert=False):
+def build_robot_collision_overlay(robot):
     """``robot`` のプリミティブ近似ジオメトリを半透明の別 ``RobotModel``
     (overlay) として読み込む。姿勢は ``sync_robot_collision_overlay`` で
     追従させる。"""
-    collision_urdf_path = build_collision_model_urdf(
-        robot.urdf_path, primitive_type=primitive_type, force=force_convert)
+    collision_urdf_path = build_collision_model_urdf(robot.urdf_path)
     collision_robot = RobotModel()
     collision_robot.load_urdf_file(
         str(collision_urdf_path), include_mimic_joints=False)
@@ -221,7 +219,7 @@ def apply_waypoint_pose(robot, joint_names, waypoints, index):
         pos=wp['base_position'], rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
 
 
-def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINTS):
+def build_display_waypoints(motion, result):
     """接近経路の後ろに押し込み区間と横並び移動の waypoint を足す。
 
     Returns
@@ -236,7 +234,7 @@ def build_display_waypoints(motion, result, n_press_in=PRESS_IN_DISPLAY_WAYPOINT
     if post is None:
         return waypoints, n_approach
     waypoints += build_press_in_waypoints(
-        waypoints[-1], motion['joint_names'], post, n_press_in)
+        waypoints[-1], motion['joint_names'], post)
     waypoints += transition_waypoints(motion)
     return waypoints, n_approach
 
@@ -260,10 +258,10 @@ def transition_waypoints(motion):
     return waypoints
 
 
-def build_press_in_waypoints(last_wp, joint_names, post,
-                             n_press_in=PRESS_IN_DISPLAY_WAYPOINTS):
+def build_press_in_waypoints(last_wp, joint_names, post):
     """hover の waypoint ``last_wp`` から押し込み姿勢 ``post`` までを
-    ``n_press_in`` 等分した waypoint のリスト (``last_wp`` は含まない)。"""
+    ``PRESS_IN_DISPLAY_WAYPOINTS`` 等分した waypoint のリスト (``last_wp``
+    は含まない)。"""
     waypoints = []
     start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
     post_name_to_angle = dict(zip(post['joint_names'],
@@ -275,7 +273,7 @@ def build_press_in_waypoints(last_wp, joint_names, post,
     base_end = np.array([post['base_position'][0], post['base_position'][1],
                          post['base_yaw']])
 
-    for t in np.linspace(0.0, 1.0, n_press_in + 1)[1:]:
+    for t in np.linspace(0.0, 1.0, PRESS_IN_DISPLAY_WAYPOINTS + 1)[1:]:
         angle_vec = start_vec + (end_vec - start_vec) * t
         base_vec = base_start + (base_end - base_start) * t
         waypoints.append(dict(

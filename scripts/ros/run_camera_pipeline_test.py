@@ -518,7 +518,7 @@ class HandshakePipelineNode(object):
               'います (数秒~数十秒かかります)...')
         warmup_t0 = time.time()
         collision_obstacles = (
-            [] if (args.no_human_collision or self.collision_pairs is None)
+            [] if self.collision_pairs is None
             else spik.human_body_obstacles({}))
         warmup_human_xy = np.array([args.human_front_distance, 0.0])
         motion_args = copy.copy(args)
@@ -537,8 +537,7 @@ class HandshakePipelineNode(object):
                 collision_obstacles,
                 attempts_per_pose=args.attempts_per_pose,
                 base_limits=self.base_limits,
-                self_collision=(not args.no_self_collision
-                                and self.collision_pairs is not None),
+                self_collision=self.collision_pairs is not None,
                 collision_pairs=self.collision_pairs,
                 joint_positions={},
                 verification_pairs=self.verification_pairs)
@@ -693,12 +692,8 @@ class HandshakePipelineNode(object):
                                      *(list(matrix[:3, 3]) + [diff_deg])))
 
     def _resolve_robot_position(self):
-        """差し出し手判定の基準にするロボット手先の base_link 座標を返す。
-
-        ``--robot-hand-position`` > TF > 右腕の種の姿勢の手先位置 の順。
-        """
-        if self.args.robot_hand_position is not None:
-            return np.asarray(self.args.robot_hand_position, dtype=np.float64)
+        """差し出し手判定の基準にするロボット手先の base_link 座標を返す
+        (TF が引けなければ右腕の種の姿勢の手先位置)。"""
         return lookup_frame_position(
             self.tf_buffer, self.args.base_frame, self.args.robot_hand_frame,
             self._robot_hand_position_fallback,
@@ -925,8 +920,7 @@ class HandshakePipelineNode(object):
               '(ログ: {})。'.format(attempt, offered_hand, log_path))
         self._log_debug(dict(event='armed', person=attempt,
                              offered_hand=offered_hand))
-        robot_arm = (spik.DEFAULT_ROBOT_ARM[offered_hand]
-                    if args.robot_arm == 'auto' else args.robot_arm)
+        robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
         palm = palms[offered_hand]
 
         offset = spik.human_translation_offset(
@@ -939,7 +933,7 @@ class HandshakePipelineNode(object):
         collision_joints = spik.shift_torso_joints_from_surface(
             translated_joints, offset, args.torso_surface_offset)
         collision_obstacles = (
-            [] if (args.no_human_collision or self.collision_pairs is None)
+            [] if self.collision_pairs is None
             else spik.human_body_obstacles(collision_joints))
 
         # 差し出し手の側・人の正面方向に合わせた台車の可動域。
@@ -976,8 +970,7 @@ class HandshakePipelineNode(object):
                 front_offset_weight=args.front_offset_weight,
                 facing_yaw_weight=args.facing_yaw_weight,
                 attempts_per_pose=args.attempts_per_pose,
-                self_collision=(not args.no_self_collision
-                                and self.collision_pairs is not None),
+                self_collision=self.collision_pairs is not None,
                 collision_pairs=self.collision_pairs,
                 joint_positions=collision_joints,
                 placement_joint_positions=translated_joints,
@@ -1241,7 +1234,7 @@ class HandshakePipelineNode(object):
             wp['base_position'][0] -= dx
             wp['base_position'][1] -= dy
 
-    def _save_attempt(self, joint_positions, palms, result, motion=None):
+    def _save_attempt(self, joint_positions, palms, result, motion):
         stamp = time.strftime('%Y%m%d_%H%M%S')
         name = '{}.json'.format(stamp)
         skeleton_dir = os.path.join(self.args.save_dir, 'skeletons')
@@ -2592,14 +2585,6 @@ def main():
         help='人物からロボット手先までの距離 [m] がこれを超えたら差し出し '
             '候補から外す (0 以下で無効)。')
     parser.add_argument(
-        '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
-        help='使うロボットの腕 (auto: 人の手の反対側)。')
-    parser.add_argument(
-        '--robot-hand-position', type=float, nargs=3, default=None,
-        metavar=('X', 'Y', 'Z'),
-        help='差し出し手判定の基準にするロボット手先の base_link 座標 [m] '
-            '(指定すると TF より優先)。')
-    parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
         help='差し出し手判定の基準にするロボット手先の TF フレーム。')
     parser.add_argument(
@@ -2612,13 +2597,11 @@ def main():
     parser.add_argument(
         '--collision-pairs', type=str,
         default=os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'))
-    parser.add_argument('--no-human-collision', action='store_true')
     parser.add_argument(
         '--torso-surface-offset', type=float,
         default=spik.DEFAULT_TORSO_SURFACE_OFFSET,
         help='干渉判定用に体幹の関節をカメラから離れる向きへずらす距離 [m] '
             '(関節が体の表面にあるため)。')
-    parser.add_argument('--no-self-collision', action='store_true')
     parser.add_argument(
         '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
         default=spik.DEFAULT_COLLISION_VERIFY_MODEL,
@@ -2658,13 +2641,6 @@ def main():
         default=phm.DEFAULT_APPROACH_DISTANCE,
         help='接近開始位置の円の半径への上乗せ分 [m]。')
     parser.add_argument(
-        '--pretouch-standoff', type=float,
-        default=phm.DEFAULT_PRETOUCH_STANDOFF,
-        help='pre-touch 姿勢を掌の法線方向へ引き戻す距離 [m]。')
-    parser.add_argument(
-        '--pretouch-split', type=float, default=phm.DEFAULT_PRETOUCH_SPLIT,
-        help='軌道のうち pre-touch 姿勢までに使う割合。')
-    parser.add_argument(
         '--n-waypoints', type=int, default=phm.DEFAULT_N_WAYPOINTS,
         help='軌道の waypoint 数 (始点・終点を含む)。')
     parser.add_argument(
@@ -2674,21 +2650,8 @@ def main():
         '--collision-activation-distance', type=float,
         default=phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE)
     parser.add_argument(
-        '--self-collision-activation-distance', type=float,
-        default=phm.DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE)
-    parser.add_argument('--collision-weight', type=float, default=100.0)
-    parser.add_argument('--self-collision-weight', type=float, default=100.0)
-    parser.add_argument(
-        '--smoothness-weight', type=float,
-        default=phm.DEFAULT_SMOOTHNESS_WEIGHT)
-    parser.add_argument(
-        '--acceleration-weight', type=float,
-        default=phm.DEFAULT_ACCELERATION_WEIGHT)
-    parser.add_argument(
         '--motion-attempts', type=int, default=3,
         help='軌道の干渉が残ったとき warm start を変えて解き直す最大回数。')
-    parser.add_argument(
-        '--motion-attempt-perturbation', type=float, default=0.3)
     parser.add_argument(
         '--motion-collision-verify-tolerance', type=float,
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,

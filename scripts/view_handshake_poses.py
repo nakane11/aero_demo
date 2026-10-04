@@ -109,7 +109,7 @@ def load_handshake_json(path):
 def smpl_world_rots(model, pose):
     """SMPL の各関節のワールド (ロボット座標系) 回転行列 ``(24, 3, 3)``.
 
-    root_rot は単位行列 (``forward_world`` の既定と同じ)。
+    root は回転しない (``forward_world`` と同じ)。
     """
     pose = np.asarray(pose, dtype=np.float64).reshape(24, 3)
     world_rots = np.zeros((24, 3, 3))
@@ -138,16 +138,14 @@ def limit_direction(base, direction, max_angle):
     return smpl_body.rodrigues(axis / norm * max_angle).dot(base)
 
 
-def look_at_pose(model, person, target_position,
-                 neck_ratio=GAZE_NECK_RATIO,
-                 max_angle_deg=GAZE_MAX_ANGLE_DEG):
+def look_at_pose(model, person, target_position):
     """人間が ``target_position`` を見るよう首/頭だけ回した pose (24, 3) を返す.
 
     ``person['pose']`` は変更しない。
     """
     pose = np.array(person['pose'], dtype=np.float64).reshape(24, 3)
     target_position = np.asarray(target_position, dtype=np.float64)
-    max_angle = np.deg2rad(max_angle_deg)
+    max_angle = np.deg2rad(GAZE_MAX_ANGLE_DEG)
 
     for _ in range(GAZE_ITERATIONS):
         _vertices, joints = smpl_body.forward_world(
@@ -173,8 +171,8 @@ def look_at_pose(model, person, target_position,
         # (頭の親は回した後の首)。
         parent_world = world_rots[model.parent[smpl_body.NECK]]
         accumulated = np.eye(3)
-        for joint_index, ratio in ((smpl_body.NECK, neck_ratio),
-                                   (smpl_body.HEAD, 1.0 - neck_ratio)):
+        for joint_index, ratio in ((smpl_body.NECK, GAZE_NECK_RATIO),
+                                   (smpl_body.HEAD, 1.0 - GAZE_NECK_RATIO)):
             accumulated = smpl_body.rodrigues(
                 axis_angle * ratio).dot(accumulated)
             new_world = accumulated.dot(world_rots[joint_index])
@@ -287,10 +285,6 @@ def main():
             '~/SMPL_python_v.1.0.0/smpl/models/'
             'basicModel_f_lbs_10_207_0_v1.0.0.pkl'),
         help='SMPL (女性) モデル .pkl のパス (無ければ男性のみ)。')
-    parser.add_argument(
-        '--no-hand', dest='use_hand', action='store_false',
-        help='指関節なしの URDF で表示する。')
-    parser.set_defaults(use_hand=True)
     parser.add_argument('--client-wait-timeout', type=float, default=30.0,
                         help='ブラウザ接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true',
@@ -307,7 +301,7 @@ def main():
     models_by_gender = dict(
         load_smpl_models(args.model_path, args.female_model_path))
 
-    robot = load_aero(use_hand=args.use_hand)
+    robot = load_aero(use_hand=True)
 
     viewer = ViserViewer(draw_grid=True)
     # ボタンはロボットを add する前に作る (関節スライダーの下に埋もれるため)。

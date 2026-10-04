@@ -287,8 +287,8 @@ def main():
               '{:.1f} 秒中)'.format(warmup_total, solve_elapsed))
     else:
         print('[4/5] warmup 行が見つかりませんでした '
-              '(--no-warmup 指定、または IK 対象が 0 人でスキップされた '
-              '可能性があります)。壁時計時間 {:.1f} 秒'.format(solve_elapsed))
+              '(IK 対象が 0 人でスキップされた可能性があります)。'
+              '壁時計時間 {:.1f} 秒'.format(solve_elapsed))
 
     # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
     motion_summary = None
@@ -340,9 +340,8 @@ def main():
                   '(plan_handshake_motion.py の壁時計時間 {:.1f} 秒中)'
                   .format(motion_warmup_total, motion_elapsed))
         else:
-            print('[4.5/5] warmup 行が見つかりませんでした '
-                  '(--no-warmup 指定、または軌道計画対象が 0 人でスキップ '
-                  'された可能性があります)。壁時計時間 {:.1f} 秒'
+            print('[4.5/5] warmup 行が見つかりませんでした (入力の握手姿勢 '
+                  'JSON が無かった可能性があります)。壁時計時間 {:.1f} 秒'
                   .format(motion_elapsed))
 
     print()

@@ -146,7 +146,7 @@ class OfferAdvisor(object):
             return None, None
         return dict(zip(_KEYS, (float(v) for v in x[i]))), float(dist[i])
 
-    def advise(self, measure, hand, max_items=MAX_ADVICE):
+    def advise(self, measure, hand):
         """(key, 差 [m/度], 発話句) のリストを差の大きい順に返す (と目標点)."""
         if measure is None:
             return [], None
@@ -166,7 +166,7 @@ class OfferAdvisor(object):
                               _angle_phrase(key, diff, target)))
         items.sort(key=lambda item: -item[0])
         return [(key, diff, phrase)
-                for _, key, diff, phrase in items[:max_items]], target
+                for _, key, diff, phrase in items[:MAX_ADVICE]], target
 
 
 def _centimeters(diff):

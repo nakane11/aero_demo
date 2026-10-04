@@ -183,12 +183,12 @@ JOINT_BEND_COST_JOINTS = {
 }
 
 
-def _joint_bend_cost_indices(robot, robot_arm, weights=JOINT_BEND_COST_JOINTS):
+def _joint_bend_cost_indices(robot, robot_arm):
     """曲げ量コストの各関節の ``robot.angle_vector()`` 中のインデックスと
     重みのリストを返す。"""
     index_by_name = {joint.name: i for i, joint in enumerate(robot.joint_list)}
     return [(index_by_name['{}_{}_joint'.format(robot_arm, suffix)], weight)
-           for suffix, weight in weights.items()]
+           for suffix, weight in JOINT_BEND_COST_JOINTS.items()]
 
 
 def _joint_bend_cost_from_vector(angle_vector, bend_cost_indices):
@@ -666,14 +666,14 @@ def apply_other_arm_posture(robot, robot_arm, posture_index):
         math.radians(elbow))
 
 
-def select_other_arm_posture(robot, robot_arm,
-                             clearance=OTHER_ARM_BASE_CLEARANCE):
-    """現在の姿勢で差し出さない手が台車の箱から ``clearance`` 以上離れる
-    最初の ``OTHER_ARM_POSTURES_DEG`` の添字を返す (無ければ None)。腕は
-    最後に試した姿勢のままになる。"""
+def select_other_arm_posture(robot, robot_arm):
+    """現在の姿勢で差し出さない手が台車の箱から ``OTHER_ARM_BASE_CLEARANCE``
+    以上離れる最初の ``OTHER_ARM_POSTURES_DEG`` の添字を返す (無ければ
+    None)。腕は最後に試した姿勢のままになる。"""
     for index in range(len(OTHER_ARM_POSTURES_DEG)):
         apply_other_arm_posture(robot, robot_arm, index)
-        if other_hand_base_clearance(robot, robot_arm) >= clearance:
+        if other_hand_base_clearance(robot, robot_arm) \
+                >= OTHER_ARM_BASE_CLEARANCE:
             return index
     return None
 
@@ -686,23 +686,24 @@ def with_other_arm_posture(robot, angle_vector, robot_arm, posture_index):
     return robot.angle_vector().copy()
 
 
-def restrict_elbow_range(robot, min_angle_deg=ELBOW_MIN_ANGLE_DEG):
-    """両肘の下限を ``min_angle_deg`` にする (``*_whole_body`` にも効く)。"""
-    min_angle = math.radians(min_angle_deg)
+def restrict_elbow_range(robot):
+    """両肘の下限を ``ELBOW_MIN_ANGLE_DEG`` にする (``*_whole_body`` にも
+    効く)。"""
+    min_angle = math.radians(ELBOW_MIN_ANGLE_DEG)
     for arm in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
 
 
-def restrict_leg_range(robot, margin_ratio=LEG_LOW_SIDE_MARGIN_RATIO):
+def restrict_leg_range(robot):
     """ankle の上限と knee の下限 (腰が低くなる側) を全域幅の
-    ``margin_ratio`` だけ狭める。URDF の可動域を ``_urdf_range`` に覚える
-    ので 2 回呼んでも重ならない。"""
+    ``LEG_LOW_SIDE_MARGIN_RATIO`` だけ狭める。URDF の可動域を
+    ``_urdf_range`` に覚えるので 2 回呼んでも重ならない。"""
     for joint, low_side_is_max in ((robot.ankle_joint, True),
                                    (robot.knee_joint, False)):
         if not hasattr(joint, '_urdf_range'):
             joint._urdf_range = (joint.min_angle, joint.max_angle)
         lo, hi = joint._urdf_range
-        margin = margin_ratio * (hi - lo)
+        margin = LEG_LOW_SIDE_MARGIN_RATIO * (hi - lo)
         if low_side_is_max:
             joint.max_angle = hi - margin
         else:
@@ -711,14 +712,16 @@ def restrict_leg_range(robot, margin_ratio=LEG_LOW_SIDE_MARGIN_RATIO):
                               joint.max_angle))
 
 
-def restrict_waist_range(robot, max_angle_deg=WAIST_P_MAX_ANGLE_DEG):
-    """``waist_p_joint`` の上限 (前傾側) を ``max_angle_deg`` まで狭める。"""
-    _restrict_max_angle(robot.waist_p_joint, max_angle_deg)
+def restrict_waist_range(robot):
+    """``waist_p_joint`` の上限 (前傾側) を ``WAIST_P_MAX_ANGLE_DEG`` まで
+    狭める。"""
+    _restrict_max_angle(robot.waist_p_joint, WAIST_P_MAX_ANGLE_DEG)
 
 
-def restrict_neck_range(robot, max_angle_deg=NECK_P_MAX_ANGLE_DEG):
-    """``neck_p_joint`` の上限 (下向き側) を ``max_angle_deg`` まで狭める。"""
-    _restrict_max_angle(robot.neck_p_joint, max_angle_deg)
+def restrict_neck_range(robot):
+    """``neck_p_joint`` の上限 (下向き側) を ``NECK_P_MAX_ANGLE_DEG`` まで
+    狭める。"""
+    _restrict_max_angle(robot.neck_p_joint, NECK_P_MAX_ANGLE_DEG)
 
 
 def _restrict_max_angle(joint, max_angle_deg):
@@ -749,15 +752,15 @@ def lock_fixed_joints(robot):
 GRASP_POINT_OFFSET_X = 0.04
 
 
-def shift_grasp_point(robot, offset_x=GRASP_POINT_OFFSET_X):
-    """``{r,l}arm_end_coords`` を親から局所 +X に ``offset_x`` [m] の位置に
-    置き直す (何度呼んでも重ならない)。"""
+def shift_grasp_point(robot):
+    """``{r,l}arm_end_coords`` を親から局所 +X に ``GRASP_POINT_OFFSET_X``
+    [m] の位置に置き直す (何度呼んでも重ならない)。"""
     for side in ('r', 'l'):
         end_coords = getattr(robot, '{}arm_end_coords'.format(side), None)
         if end_coords is None:
             continue
         local = end_coords.copy_coords()
-        local.translation = np.array([offset_x, 0.0, 0.0])
+        local.translation = np.array([GRASP_POINT_OFFSET_X, 0.0, 0.0])
         end_coords.newcoords(local)
 
 
@@ -1005,10 +1008,16 @@ def human_capsules(joint_positions):
 # 事後検証で許す自己干渉の貫通深さ [m] (人体との組は距離で見る)。
 DEFAULT_COLLISION_VERIFY_TOLERANCE = 0.0  # [m]
 
+# 円柱の表面サンプルの周方向・軸方向の点数。
+CYLINDER_SAMPLES_N_THETA = 16
+CYLINDER_SAMPLES_N_HEIGHT = 5
 
-def cylinder_surface_samples(obstacle, n_theta=16, n_height=5):
+
+def cylinder_surface_samples(obstacle):
     """円柱の表面をワールド座標でサンプルし、``(points, center, radius)``
     (``center``/``radius`` は足切り用の包含球) を返す。"""
+    n_theta = CYLINDER_SAMPLES_N_THETA
+    n_height = CYLINDER_SAMPLES_N_HEIGHT
     thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
     heights = np.linspace(-obstacle.height / 2.0, obstacle.height / 2.0,
                           n_height)
@@ -1663,10 +1672,10 @@ def hand_box_primitives(robot):
             link = parent
 
     groups = {}
-    for link in collision_link_list_for_arm(model, 'r'):
+    for link in collision_link_list_for_arm(model):
         groups.setdefault(rigid_root(link), []).append(link)
     robot_links = {link.name: link
-                   for link in collision_link_list_for_arm(robot, 'r')}
+                   for link in collision_link_list_for_arm(robot)}
 
     def box_around(root, members):
         points = np.vstack([
@@ -1729,27 +1738,11 @@ def apply_hand_box(robot):
     robot.extra_collision_links = extra_links
 
 
-def apply_collision_model(robot, primitive_type=None, force_convert=False,
-                          collision_urdf_path=None):
+def apply_collision_model(robot):
     """``robot`` の各リンクの ``collision_mesh`` をプリミティブ近似形状
     (``build_collision_model_urdf`` が生成・キャッシュ) に差し替え、干渉
-    モデルにだけあるリンクを ``robot.extra_collision_links`` に足す.
-
-    ``collision_urdf_path`` を指定するとその URDF を使い、そこに無いリンク
-    は干渉回避の対象から外す (``primitive_type``/``force_convert`` とは
-    併用不可)。
-    """
-    if collision_urdf_path is not None:
-        if primitive_type is not None or force_convert:
-            raise ValueError(
-                'collision_urdf_path (--collision-urdf) は '
-                'primitive_type (--collision-primitive-type) / '
-                'force_convert (--force-convert-collision-model) と '
-                '併用できません。')
-    else:
-        collision_urdf_path = build_collision_model_urdf(
-            robot.urdf_path, primitive_type=primitive_type,
-            force=force_convert)
+    モデルにだけあるリンクを ``robot.extra_collision_links`` に足す."""
+    collision_urdf_path = build_collision_model_urdf(robot.urdf_path)
 
     collision_robot = RobotModel()
     collision_robot.load_urdf_file(
@@ -1757,10 +1750,7 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False,
     collision_links_by_name = {
         link.name: link for link in collision_robot.link_list}
 
-    explicit_exclude = collision_urdf_path is not None
-
     n_replaced = 0
-    n_excluded = 0
     for link in robot.link_list:
         collision_link = collision_links_by_name.get(link.name)
         mesh = (getattr(collision_link, 'collision_mesh', None)
@@ -1771,10 +1761,6 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False,
             link.collision_primitive = getattr(
                 collision_link, 'collision_primitive', None)
             n_replaced += 1
-        elif explicit_exclude:
-            link.collision_mesh = None
-            link.collision_primitive = None
-            n_excluded += 1
 
     # 干渉モデルにだけあるリンク (台車前方の箱など) は、link_list に入れず
     # 親リンクに assoc した干渉専用のリンクにする (parent_link も設定する)。
@@ -1808,17 +1794,15 @@ def apply_collision_model(robot, primitive_type=None, force_convert=False,
     robot.extra_collision_links = extra_links
 
     print('[collision-model] {} 個のリンクの干渉ジオメトリを ({}) から '
-          '差し替えました{}{}。'.format(
+          '差し替えました{}。'.format(
               n_replaced, collision_urdf_path,
-              ' ({} 個のリンクを干渉回避の対象から除外)'.format(n_excluded)
-              if explicit_exclude else '',
               ' (干渉専用のリンク {} を追加)'.format(
                   ', '.join(link.name for link in extra_links))
               if extra_links else ''))
 
 
-def collision_link_list_for_arm(robot, robot_arm):
-    """干渉ジオメトリを持つ全身のリンクの一覧を返す (``robot_arm`` は未使用).
+def collision_link_list_for_arm(robot):
+    """干渉ジオメトリを持つ全身のリンクの一覧を返す.
 
     干渉専用のリンクは親リンクの直後に並べる (``ignore_adjacent`` で常に
     重なる親子の組が除かれるようにするため)。
@@ -1881,12 +1865,11 @@ def _collision_parent(link, collision_links):
     return parent
 
 
-def self_collision_ignored(robot, collision_link_list,
-                           max_link_distance=SELF_COLLISION_IGNORE_LINK_DISTANCE,
-                           tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE):
+def self_collision_ignored(robot, collision_link_list):
     """自己干渉の事後検証から除く組 (``frozenset`` の集合) を返す: つながり
-    が ``max_link_distance`` 段以内の組、既定の姿勢で既に貫通している組、
-    ``SELF_COLLISION_IGNORE_PAIRS``。``robot`` の姿勢は戻す。"""
+    が ``SELF_COLLISION_IGNORE_LINK_DISTANCE`` 段以内の組、既定の姿勢で既に
+    貫通している組、``SELF_COLLISION_IGNORE_PAIRS``。``robot`` の姿勢は
+    戻す。"""
     collision_links = set(collision_link_list)
     ignore_names = {frozenset((a.format(side), b.format(side)))
                     for a, b in SELF_COLLISION_IGNORE_PAIRS
@@ -1906,8 +1889,9 @@ def self_collision_ignored(robot, collision_link_list,
     for link_a, link_b in itertools.combinations(collision_link_list, 2):
         depth_a, depth_b = ancestor_depth[link_a], ancestor_depth[link_b]
         common = [depth_a[a] + depth_b[a] for a in depth_a if a in depth_b]
-        if (common and min(common) <= max_link_distance) or \
-                frozenset((link_a.name, link_b.name)) in ignore_names:
+        if ((common
+             and min(common) <= SELF_COLLISION_IGNORE_LINK_DISTANCE)
+                or frozenset((link_a.name, link_b.name)) in ignore_names):
             ignored.add(frozenset((link_a, link_b)))
 
     saved_av = robot.angle_vector().copy()
@@ -1919,8 +1903,8 @@ def self_collision_ignored(robot, collision_link_list,
             robot.init_pose()
         for link_a, link_b in itertools.combinations(collision_link_list, 2):
             key = frozenset((link_a, link_b))
-            if key not in ignored and \
-                    self_collision_depth(link_a, link_b) > tolerance:
+            if key not in ignored and self_collision_depth(
+                    link_a, link_b) > DEFAULT_COLLISION_VERIFY_TOLERANCE:
                 ignored.add(key)
     finally:
         robot.angle_vector(saved_av)
@@ -1932,7 +1916,7 @@ def build_collision_verification_pairs(robot, robot_arm):
     """事後検証用の総当たりのペア (``load_collision_pairs`` と同じ形式) を
     作る: ``self_collision_ignored`` を除いた自己干渉の全組と、全リンク x
     全人体セグメント。ロボットの構造だけで決まる。"""
-    collision_link_list = collision_link_list_for_arm(robot, robot_arm)
+    collision_link_list = collision_link_list_for_arm(robot)
     ignored = self_collision_ignored(robot, collision_link_list)
     pairs = [(link_a, link_b) for link_a, link_b in
              itertools.combinations(collision_link_list, 2)
@@ -1998,7 +1982,8 @@ COLLISION_VERIFY_MODELS = ('mixed', 'nohand', 'hand')
 DEFAULT_COLLISION_VERIFY_MODEL = 'mixed'
 
 
-def build_verification_pairs_for_model(robot, verify_model='nohand'):
+def build_verification_pairs_for_model(
+        robot, verify_model=DEFAULT_COLLISION_VERIFY_MODEL):
     """``verify_model`` で事後検証する ``VerificationPairs`` を作る:
     'nohand' は ``robot`` (指なし+手の箱)、'hand' は指ありモデル、'mixed'
     は自己干渉を ``robot`` で、人体との距離を指ありモデルで測る。"""
@@ -2096,16 +2081,16 @@ def _reaim_gaze(robot, gaze_coords, position, stop, rthre,
 
 
 def solve_post_process(robot, robot_arm, palm, target_rot,
-                       offset=POST_PROCESS_TARGET_HOVER_OFFSET,
                        stop=DEFAULT_POST_PROCESS_IK_STOP,
                        thre=DEFAULT_POST_PROCESS_IK_THRE,
                        rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                        gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
                        gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
                        gaze=True):
-    """後処理判定: 台車を動かさずに、腕で掌から ``offset`` の位置 (わずか
-    にめり込む) へ ``target_rot`` で押し付けるのと、カメラの光軸を掌へ
-    向ける (``gaze=False`` なら省く) のを同時に解く.
+    """後処理判定: 台車を動かさずに、腕で掌から
+    ``POST_PROCESS_TARGET_HOVER_OFFSET`` の位置 (わずかにめり込む) へ
+    ``target_rot`` で押し付けるのと、カメラの光軸を掌へ向ける
+    (``gaze=False`` なら省く) のを同時に解く.
 
     ``robot`` の現在の姿勢を初期値に書き換える (失敗時は元に戻る)。両方
     収束したら結果 dict、そうでなければ None を返す。
@@ -2113,7 +2098,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     start_time = time.time()
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
-    target_pos = position + normal * offset
+    target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
     target_coords = Coordinates(pos=target_pos.tolist(), rot=target_rot)
 
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -2163,9 +2148,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     )
 
 
-def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
-                        max_position_change=REFINE_MAX_POSITION_CHANGE,
-                        max_rotation_change=REFINE_MAX_ROTATION_CHANGE):
+def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post):
     """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終
     補正.
 
@@ -2187,8 +2170,8 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
         np.clip((np.trace(rel_rot) - 1.0) / 2.0, -1.0, 1.0)))
     info = dict(post_process=None, position_change=position_change,
                 rotation_change=rotation_change)
-    if (position_change > max_position_change
-            or rotation_change > max_rotation_change):
+    if (position_change > REFINE_MAX_POSITION_CHANGE
+            or rotation_change > REFINE_MAX_ROTATION_CHANGE):
         info.update(reason='too_large', compute_time=time.time() - start_time)
         return info
     post = solve_post_process(robot, robot_arm, palm, target_rot)
@@ -2290,8 +2273,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                             post_process_max_candidates=(
                                 DEFAULT_POST_PROCESS_MAX_CANDIDATES),
-                            front_offset_weight=0.0,
-                            facing_yaw_weight=0.0,
+                            front_offset_weight=DEFAULT_FRONT_OFFSET_WEIGHT,
+                            facing_yaw_weight=DEFAULT_FACING_YAW_WEIGHT,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
                             placement_joint_positions=None):
@@ -2513,11 +2496,10 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     post_process_rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                     post_process_max_candidates=(
                         DEFAULT_POST_PROCESS_MAX_CANDIDATES),
-                    front_offset_weight=0.0,
-                    facing_yaw_weight=0.0,
+                    front_offset_weight=DEFAULT_FRONT_OFFSET_WEIGHT,
+                    facing_yaw_weight=DEFAULT_FACING_YAW_WEIGHT,
                     n_turn_candidates=None,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
-                    offered_hand_penalty=True,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
                     placement_joint_positions=None):
     """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉
@@ -2559,7 +2541,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         if not effective_collision_pairs:
             # 空リストだと ValueError になるので自己干渉を無効にする。
             effective_self_collision = False
-    elif offered_hand_penalty:
+    else:
         # 差し出された手・前腕とロボットの手先側のリンクの組を足す。
         offered = sorted(offered_hand_obstacle_indices(hand))
         links_by_name = {link.name: link for link in
@@ -2756,18 +2738,13 @@ _WARMUP_PALM = dict(
 )
 
 
-def _warmup_batch_ik(robot, args, base_limits, ik_kwargs):
+def _warmup_batch_ik(robot, base_limits, ik_kwargs):
     """人物ループの前にダミー目標で ``solve_person_ik`` を解き、jax の
-    トレース/コンパイルを済ませる (使う腕ごと、結果は捨てる)。
+    トレース/コンパイルを済ませる (左右の腕ごと、結果は捨てる)。
     ``ik_kwargs`` は人物ループと同じものを渡すこと (違うと別のコンパイル)。
     """
     collision_obstacles = human_body_obstacles({})
-    if args.robot_arm == 'auto':
-        arms_to_warm = (('l', 'R'), ('r', 'L'))
-    else:
-        hand = 'R' if args.robot_arm == 'l' else 'L'
-        arms_to_warm = ((args.robot_arm, hand),)
-    for robot_arm, hand in arms_to_warm:
+    for robot_arm, hand in (('l', 'R'), ('r', 'L')):
         t0 = time.time()
         solve_person_ik(
             robot, _WARMUP_PALM, hand, robot_arm, collision_obstacles,
@@ -2789,9 +2766,6 @@ def main():
         '--output-dir', type=str,
         default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
         help='IK の結果 JSON の保存先 (入力と同じファイル名)。')
-    parser.add_argument(
-        '--robot-arm', choices=['auto', 'r', 'l'], default='auto',
-        help='使うロボットの腕。既定 (auto) は人間の手の反対側。')
     parser.add_argument(
         '--attempts-per-pose', type=int,
         default=DEFAULT_ATTEMPTS_PER_POSE,
@@ -2893,18 +2867,9 @@ def main():
         help='hover 姿勢でロボットと人体の間に空ける距離 [m] (既定 {}、'
             '負で無効)。'.format(DEFAULT_HOVER_HUMAN_CLEARANCE))
     parser.add_argument(
-        '--no-offered-hand-penalty', action='store_true',
-        help='差し出された手・前腕とロボットの手先側の組を IK の干渉ペナルティ'
-            'に足さない。')
-    parser.add_argument(
         '--target-hover-offset', type=float, default=TARGET_HOVER_OFFSET,
         help='IK の目標を掌から法線方向に浮かせる距離 [m] (既定 {})。'
             .format(TARGET_HOVER_OFFSET))
-    parser.add_argument(
-        '--ik-collision-geometry', choices=('primitive', 'spheres'),
-        default=DEFAULT_IK_COLLISION_GEOMETRY,
-        help='バッチ IK の干渉ペナルティでのロボット側の形状 (既定 {})。'
-            .format(DEFAULT_IK_COLLISION_GEOMETRY))
     parser.add_argument(
         '--torso-surface-offset', type=float, default=0.0,
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '
@@ -2977,16 +2942,14 @@ def main():
             and args.post_process_max_candidates > 0 else None),
         n_turn_candidates=args.turn_candidates,
         hover_human_clearance=(args.hover_human_clearance
-                               if args.hover_human_clearance >= 0.0 else None),
-        offered_hand_penalty=not args.no_offered_hand_penalty,
-        collision_geometry=args.ik_collision_geometry)
+                               if args.hover_human_clearance >= 0.0 else None))
 
     # IK 対象が 1 人もいなければウォームアップしない。
     has_target = any(
         load_palm_json(path).get('offered_hand') in ('L', 'R')
         for path in files)
     if has_target:
-        _warmup_batch_ik(robot, args, base_limits, ik_kwargs)
+        _warmup_batch_ik(robot, base_limits, ik_kwargs)
 
     n_solved = 0
     n_total = 0
@@ -3006,8 +2969,7 @@ def main():
             print('[{}/{}] {} -> {} (not target: {})'.format(
                 i + 1, len(files), os.path.basename(path), out_path, reason))
             continue
-        robot_arm = (DEFAULT_ROBOT_ARM[human_hand]
-                     if args.robot_arm == 'auto' else args.robot_arm)
+        robot_arm = DEFAULT_ROBOT_ARM[human_hand]
 
         # 骨格があれば人物を前方 HUMAN_FRONT_DISTANCE へ平行移動し、身体を
         # 障害物にする (無ければ人体との干渉回避なし)。

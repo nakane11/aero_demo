@@ -116,11 +116,8 @@ def collect_synced_frames(bag_path, color_topic, depth_topic, info_topic,
     return frames
 
 
-def _lookup_robot_position(buf, base_frame, hand_frame, stamp,
-                           fixed_position):
-    """ロボット手先位置 (優先順: 固定値 > TF > フォールバック)。"""
-    if fixed_position is not None:
-        return np.asarray(fixed_position, dtype=np.float64)
+def _lookup_robot_position(buf, base_frame, hand_frame, stamp):
+    """ロボット手先位置 (TF、引けなければフォールバック)。"""
     try:
         transform = buf.lookup_transform_core(base_frame, hand_frame, stamp)
     except Exception:
@@ -158,8 +155,7 @@ def _save_frame(joint_positions, person_joints_2d, color, palm_estimator,
     (tune_offer_selector.py が再計算に使う)。
     """
     robot_position = _lookup_robot_position(
-        buf, args.base_frame, args.robot_hand_frame, stamp,
-        args.robot_hand_position)
+        buf, args.base_frame, args.robot_hand_frame, stamp)
     palm_estimator.offered_hand_selector.robot_position = robot_position
     palms = palm_estimator.estimate(joint_positions)
     palms['robot_position'] = [float(v) for v in robot_position]
@@ -296,9 +292,6 @@ def main():
     parser.add_argument('--joint-smoothing-dcutoff', type=float, default=1.0)
     # --- 差し出し手判定 (estimate_palm_poses.OfferedHandSelector) ---
     parser.add_argument('--offer-score-min', type=float, default=0.65)
-    parser.add_argument(
-        '--robot-hand-position', type=float, nargs=3, default=None,
-        metavar=('X', 'Y', 'Z'))
     parser.add_argument('--robot-hand-frame', type=str,
                         default='r_eef_grasp_link')
     parser.add_argument('--max-person-distance', type=float, default=3.0)

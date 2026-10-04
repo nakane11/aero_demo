@@ -6,9 +6,9 @@ import json
 import os
 
 
-def iter_json_files(directory, pattern='*.json'):
-    """Sorted list of files matching ``pattern`` under ``directory``."""
-    return sorted(glob.glob(os.path.join(directory, pattern)))
+def iter_json_files(directory):
+    """Sorted list of ``*.json`` files under ``directory``."""
+    return sorted(glob.glob(os.path.join(directory, '*.json')))
 
 
 def save_json(path, data):

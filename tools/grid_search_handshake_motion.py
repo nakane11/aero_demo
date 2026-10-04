@@ -50,9 +50,9 @@ from aero_demo import json_io  # noqa: E402
 from skrobot.models import Aero  # noqa: E402
 
 
-def generate_dataset(python, human_dir, palm_dir, handshake_dir,
-                     num_samples, seed):
+def generate_dataset(human_dir, palm_dir, handshake_dir, num_samples, seed):
     """骨格 -> 掌 -> 握手 IK を作る (既に JSON があるディレクトリは使い回す)。"""
+    python = sys.executable
     if not glob.glob(os.path.join(human_dir, '*.json')):
         print('[grid] {} 人分の人物を生成します -> {}'.format(
             num_samples, human_dir))
@@ -211,7 +211,7 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
         joint.joint_angle(float(angle))
 
     world_obstacles = phm.human_body_cylinder_obstacles(joint_positions)
-    collision_link_list = spik.collision_link_list_for_arm(robot, robot_arm)
+    collision_link_list = spik.collision_link_list_for_arm(robot)
     problem = phm.build_problem(
         robot, robot_arm, link_list, args.n_waypoints, args.dt,
         world_obstacles, collision_link_list,
@@ -384,8 +384,6 @@ def main():
         '--mode', choices=['ofat', 'full'], default='ofat',
         help='ofat: 1 軸ずつ振る。full: 総当たり。')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--python', type=str, default=sys.executable,
-                        help='データセット生成に使う Python。')
     parser.add_argument(
         '--output-csv', type=str,
         default=os.path.join(_THIS_DIR,
@@ -404,7 +402,7 @@ def main():
         if args.handshake_poses_dir is None:
             args.handshake_poses_dir = os.path.join(base_dir, 'handshakes')
 
-    generate_dataset(args.python, args.human_poses_dir, args.palm_poses_dir,
+    generate_dataset(args.human_poses_dir, args.palm_poses_dir,
                      args.handshake_poses_dir, args.num_samples, args.seed)
     targets = load_targets(args.handshake_poses_dir, args.human_poses_dir)
     if not targets:

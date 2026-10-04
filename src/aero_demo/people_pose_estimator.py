@@ -13,35 +13,33 @@ import time
 import cv2
 import numpy as np
 import mediapipe as mp
-import matplotlib
-matplotlib.use('Agg')  # Prevent GUI issues
-import matplotlib.cm
 
 from aero_demo.people_pose_types import CameraIntrinsics
-from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2HANDNAME
-from aero_demo.people_pose_types import INDEX2LIMBNAME, LIMB_SEQUENCE
+from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2LIMBNAME
 
 __all__ = ['CameraIntrinsics', 'PeoplePoseEstimator']
 
 logger = logging.getLogger(__name__)
 
+# estimate_hands_3d で検出する手の最大数。
+MAX_NUM_HANDS = 2
+
 
 class PeoplePoseEstimator(object):
     """MediaPipe による人物姿勢推定 (ROS 非依存).
 
+    既定値は run_camera_pipeline_test.py の既定と同じ。
+
     Examples
     --------
-    >>> estimator = PeoplePoseEstimator(use_hand=False)
+    >>> estimator = PeoplePoseEstimator()
     >>> joints = estimator.estimate(bgr_img)                  # 2D
     >>> people, joints = estimator.estimate_3d(bgr_img, depth_m, intr)  # 3D
     >>> people[0]  # {'Neck': [x, y, z], 'RShoulder': [x, y, z], ...}
-    >>> vis = estimator.draw_joints(bgr_img.copy(), joints)
     >>> estimator.close()
     """
 
-    limb_sequence = LIMB_SEQUENCE
     index2limbname = INDEX2LIMBNAME
-    index2handname = INDEX2HANDNAME
     hand_sequence = HAND_SEQUENCE
 
     # 腕・脚の (近位, 遠位) 関節ペア。長すぎる区間は遠位側を落とす。
@@ -73,8 +71,7 @@ class PeoplePoseEstimator(object):
     }
 
     def __init__(self,
-                 use_hand=False,
-                 model_complexity=0,
+                 use_hand=True,
                  min_detection_confidence=0.5,
                  min_tracking_confidence=0.5,
                  min_visibility=0.5,
@@ -87,10 +84,6 @@ class PeoplePoseEstimator(object):
                  max_hand_reach=0.22,
                  max_hand_wrist_offset=0.08,
                  depth_patch_size=3,
-                 min_neck_height=0.8,
-                 max_neck_height=2.0,
-                 enable_neck_height_filter=False,
-                 camera_to_base_transform=None,
                  history_duration=1.0,
                  history_distance=1.0):
         """
@@ -108,8 +101,6 @@ class PeoplePoseEstimator(object):
             Pose の手首と Hand の手首 (Hand0) がこれ以上ずれたら手全体を捨てる [m]。
         depth_patch_size : int
             深度を取る近傍の一辺 [px] (有効画素の中央値)。
-        camera_to_base_transform : numpy.ndarray or callable or None
-            首の高さフィルタ用。4x4 行列か (x, y, z) -> (x, y, z)。
         history_duration, history_distance : float
             直近の検出位置付近 [m] を一定時間 [s] 人物として信頼する。
         """
@@ -126,19 +117,9 @@ class PeoplePoseEstimator(object):
         self.max_hand_reach = max_hand_reach
         self.max_hand_wrist_offset = max_hand_wrist_offset
         self.depth_patch_size = max(1, int(depth_patch_size))
-        self.min_neck_height = min_neck_height
-        self.max_neck_height = max_neck_height
-        self.enable_neck_height_filter = enable_neck_height_filter
-        self.camera_to_base_transform = camera_to_base_transform
         self.history_duration = history_duration
         self.history_distance = history_distance
         self.recent_human_positions = []
-
-        if self.enable_neck_height_filter and self.camera_to_base_transform is None:
-            logger.warning(
-                "enable_neck_height_filter is True but camera_to_base_transform "
-                "is not given; the neck height filter is disabled.")
-            self.enable_neck_height_filter = False
 
         # Initialize MediaPipe Solutions
         if self.use_hand:
@@ -150,7 +131,7 @@ class PeoplePoseEstimator(object):
         else:
             self.holistic = None
             self.pose = mp.solutions.pose.Pose(
-                model_complexity=model_complexity,
+                model_complexity=0,
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence
             )
@@ -282,7 +263,7 @@ class PeoplePoseEstimator(object):
         raise ValueError('Unsupported depth encoding: {}'.format(encoding))
 
     def estimate_3d(self, bgr_img, depth_img, intrinsics,
-                    people_joint_positions=None, output_transform=None):
+                    output_transform=None):
         """深度画像 [m] とカメラ内部パラメータから 3 次元姿勢を求める.
 
         output_transform (4x4 行列か callable) を渡すと返す点をその座標系へ
@@ -293,8 +274,7 @@ class PeoplePoseEstimator(object):
         (list of dict, list of list of dict)
             人物ごとの {関節名: [x, y, z]} (検出できた関節のみ) と 2D 関節位置。
         """
-        if people_joint_positions is None:
-            people_joint_positions = self.estimate(bgr_img)
+        people_joint_positions = self.estimate(bgr_img)
 
         people = []
         current_time = time.time()
@@ -323,7 +303,7 @@ class PeoplePoseEstimator(object):
         return people, people_joint_positions
 
     def estimate_hands_3d(self, bgr_img, depth_img, intrinsics,
-                          output_transform=None, max_num_hands=2):
+                          output_transform=None):
         """体を使わず MediaPipe Hands で手だけを検出する (体が画角外でも使える).
 
         Returns
@@ -335,7 +315,7 @@ class PeoplePoseEstimator(object):
         """
         if self.hands is None:
             self.hands = mp.solutions.hands.Hands(
-                max_num_hands=max_num_hands,
+                max_num_hands=MAX_NUM_HANDS,
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence)
         h, w, _ = bgr_img.shape
@@ -516,19 +496,6 @@ class PeoplePoseEstimator(object):
                     "(limits: %sm - %sm)",
                     body_size, self.min_body_size, self.max_body_size)
                 return False
-
-        if self.enable_neck_height_filter:
-            neck_height = self._transform_to_base(neck_pos)
-            if neck_height is None:
-                return True  # 変換できないときは棄却しない
-            neck_height = neck_height[2]
-            if neck_height < self.min_neck_height \
-                    or neck_height > self.max_neck_height:
-                logger.warning(
-                    "Pose rejected by neck height filter: height=%.2fm "
-                    "(limits: %sm - %sm)",
-                    neck_height, self.min_neck_height, self.max_neck_height)
-                return False
         return True
 
     @staticmethod
@@ -556,133 +523,3 @@ class PeoplePoseEstimator(object):
         homogeneous = np.hstack([points, np.ones((len(points), 1))])
         transformed = homogeneous.dot(matrix.T)[:, :3]
         return {name: transformed[i] for i, name in enumerate(names)}
-
-    def _transform_to_base(self, point):
-        transform = self.camera_to_base_transform
-        try:
-            if callable(transform):
-                return np.asarray(transform(point), dtype=np.float64)
-            matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-            homogeneous = np.array([point[0], point[1], point[2], 1.0])
-            return matrix.dot(homogeneous)[:3]
-        except Exception as e:
-            logger.warning("Transform to base frame failed: %s", e)
-            return None
-
-    # ------------------------------------------------------------------
-    # visualization
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _get_cmap(name='hsv'):
-        try:
-            return matplotlib.colormaps.get_cmap(name)
-        except AttributeError:
-            return matplotlib.cm.get_cmap(name)
-
-    def draw_joints(self, img, people_joint_positions):
-        """``estimate`` の結果を img へ描き込む (img は破壊的に変更される)."""
-        all_peaks = [[] for _ in range(len(self.index2limbname) - 1)]
-        for person_joint_positions in people_joint_positions:
-            for i in range(len(self.index2limbname) - 1):
-                jt = person_joint_positions[i]
-                if jt['score'] >= 0:
-                    all_peaks[i].append((jt['x'], jt['y']))
-
-        cmap = self._get_cmap('hsv')
-
-        if all_peaks:
-            # keypoints
-            n = len(self.index2limbname) - 1
-            for i in range(len(self.index2limbname) - 1):
-                rgba = np.array(cmap(1. * i / n))
-                color = rgba[:3] * 255
-                for j in range(len(all_peaks[i])):
-                    cv2.circle(img, (int(all_peaks[i][j][0]), int(
-                        all_peaks[i][j][1])), 4, color, thickness=-1)
-
-        # connections
-        stickwidth = 4
-        for joint_positions in people_joint_positions:
-            n = len(self.limb_sequence)
-            for i, conn in enumerate(self.limb_sequence):
-                rgba = np.array(cmap(1. * i / n))
-                color = rgba[:3] * 255
-                j1, j2 = joint_positions[conn[0] - 1], joint_positions[conn[1] - 1]
-                if j1['score'] < 0 or j2['score'] < 0:
-                    continue
-                self._draw_stick(img, j1, j2, color, stickwidth)
-
-        # for hand
-        if self.use_hand:
-            offset = len(self.limb_sequence)
-            for joint_positions in people_joint_positions:
-                n = len(joint_positions[offset:])
-                for i, jt in enumerate(joint_positions[offset:]):
-                    if jt['score'] < 0.0:
-                        continue
-                    rgba = np.array(cmap(1. * i / n))
-                    color = rgba[:3] * 255
-                    cv2.circle(img, (int(jt['x']), int(jt['y'])),
-                               2, color, thickness=-1)
-
-            for joint_positions in people_joint_positions:
-                offset = len(self.limb_sequence)
-                n = len(self.hand_sequence)
-                for _ in range(2):
-                    # for both hands
-                    for i, conn in enumerate(self.hand_sequence):
-                        rgba = np.array(cmap(1. * i / n))
-                        color = rgba[:3] * 255
-                        j1 = joint_positions[offset + conn[0]]
-                        j2 = joint_positions[offset + conn[1]]
-                        if j1['score'] < 0 or j2['score'] < 0:
-                            continue
-                        self._draw_stick(img, j1, j2, color, stickwidth)
-                    #
-                    offset += int(len(self.index2handname) / 2)
-
-        return img
-
-    @staticmethod
-    def _draw_stick(img, j1, j2, color, stickwidth):
-        cx, cy = int((j1['x'] + j2['x']) / 2.), int((j1['y'] + j2['y']) / 2.)
-        dx, dy = j1['x'] - j2['x'], j1['y'] - j2['y']
-        length = np.linalg.norm([dx, dy])
-        angle = int(np.degrees(np.arctan2(dy, dx)))
-        polygon = cv2.ellipse2Poly((cx, cy), (int(length / 2.), stickwidth),
-                                   angle, 0, 360, 1)
-        top = max(0, np.min(polygon[:, 1]))
-        left = max(0, np.min(polygon[:, 0]))
-        bottom = min(img.shape[0], np.max(polygon[:, 1]))
-        right = min(img.shape[1], np.max(polygon[:, 0]))
-        if top >= bottom or left >= right:
-            return
-        roi = img[top:bottom, left:right]
-        roi2 = roi.copy()
-        cv2.fillConvexPoly(roi2, polygon - np.array([left, top]), color)
-        cv2.addWeighted(roi, 0.4, roi2, 0.6, 0.0, dst=roi)
-
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', type=int, default=0, help='camera device id')
-    parser.add_argument('--no-hand', dest='hand', action='store_false',
-                        help='do not estimate hands (estimated by default)')
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO)
-    cap = cv2.VideoCapture(args.device)
-    with PeoplePoseEstimator(use_hand=args.hand) as estimator:
-        while cap.isOpened():
-            ok, frame = cap.read()
-            if not ok:
-                break
-            people_joint_positions = estimator.estimate(frame)
-            cv2.imshow('people_pose_estimator',
-                       estimator.draw_joints(frame, people_joint_positions))
-            if cv2.waitKey(1) == 27:  # ESC
-                break
-    cap.release()
-    cv2.destroyAllWindows()

@@ -239,14 +239,12 @@ class OfferedHandSelector(object):
     持つので人物ごとに別インスタンスを使うこと。
     """
 
-    def __init__(self, robot_position=None, side_prior=None, weights=None,
+    def __init__(self, robot_position=None, weights=None,
                  score_min=OFFER_SCORE_MIN,
                  ambiguous_margin=AMBIGUOUS_MARGIN,
-                 face_away_penalty=FACE_AWAY_PENALTY,
                  max_distance=None,
                  finger_to_robot_axis_blend=0.0,
                  finger_to_robot_ramp=FINGER_TO_ROBOT_RAMP,
-                 approach_ramp=APPROACH_RAMP,
                  approach_height_scale=1.0,
                  stillness_window=STILLNESS_WINDOW,
                  stillness_max_displacement=STILLNESS_MAX_DISPLACEMENT,
@@ -257,8 +255,6 @@ class OfferedHandSelector(object):
         robot_position : (3,) array_like or None
             ロボット手先のワールド座標。``None`` なら人物ごとに
             :meth:`_robot_position` の既定位置。
-        side_prior : dict or None
-            ``{'R': float, 'L': float}``。スコアに足す事前分布。
         max_distance : float or None
             人物 (腰) からロボットまでがこれを超えたら両手 ``veto='too_far'``。
         finger_to_robot_axis_blend : float
@@ -271,16 +267,13 @@ class OfferedHandSelector(object):
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
                                                dtype=np.float64))
-        self.side_prior = dict(side_prior or {})
         self.weights = dict(weights or OFFER_FEATURE_WEIGHTS)
         self.score_min = float(score_min)
         self.ambiguous_margin = float(ambiguous_margin)
-        self.face_away_penalty = float(face_away_penalty)
         self.max_distance = (None if max_distance is None
                              else float(max_distance))
         self.finger_to_robot_axis_blend = float(finger_to_robot_axis_blend)
         self.finger_to_robot_ramp = tuple(finger_to_robot_ramp)
-        self.approach_ramp = tuple(approach_ramp)
         self.approach_height_scale = float(approach_height_scale)
         self.stillness_window = float(stillness_window)
         self.stillness_max_displacement = float(stillness_max_displacement)
@@ -343,8 +336,7 @@ class OfferedHandSelector(object):
             features[side] = feats
             scores[side] = sum(w * feats[key]
                                for key, w in self.weights.items()) \
-                - self.face_away_penalty * (1.0 - feats['face_to_robot']) \
-                + float(self.side_prior.get(side, 0.0))
+                - FACE_AWAY_PENALTY * (1.0 - feats['face_to_robot'])
 
         candidates = {s: v for s, v in scores.items() if v is not None}
         margin = None
@@ -446,7 +438,7 @@ class OfferedHandSelector(object):
         rest = shoulder - arm * body.up
         approach = _ramp(self._robot_distance(robot, rest)
                          - self._robot_distance(robot, center),
-                         *self.approach_ramp)
+                         *APPROACH_RAMP)
         separation = _ramp(
             _distance_to_segment(center, body.hip_center,
                                  body.shoulder_center),
@@ -576,15 +568,14 @@ class PalmPoseEstimator(object):
             rot=[[float(v) for v in row] for row in rot])
 
 
-def save_json(palms, path, keep_keys=('human_label',)):
-    """``estimate`` の結果を保存する。既存 JSON の ``keep_keys`` は引き継ぐ."""
+def save_json(palms, path):
+    """``estimate`` の結果を保存する。既存 JSON の ``human_label`` は引き継ぐ."""
     saved = dict(palms)
     if os.path.exists(path):
         with open(path) as f:
             previous = json.load(f)
-        for key in keep_keys:
-            if key in previous:
-                saved[key] = previous[key]
+        if 'human_label' in previous:
+            saved['human_label'] = previous['human_label']
     json_io.save_json(path, saved)
 
 

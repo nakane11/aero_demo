@@ -60,13 +60,12 @@ def _format_extra_link(link_name, parent_name, xyz, size):
                                            size))
 
 
-def write_extra_collision_urdf(src_path, dst_path, extra_boxes=None):
-    """``src_path`` に ``extra_boxes`` のリンクを足して ``dst_path`` に書く.
+def write_extra_collision_urdf(src_path, dst_path):
+    """``src_path`` に ``EXTRA_COLLISION_BOXES`` のリンクを足して ``dst_path`` に書く.
 
     内容が同じなら書き直さない。
     """
-    if extra_boxes is None:
-        extra_boxes = EXTRA_COLLISION_BOXES
+    extra_boxes = EXTRA_COLLISION_BOXES
     text = Path(src_path).read_text()
     for link_name, (parent_name, _, _) in extra_boxes.items():
         if re.search(r'<link name="{}"'.format(re.escape(link_name)), text):

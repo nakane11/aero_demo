@@ -248,7 +248,7 @@ def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
     return np.array([p0[0], p0[1], math.atan2(travel[1], travel[0])])
 
 
-def orbit_sweep(base_start, base_goal, center_xy, avoid_xy=None):
+def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
     """``base_start`` から ``base_goal`` への公転・自転の量を返す。
 
     Returns
@@ -258,7 +258,7 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy=None):
         半径 [m]、yaw の変化量 [rad]。半径がほぼ 0 なら ``None``。
 
     公転は ``avoid_xy`` (人の立ち位置) の方位を通らない向きに回る
-    (``None`` なら近い方)。
+    (中心と重なるなら近い方)。
     """
     center_xy = np.asarray(center_xy, dtype=np.float64)
     rel0 = np.asarray(base_start[:2], dtype=np.float64) - center_xy
@@ -270,18 +270,17 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy=None):
     theta1 = math.atan2(rel1[1], rel1[0])
     ccw = (theta1 - theta0) % (2 * math.pi)
     sweep = wrap_angle(theta1 - theta0)
-    if avoid_xy is not None:
-        rel_h = np.asarray(avoid_xy[:2], dtype=np.float64) - center_xy
-        if float(np.linalg.norm(rel_h)) > 1e-6:
-            theta_h = math.atan2(rel_h[1], rel_h[0])
-            passes_human = (theta_h - theta0) % (2 * math.pi) < ccw
-            sweep = ccw - 2 * math.pi if passes_human else ccw
+    rel_h = np.asarray(avoid_xy[:2], dtype=np.float64) - center_xy
+    if float(np.linalg.norm(rel_h)) > 1e-6:
+        theta_h = math.atan2(rel_h[1], rel_h[0])
+        passes_human = (theta_h - theta0) % (2 * math.pi) < ccw
+        sweep = ccw - 2 * math.pi if passes_human else ccw
     dyaw = sweep + wrap_angle(
         float(base_goal[2]) - float(base_start[2]) - sweep)
     return theta0, sweep, r0, r1, dyaw
 
 
-def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy=None):
+def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy):
     """``unwrap_start_yaw`` の公転版 (``orbit_sweep`` の自転量に合わせる)。"""
     sweep = orbit_sweep(base_start, base_goal, center_xy, avoid_xy)
     if sweep is None:
@@ -444,12 +443,12 @@ def unwrap_start_yaw(base_start, base_goal):
     return base_start
 
 
-def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit=None):
+def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit):
     """始点 (腕を下ろした姿勢 + ``base_start``) と終点 (``handshake``) の
     関節角・台車姿勢を ``{robot_arm}arm_whole_body`` の関節順で求める。
 
-    ``orbit`` (``(公転の中心, 避ける位置)``) を渡すと始点の yaw を
-    ``orbit_unwrap_start``、``None`` なら ``unwrap_start_yaw`` で調整する。
+    始点の yaw は ``orbit`` (``(公転の中心, 避ける位置)``) で
+    ``orbit_unwrap_start`` により調整する。
 
     Returns
     -------
@@ -471,10 +470,7 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit=None):
             joint.joint_angle(name_to_angle[joint.name])
     q_goal = np.array([j.joint_angle() for j in joint_list])
     base_goal = handshake_base_goal(handshake)
-    if orbit is None:
-        base_start = unwrap_start_yaw(base_start, base_goal)
-    else:
-        base_start = orbit_unwrap_start(base_start, base_goal, *orbit)
+    base_start = orbit_unwrap_start(base_start, base_goal, *orbit)
 
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
@@ -951,10 +947,9 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     return motion
 
 
-def blend_head_to_post_process(robot, motion, handshake,
-                               start_fraction=HEAD_GAZE_BLEND_START):
-    """接近区間の ``start_fraction`` 以降で首の角度を押し込み姿勢の値へ
-    線形補間する (破壊的。hover 時点で掌が画角に入るように)。
+def blend_head_to_post_process(robot, motion, handshake):
+    """接近区間の ``HEAD_GAZE_BLEND_START`` 以降で首の角度を押し込み姿勢の
+    値へ線形補間する (破壊的。hover 時点で掌が画角に入るように)。
 
     書き換えた waypoint は検証し直さない。書き換えたら True を返す。
     """
@@ -977,7 +972,7 @@ def blend_head_to_post_process(robot, motion, handshake,
         return False
 
     n = len(waypoints)
-    start = min(int(n * start_fraction), n - 1)
+    start = min(int(n * HEAD_GAZE_BLEND_START), n - 1)
     for k in range(start, n):
         t = (k - start + 1) / float(n - start)
         vec = waypoints[k]['joint_angle_vector']
@@ -987,8 +982,8 @@ def blend_head_to_post_process(robot, motion, handshake,
 
 
 def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
-                     args, verification_pairs, solver, obstacle_cache,
-                     optimize=True, orbit=None):
+                     args, verification_pairs, solver, obstacle_cache, orbit,
+                     optimize=True):
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する。
 
     pre-touch 経由 → 線形補間の順に検証し、通ればそれを返す。通らなければ
@@ -1087,7 +1082,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         joint.joint_angle(float(angle))
 
     world_obstacles = human_body_cylinder_obstacles(joint_positions)
-    collision_link_list = spik.collision_link_list_for_arm(robot, robot_arm)
+    collision_link_list = spik.collision_link_list_for_arm(robot)
     problem = build_problem(
         robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
         world_obstacles, collision_link_list,
@@ -1135,8 +1130,7 @@ def _warmup_solver(robot, solver, args):
         q_goal = q_start
         base_start = np.array([0.0, 0.0, 0.0])
         base_goal = np.array([0.3, 0.0, 0.1])
-        collision_link_list = spik.collision_link_list_for_arm(
-            robot, robot_arm)
+        collision_link_list = spik.collision_link_list_for_arm(robot)
         problem = build_problem(
             robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
             world_obstacles, collision_link_list,
@@ -1192,9 +1186,6 @@ def main():
         '--force-optimize', action='store_true',
         help='最適化なしの軌道が通っても必ず jaxls で最適化する (計測用)。')
     parser.add_argument(
-        '--no-warmup', action='store_true',
-        help='軌道最適化のウォームアップを省く。')
-    parser.add_argument(
         '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
         default=spik.DEFAULT_COLLISION_VERIFY_MODEL,
         help='事後検証のモデル (solve_palm_ik.py と同じ意味)。')
@@ -1238,10 +1229,9 @@ def main():
     print('[collision-verify] 軌道の事後検証は {} モデルの {} 組で行います。'
           .format(args.collision_verify_model, len(verification_pairs)))
     # jit キャッシュを効かせるためソルバーは人物間で使い回す。
-    solver = create_solver('jaxls', max_iterations=DEFAULT_MAX_ITERATIONS,
+    solver = create_solver('jaxls', max_iterations=args.max_iterations,
                            verbose=False)
-    if not args.no_warmup:
-        _warmup_solver(robot, solver, args)
+    _warmup_solver(robot, solver, args)
 
     transition_pairs = None
     base_limits = [tuple(spik.DEFAULT_BASE_X_RANGE),

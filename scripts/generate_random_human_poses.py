@@ -269,9 +269,6 @@ class RandomSkeletonGenerator(object):
         smpl_body.L_ANKLE: 'LAnkle', smpl_body.R_ANKLE: 'RAnkle',
     }
 
-    def __init__(self, include_hand=True):
-        self.include_hand = include_hand
-
     @staticmethod
     def _hand_frame(wrist_rot, rest_dir_robot, side):
         """手首の局所座標系 (u=指方向, v=親指側, n=掌の向き) を返す.
@@ -339,19 +336,18 @@ class RandomSkeletonGenerator(object):
 
         height = float(vertices[:, 2].max() - vertices[:, 2].min())
 
-        if self.include_hand:
-            hand_length = height * _HAND_LENGTH_HEIGHT_RATIO
-            model = smpl_person['model']
-            for side, elbow_idx, wrist_idx in (
-                    ('L', smpl_body.L_ELBOW, smpl_body.L_WRIST),
-                    ('R', smpl_body.R_ELBOW, smpl_body.R_WRIST)):
-                wrist = joints['{}Wrist'.format(side)]
-                wrist_rot = smpl_person['wrist_rots'][side]
-                rest_dir_robot = _unit(smpl_body.PERM.dot(
-                    model.J[wrist_idx] - model.J[elbow_idx]))
-                u, v, n = self._hand_frame(wrist_rot, rest_dir_robot, side)
-                joints.update(self._hand_landmarks(
-                    side, wrist, u, v, n, hand_length))
+        hand_length = height * _HAND_LENGTH_HEIGHT_RATIO
+        model = smpl_person['model']
+        for side, elbow_idx, wrist_idx in (
+                ('L', smpl_body.L_ELBOW, smpl_body.L_WRIST),
+                ('R', smpl_body.R_ELBOW, smpl_body.R_WRIST)):
+            wrist = joints['{}Wrist'.format(side)]
+            wrist_rot = smpl_person['wrist_rots'][side]
+            rest_dir_robot = _unit(smpl_body.PERM.dot(
+                model.J[wrist_idx] - model.J[elbow_idx]))
+            u, v, n = self._hand_frame(wrist_rot, rest_dir_robot, side)
+            joints.update(self._hand_landmarks(
+                side, wrist, u, v, n, hand_length))
 
         joint_positions = {
             name: [float(x) for x in p] for name, p in joints.items()}

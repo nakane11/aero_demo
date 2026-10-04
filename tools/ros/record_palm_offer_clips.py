@@ -24,7 +24,6 @@ import threading
 import time
 
 import cv2
-import numpy as np
 
 import rosbag
 import rospy
@@ -60,6 +59,7 @@ _TF_STATIC_TOPIC = '/tf_static'
 # 手先の TF が引けない間に使う base_link 座標 [m] (右腕初期姿勢の概算)。
 # OfferedHandSelector の robot_position=None は合成骨格向けの仮定なので使わない。
 _FALLBACK_ROBOT_HAND_POSITION = (0.32, -0.55, 0.93)
+
 
 class ClipWindowTracker(object):
     """``offered_hand`` の None -> 'R'/'L' を検出時刻 t0 とし、
@@ -269,9 +269,7 @@ class PalmOfferClipRecorder(object):
             self._close_clip(*closed)
 
     def _resolve_robot_position(self):
-        """判定基準のロボット手先位置 (base_link)。固定値 > TF > フォールバック。"""
-        if self.args.robot_hand_position is not None:
-            return np.asarray(self.args.robot_hand_position, dtype=np.float64)
+        """判定基準のロボット手先位置 (base_link)。TF、引けなければフォールバック。"""
         return lookup_frame_position(
             self.tf_buffer, self.args.base_frame, self.args.robot_hand_frame,
             _FALLBACK_ROBOT_HAND_POSITION,
@@ -411,10 +409,6 @@ def main():
     # --- 差し出し手判定 ---
     parser.add_argument('--offer-score-min', type=float, default=0.65,
                         help='差し出し手と判定するスコアの閾値。')
-    parser.add_argument(
-        '--robot-hand-position', type=float, nargs=3, default=None,
-        metavar=('X', 'Y', 'Z'),
-        help='判定基準のロボット手先位置 [m] (base_link) を固定する (既定は TF)。')
     parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
         help='判定基準のロボット手先の TF フレーム。')

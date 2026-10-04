@@ -173,9 +173,6 @@ def main():
         '--work-dir', default=None,
         help='パイプラインを実行せず既存の作業ディレクトリを描く。')
     parser.add_argument(
-        '--motion-dir', default=None,
-        help='軌道計画の結果 JSON のディレクトリ (既定は <作業ディレクトリ>/motions)。')
-    parser.add_argument(
         '--output-dir', default=None,
         help='PNG の保存先 (既定は <作業ディレクトリ>/plots)。')
     args, pipeline_args = parser.parse_known_args()
@@ -187,7 +184,7 @@ def main():
         work_dir = run_pipeline(pipeline_args)
     else:
         work_dir = args.work_dir
-    motion_dir = args.motion_dir or os.path.join(work_dir, 'motions')
+    motion_dir = os.path.join(work_dir, 'motions')
     if not os.path.isdir(motion_dir):
         sys.exit('{} がありません (--plan-motion 付きで実行した作業 '
                  'ディレクトリを指定してください)。'.format(motion_dir))

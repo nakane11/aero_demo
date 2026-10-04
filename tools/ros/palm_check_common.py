@@ -42,6 +42,9 @@ REPO_ROOT = _REPO_ROOT
 # holistic_smoothed は計画時と同じ (One Euro Filter 後に掌を求める)。
 SOURCES = ('holistic', 'holistic_smoothed', 'hands')
 
+# FrameSource.get_frame でフレームを待つ時間 [s]。
+FRAME_TIMEOUT = 2.0
+
 
 def add_camera_args(parser):
     """カメラ・骨格推定の引数 (``run_camera_pipeline_test.py`` と同じ既定値)。"""
@@ -90,9 +93,9 @@ class FrameSource(object):
         # 受信時刻は PC の時計 (ロボットとの時計ずれの影響を避ける)。
         self._latest = (time.time(), color_msg, depth_msg, info_msg)
 
-    def get_frame(self, after, timeout=2.0):
-        """``after`` (PC 時刻) 以降のフレーム。届かない・TF 失敗なら None。"""
-        deadline = time.time() + timeout
+    def get_frame(self, after):
+        """``after`` (PC 時刻) 以降のフレーム。2 秒以内に届かない・TF 失敗なら None。"""
+        deadline = time.time() + FRAME_TIMEOUT
         latest = None
         while not rospy.is_shutdown() and time.time() < deadline:
             latest = self._latest

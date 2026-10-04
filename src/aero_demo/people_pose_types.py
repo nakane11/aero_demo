@@ -3,7 +3,7 @@
 
 """姿勢推定結果のデータ型と MediaPipe の関節レイアウト定数."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -75,33 +75,3 @@ class Bone:
     name: str
     start_point: np.ndarray
     end_point: np.ndarray
-
-
-@dataclass
-class Person3D:
-    """カメラ座標系での 1 人分の 3 次元姿勢."""
-    limb_names: list = field(default_factory=list)
-    scores: list = field(default_factory=list)
-    positions: list = field(default_factory=list)  # np.ndarray([x, y, z])
-    bones: list = field(default_factory=list)      # Bone
-
-    def position_of(self, limb_name):
-        if limb_name not in self.limb_names:
-            return None
-        return self.positions[self.limb_names.index(limb_name)]
-
-
-@dataclass
-class EstimationResult:
-    """1 フレーム分の推定結果."""
-    stamp: object = None                        # rospy.Time
-    frame_id: str = ''                          # people の座標系 (既定 base_link)
-    camera_frame_id: str = ''                   # 入力画像の frame_id
-    image: np.ndarray = None                    # BGR 画像
-    joint_positions: list = field(default_factory=list)  # 2D 関節 (dict のリスト)
-    people: list = field(default_factory=list)           # Person3D
-    # CameraInfo/TF が無ければ None のことがある。
-    camera_intrinsics: object = None             # CameraIntrinsics or None
-    camera_width: int = 0
-    camera_height: int = 0
-    camera_pose: np.ndarray = None               # camera_frame_id -> frame_id, 4x4 or None
