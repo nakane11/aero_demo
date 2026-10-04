@@ -556,8 +556,7 @@ class TransitionChecker(object):
             return None
         clearances = spik.human_obstacle_clearances(
             robot, self.clearance_pairs,
-            spik.human_body_obstacles(joint_positions,
-                                      cylinder=spik.CylinderShape),
+            spik.human_body_obstacles(joint_positions),
             cull_distance=self.clearance)
         if not clearances:
             return None
