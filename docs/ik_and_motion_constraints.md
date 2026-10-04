@@ -244,10 +244,9 @@
 | 関節可動域・台車可動域 | ハード (範囲内にクリップ) | — |
 
 - ロボット側の形状は各リンクのプリミティブ (箱・円柱・球) そのものと人体の円柱の厳密な
-  距離で計算する (`collision_geometry='primitive'`, `DEFAULT_IK_COLLISION_GEOMETRY`、
-  `--ik-collision-geometry spheres` でリンクを球 3 個で近似する skrobot の既定に戻せる)。
+  距離で計算する (`collision_geometry='primitive'`, `DEFAULT_IK_COLLISION_GEOMETRY`)。
 - 差し出された手・前腕の 28 組は、hover の事後検証 (人体から 6 cm) で棄却される候補を
-  減らすため (`--no-offered-hand-penalty` で外せる)。
+  減らすため。
 - 干渉はペナルティなので、干渉が解消していなくても収束判定は通る。そのため必ず
   事後検証を挟む。
 

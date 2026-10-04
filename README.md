@@ -24,7 +24,7 @@ MediaPipe 形式の骨格・掌の
 4. **`scripts/solve_palm_ik.py`**
    手順 2 の JSONを入力とし、人間の手にロボットが触れる干渉回避付き全身 
    IK (台車移動を含む) を解いて、結果を JSON として保存する。
-   IK に使う腕は人間の手の反対側 (`--robot-arm r`/`l` で上書きできる)。
+   IK に使う腕は人間の手の反対側。
    干渉回避付きバッチ IK → 干渉の事後検証 → 掌へ押し込む後処理 IK の
    二段階で、制約・重み・解の優先順位・棄却条件は
    [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)
@@ -212,8 +212,7 @@ python3 view_handshake_poses.py
 `--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
 (例: `--output-dir /tmp/random_human_poses`)。`solve_palm_ik.py` が対象に
 する人間の手は掌 JSON の `offered_hand` で決まる。
-使うロボットの腕は `--robot-arm` で変更できる (既定のは人間の手の
-反対側)。
+使うロボットの腕は人間の手の反対側。
 
 上記の 3. を含め、grid search・データ収集・ラベル付けなど本番パイプライン
 に必須ではない開発・デバッグ用のプログラムは `tools/` (ROS 依存のものは

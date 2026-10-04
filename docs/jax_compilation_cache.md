@@ -12,7 +12,7 @@
 `~/.cache/jax_compilation_cache`、`JAX_COMPILATION_CACHE_DIR` 環境変数で
 変更できる)を有効にする。JIT コンパイルは、計算グラフの形状(
 `--collision-ik-stop`/`--attempts-per-pose`/`--skeleton-dir` の有無/使う腕
-(`--robot-arm`)などで決まる)ごとに初回だけ必要な重い処理で、以降は同じ
+などで決まる)ごとに初回だけ必要な重い処理で、以降は同じ
 venv/jax バージョンで同じ形状の計算であればディスクキャッシュから即座に
 読み込まれる。
 
@@ -147,9 +147,8 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 (`solve_person_ik` → `batch_inverse_kinematics`, `backend='jax'`)の部分を
 `solve_palm_ik.py` にも `_warmup_batch_ik` として移植した(`main()` が
 人物ループに入る前に実行、既定で有効)。
-`--robot-arm auto`(既定)では対象人物がどちらの手を差し出すか事前に
-分からないため両腕分ウォームアップし(`--robot-arm` で固定している場合は
-使う方だけ)、ダミー目標には `human_body_obstacles({})` を使い実際の対象者
+対象人物がどちらの手を差し出すか事前に分からないため両腕分
+ウォームアップし、ダミー目標には `human_body_obstacles({})` を使い実際の対象者
 と同じ shape で jit をトレース/コンパイルさせる。
 
 ただし入力バッチに IK 対象(`offered_hand` が L/R)が1人もいない場合は
