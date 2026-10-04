@@ -1274,7 +1274,28 @@ def restrict_joint_range_margin(link_list, margin_ratio):
     return restore
 
 
-def _cylinder_between(p0, p1, radius):
+class CylinderShape(object):
+    """``Cylinder`` と同じ位置姿勢 (``worldpos``/``worldrot``)・寸法
+    (``radius``/``height``) だけを持つ軽い円柱。``Cylinder`` は作るたびに
+    表示用のメッシュも作る (人体 1 人分で約 20 ms) ので、距離を測るだけ
+    (``human_obstacle_clearances``) のときに ``human_body_obstacles`` の
+    ``cylinder`` に渡す。"""
+
+    def __init__(self, radius, height, pos, rot=None):
+        self.radius = radius
+        self.height = height
+        self._pos = np.asarray(pos, dtype=np.float64)
+        self._rot = (np.eye(3) if rot is None
+                     else np.asarray(rot, dtype=np.float64))
+
+    def worldpos(self):
+        return self._pos
+
+    def worldrot(self):
+        return self._rot
+
+
+def _cylinder_between(p0, p1, radius, cylinder=Cylinder):
     """``p0``-``p1`` を結ぶ線分を近似する ``Cylinder`` (骨格の 1 本の骨)
     を作る。円柱のローカル +Z が線分の向きになるよう回転させる。"""
     p0 = np.asarray(p0, dtype=np.float64)
@@ -1295,11 +1316,11 @@ def _cylinder_between(p0, p1, radius):
     x_axis /= np.linalg.norm(x_axis)
     y_axis = np.cross(z_axis, x_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])
-    return Cylinder(radius=radius, height=height,
+    return cylinder(radius=radius, height=height,
                     pos=((p0 + p1) / 2.0).tolist(), rot=rot)
 
 
-def _palm_obstacle(points):
+def _palm_obstacle(points, cylinder=Cylinder):
     """掌を近似する平たい ``Cylinder`` を作る。``points`` は手首 + 4 指の
     付け根 (``HAND_PALM_LANDMARKS`` の順, MediaPipe 手ランドマーク) の
     座標。円柱の軸 (厚み方向) は掌面の法線 (手首->人差し指付け根,
@@ -1318,11 +1339,11 @@ def _palm_obstacle(points):
     x_axis /= np.linalg.norm(x_axis)
     y_axis = np.cross(z_axis, x_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])
-    return Cylinder(radius=HAND_PALM_RADIUS, height=HAND_PALM_HEIGHT,
+    return cylinder(radius=HAND_PALM_RADIUS, height=HAND_PALM_HEIGHT,
                     pos=center.tolist(), rot=rot)
 
 
-def _palm_obstacle_partial(points):
+def _palm_obstacle_partial(points, cylinder=Cylinder):
     """``HAND_PALM_LANDMARKS`` のうち検出できた landmark (``PALM_OBSTACLE_
     MIN_POINTS`` 点以上) だけから、大まかな掌の Cylinder を作る。
 
@@ -1351,18 +1372,18 @@ def _palm_obstacle_partial(points):
     x_axis /= np.linalg.norm(x_axis)
     y_axis = np.cross(z_axis, x_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])
-    return Cylinder(radius=HAND_PALM_RADIUS, height=HAND_PALM_HEIGHT,
+    return cylinder(radius=HAND_PALM_RADIUS, height=HAND_PALM_HEIGHT,
                     pos=center.tolist(), rot=rot)
 
 
-def _dummy_cylinder(radius):
+def _dummy_cylinder(radius, cylinder=Cylinder):
     """``DUMMY_OBSTACLE_DISTANCE`` だけ離れた位置に置くダミー ``Cylinder``
     (骨・掌・指が欠けている場合に個数を揃えるため)。"""
-    return Cylinder(radius=radius, height=1e-3,
+    return cylinder(radius=radius, height=1e-3,
                     pos=[DUMMY_OBSTACLE_DISTANCE] * 3)
 
 
-def human_body_obstacles(joint_positions):
+def human_body_obstacles(joint_positions, cylinder=Cylinder):
     """骨格の関節位置 (``generate_random_human_poses.py`` の
     ``skeleton.joint_positions``) から、干渉回避の障害物として使う
     ``Cylinder`` のリストを作る (``HUMAN_COLLISION_SEGMENTS``/
@@ -1378,6 +1399,9 @@ def human_body_obstacles(joint_positions):
     さえ検出できていれば、``_fill_missing_joints_straight_down`` により
     子関節はダミーにせず鉛直方向に伸ばした推定位置で埋める (肘から先/膝
     から先がカメラ視野外のときに、そこに障害物が無いと誤解しないため)。
+
+    ``cylinder`` に ``CylinderShape`` を渡すと、メッシュを作らない軽い
+    円柱 (距離を測るだけのとき用) で返す。
     """
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     obstacles = []
@@ -1386,30 +1410,32 @@ def human_body_obstacles(joint_positions):
             radius = _torso_segment_radius(
                 name_a, name_b, default_radius, joint_positions)
             obstacles.append(_cylinder_between(
-                joint_positions[name_a], joint_positions[name_b], radius))
+                joint_positions[name_a], joint_positions[name_b], radius,
+                cylinder))
         else:
-            obstacles.append(_dummy_cylinder(default_radius))
+            obstacles.append(_dummy_cylinder(default_radius, cylinder))
     for side in ('R', 'L'):
         palm_names = ['{}Hand{}'.format(side, idx)
                      for idx in HAND_PALM_LANDMARKS]
         available = [joint_positions[name] for name in palm_names
                     if name in joint_positions]
         if len(available) == len(palm_names):
-            obstacles.append(_palm_obstacle(available))
+            obstacles.append(_palm_obstacle(available, cylinder))
         else:
-            partial = _palm_obstacle_partial(available)
+            partial = _palm_obstacle_partial(available, cylinder)
             obstacles.append(
                 partial if partial is not None
-                else _dummy_cylinder(HAND_PALM_RADIUS))
+                else _dummy_cylinder(HAND_PALM_RADIUS, cylinder))
         for base_idx, tip_idx in HAND_FINGER_LANDMARKS:
             base_name = '{}Hand{}'.format(side, base_idx)
             tip_name = '{}Hand{}'.format(side, tip_idx)
             if base_name in joint_positions and tip_name in joint_positions:
                 obstacles.append(_cylinder_between(
                     joint_positions[base_name], joint_positions[tip_name],
-                    HAND_FINGER_RADIUS))
+                    HAND_FINGER_RADIUS, cylinder))
             else:
-                obstacles.append(_dummy_cylinder(HAND_FINGER_RADIUS))
+                obstacles.append(_dummy_cylinder(HAND_FINGER_RADIUS,
+                                                 cylinder))
     return obstacles
 
 

@@ -52,19 +52,36 @@ import solve_palm_ik as spik
 # 後ろのうち前腕まわりのひねりが一番少ない向きへ回す
 # (LOWERED_PALM_FACINGS)。肘を曲げて前腕だけを上げる (肘を直角にして
 # 前腕を水平にする) 形は人から見ると手を下ろしていないので使わない。
-# 移動先のバッチ IK は組ごとに 3 つを目標にし、人が一番低く下ろせる角度の
-# 解を優先する。低い組で横並びまで進めなければ次の組を試す。
+# 移動先のバッチ IK は組 ((上腕の角度 3 つ), 脇の開き) ごとに 3 つを目標に
+# し、人が一番低く下ろせる角度の解を優先する。前の組で横並びまで進めなければ
+# 次の組を試す (LOWERED_ARM_GROUPS)。
 # 脇は、胴体の干渉円柱 (肩の関節から横へ約 13 cm) の外に手が出る 25 度開く
-# (10 度だと低い目標が人体との距離 6 cm の検証でほぼ全部落ちる)。
+# (10 度だと低い目標が人体との距離 6 cm の検証でほぼ全部落ちる)。25 度で
+# 移動先・経路が人の胴体・下ろした上腕に近すぎる人は 40 度開く組も試す。
+# 腕を低く下ろす方を脇を狭める方より優先し、上腕 0/15/30 度は 25 -> 40 度、
+# その後に 45/60/75 度を 25 -> 40 度の順。
 LOWERED_ARM_ABDUCTION_DEG = 25.0
+LOWERED_ARM_WIDE_ABDUCTION_DEG = 40.0
 LOWERED_ELBOW_FLEX_DEG = 15.0
 LOWERED_ARM_DEG_GROUPS = ((0.0, 15.0, 30.0), (45.0, 60.0, 75.0))
+LOWERED_ARM_GROUPS = tuple(
+    (degs, abduction) for degs in LOWERED_ARM_DEG_GROUPS
+    for abduction in (LOWERED_ARM_ABDUCTION_DEG,
+                      LOWERED_ARM_WIDE_ABDUCTION_DEG))
 LOWERED_PALM_FACINGS = ('inward', 'forward', 'backward')
 LOWERED_TARGET_COUNT = 3
 
 # 移動先の台車の前後位置を、人の立ち位置からどれだけずらしてよいか [m]。
-# 狭い方から試し、解けなければ広げる。
-DEFAULT_GOAL_X_MARGINS = (0.05, 0.15, 0.3, 0.5)
+# 狭い方から試し、解けなければ広げる。合成データでは横並びまで進めた人は
+# 全員 ±0.05 m で解けており、広げて解けるのは移動先の検証・経路に通らない
+# 解だけだった (広げると解けない人で 1 組あたりバッチ IK が 4 回になる) ので、
+# ±0.05 m だけにしている。
+DEFAULT_GOAL_X_MARGINS = (0.05,)
+
+# 移動先のバッチ IK の目標 1 つあたりの初期値の数 (押し込みの IK の
+# DEFAULT_ATTEMPTS_PER_POSE = 512 の半分)。合成データで 512 と成功数は
+# 同じで、1 回あたり約 0.32 -> 0.23 秒。
+GOAL_ATTEMPTS_PER_POSE = 256
 
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
 # 上体の前後ずれ |ankle + knee| [rad] (脚は平行リンクで、胴体は台車の
@@ -323,16 +340,19 @@ class HumanArm(object):
         return (elbow, wrist, wrist + rot @ (self.palm_pos0 - self.wrist0),
                 rot @ self.palm_rot0)
 
-    def lowering(self, arm_deg):
-        """上腕を真下から前へ ``arm_deg`` 度上げ、外へ
-        ``LOWERED_ARM_ABDUCTION_DEG`` 開き、肘を ``LOWERED_ELBOW_FLEX_DEG``
-        曲げた腕へ下ろす動き。掌は ``LOWERED_PALM_FACINGS`` のうち前腕の
-        ひねりが一番少ない向きにする。``lowering_pose`` に渡す dict
-        (``palm``: 下ろしきった掌の ``(位置, 回転行列)``、``arm_deg``、
-        ``palm_facing``) を返す。"""
+    def lowering(self, arm_deg, abduction_deg=None):
+        """上腕を真下から前へ ``arm_deg`` 度上げ、外へ ``abduction_deg``
+        (既定 ``LOWERED_ARM_ABDUCTION_DEG``) 開き、肘を
+        ``LOWERED_ELBOW_FLEX_DEG`` 曲げた腕へ下ろす動き。掌は
+        ``LOWERED_PALM_FACINGS`` のうち前腕のひねりが一番少ない向きにする。
+        ``lowering_pose`` に渡す dict (``palm``: 下ろしきった掌の ``(位置,
+        回転行列)``、``arm_deg``、``abduction_deg``、``palm_facing``) を
+        返す。"""
+        if abduction_deg is None:
+            abduction_deg = LOWERED_ARM_ABDUCTION_DEG
         start_frame, start_flex = self._press_arm_frame()
         th = math.radians(arm_deg)
-        ab = math.radians(LOWERED_ARM_ABDUCTION_DEG)
+        ab = math.radians(abduction_deg)
         ua = (math.cos(ab) * (math.cos(th) * _DOWN
                               + math.sin(th) * self.forward)
               + math.sin(ab) * self.outward)
@@ -354,7 +374,8 @@ class HumanArm(object):
         twists = {name: twist_to(facings[name])
                   for name in LOWERED_PALM_FACINGS}
         facing = min(twists, key=lambda name: abs(twists[name]))
-        goal = dict(arm_deg=float(arm_deg), palm_facing=facing,
+        goal = dict(arm_deg=float(arm_deg),
+                    abduction_deg=float(abduction_deg), palm_facing=facing,
                     start_frame=start_frame, start_flex=start_flex,
                     frame=frame, flex=flex, twist=twists[facing])
         goal['palm'] = self.lowering_pose(goal, 1.0)[2:]
@@ -535,7 +556,8 @@ class TransitionChecker(object):
             return None
         clearances = spik.human_obstacle_clearances(
             robot, self.clearance_pairs,
-            spik.human_body_obstacles(joint_positions),
+            spik.human_body_obstacles(joint_positions,
+                                      cylinder=spik.CylinderShape),
             cull_distance=self.clearance)
         if not clearances:
             return None
@@ -553,20 +575,82 @@ def _branch_joint_indices(robot, robot_arm):
             if name.format(robot_arm) in names]
 
 
+# 移動先のバッチ IK に、押し込みの干渉ペア (collision_pairs.json) へ足す組
+# (_transition_pairs)。移動先の検証で落ちる候補はほぼ、ロボットの差し出す
+# 腕の前腕・肘が人の下ろした上腕・胴体の横に 6 cm 以内まで近づくもの
+# (下ろした上腕は押し込みの IK には無い) と、差し出さない腕の前腕・手が腰に
+# めり込む自己干渉 (押し込みの干渉ペアには自己干渉の組が無い) だった。
+# IK に避けさせると、移動先の検証に落ちる候補が約半分になり、合成データで
+# 移動先まで 100% の人が 33 -> 35/41 人に増えた。
+TRANSITION_EXTRA_PAIRS = True
+TRANSITION_ARM_LINKS = ('{}_forearm_link', '{}_elbow_link')
+TRANSITION_SELF_PAIRS = (
+    ('{other}_forearm_link', 'hip_sphere_link'),
+    ('{other}_forearm_link', 'waist_link'),
+    ('{other}_hand_link', 'waist_link'),
+    ('{arm}_forearm_link', 'waist_link'),
+    ('{arm}_hand_link', 'waist_link'),
+    ('{arm}_forearm_link', 'body_link'),
+    ('{arm}_elbow_link', 'body_link'),
+)
+
+
+def _lowered_arm_slots(hand):
+    """``_batch_ik`` で、下ろした人の上腕 (目標ごとに 1 本) を置く障害物の
+    添字 (差し出した腕・手の枠を使い回す。個数は変えない)。"""
+    names = spik.human_obstacle_names()
+    return [names.index(name.format(hand)) for name in
+            ('{0}Shoulder-{0}Elbow', '{0}Elbow-{0}Wrist', '{0}_palm')]
+
+
+def _transition_pairs(robot, robot_arm, hand):
+    """横並び移動の移動先のバッチ IK に、押し込みの干渉ペアへ足す組。
+    移動先の検証で落ちるのはほぼ、ロボットの差し出す腕の前腕・肘と人の
+    下ろした上腕・胴体の横、差し出さない腕の前腕・手と腰の自己干渉
+    (押し込みの干渉ペアには無い組)。"""
+    other = 'l' if robot_arm == 'r' else 'r'
+    links_by_name = {link.name: link for link in
+                     list(robot.link_list)
+                     + list(getattr(robot, 'extra_collision_links', []))}
+    torso = spik.human_obstacle_names().index(
+        '{0}Shoulder-{0}Hip'.format(hand))
+    pairs = []
+    for name in TRANSITION_ARM_LINKS:
+        link = links_by_name.get(name.format(robot_arm))
+        if link is not None:
+            pairs += [(link, i) for i in _lowered_arm_slots(hand) + [torso]]
+    for a, b in TRANSITION_SELF_PAIRS:
+        a = links_by_name.get(a.format(arm=robot_arm, other=other))
+        b = links_by_name.get(b.format(arm=robot_arm, other=other))
+        if a is not None and b is not None:
+            pairs.append((a, b))
+    return pairs
+
+
 def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
               collision_pairs, base_limits, attempts_per_pose,
-              free_turn=False):
+              free_turn=False, lowered_arms=()):
     """押し込み目標 ``targets`` (3 つ) に対して台車も動かす干渉回避付き
     バッチ IK (``solve_person_ik`` と同じ形: 目標 3 つ・初期値・干渉ペア)。
     人の差し出した手・前腕・上腕は手を合わせているので障害物から外す
-    (遠くのダミーにする、個数は変えない)。差し出さない腕・首の初期値は
-    ``seed_av``。収束した解 ``[(目標の添字, angle_vector, (x, y, yaw)),
-    ...]`` を返す。"""
+    (遠くのダミーにする、個数は変えない)。代わりに、下ろした人の上腕
+    ``lowered_arms`` (目標ごとの (肩, 肘)) をその枠に置き、ロボットの
+    差し出す腕の前腕・肘に避けさせる (``_transition_pairs``)。差し出さない
+    腕・首の初期値は ``seed_av``。収束した解 ``[(目標の添字,
+    angle_vector, (x, y, yaw)), ...]`` を返す。"""
     obstacles = spik.human_body_obstacles(collision_joints)
+    names = spik.human_obstacle_names()
     removed = spik.offered_hand_obstacle_indices(hand) | {
-        spik.human_obstacle_names().index('{0}Shoulder-{0}Elbow'.format(hand))}
+        names.index('{0}Shoulder-{0}Elbow'.format(hand))}
     obstacles = [spik._dummy_cylinder(o.radius) if i in removed else o
                  for i, o in enumerate(obstacles)]
+    upper_radius = dict(
+        ('{}-{}'.format(a, b), r) for a, b, r in spik.HUMAN_COLLISION_SEGMENTS
+    )['{0}Shoulder-{0}Elbow'.format(hand)]
+    for slot, (shoulder, elbow) in zip(_lowered_arm_slots(hand),
+                                       lowered_arms):
+        obstacles[slot] = spik._cylinder_between(shoulder, elbow,
+                                                 upper_radius)
     pairs = None
     if collision_pairs:
         links_by_name = {link.name: link for link in
@@ -576,7 +660,10 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
         pairs = list(collision_pairs) + [
             (links_by_name[name.format(robot_arm)], i)
             for name in spik.OFFERED_HAND_PENALTY_LINKS
-            if name.format(robot_arm) in links_by_name for i in offered]
+            if name.format(robot_arm) in links_by_name for i in offered
+            if i not in _lowered_arm_slots(hand)]
+        if TRANSITION_EXTRA_PAIRS:
+            pairs += _transition_pairs(robot, robot_arm, hand)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     # バッチ IK は台車をワールド原点から動かす (base_limits もその前提の
     # 絶対座標)。
@@ -627,7 +714,7 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
 
 def warmup_batch_ik(robot, robot_arm, hand, seed_av, collision_pairs,
                     base_limits,
-                    attempts_per_pose=spik.DEFAULT_ATTEMPTS_PER_POSE):
+                    attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
     """横並び移動の移動先のバッチ IK (``_batch_ik``) を、実際の呼び出しと
     同じ形 (目標 3 つ・障害物・干渉ペア・回転の拘束) で 1 回解いて、JAX の
     トレース・コンパイルを前倒しで済ませる。握りの向きを自由にしない
@@ -669,11 +756,11 @@ def placement_cost(base, standing_xy, facing):
 def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           translated_joints, collision_joints,
                           collision_pairs, base_limits,
-                          x_margins=DEFAULT_GOAL_X_MARGINS,
+                          x_margins=None,
                           turn_degs=GOAL_TURN_DEGS,
-                          attempts_per_pose=spik.DEFAULT_ATTEMPTS_PER_POSE,
+                          attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
                           branch_range_deg=GOAL_BRANCH_JOINT_RANGE_DEG,
-                          free_turn=False):
+                          free_turn=False, lowered_arms=()):
     """下ろした手の候補 ``goal_palms`` (腕の低い順の 3 つの ``(位置,
     回転行列)``) への押し込み目標を、握りの向き ``turn_degs`` ごとに 1 回の
     バッチ IK で解き、移動先の台車・姿勢の候補を前後の窓の狭い方から
@@ -692,6 +779,8 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
         turn_deg, goal_palms の添字)`` のリスト、``x_margin`` は候補が
         出た窓。
     """
+    if x_margins is None:
+        x_margins = DEFAULT_GOAL_X_MARGINS
     standing = spik.human_standing_xy(translated_joints)
     facing = spik.human_facing_direction(translated_joints)
     human_yaw = math.atan2(facing[1], facing[0])
@@ -701,6 +790,9 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     for name, p in translated_joints.items()}
     local_collision_joints = {name: to_local.transform_point(p)
                               for name, p in collision_joints.items()}
+    local_arms = [[to_local.transform_point(p) for p in arm]
+                  for arm in lowered_arms]
+
     def local_targets(turn_deg):
         targets = []
         for goal_palm in goal_palms:
@@ -733,7 +825,8 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
             for palm_index, av, base in _batch_ik(
                     robot, robot_arm, hand, local_targets(turn_deg), seed_av,
                     local_collision_joints, collision_pairs, window,
-                    attempts_per_pose, free_turn=free_turn):
+                    attempts_per_pose, free_turn=free_turn,
+                    lowered_arms=local_arms):
                 if np.any(np.abs(av[branch] - seed[branch]) > branch_range):
                     continue
                 xy = to_world.transform_point([base[0], base[1], 0.0])[:2]
@@ -875,7 +968,7 @@ def forward_gaze_point(joint_positions):
 def plan_transition(robot, robot_arm, hand, post, turn_deg,
                     translated_joints, collision_joints, verification_pairs,
                     collision_pairs, base_limits,
-                    attempts_per_pose=spik.DEFAULT_ATTEMPTS_PER_POSE):
+                    attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
     """押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict、向き
     ``turn_deg``) から、つないだ手を人の体の横へ下ろしながら、ロボットも
     人と横並びになる位置・姿勢へ移る waypoint を計画する.
@@ -931,12 +1024,16 @@ def plan_transition(robot, robot_arm, hand, post, turn_deg,
         """腕の下ろし方 ``lowerings`` (3 つ) を移動先にして経路を作る。
         横並びまで (100%) 進めたら True。"""
         goal_palms = [lowering['palm'] for lowering in lowerings]
+        lowered_arms = [(human_arm.shoulder,
+                         human_arm.lowering_pose(lowering, 1.0)[0])
+                        for lowering in lowerings]
         for turn_degs in turn_groups:
             candidates, x_margin = solve_goal_candidates(
                 robot, robot_arm, hand, goal_palms, start_av,
                 translated_joints, collision_joints, collision_pairs,
                 base_limits, turn_degs=turn_degs,
-                attempts_per_pose=attempts_per_pose, free_turn=free_turn)
+                attempts_per_pose=attempts_per_pose, free_turn=free_turn,
+                lowered_arms=lowered_arms)
             if not candidates:
                 reasons.append('移動先の IK が解けない (腕 {} 度、握りの向き '
                                '{})'.format(
@@ -988,6 +1085,7 @@ def plan_transition(robot, robot_arm, hand, post, turn_deg,
                 if best[0] is None or fraction > best[0][1]:
                     best[0] = (waypoints, fraction)
                     result.update(arm_deg=lowering['arm_deg'],
+                                  abduction_deg=lowering['abduction_deg'],
                                   palm_facing=lowering['palm_facing'],
                                   x_margin=x_margin)
                 if fraction >= 1.0:
@@ -1000,8 +1098,9 @@ def plan_transition(robot, robot_arm, hand, post, turn_deg,
         return False
 
     # 人が腕を低く下ろせる組から試し、横並びまで進めた組で止める。
-    for arm_degs in LOWERED_ARM_DEG_GROUPS:
-        if try_lowerings([human_arm.lowering(deg) for deg in arm_degs]):
+    for arm_degs, abduction_deg in LOWERED_ARM_GROUPS:
+        if try_lowerings([human_arm.lowering(deg, abduction_deg)
+                          for deg in arm_degs]):
             break
     best = best[0]
     if best is None or best[1] < MIN_FRACTION:
