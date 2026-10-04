@@ -803,10 +803,11 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
         return targets
 
     limits = list(base_limits)
-    side_sign = spik.offered_hand_side_sign(hand, local_joints, None)
-    if side_sign is not None:
-        limits[1] = spik.restrict_base_y_range_to_hand_side(
-            limits[1], side_sign)
+    # 下ろした手は人の体の左右どちらか (人の正面が +x なので左は +y) に
+    # 来るので、差し出した手首の位置 (体の中心線をまたぐことがある) では
+    # なく、手の左右で台車の側を決める。
+    limits[1] = spik.restrict_base_y_range_to_hand_side(
+        limits[1], 1.0 if hand == 'L' else -1.0)
     limits[2] = spik.restrict_base_yaw_range_to_human_facing(
         limits[2], 0.0,
         margin=math.radians(spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
