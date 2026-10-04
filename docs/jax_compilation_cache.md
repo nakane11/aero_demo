@@ -146,7 +146,7 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 `run_camera_pipeline_test.py` の `_warmup_ik` のうち、バッチIK
 (`solve_person_ik` → `batch_inverse_kinematics`, `backend='jax'`)の部分を
 `solve_palm_ik.py` にも `_warmup_batch_ik` として移植した(`main()` が
-人物ループに入る前に実行、`--no-warmup` で無効化可能、既定で有効)。
+人物ループに入る前に実行、既定で有効)。
 `--robot-arm auto`(既定)では対象人物がどちらの手を差し出すか事前に
 分からないため両腕分ウォームアップし(`--robot-arm` で固定している場合は
 使う方だけ)、ダミー目標には `human_body_obstacles({})` を使い実際の対象者
@@ -154,8 +154,7 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 
 ただし入力バッチに IK 対象(`offered_hand` が L/R)が1人もいない場合は
 バッチIK自体が呼ばれずウォームアップが無駄になるため、`main()` は事前に
-対象の有無を確認し、**0人ならウォームアップ自体をスキップする**
-(`--no-warmup` の指定に関わらず)。
+対象の有無を確認し、**0人ならウォームアップ自体をスキップする**。
 
 `plan_handshake_motion.py`(jaxls の軌道最適化)へは移植しなかった。この
 スクリプトは1回の起動につき1回だけ実行される使い捨てプロセスで、
