@@ -256,7 +256,8 @@ def follow_arm_pose(model, person, pose, human_arm, arm):
 
     手首から先は押し込み時の手に対して剛体のまま (``arm`` の掌の位置姿勢に
     合わせて) 動かし、肩・肘は SMPL 自身の上腕・前腕の長さで 2 リンクの
-    IK を解いて、肩 -> 肘 -> 手首の順に骨の向きを合わせる (肩より体幹側は
+    IK を解いて (肘は ``arm`` の肘の側)、肩 -> 肘 -> 手首の順に骨の向きを
+    合わせる (肩より体幹側は
     触らない)。"""
     if human_arm.hand == 'R':
         joints_ix = (smpl_body.R_SHOULDER, smpl_body.R_ELBOW,
@@ -277,9 +278,11 @@ def follow_arm_pose(model, person, pose, human_arm, arm):
     palm_pos = np.asarray(arm['palm_position'])
     hand_rot = palm_rot @ human_arm.palm_rot0.T
     wrist_target = palm_pos + hand_rot @ (joints0[w] - human_arm.palm_pos0)
+    # 肘は計画した腕の肘と同じ側 (肩から見た向き) に置く。
     elbow_target = sbs.two_link_elbow(
         joints0[s], wrist_target, np.linalg.norm(joints0[e] - joints0[s]),
-        np.linalg.norm(joints0[w] - joints0[e]), human_arm.outward)
+        np.linalg.norm(joints0[w] - joints0[e]), human_arm.outward,
+        prefer=np.asarray(arm['elbow']) - human_arm.shoulder)
 
     def set_world(index, world_rot, rots):
         parent_world = rots[model.parent[index]]
