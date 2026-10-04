@@ -1231,6 +1231,11 @@ def main():
     # jit キャッシュを効かせるためソルバーは人物間で使い回す。
     solver = create_solver('jaxls', max_iterations=args.max_iterations,
                            verbose=False)
+    # skrobot の JaxBackend は最初に作られた時に x64 を有効にする (バッチ IK
+    # が作る)。warmup をその前に走らせると float32 でコンパイルされ、本番の
+    # float64 の solve で各腕の初回に約 9 秒の再コンパイルが起きる。
+    import jax
+    jax.config.update('jax_enable_x64', True)
     _warmup_solver(robot, solver, args)
 
     transition_pairs = None
