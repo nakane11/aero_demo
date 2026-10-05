@@ -543,6 +543,44 @@ class TransitionChecker(object):
             self.clearance_pairs = (
                 source.with_pairs(pairs)
                 if isinstance(source, spik.VerificationPairs) else pairs)
+        # 台車の車輪と人の脚などの組 (人の腕は動くので除く)。腕・腰・脚の
+        # 姿勢によらず台車の位置だけで距離が決まる。
+        self.base_pairs = None
+        if source is not None:
+            arm = offered | set(_lowered_arm_slots(hand))
+            pairs = [pair for pair in source
+                     if isinstance(pair[1], int) and pair[1] not in arm
+                     and pair[0].name.startswith('wheel')]
+            self.base_pairs = (
+                source.with_pairs(pairs)
+                if isinstance(source, spik.VerificationPairs) else pairs)
+
+    def check_base_path(self, robot, av, start_base, goal_base,
+                        joint_positions):
+        """台車を ``start_base`` から ``goal_base`` へ直線で動かす経路
+        (``plan_path`` と同じ補間) で、車輪が人体の脚などに
+        ``clearance`` 未満まで近づけば説明、無ければ ``None`` を返す。
+        ``av`` は台車以外の姿勢 (車輪は台車の位置だけで決まる)。"""
+        if not self.base_pairs:
+            return None
+        delta = np.asarray(goal_base, dtype=np.float64) \
+            - np.asarray(start_base, dtype=np.float64)
+        n = max(2, int(math.ceil(max(np.linalg.norm(delta[:2]) / MAX_STEP,
+                                     abs(delta[2]) / MAX_ANGLE_STEP))))
+        obstacles = spik.human_body_obstacles(joint_positions)
+        names = spik.human_obstacle_names()
+        for k in range(1, n + 1):
+            _place(robot, av, np.asarray(start_base) + delta * (k / float(n)))
+            clearances = spik.human_obstacle_clearances(
+                robot, self.base_pairs, obstacles,
+                cull_distance=self.clearance)
+            if not clearances:
+                continue
+            index = min(clearances, key=clearances.get)
+            if clearances[index] < self.clearance:
+                return '経路の車輪が人体 ({}) まで {:.3f} m'.format(
+                    names[index], clearances[index])
+        return None
 
     def check(self, robot, joint_positions):
         """``robot`` の今の姿勢を、人の骨格 ``joint_positions`` に対して
@@ -1048,7 +1086,6 @@ def plan_transition(robot, robot_arm, hand, post, turn_deg,
                 if (tried.get(palm_index, 0) >= MAX_GOAL_CANDIDATES
                         or checked.get(palm_index, 0) >= MAX_GOAL_CHECKS):
                     continue
-                checked[palm_index] = checked.get(palm_index, 0) + 1
                 lowering = lowerings[palm_index]
                 goal_palm = lowering['palm']
                 goal_skeleton = human_arm.skeleton(human_arm.pose(
@@ -1058,6 +1095,14 @@ def plan_transition(robot, robot_arm, hand, post, turn_deg,
                 goal_base = np.array([goal_base[0], goal_base[1],
                                       start_base[2]
                                       + _wrap(goal_base[2] - start_base[2])])
+                # 台車の経路で車輪が人の脚に近づく候補は、経路を計画する前に
+                # 外す (安く判定できるので ``checked`` には数えない)。
+                problem = checker.check_base_path(
+                    robot, goal_av, start_base, goal_base, goal_skeleton)
+                if problem is not None:
+                    reasons.append(problem)
+                    continue
+                checked[palm_index] = checked.get(palm_index, 0) + 1
                 # 移動先の姿勢そのものを、首も含めて押し込み姿勢に解き直して
                 # 検証してから経路を解く。
                 goal_target = press_target(palm_from_frame(*goal_palm),
