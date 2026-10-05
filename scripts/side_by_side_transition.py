@@ -188,8 +188,8 @@ MAX_GOAL_CANDIDATES = 2
 MAX_GOAL_CHECKS = 8
 
 # 1 waypoint あたりの台車・掌の移動量の上限 (位置 [m]・向き [rad])。
-MAX_STEP = 0.05
-MAX_ANGLE_STEP = math.radians(5.0)
+MAX_STEP = 0.10
+MAX_ANGLE_STEP = math.radians(10.0)
 
 # 隣り合う waypoint の間で、関節角がこれより大きく変わったら IK が別の解へ
 # 飛んだとみなして、そこで止める [rad]。首は視線の IK で別の解へ飛ぶことは
@@ -200,7 +200,7 @@ MAX_JOINT_STEP = math.radians(20.0)
 # [rad] ごとに 1 区間以上になるようにも決める (台車・掌の移動量だけで
 # 決めると、関節の動きの大きい人で 1 区間の変化が MAX_JOINT_STEP を
 # 超える)。
-PLANNED_JOINT_STEP = math.radians(15.0)
+PLANNED_JOINT_STEP = math.radians(20.0)
 
 # 移動先までのうち進めた割合がこれに満たなければ、横並び移動はしない。
 MIN_FRACTION = 0.3

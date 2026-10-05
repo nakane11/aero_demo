@@ -344,7 +344,7 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 横並びへ移る) を続けて行う。計画が移動先の 3 割以上まで進めた人だけで、
 押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 2.0) 後に
 「一緒に横に並びますね」(`--speech-transition-text`) と発話して動き出す。
-人の手を引いて動くので、各区間は `--side-by-side-segment-time` 秒 (既定 0.5)
+人の手を引いて動くので、各区間は `--side-by-side-segment-time` 秒 (既定 0.2)
 以上かける。押し込み後の画像の保存 (`--grasp-capture-duration`) は動き出す
 までで打ち切る。`--no-side-by-side-transition` で行わない。
 

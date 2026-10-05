@@ -2733,7 +2733,7 @@ def main():
         action='store_false',
         help='押し込み後の横並び移動を行わない。')
     parser.add_argument(
-        '--side-by-side-segment-time', type=float, default=0.5,
+        '--side-by-side-segment-time', type=float, default=0.2,
         help='横並び移動の 1 区間にかける最短時間 [秒]。')
     parser.add_argument(
         '--side-by-side-delay', type=float, default=4.0,
