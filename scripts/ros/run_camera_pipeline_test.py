@@ -102,7 +102,7 @@ INITIAL_POSE_AXIS_RADIUS = 0.008
 
 DEFAULT_PLAYBACK_FPS = 40.0  # [waypoint/秒]
 
-ARM_INITIAL_POSE_MOVE_TIME = 5  # [秒] ARM 時に初期姿勢へ戻す時間
+ARM_INITIAL_POSE_MOVE_TIME = 10  # [秒] ARM 時に初期姿勢へ戻す時間
 # うなずきで首 (neck_p_joint、既定 25 度) を下げる角度 [deg]。
 # 実機で向きが逆なら符号を反転させること。
 HEAD_NOD_PITCH_DEG = 40.0
@@ -1337,6 +1337,7 @@ class HandshakePipelineNode(object):
         move_time, = self._limited_time_list(
             [target_av], None, [ARM_INITIAL_POSE_MOVE_TIME])
         self.ri.angle_vector(target_av, move_time)
+        self.ri.wait_interpolation()
         print('[ARM] 腕・首を初期姿勢に戻しました。')
 
     def _nod_head(self):
@@ -1995,6 +1996,7 @@ class HandshakePipelineNode(object):
 
         if arm_angle_vectors:
             self.ri.wait_interpolation()
+            self._log_controller_states()
         if base_trajectory_points:
             self.ri.move_base_trajectory_action.wait_for_result()
             # [debug] 完了直後の odom yaw と計画との差。
@@ -2014,6 +2016,19 @@ class HandshakePipelineNode(object):
         final_traj_point = (
             base_trajectory_points[-1] if base_trajectory_points else None)
         return start_odom_coords, final_traj_point
+
+    def _log_controller_states(self):
+        """腕・脚・腰などの各コントローラのゴール終了状態をログに出す
+        (ABORTED などで途中で止まった関節を見つけるため)。"""
+        parts = []
+        for action in self.ri.controller_table[self.ri.controller_type]:
+            state = action.get_state()
+            name = getattr(getattr(action, 'action_client', None), 'ns',
+                           None) or getattr(action, 'name', '?')
+            parts.append('{}={}'.format(
+                name, GOAL_STATUS_NAMES.get(state, state)))
+        log_debug('[debug][segment] 腕・脚コントローラのゴール終了状態: '
+                  + ', '.join(parts))
 
     def _send_base_trajectory(self, base_trajectory_points, time_list,
                               wait):
@@ -2709,7 +2724,7 @@ def main():
         '--side-by-side-segment-time', type=float, default=0.5,
         help='横並び移動の 1 区間にかける最短時間 [秒]。')
     parser.add_argument(
-        '--side-by-side-delay', type=float, default=2.0,
+        '--side-by-side-delay', type=float, default=4.0,
         help='押し込み終了から横並び移動を始めるまでの時間 [秒]。')
     parser.add_argument(
         '--speech-transition-text', type=str,
