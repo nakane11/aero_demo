@@ -1128,8 +1128,7 @@ class HandshakePipelineNode(object):
             # 姿勢の反映は _apply_current_waypoint が lock 付きで行う。
             self._set_waypoint_slider_range(0)
 
-        if args.save_dir:
-            self._save_attempt(joint_positions, palms, result, motion)
+        self._save_attempt(joint_positions, palms, result, motion)
 
         # 戻り値: 'execute' (実機で実行) / 'failed' (--auto-execute で失敗、
         # ARMED に戻る) / 'solved' (それ以外、RESET 待ち)。
@@ -1235,12 +1234,22 @@ class HandshakePipelineNode(object):
             wp['base_position'][1] -= dy
 
     def _save_attempt(self, joint_positions, palms, result, motion):
+        """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
+        ``--save-dir``、無ければ ``LOG_DIR`` (起動時に消える)。保存に
+        失敗しても試行は続ける。"""
+        try:
+            self._save_attempt_files(joint_positions, palms, result, motion)
+        except Exception as e:  # noqa: BLE001 (保存の失敗で実機を止めない)
+            print('[save] 試行の JSON を保存できませんでした: {!r}'.format(e))
+
+    def _save_attempt_files(self, joint_positions, palms, result, motion):
+        root = self.args.save_dir or LOG_DIR
         stamp = time.strftime('%Y%m%d_%H%M%S')
         name = '{}.json'.format(stamp)
-        skeleton_dir = os.path.join(self.args.save_dir, 'skeletons')
-        palm_dir = os.path.join(self.args.save_dir, 'palms')
-        handshake_dir = os.path.join(self.args.save_dir, 'handshakes')
-        motion_dir = os.path.join(self.args.save_dir, 'motions')
+        skeleton_dir = os.path.join(root, 'skeletons')
+        palm_dir = os.path.join(root, 'palms')
+        handshake_dir = os.path.join(root, 'handshakes')
+        motion_dir = os.path.join(root, 'motions')
         dirs = [skeleton_dir, palm_dir, handshake_dir]
         if motion is not None:
             dirs.append(motion_dir)
@@ -1257,11 +1266,12 @@ class HandshakePipelineNode(object):
             subdirs = '{skeletons,palms,handshakes,motions}'
         else:
             subdirs = '{skeletons,palms,handshakes}'
-        print('[save] {} に保存しました (view_handshake_motion.py '
-              '--skeleton-dir <dir>/skeletons --handshake-dir '
-              '<dir>/handshakes --motion-dir <dir>/motions で後から '
-              '見返せる)。'.format(
-                  os.path.join(self.args.save_dir, subdirs, name)))
+        # 毎試行なので画面には出さず、試行のログファイルにだけ書く。
+        log_debug('[save] {} に保存しました (view_handshake_motion.py '
+                  '--skeleton-dir <dir>/skeletons --handshake-dir '
+                  '<dir>/handshakes --motion-dir <dir>/motions で後から '
+                  '見返せる)。'.format(
+                      os.path.join(root, subdirs, name)))
 
     # ------------------------------------------------------------------
     # waypoint スライダー/Play (直近 1 件の軌道だけを扱う)
@@ -2649,7 +2659,9 @@ def main():
         help='IK 候補のコストに足す、台車の向きのずれ [rad] の重み。')
     parser.add_argument(
         '--save-dir', type=str, default=None,
-        help='試行ごとに骨格/掌/IK 結果/軌道の JSON を保存するディレクトリ。')
+        help='試行ごとに骨格/掌/IK 結果/軌道の JSON を保存するディレクトリ '
+             '(既定: {}、起動時に消える)。指定したときは押し込みの解き直しの '
+             '失敗・把持画像もここに保存する。'.format(LOG_DIR))
     # --- 軌道計画 (plan_handshake_motion.py と同じオプション・既定値) ---
     parser.add_argument(
         '--approach-distance', type=float,
