@@ -2608,6 +2608,21 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     return picked, collision_ik_time, candidate_selection_time
 
 
+# 押し込み姿勢の肩ヨーの大きさ [deg] がこれを超える解は、肘を外へ大きく
+# 回して手首もひねった枝 (接近で肘と掌が大きく回る)。狭い窓の解がこの枝
+# なら、次の (有限の) 窓も解き、収まる解があればそちらを採る。
+TWISTED_SHOULDER_YAW_DEG = 60.0
+
+
+def _twisted_shoulder_yaw_deg(robot, robot_arm, angle_vector):
+    """``angle_vector`` の肩ヨー [deg] が ``TWISTED_SHOULDER_YAW_DEG`` を
+    超えればその値、収まれば None。"""
+    names = [joint.name for joint in robot.joint_list]
+    yaw = math.degrees(float(angle_vector[names.index(
+        '{}_shoulder_y_joint'.format(robot_arm))]))
+    return yaw if abs(yaw) > TWISTED_SHOULDER_YAW_DEG else None
+
+
 def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  collision_obstacles, base_limits,
                                  standing_x,
@@ -2615,16 +2630,21 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に絞って
     狭い順に ``solve_person_ik`` を解き、後処理まで解けた最初の結果を返す.
+    ただし肩ヨーがねじれた解 (``TWISTED_SHOULDER_YAW_DEG``) なら、次の有限の
+    窓でねじれずに後処理まで解ければそちらを返す。
 
     ``(picked, collision_ik_time, candidate_selection_time, base_limits,
-    x_margin)`` を返す (時間は合計、窓は最後に試したもの)。
+    x_margin)`` を返す (時間は合計、窓は採った解のもの)。
     """
     if standing_x is None or not x_margins:
         x_margins = (-1.0,)
     collision_ik_time = candidate_selection_time = 0.0
-    # どの窓でも後処理まで通らなければ、最初に見つかった後処理前の解を返す。
-    fallback = None
+    # 後処理まで通ってねじれていない解が無ければ、ねじれた解、それも無ければ
+    # 最初に見つかった後処理前の解を返す。
+    chosen = fallback = twisted = None
     for x_margin in x_margins:
+        if twisted is not None and x_margin < 0.0:
+            break
         person_base_limits = [
             restrict_base_x_range_to_human_standing(
                 base_limits[0], standing_x, margin=x_margin),
@@ -2635,14 +2655,24 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
         collision_ik_time += ik_time
         candidate_selection_time += selection_time
         if picked is not None and picked[3] is not None:
-            break
+            yaw = _twisted_shoulder_yaw_deg(robot, robot_arm, picked[1])
+            if yaw is None:
+                chosen = (picked, person_base_limits, x_margin)
+                break
+            if twisted is None:
+                twisted = (picked, person_base_limits, x_margin)
+                print('  [base-x] 立ち位置 ±{} m の解は肩ヨーが {:.0f} 度と'
+                      'ねじれているため、次の窓も試します。'.format(
+                          x_margin, yaw))
+            continue
         if picked is not None and fallback is None:
             fallback = (picked, person_base_limits, x_margin)
-        print('  [base-x] 立ち位置 ±{} m では後処理まで解けませんでした。'
-              .format(x_margin if x_margin >= 0.0 else 'inf'))
-    else:
-        if fallback is not None:
-            picked, person_base_limits, x_margin = fallback
+        print('  [base-x] 立ち位置 ±{} m では{}後処理まで解けませんでした。'
+              .format(x_margin if x_margin >= 0.0 else 'inf',
+                      '' if twisted is None else 'ねじれずに'))
+    if chosen is None:
+        chosen = twisted or fallback or (picked, person_base_limits, x_margin)
+    picked, person_base_limits, x_margin = chosen
     return (picked, collision_ik_time, candidate_selection_time,
             person_base_limits, x_margin)
 
