@@ -627,6 +627,7 @@ def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
     rthre = spik.DEFAULT_POST_PROCESS_IK_RTHRE
     gaze_rthre = spik.DEFAULT_POST_PROCESS_GAZE_IK_RTHRE
     hand_mask = _rotation_mask(free_turn)
+    gaze_links = spik.gaze_link_list(robot) if gaze_point is not None else None
     if gaze_point is None:
         result = robot.inverse_kinematics(
             target, move_target=move_target, link_list=link_list,
@@ -637,7 +638,7 @@ def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
     result = robot.inverse_kinematics(
         target_coords=[target, spik._gaze_target(gaze_coords, gaze_point)],
         move_target=[move_target, gaze_coords],
-        link_list=[link_list, robot.head.link_list],
+        link_list=[link_list, gaze_links],
         position_mask=[normalize_mask(True), normalize_mask(False)],
         rotation_mask=[hand_mask, normalize_mask('xy')],
         stop=stop, thre=[thre, thre], rthre=[rthre, gaze_rthre],
@@ -662,7 +663,7 @@ def _aim_head(robot, gaze_point):
     前を向くまで大きく回すと、今の角度からでは解けないことがある)。視線の
     ずれ [rad] を返す。"""
     gaze_coords = spik.camera_optical_coords(robot)
-    joints = [link.joint for link in robot.head.link_list]
+    joints = [link.joint for link in spik.gaze_link_list(robot)]
     best = None
     for start in ([joint.joint_angle() for joint in joints],
                   [0.0] * len(joints)):

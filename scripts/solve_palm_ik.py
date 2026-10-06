@@ -169,6 +169,13 @@ WAIST_P_MAX_ANGLE_DEG = 32.5
 # 首ピッチの上限 [deg]。URDF は 55 度だが実機は 45.44 度で止まる。
 NECK_P_MAX_ANGLE_DEG = 44.5
 
+# 首ロール (neck_r_joint) は視線 IK で使わず 0 度に固定する。実機の首の
+# ピッチ・ロールは左右 2 本のアクチュエータの差動で、ロールを付けると片側の
+# ストロークが端に当たってピッチ・ロールとも指令に届かない (neck_r 5 度で
+# ピッチは 33.6 度まで)。また実機の /joint_states の neck_r は符号が逆
+# (物理的には指令どおりに傾く) なので、0 以外では TF もずれる。
+NECK_ROLL_FIXED_ANGLE = 0.0
+
 # 干渉回避付きバッチ IK だけに適用する関節可動域の上下マージン比率。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
 
@@ -2035,6 +2042,14 @@ def camera_optical_coords(robot):
     return coords
 
 
+def gaze_link_list(robot):
+    """視線 IK で動かす首のリンク (``robot.head.link_list`` から首ロールを
+    除いたもの)。首ロールを ``NECK_ROLL_FIXED_ANGLE`` にしてから返す。"""
+    robot.neck_r_joint.joint_angle(NECK_ROLL_FIXED_ANGLE)
+    return [link for link in robot.head.link_list
+            if link.joint is not robot.neck_r_joint]
+
+
 def _gaze_target(gaze_coords, position):
     """``gaze_coords`` の +Z を ``position`` へ向ける視線 IK の目標座標。
     rotation_mask='xy' はひねりが大きいと収束しないので、現在の向きから
@@ -2063,7 +2078,8 @@ def _reaim_gaze(robot, gaze_coords, position, stop, rthre,
     同時 IK の視線目標は解く前の頭の位置で固定され、解く間に頭が動く分
     ずれるため。目標を作り直して最大 ``rounds`` 回繰り返し、悪化したら戻す。
     """
-    head_joints = [link.joint for link in robot.head.link_list]
+    link_list = gaze_link_list(robot)
+    head_joints = [link.joint for link in link_list]
     for _ in range(rounds):
         error = _gaze_error(gaze_coords, position)
         if error < rthre:
@@ -2071,7 +2087,7 @@ def _reaim_gaze(robot, gaze_coords, position, stop, rthre,
         before = [joint.joint_angle() for joint in head_joints]
         robot.inverse_kinematics(
             _gaze_target(gaze_coords, position), move_target=gaze_coords,
-            link_list=robot.head.link_list, position_mask=False,
+            link_list=link_list, position_mask=False,
             rotation_mask='xy', stop=stop, rthre=rthre,
             revert_if_fail=False)
         if _gaze_error(gaze_coords, position) >= error:
@@ -2113,7 +2129,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
             result = robot.inverse_kinematics(
                 target_coords=[target_coords, head_target],
                 move_target=[move_target, head_move_target],
-                link_list=[whole_body.link_list, robot.head.link_list],
+                link_list=[whole_body.link_list, gaze_link_list(robot)],
                 position_mask=[normalize_mask(True), normalize_mask(False)],
                 rotation_mask=[normalize_mask(True), normalize_mask('xy')],
                 stop=max(stop, gaze_ik_stop),
