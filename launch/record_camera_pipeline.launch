@@ -1,0 +1,42 @@
+<launch>
+  <!-- run_camera_pipeline_test.py を bag 再生でテストするのに必要なトピックを
+       連続録画する。トピック名は run_camera_pipeline_test.py の既定値に合わせてある。
+       decompressed の画像は decompress.launch が出すので、先に起動しておくこと。
+
+       使い方:
+         mkdir -p ~/bags
+         roslaunch aero_demo record_camera_pipeline.launch
+         # 保存先を変える場合
+         roslaunch aero_demo record_camera_pipeline.launch prefix:=/tmp/session1
+  -->
+
+  <!-- 保存先 (rosbag record -o の接頭辞。末尾に日時が付く)。
+       roslaunch では相対パスが ~/.ros 基準になるので絶対パスで指定する。
+       ディレクトリは自動では作られない。 -->
+  <arg name="prefix" default="$(env HOME)/bags/camera_pipeline" />
+  <!-- 圧縮画像 (decompress 前) も一緒に残す -->
+  <arg name="record_compressed" default="false" />
+  <!-- 追加で録るトピック (スペース区切り) -->
+  <arg name="extra_topics" default="" />
+
+  <!-- 画像・TF (骨格検出・差し出し判定・base_link 座標への変換) -->
+  <arg name="camera_topics"
+       value="/camera/color/image_raw/decompressed
+              /camera/depth/image_raw/decompressed
+              /camera/color/camera_info
+              /tf /tf_static" />
+  <!-- /scan: 押し込み前の台車位置補正 (base-correction scan)。
+       /joint_states, /odom: AeroROSRobotInterface が購読する実機の状態。 -->
+  <arg name="robot_topics"
+       value="/scan /joint_states /odom" />
+  <arg name="compressed_topics"
+       value="/camera/color/image_raw/compressed
+              /camera/depth/image_raw/compressedDepth"
+       if="$(arg record_compressed)" />
+  <arg name="compressed_topics" value="" unless="$(arg record_compressed)" />
+
+  <node pkg="rosbag" type="record" name="record_camera_pipeline" output="screen"
+        args="-o $(arg prefix) --buffsize=2048
+              $(arg camera_topics) $(arg robot_topics)
+              $(arg compressed_topics) $(arg extra_topics)" />
+</launch>
