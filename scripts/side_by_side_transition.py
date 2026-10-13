@@ -105,6 +105,12 @@ LOWERED_TWIST_START = 0.5
 # 'natural' は前腕をひねらない向き。
 LOWERED_FACING_ORDER = ('backward', 'natural', 'inward', 'forward')
 
+# 押し込み時に人の掌が上向き (掌の法線の上向き成分がこの値以上) のときは、
+# 最後に掌が前向きになる向きを先に試す。上向きの掌を後ろ向きへ回すと前腕を
+# 大きくひねる (回内する) ので、前向きへ回して(回外の向きのまま)手を下ろす。
+PALM_UP_NORMAL_Z = 0.0
+LOWERED_FACING_ORDER_PALM_UP = ('forward', 'backward', 'natural', 'inward')
+
 # 移動先の台車の前後位置を、人の立ち位置からどれだけずらしてよいか [m]。
 # 狭い方から試し、解けなければ広げる。合成データでは横並びまで進めた人は
 # 全員 ±0.05 m で解けており、広げて解けるのは移動先の検証・経路に通らない
@@ -139,10 +145,18 @@ GOAL_WRIST_MARGIN_START = 0.7
 GOAL_WRIST_RATIO_RANGE = 0.3
 GOAL_WRIST_AXES = ('y', 'r')
 
-# 移動先のコストで、ロボットの指先 (手先の +X) が下を向いていない分
-# (1 - 下向きの成分、0〜2) に掛ける重み。握りの向きを自由にすると、手首を
-# 曲げたまま握りの向きだけが回り、指先が上を向いたまま横並びになる。
+# 移動先のコストで、ロボットの指先 (手先の +Z、``finger_direction``) が
+# 下を向いていない分 (1 - 下向きの成分、0〜2) に掛ける重み。握りの向きを
+# 自由にすると、手首を曲げたまま握りの向きだけが回り、指先が上を向いた
+# まま横並びになる。
 GOAL_ROBOT_FINGER_DOWN_WEIGHT = 30.0
+
+# 移動先の候補のうち、ロボットの指先 (手先の +Z) の鉛直成分 (-1 が真下) が
+# この値以下の「指先が下を向く」候補があれば、そうでない候補は捨てる
+# (下向きのコストだけでは、腕を低く下ろせる上向きの解が先に選ばれ、
+# 指先が上を向いたまま横並びになる)。下向きの候補が窓に 1 つもなければ
+# 全候補をコストで選ぶ。
+GOAL_FINGER_DOWN_MAX_Z = -0.5
 
 # 移動先のコストで、差し出す腕の手首の曲げ (ロール・ヨーの |角度| [rad]
 # の和) に掛ける重み。手首を曲げたままだと、横並びで手首が窮屈に見える。
@@ -609,6 +623,28 @@ def grip_turn_deg(robot, robot_arm, palm):
                                    float(np.dot(x, base[:, 0]))))
 
 
+def finger_direction(rot):
+    """手先 (``{l,r}arm_end_coords``) の回転行列 ``rot`` から、ロボットの
+    指先の向き (単位ベクトル)。指ありモデルの指の表面点の向きで確かめた
+    もので、左右とも手先の +Z (``_correct_grasp_frame`` の +X ではない)。"""
+    return np.asarray(rot)[:, 2]
+
+
+def finger_z(robot, robot_arm):
+    """ロボットの指先の鉛直成分 (-1 が真下、+1 が真上)。"""
+    return float(finger_direction(
+        getattr(robot, '{}arm_end_coords'.format(robot_arm)).worldrot())[2])
+
+
+def down_turn_deg(palm, robot_arm):
+    """人の掌 ``palm`` に掌を合わせたまま、ロボットの指先が一番下を向く握りの
+    向き (``press_target`` の ``turn_deg`` [度]、1 度刻みで探す)。"""
+    turns = np.arange(-180.0, 180.0)
+    zs = [finger_direction(spik.palm_target_rot(palm, t, robot_arm))[2]
+          for t in turns]
+    return float(turns[int(np.argmin(zs))])
+
+
 def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
               free_turn=False):
     """台車をいまの位置に固定し、腕・腰を押し込み目標 ``target`` に、カメラ
@@ -1052,6 +1088,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
         window = [spik.restrict_base_x_range_to_human_standing(
             limits[0], standing[0], x_margin), limits[1], limits[2]]
         candidates = []
+        finger_zs = []
         for turn_deg in turn_degs:
             for palm_index, av, base in _batch_ik(
                     robot, robot_arm, hand, local_targets(turn_deg), seed_av,
@@ -1062,8 +1099,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     continue
                 # 指先の上下は台車の yaw に依らないので、解いた座標系のまま。
                 _place(robot, av, base)
-                finger = spik._correct_grasp_frame(
-                    np.asarray(end_coords.worldrot()), robot_arm)[:, 0]
+                finger = finger_direction(end_coords.worldrot())
                 xy = to_world.transform_point([base[0], base[1], 0.0])[:2]
                 base = (float(xy[0]), float(xy[1]), base[2] + human_yaw)
                 cost = (spik._joint_bend_cost_from_vector(
@@ -1078,6 +1114,11 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                         + GOAL_WRIST_BEND_WEIGHT
                         * sum(abs(av[index]) for index, _, _ in wrist))
                 candidates.append((cost, av, base, turn_deg, palm_index))
+                finger_zs.append(float(finger[2]))
+        down = [c for c, z in zip(candidates, finger_zs)
+                if z <= GOAL_FINGER_DOWN_MAX_Z]
+        if down:
+            candidates = down
         if candidates:
             candidates.sort(key=lambda c: (c[4], c[0]))
             return candidates, x_margin
@@ -1360,6 +1401,19 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                                  free_turn=free_turn):
                     reasons.append('移動先で押し込み IK が解けない')
                     continue
+                # 指先が上を向いた解は、握りの向きを指先が一番下を向く角度に
+                # 固定して解き直す (解けなければそのまま)。
+                if finger_z(robot, robot_arm) > GOAL_FINGER_DOWN_MAX_Z:
+                    before = robot.angle_vector().copy()
+                    before_z = finger_z(robot, robot_arm)
+                    down_target = press_target(
+                        palm_from_frame(*goal_palm),
+                        down_turn_deg(palm_from_frame(*goal_palm), robot_arm),
+                        robot_arm)
+                    if (not _press_ik(robot, robot_arm, down_target,
+                                      gaze_forward)
+                            or finger_z(robot, robot_arm) >= before_z):
+                        robot.angle_vector(before)
                 # 腕と同時の視線 IK は押し込み時の首から大きく回せず解けない
                 # ことがあるので、首だけで前へ向け直す (経路の首はここへ補間
                 # する、PATH_INTERPOLATE_NECK)。
@@ -1404,7 +1458,10 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
             return [(0, [human_arm.lowering(deg, abduction_deg)
                          for deg in arm_degs])]
         variants = []
-        for rank, facing in enumerate(LOWERED_FACING_ORDER):
+        palm_up = float(human_arm.palm_rot0[2, 1]) >= PALM_UP_NORMAL_Z
+        facing_order = (LOWERED_FACING_ORDER_PALM_UP if palm_up
+                        else LOWERED_FACING_ORDER)
+        for rank, facing in enumerate(facing_order):
             lowerings = [human_arm.lowering(deg, abduction_deg, facing)
                          for deg in arm_degs]
             if any(lw is None for lw in lowerings):
