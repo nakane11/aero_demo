@@ -96,7 +96,7 @@ LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
 
-# pre-touch 姿勢を掌の法線方向へ引き戻す距離 [m]。
+# pre-touch 姿勢を hover から台車の方へ水平に引き戻す距離 [m]。
 DEFAULT_PRETOUCH_STANDOFF = 0.25  # [m]
 
 # 軌道のうち pre-touch 姿勢までに使う割合。
@@ -570,41 +570,44 @@ KIND_LABELS = {
 }
 
 
-def palm_normal_direction(handshake, joint_positions):
-    """人間の掌の外向き法線 (古い結果では掌の中心から IK の目標位置への
-    向き)。掌の中心が求まらなければ ``None``。"""
-    if handshake.get('palm_normal') is not None:
-        return np.asarray(handshake['palm_normal'], dtype=np.float64)
-    side = handshake.get('offered_hand')
-    names = ['{}Hand{}'.format(side, index)
-             for index in spik.HAND_PALM_LANDMARKS]
-    if not all(name in joint_positions for name in names):
-        return None
-    palm_center = np.mean(
-        [joint_positions[name] for name in names], axis=0)
-    direction = np.asarray(handshake['target_position']) - palm_center
+def pretouch_direction(handshake, base_goal):
+    """pre-touch 姿勢へ手先を引き戻す向き: hover 目標から終点の台車へ向かう
+    水平の単位ベクトル (高さを変えない。掌の法線方向に引き戻すと、掌が下を
+    向いた人ではしゃがみ込む)。求まらなければ ``None``。"""
+    direction = np.zeros(3)
+    direction[:2] = (np.asarray(base_goal[:2], dtype=np.float64)
+                     - np.asarray(handshake['target_position'][:2]))
     norm = float(np.linalg.norm(direction))
     return None if norm < 1e-6 else direction / norm
 
 
 def solve_pretouch_pose(robot, robot_arm, link_list, joint_list, handshake,
-                        q_goal, base_goal, normal, standoff):
-    """終点の手先を掌の法線方向へ ``standoff`` [m] 引き戻した pre-touch 姿勢を
-    台車固定・干渉回避なしの IK で解き、``joint_list`` 順の関節角を返す
-    (失敗時 ``None``)。"""
+                        q_goal, base_goal, direction, standoff):
+    """終点の手先を ``direction`` (``pretouch_direction``) へ ``standoff``
+    [m] 引き戻した pre-touch 姿勢を台車固定・干渉回避なしの IK で解き、
+    ``joint_list`` 順の関節角を返す (失敗時 ``None``)。
+
+    脚 (足首・膝) は終点の角度のまま腕と腰だけで解く (脚も動かすと手先を
+    手前に引くのにしゃがみ込む解になる)。"""
     target_position = (np.asarray(handshake['target_position'])
-                       + normal * standoff)
+                       + direction * standoff)
     robot.newcoords(Coordinates(
         pos=[float(base_goal[0]), float(base_goal[1]), 0.0],
         rot=rpy_matrix(float(base_goal[2]), 0.0, 0.0)))
     for joint, angle in zip(joint_list, q_goal):
         joint.joint_angle(float(angle))
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
+    leg_joints = (robot.ankle_joint, robot.knee_joint)
+    upper_link_list = [
+        link for link in link_list
+        if not any(link.joint is joint
+                   or link.joint.name.startswith(joint.name)
+                   for joint in leg_joints)]
     result = robot.inverse_kinematics(
         target_coords=Coordinates(
             pos=target_position.tolist(),
             rot=np.asarray(handshake['target_rot'], dtype=np.float64)),
-        move_target=whole_body.end_coords, link_list=link_list,
+        move_target=whole_body.end_coords, link_list=upper_link_list,
         stop=DEFAULT_PRETOUCH_IK_STOP, thre=DEFAULT_PRETOUCH_IK_THRE,
         rthre=DEFAULT_PRETOUCH_IK_RTHRE, revert_if_fail=True)
     if result is False:
@@ -1084,12 +1087,12 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         q_start, base_start, q_goal, base_goal, args.n_waypoints,
         orbit=orbit)
     candidates = []
-    normal = palm_normal_direction(handshake, joint_positions)
-    pretouch_status = 'no_palm_normal'
-    if normal is not None:
+    direction = pretouch_direction(handshake, base_goal)
+    pretouch_status = 'no_direction'
+    if direction is not None:
         q_pre = solve_pretouch_pose(
             robot, robot_arm, link_list, joint_list, handshake, q_goal,
-            base_goal, normal, DEFAULT_PRETOUCH_STANDOFF)
+            base_goal, direction, DEFAULT_PRETOUCH_STANDOFF)
         pretouch_status = 'ik_failed'
         if q_pre is not None:
             pretouch_status = 'built'

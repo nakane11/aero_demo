@@ -194,11 +194,11 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
     initial_traj = phm.build_initial_trajectory(
         q_start, base_start, q_goal, base_goal, args.n_waypoints)
     warm_start_traj = initial_traj
-    normal = phm.palm_normal_direction(handshake, joint_positions)
-    if normal is not None:
+    direction = phm.pretouch_direction(handshake, base_goal)
+    if direction is not None:
         q_pre = phm.solve_pretouch_pose(
             robot, robot_arm, link_list, joint_list, handshake, q_goal,
-            base_goal, normal, args.pretouch_standoff)
+            base_goal, direction, args.pretouch_standoff)
         if q_pre is not None:
             warm_start_traj = phm.build_pretouch_trajectory(
                 q_start, base_start, q_pre, q_goal, base_goal,
