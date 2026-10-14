@@ -262,8 +262,9 @@ def build_press_in_waypoints(last_wp, joint_names, post):
     """hover の waypoint ``last_wp`` から押し込み姿勢 ``post`` までの waypoint
     のリスト (``last_wp`` は含まない)。
 
-    ``post['press_in_path']`` (押し込みの曲線上で IK を解いた途中の姿勢) が
-    あればそれと最終姿勢を、無ければ (古い結果) 関節空間で
+    ``post['press_in_path']`` (押し込みの曲線上で IK を解いた途中の姿勢、
+    台車は ``press_in_base_path``) があればそれと最終姿勢を、無ければ (古い
+    結果) 関節空間で
     ``PRESS_IN_DISPLAY_WAYPOINTS`` 等分した姿勢を返す。"""
     waypoints = []
     start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
@@ -280,11 +281,15 @@ def build_press_in_waypoints(last_wp, joint_names, post):
                          post['base_yaw']])
 
     if post.get('press_in_path') is not None:
-        for angle_vector in post['press_in_path'] + [
-                post['joint_angle_vector']]:
+        # 押し込みと同時に台車も動く (無ければ台車は固定)。
+        bases = post.get('press_in_base_path') or (
+            [base_end] * len(post['press_in_path']))
+        for angle_vector, base in zip(
+                post['press_in_path'] + [post['joint_angle_vector']],
+                list(bases) + [base_end]):
             waypoints.append(dict(
-                base_position=[float(base_end[0]), float(base_end[1]), 0.0],
-                base_yaw=float(base_end[2]),
+                base_position=[float(base[0]), float(base[1]), 0.0],
+                base_yaw=float(base[2]),
                 joint_angle_vector=[
                     float(v) for v in to_motion_order(angle_vector)],
             ))

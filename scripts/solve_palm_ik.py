@@ -52,6 +52,7 @@ from skrobot.coordinates import CascadedCoords  # noqa: E402
 from skrobot.coordinates import Coordinates  # noqa: E402
 from skrobot.coordinates.math import matrix2ypr, normalize_mask  # noqa: E402
 from skrobot.coordinates.math import quaternion2matrix  # noqa: E402
+from skrobot.coordinates.math import rpy_matrix  # noqa: E402
 from skrobot.model import Link  # noqa: E402
 from skrobot.model import RobotModel  # noqa: E402
 from skrobot.model.primitives import Cylinder  # noqa: E402
@@ -130,6 +131,10 @@ PRESS_IN_SLIDE = 0.15  # [m]
 # 指先方向の進み u (0 -> 1) に対し、法線方向は 1 - u**指数 で詰める
 # (大きいほど押し出しの終盤で詰める、1 で直線)。
 PRESS_IN_CURVE_EXPONENT = 3.0
+# 押し込み中に台車が受け持つ割合: 指先方向の押し出し (PRESS_IN_SLIDE) の
+# 水平成分のこの割合だけ、押し出すのと同時に台車も平行移動する (向きは
+# 変えない、0 で台車固定)。法線方向の詰め (PRESS_IN_LIFT) は腕で行う。
+PRESS_IN_BASE_RATIO = 1.0
 # 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。各点で IK を
 # 解いた waypoint 列にする (関節空間の補間では曲線にならないため)。
 PRESS_IN_PATH_POINTS = 8
@@ -477,6 +482,14 @@ def press_in_target_position(palm, target_rot, u):
     slide = press_in_slide_direction(palm, target_rot)
     return (final - slide * PRESS_IN_SLIDE * (1.0 - u)
             + normal * PRESS_IN_LIFT * (1.0 - u ** PRESS_IN_CURVE_EXPONENT))
+
+
+def press_in_base_shift(palm, target_rot, u):
+    """押し込み区間の進み ``u`` での台車の hover からの平行移動量 (z = 0)。"""
+    slide = press_in_slide_direction(palm, target_rot)
+    shift = slide * PRESS_IN_SLIDE * PRESS_IN_BASE_RATIO * u
+    shift[2] = 0.0
+    return shift
 
 
 def palm_target_position(palm, target_rot):
@@ -2311,19 +2324,36 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
                    n_points=PRESS_IN_PATH_POINTS):
     """hover 姿勢の ``robot`` から押し込みの曲線
     (``press_in_target_position``) を ``n_points`` 等分した手先目標を、途中は
-    腕だけの IK、最終目標は ``solve_post_process`` で順に解く (台車は固定).
+    腕だけの IK、最終目標は ``solve_post_process`` で順に解く.
 
-    途中の点の首は最終姿勢の角度にする (接近区間の終盤で首は最終姿勢の
-    角度へ補間済み)。``solve_post_process`` の結果に、途中の点の関節角
-    (``robot.joint_list`` 順、最終姿勢は含まない) のリスト ``press_in_path``
-    を足して返す。どこかで解けなければ ``robot`` を元に戻して None。
+    台車は各点で ``press_in_base_shift`` だけ hover の位置から平行移動して
+    おく (押し出すのと同時に近づく)。途中の点の首は最終姿勢の角度にする
+    (接近区間の終盤で首は最終姿勢の角度へ補間済み)。``solve_post_process``
+    の結果に、途中の点の関節角 (``robot.joint_list`` 順、最終姿勢は含まない)
+    のリスト ``press_in_path`` と台車 ``[x, y, yaw]`` のリスト
+    ``press_in_base_path`` を足して返す。どこかで解けなければ ``robot`` を
+    元に戻して None。
     """
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
+    initial_coords = robot.copy_worldcoords()
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+
+    def restore():
+        robot.newcoords(initial_coords)
+        robot.angle_vector(initial_angle_vector)
+
+    def move_base(u):
+        robot.newcoords(Coordinates(
+            pos=(initial_coords.worldpos()
+                 + press_in_base_shift(palm, target_rot, u)).tolist(),
+            rot=initial_coords.worldrot()))
+
     path = []
+    base_path = []
     for k in range(1, n_points):
+        move_base(k / float(n_points))
         target_coords = Coordinates(
             pos=press_in_target_position(
                 palm, target_rot, k / float(n_points)).tolist(),
@@ -2338,15 +2368,19 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
                   'します: {}'.format(e))
             result = False
         if result is False:
-            robot.angle_vector(initial_angle_vector)
+            restore()
             return None
         path.append(robot.angle_vector().copy())
+        yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
+        base_path.append([float(v) for v in robot.base_link.worldpos()[:2]]
+                         + [float(yaw)])
+    move_base(1.0)
     post = solve_post_process(
         robot, robot_arm, palm, target_rot, stop=stop, thre=thre,
         rthre=rthre, gaze_ik_stop=gaze_ik_stop, gaze_ik_rthre=gaze_ik_rthre,
         gaze=gaze, arm_only_fallback=arm_only_fallback)
     if post is None:
-        robot.angle_vector(initial_angle_vector)
+        restore()
         return None
     final_angle_vector = robot.angle_vector()
     head_joints = [link.joint for link in robot.head.link_list]
@@ -2356,6 +2390,7 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
         angle_vector[head_indices] = final_angle_vector[head_indices]
     post['press_in_path'] = [[float(v) for v in angle_vector]
                              for angle_vector in path]
+    post['press_in_base_path'] = base_path
     post['compute_time'] = time.time() - start_time
     return post
 
@@ -2522,7 +2557,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         cost = _joint_bend_cost_from_vector(
             angle_vectors[candidate_index], bend_cost_indices)
         if standing_xy is not None and facing is not None:
-            base_pose = base_poses[candidate_index]
+            # 台車の置き方は押し込み後 (台車も近づいた後) の位置で見る。
+            hover_base = base_poses[candidate_index]
+            base_pose = Coordinates(
+                pos=(hover_base.worldpos() + press_in_base_shift(
+                    palm, rots[candidate_index // attempts_per_pose],
+                    1.0)).tolist(),
+                rot=hover_base.worldrot())
             if front_offset_weight > 0.0:
                 cost += front_offset_weight * abs(_base_front_offset(
                     base_pose, standing_xy, facing))
@@ -2602,12 +2643,15 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                   clearances[index]))
         return True
 
-    def _press_in_path_rejected(path, posture, label):
-        # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの) を
-        # 自己干渉と手まわり以外の人体距離で検証し、差し替えた関節角の
-        # リストを返す (通らなければ None)。
+    def _press_in_path_rejected(path, bases, posture, label):
+        # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの、台車は
+        # bases の [x, y, yaw]) を自己干渉と手まわり以外の人体距離で検証し、
+        # 差し替えた関節角のリストを返す (通らなければ None)。
         replaced = []
-        for k, angle_vector in enumerate(path):
+        for k, (angle_vector, base) in enumerate(zip(path, bases)):
+            robot.newcoords(Coordinates(
+                pos=[base[0], base[1], 0.0],
+                rot=rpy_matrix(base[2], 0.0, 0.0)))
             angle_vector = with_other_arm_posture(
                 robot, angle_vector, robot_arm, posture)
             dist, pair = collision_pairs_min_distance(
@@ -2670,6 +2714,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             print('  [other-arm] {} の候補は差し出さない手の指先が台車に'
                   'かからない腕の姿勢が無いため棄却します。'.format(label))
             continue
+        # 押し込みで台車が動いているので hover の位置に戻す。
+        robot.newcoords(base_poses[candidate_index])
         hover_av = with_other_arm_posture(robot, hover_av, robot_arm, posture)
         min_dist, pair = collision_pairs_min_distance(
             robot, other_arm_penetration_pairs, joint_positions,
@@ -2690,7 +2736,11 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             # 自己干渉と手まわり以外の人体距離だけを検証する。
             replaced = _press_in_path_rejected(
                 post_result['press_in_path']
-                + [post_result['joint_angle_vector']], posture, label)
+                + [post_result['joint_angle_vector']],
+                post_result['press_in_base_path'] + [
+                    post_result['base_position'][:2]
+                    + [post_result['base_yaw']]],
+                posture, label)
             if replaced is None:
                 post_result = None
             else:
@@ -3046,7 +3096,8 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 
 def main():
-    global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT
+    global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
+        PRESS_IN_BASE_RATIO
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3167,6 +3218,10 @@ def main():
         help='hover 目標を押し込みの最終目標から掌の法線方向に浮かせる距離 '
             '[m] (既定 {})。'.format(PRESS_IN_LIFT))
     parser.add_argument(
+        '--press-in-base-ratio', type=float, default=PRESS_IN_BASE_RATIO,
+        help='押し込み中に台車も動かす割合 (指先方向の押し出しの水平成分に '
+            '対する割合、0 で台車固定、既定 {})。'.format(PRESS_IN_BASE_RATIO))
+    parser.add_argument(
         '--press-in-curve-exponent', type=float,
         default=PRESS_IN_CURVE_EXPONENT,
         help='押し込みの曲線の指数 (1 で直線、既定 {})。'.format(
@@ -3180,6 +3235,7 @@ def main():
     PRESS_IN_SLIDE = args.press_in_slide
     PRESS_IN_LIFT = args.press_in_lift
     PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
+    PRESS_IN_BASE_RATIO = args.press_in_base_ratio
 
     files = iter_palm_files(args.input_dir)
     if not files:
