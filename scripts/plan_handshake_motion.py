@@ -123,15 +123,31 @@ DEFAULT_HUMAN_CLEARANCE = 0.05  # [m]
 HEAD_GAZE_BLEND_START = 0.5
 
 
-def human_body_cylinder_obstacles(joint_positions):
+def human_body_cylinder_obstacles(
+        joint_positions, hand=None,
+        activation_distance=DEFAULT_COLLISION_ACTIVATION_DISTANCE):
     """``solve_palm_ik.human_body_obstacles`` の円柱を ``add_collision_cost``
     の ``world_obstacles`` 形式 (``type='cylinder'``) に変換する。
+
+    ``hand`` (差し出した手) を渡すと、hover が人の掌から約 2 cm なので、
+    その掌・指は遠くのダミーに置き換え (経路の検証で
+    ``OFFERED_HAND_CLEARANCE`` を見る)、前腕は ``activation_distance`` で
+    ``OFFERED_HAND_CLEARANCE`` の距離になるよう細らせる。
 
     個数は人物によらず ``len(human_obstacle_names())`` で一定 (jit キャッシュ
     のため)。
     """
+    cylinders = spik.human_body_obstacles(joint_positions)
+    if hand is not None:
+        forearm = spik.human_obstacle_names().index(
+            '{0}Elbow-{0}Wrist'.format(hand))
+        for i in spik.offered_hand_obstacle_indices(hand):
+            cylinders[i] = (
+                spik.offered_hand_penalty_obstacle(
+                    cylinders[i], activation_distance) if i == forearm
+                else spik._dummy_cylinder(cylinders[i].radius))
     obstacles = []
-    for cyl in spik.human_body_obstacles(joint_positions):
+    for cyl in cylinders:
         obstacles.append(dict(
             type='cylinder',
             center=[float(v) for v in cyl.worldpos()],
@@ -174,8 +190,9 @@ def approach_direction(human_xy, base_goal):
 
 
 def orbit_center_xy(handshake):
-    """公転の中心 (IK の目標位置 ``target_position`` の水平位置)。"""
-    return np.asarray(handshake['target_position'][:2], dtype=np.float64)
+    """公転の中心 (掌の水平位置、古い結果では IK の目標位置)。"""
+    center = handshake.get('palm_position', handshake['target_position'])
+    return np.asarray(center[:2], dtype=np.float64)
 
 
 def orbit_direction(center_xy, initial_base_pose, human_xy, base_goal):
@@ -416,7 +433,7 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
 
 
 def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
-                   joint_positions, human_xy, obstacle_cache):
+                   joint_positions, human_xy, obstacle_cache, hand=None):
     """人から ``LEAD_IN_CHECK_RADIUS`` 以内の lead-in waypoint を検証し、
     (最小距離のリスト, 人体距離の余裕のリスト) を返す (未検証は ``None``)。"""
     near = [i for i, wp in enumerate(lead_in)
@@ -433,7 +450,7 @@ def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
             obstacle_cache=obstacle_cache)
         checked_clearances = verify_human_clearance(
             robot, joint_names, near_waypoints, verification_pairs,
-            obstacle_cache)
+            obstacle_cache, hand=hand)
         for i, d, c in zip(near, checked, checked_clearances):
             distances[i] = float(d)
             clearances[i] = float(c)
@@ -554,8 +571,10 @@ KIND_LABELS = {
 
 
 def palm_normal_direction(handshake, joint_positions):
-    """人間の掌の外向き法線 (掌の中心から IK の目標位置への向き)。
-    掌の中心が求まらなければ ``None``。"""
+    """人間の掌の外向き法線 (古い結果では掌の中心から IK の目標位置への
+    向き)。掌の中心が求まらなければ ``None``。"""
+    if handshake.get('palm_normal') is not None:
+        return np.asarray(handshake['palm_normal'], dtype=np.float64)
     side = handshake.get('offered_hand')
     names = ['{}Hand{}'.format(side, index)
              for index in spik.HAND_PALM_LANDMARKS]
@@ -698,21 +717,23 @@ def _apply_waypoint(robot, joint_names, wp):
 
 
 def verify_human_clearance(robot, joint_names, waypoints, verification_pairs,
-                           obstacle_cache):
-    """各 waypoint の人体との最短距離から ``DEFAULT_HUMAN_CLEARANCE`` を
-    引いた余裕 [m] のリスト (0 以上なら通過、障害物が無ければ ``inf``)。"""
+                           obstacle_cache, hand=None):
+    """各 waypoint の人体との最短距離から ``DEFAULT_HUMAN_CLEARANCE`` (差し
+    出した手 ``hand`` の手まわりは ``OFFERED_HAND_CLEARANCE``) を引いた余裕
+    [m] の最小のリスト (0 以上なら通過、障害物が無ければ ``inf``)。"""
     obstacle_links = obstacle_cache[0]
     if not obstacle_links or not waypoints:
         return [float('inf')] * len(waypoints)
     verification_pairs = spik.human_clearance_pairs(verification_pairs)
+    thresholds = spik.human_clearance_thresholds(
+        hand, DEFAULT_HUMAN_CLEARANCE)
     margins = []
     for wp in waypoints:
         _apply_waypoint(robot, joint_names, wp)
         per_obstacle = spik.human_obstacle_clearances(
             robot, verification_pairs, obstacle_links,
             cull_distance=DEFAULT_HUMAN_CLEARANCE)
-        margins.append(min(per_obstacle.values(), default=float('inf'))
-                       - DEFAULT_HUMAN_CLEARANCE)
+        margins.append(spik.clearance_shortfall(per_obstacle, thresholds)[1])
     return margins
 
 
@@ -788,11 +809,23 @@ def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
             robot, spik.human_clearance_pairs(verification_pairs),
             spik.human_body_obstacles(joint_positions),
             cull_distance=DEFAULT_HUMAN_CLEARANCE)
-        if min(clearances.values(), default=float('inf')) \
-                < DEFAULT_HUMAN_CLEARANCE:
+        thresholds = spik.human_clearance_thresholds(
+            handshake.get('offered_hand'), DEFAULT_HUMAN_CLEARANCE)
+        if spik.clearance_shortfall(clearances, thresholds)[1] < 0.0:
             return None
     post = new.get('post_process')
     if post is not None:
+        # 押し込み区間の途中の姿勢も差し替える (検証は自己干渉のみ)。
+        path = []
+        for angle_vector in post.get('press_in_path', []):
+            step = dict(post, joint_angle_vector=angle_vector)
+            apply(step)
+            if spik.collision_pairs_min_distance(
+                    robot, self_pairs, joint_positions) < -tolerance:
+                return None
+            path.append(step['joint_angle_vector'])
+        if 'press_in_path' in post:
+            post['press_in_path'] = path
         apply(post)
         if spik.collision_pairs_min_distance(
                 robot, self_pairs, joint_positions) < -tolerance:
@@ -890,7 +923,8 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
             initial_base_pose, first_waypoint, joint_names)
         distances, clearances = verify_lead_in(
             robot, joint_names, lead_in, verification_pairs,
-            joint_positions, human_xy, obstacle_cache)
+            joint_positions, human_xy, obstacle_cache,
+            hand=handshake.get('offered_hand'))
         verified = motion_passes(distances, clearances)
         return lead_in, distances, clearances, verified
 
@@ -1011,7 +1045,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             robot_arm=robot_arm)
         clearances = verify_human_clearance(
             robot, joint_names, waypoints, verification_pairs,
-            obstacle_cache)
+            obstacle_cache, hand=handshake.get('offered_hand'))
         return dict(
             planned=True,
             kind=kind,
@@ -1086,13 +1120,16 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     for joint, angle in zip(joint_list, q_start):
         joint.joint_angle(float(angle))
 
-    world_obstacles = human_body_cylinder_obstacles(joint_positions)
+    activation_distance = getattr(args, 'collision_activation_distance',
+                                  DEFAULT_COLLISION_ACTIVATION_DISTANCE)
+    world_obstacles = human_body_cylinder_obstacles(
+        joint_positions, hand=handshake.get('offered_hand'),
+        activation_distance=activation_distance)
     collision_link_list = spik.collision_link_list_for_arm(robot)
     problem = build_problem(
         robot, robot_arm, link_list, args.n_waypoints, DEFAULT_DT,
         world_obstacles, collision_link_list,
-        getattr(args, 'collision_activation_distance',
-                DEFAULT_COLLISION_ACTIVATION_DISTANCE),
+        activation_distance,
         DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
         DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
         collision_weight=100.0,
