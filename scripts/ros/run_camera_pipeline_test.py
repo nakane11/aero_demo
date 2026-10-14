@@ -8,7 +8,8 @@ viser 画面で骨格とロボットを常時表示し、``ARM`` 後に差し出
 瞬間の骨格で IK・軌道計画を行う。IK は指なしロボットで解き、画面の干渉
 表示は指ありモデルでの事後検証。``--auto-execute`` なら計画成功時に実機を
 動かす (干渉検証 NG なら動かさない)。実機に接続できていれば、ARM 時に
-初期姿勢へ戻し、差し出し手が決まるとうなずく。
+初期姿勢へ戻し、差し出しを待つ間は人の方へ首を向け (見えなければ見渡して
+探し)、差し出し手が決まるとうなずく。
 
 Usage
 -----
@@ -107,6 +108,28 @@ ARM_INITIAL_POSE_MOVE_TIME = 10  # [秒] ARM 時に初期姿勢へ戻す時間
 # 実機で向きが逆なら符号を反転させること。
 HEAD_NOD_PITCH_DEG = 40.0
 HEAD_NOD_MOVE_TIME = 0.5  # [秒] 下げる・戻すそれぞれの時間の下限
+
+# ARMED 中の首の動き (_head_tracking_loop)。人が見えていればカメラ光軸を
+# 体幹 (HEAD_TRACK_TARGET_JOINTS の平均) へ向け、見えなくなって
+# HEAD_SCAN_START_DELAY 秒たったら首ヨーを 0 -> ±HEAD_SCAN_YAW_DEG と往復
+# させて人を探す。端と中央では止まり、首ピッチを初期角度 +
+# HEAD_SCAN_PITCH_OFFSETS_DEG の順に変えて下も見る (各 HEAD_SCAN_DWELL 秒)。
+HEAD_TRACK_PERIOD = 0.2  # [秒] 首の指令を見直す周期
+HEAD_TRACK_TARGET_JOINTS = ('Neck', 'RShoulder', 'LShoulder', 'RHip', 'LHip')
+# 光軸と体幹の方向のずれがこれ未満なら首を動かさない (動かすとカメラが
+# 揺れ、骨格・掌の推定がぶれるため)。
+HEAD_TRACK_DEADBAND_DEG = 8.0
+HEAD_TRACK_IK_STOP = 40
+HEAD_TRACK_IK_RTHRE = math.radians(2.0)
+HEAD_TRACK_SPEED_DEG = 45.0  # [deg/s] 人の方を向くときの首の速さの上限
+HEAD_TRACK_MIN_MOVE_TIME = 0.3  # [秒]
+HEAD_SCAN_START_DELAY = 2.0  # [秒]
+HEAD_SCAN_YAW_DEG = 60.0
+# 止まった位置で見る首ピッチの初期角度 (25 度) からの差 [deg] (負が上向き)。
+# 下向きは restrict_neck_range の上限 (44.5 度) を超えないこと。
+HEAD_SCAN_PITCH_OFFSETS_DEG = (0.0, 15.0)
+HEAD_SCAN_DWELL = 1.0  # [秒] 止まった各向きで骨格を検出する時間
+HEAD_SCAN_SPEED_DEG = 30.0  # [deg/s] 見渡すときの首の速さ
 
 # 実機再生時の waypoint 間の所要時間の下限 [秒] (腕の制御周期 15Hz の 1 周期)。
 MIN_SEGMENT_TIME = 1.0 / 15.0
@@ -399,6 +422,16 @@ class HandshakePipelineNode(object):
         # うなずきが終わっていれば set (_execute_on_robot が待つ)。
         self._nod_done = threading.Event()
         self._nod_done.set()
+        # ARM 時の初期姿勢への復帰が終わっていれば set (首の追従が待つ)。
+        self._initial_pose_done = threading.Event()
+        self._initial_pose_done.set()
+        # 首の追従の指令とうなずきの開始を排他にする (_head_tracking_loop)。
+        self._head_lock = threading.Lock()
+        # (time.time(), 体幹の base_link 座標) 直近に人が見えた時刻と位置 or None
+        self._head_person_seen = None
+        # 直近に人の方へ向けた首ヨーの指令 [rad] (見渡し中・停止中は None)。
+        # うなずきはこの向きのまま行う。
+        self._head_tracking_yaw = None
         self._frozen_joint_positions = None  # 差し出し手が決まった瞬間の骨格 (固定表示) or None
         self._current_result = None       # 直近の IK 結果 dict or None
         self._current_motion = None       # 直近の軌道計画結果 dict or None
@@ -440,6 +473,22 @@ class HandshakePipelineNode(object):
                       'ため、ARM 時の初期姿勢への復帰・うなずき/--auto-execute '
                       'による実機操作は無効の '
                       'ままになります ({})。'.format(exc))
+
+        # ARMED 中に人の方を向く・見渡す首の動き。視線 IK 用に首だけ動かす
+        # モデルを別に持つ (self.robot は IK で書き換わるため)。
+        self._gaze_robot = None
+        if self.ri is not None and args.head_tracking:
+            self._gaze_robot = Aero(use_hand=False)
+            spik.restrict_neck_range(self._gaze_robot)
+            name_to_initial_angle = dict(zip(
+                self._initial_joint_names, self._initial_joint_angle_vector))
+            for joint in self._gaze_robot.joint_list:
+                if joint.name in name_to_initial_angle:
+                    joint.joint_angle(name_to_initial_angle[joint.name])
+            spik.attach_camera_optical_coords(
+                self._gaze_robot, *self._camera_optical_pos_rot)
+            threading.Thread(
+                target=self._head_tracking_loop, daemon=True).start()
 
         # 発話 (失敗しても発話だけ諦めて続ける)。
         self.sound_client = None
@@ -662,9 +711,12 @@ class HandshakePipelineNode(object):
 
     def _attach_camera_optical_coords(self, timeout=3.0):
         """視線 IK で使うカメラ光軸を TF (head_link -> optical frame) から
-        ``self.robot`` に取り付ける。TF が引けなければ既定値を使う。"""
+        ``self.robot`` に取り付ける。TF が引けなければ既定値を使う。
+        head_link から見た位置・回転を ``self._camera_optical_pos_rot``
+        (既定値なら ``(None, None)``) に控える。"""
         head_frame = self.robot.head_link.name
         optical_frame = self.args.camera_optical_frame
+        self._camera_optical_pos_rot = (None, None)
         try:
             transform = self.tf_buffer.lookup_transform(
                 head_frame, optical_frame, rospy.Time(0),
@@ -682,8 +734,9 @@ class HandshakePipelineNode(object):
         default_axis = self.robot.head_link.worldrot().T.dot(
             default_coords.worldrot()[:, 2])
         matrix = transform_to_matrix(transform.transform)
+        self._camera_optical_pos_rot = (matrix[:3, 3], matrix[:3, :3])
         spik.attach_camera_optical_coords(
-            self.robot, pos=matrix[:3, 3], rot=matrix[:3, :3])
+            self.robot, *self._camera_optical_pos_rot)
         diff_deg = math.degrees(math.acos(float(np.clip(
             np.dot(default_axis, matrix[:3, 2]), -1.0, 1.0))))
         log_debug('[camera-optical] 視線 IK のカメラ光軸を TF ({} -> {}) から '
@@ -756,10 +809,16 @@ class HandshakePipelineNode(object):
                 frame_key=is_base_frame))
         armed_joint_positions = (
             preview_joint_positions if is_base_frame else None)
+        torso_points = [
+            armed_joint_positions[name] for name in HEAD_TRACK_TARGET_JOINTS
+            if armed_joint_positions and name in armed_joint_positions]
 
         with self._lock:
             self._latest_joint_positions = preview_joint_positions
             self._latest_is_base_frame = is_base_frame
+            if torso_points:
+                self._head_person_seen = (
+                    time.time(), np.mean(np.asarray(torso_points), axis=0))
             hand_frames_requested = self._hand_frames_requested
         if hand_frames_requested and is_base_frame:
             hands = self.pose_estimator.estimate_hands_3d(
@@ -795,6 +854,10 @@ class HandshakePipelineNode(object):
             self._handshake_total_time = None
         self.arm_button.visible = False
         self.reset_button.visible = True
+        if move_to_initial_pose and self.ri is not None:
+            # 首の追従は初期姿勢に戻ってから始める (全身のゴールを打ち切らない)。
+            self._initial_pose_done.clear()
+            self._head_tracking_yaw = None
         self.state = 'armed'
         if move_to_initial_pose and self.ri is not None:
             threading.Thread(
@@ -879,10 +942,14 @@ class HandshakePipelineNode(object):
         offered_hand = palms['offered_hand']
         if offered_hand is None:
             return
-        self._busy = True
+        # 首の追従の指令の送信中でないときに止める (うなずきのゴールの後に
+        # 追従のゴールが届くとうなずきが打ち切られるため)。
+        with self._head_lock:
+            self._busy = True
+            if self.ri is not None:
+                self._nod_done.clear()
         if self.ri is not None:
             # うなずきは軌道計画と並行に行う。
-            self._nod_done.clear()
             threading.Thread(target=self._nod_head, daemon=True).start()
         with self._lock:
             self._frozen_joint_positions = joint_positions
@@ -1329,7 +1396,14 @@ class HandshakePipelineNode(object):
 
         初期姿勢に含まれない関節 (指など) は実機の現在値のままにする
         (``self.real_robot`` は未同期なので先に現在値を反映する)。
+        終わったら (失敗しても) ``self._initial_pose_done`` を set する。
         """
+        try:
+            self._move_to_initial_pose_body()
+        finally:
+            self._initial_pose_done.set()
+
+    def _move_to_initial_pose_body(self):
         try:
             current_av = self.ri.angle_vector()
         except RuntimeError as exc:
@@ -1362,6 +1436,11 @@ class HandshakePipelineNode(object):
                 self._initial_joint_names,
                 self._initial_joint_angle_vector))[
                     self.real_robot.neck_p_joint.name]
+            # 人の方へ首を回している途中なら、回し終えた向きでうなずく。
+            tracking_yaw = self._head_tracking_yaw
+            if tracking_yaw is not None:
+                current_av[joint_list.index(
+                    self.real_robot.neck_y_joint)] = tracking_yaw
             down_av = current_av.copy()
             down_av[neck_index] = np.deg2rad(HEAD_NOD_PITCH_DEG)
             up_av = current_av.copy()
@@ -1380,6 +1459,114 @@ class HandshakePipelineNode(object):
             print('[nod] うなずきに失敗しました ({})。'.format(exc))
         finally:
             self._nod_done.set()
+
+    def _head_tracking_allowed(self):
+        """首の追従・見渡しの指令を送ってよいか (ARMED で差し出しを待って
+        いて、初期姿勢への復帰・うなずきが終わっている)。"""
+        return (self.state == 'armed' and not self._busy
+                and self._nod_done.is_set()
+                and self._initial_pose_done.is_set())
+
+    def _head_tracking_loop(self):
+        """ARMED 中、人が見えていればカメラ光軸を体幹へ向け、見えなくなって
+        ``HEAD_SCAN_START_DELAY`` 秒たったら首ヨーを往復させて人を探す
+        (端と中央で止まり下も見る)。
+
+        ``head_controller`` だけに送る。差し出し手が決まると
+        ``_try_handshake`` が ``self._head_lock`` の中で止める (うなずきの
+        ゴールを追従のゴールで打ち切らないため)。
+        """
+        joint_list = self.real_robot.joint_list
+        neck_y_index = joint_list.index(self.real_robot.neck_y_joint)
+        neck_p_index = joint_list.index(self.real_robot.neck_p_joint)
+        neck_r_index = joint_list.index(self.real_robot.neck_r_joint)
+        gaze_robot = self._gaze_robot
+        gaze_coords = spik.camera_optical_coords(gaze_robot)
+        initial_neck_p = gaze_robot.neck_p_joint.joint_angle()
+        scan_yaw = np.deg2rad(HEAD_SCAN_YAW_DEG)
+        scan_pitches = [initial_neck_p + np.deg2rad(offset)
+                        for offset in HEAD_SCAN_PITCH_OFFSETS_DEG]
+        mode = None  # 'track' / 'scan' / None (止めている)
+        # 見渡しの (首ヨー, 首ピッチ) の止まる向きの列と次の添字。
+        scan_steps = []
+        scan_index = 0
+        scan_step_end_time = 0.0  # 今の向きで止まり終える時刻
+        while not rospy.is_shutdown():
+            time.sleep(HEAD_TRACK_PERIOD)
+            try:
+                with self._head_lock:
+                    if not self._head_tracking_allowed():
+                        if mode is not None:
+                            log_debug('[head] 首の追従・見渡しを止めました。')
+                        # _head_tracking_yaw はうなずきが読むので残す。
+                        mode = None
+                        continue
+                    with self._lock:
+                        seen = self._head_person_seen
+                    now = time.time()
+                    current_av = np.asarray(
+                        self.ri.angle_vector(), dtype=np.float64)
+                    target_av = current_av.copy()
+                    target_av[neck_r_index] = spik.NECK_ROLL_FIXED_ANGLE
+                    if (seen is not None
+                            and now - seen[0] < HEAD_SCAN_START_DELAY):
+                        # 人の方を向く。追従中は前回の指令から解く。
+                        if mode != 'track':
+                            gaze_robot.neck_y_joint.joint_angle(
+                                current_av[neck_y_index])
+                            gaze_robot.neck_p_joint.joint_angle(
+                                current_av[neck_p_index])
+                        elif (spik._gaze_error(gaze_coords, seen[1])
+                              < np.deg2rad(HEAD_TRACK_DEADBAND_DEG)):
+                            continue
+                        spik._reaim_gaze(
+                            gaze_robot, gaze_coords, seen[1],
+                            HEAD_TRACK_IK_STOP, HEAD_TRACK_IK_RTHRE)
+                        target_av[neck_y_index] = \
+                            gaze_robot.neck_y_joint.joint_angle()
+                        target_av[neck_p_index] = \
+                            gaze_robot.neck_p_joint.joint_angle()
+                        speed = np.deg2rad(HEAD_TRACK_SPEED_DEG)
+                        if mode != 'track':
+                            log_debug('[head] 人の方を向きます。')
+                        mode = 'track'
+                        self._head_tracking_yaw = target_av[neck_y_index]
+                    else:
+                        # 見渡す。端・中央の各向きで止まって下も見る。
+                        # 最初は今向いている側の端へ。
+                        if mode == 'scan' and now < scan_step_end_time:
+                            continue
+                        if mode != 'scan':
+                            sign = (1.0 if current_av[neck_y_index] >= 0
+                                    else -1.0)
+                            scan_steps = [
+                                (yaw, pitch)
+                                for yaw in (sign * scan_yaw, 0.0,
+                                            -sign * scan_yaw, 0.0)
+                                for pitch in scan_pitches]
+                            scan_index = 0
+                            log_debug('[head] 人が見えないので見渡します。')
+                        yaw, pitch = scan_steps[scan_index]
+                        scan_index = (scan_index + 1) % len(scan_steps)
+                        target_av[neck_y_index] = yaw
+                        target_av[neck_p_index] = pitch
+                        speed = np.deg2rad(HEAD_SCAN_SPEED_DEG)
+                        mode = 'scan'
+                        self._head_tracking_yaw = None
+                    delta = float(np.max(np.abs(
+                        target_av[[neck_y_index, neck_p_index]]
+                        - current_av[[neck_y_index, neck_p_index]])))
+                    time_list = self._limited_time_list(
+                        [target_av], None,
+                        [max(HEAD_TRACK_MIN_MOVE_TIME, delta / speed)])
+                    self.ri.angle_vector_sequence(
+                        [target_av], time_list,
+                        controller_type='head_controller')
+                    scan_step_end_time = now + sum(time_list) + HEAD_SCAN_DWELL
+            except Exception as exc:  # noqa: BLE001  (首が動かせなくても差し出しの検出は続ける)
+                rospy.logwarn_throttle(
+                    5.0, '[head] 首の追従・見渡しに失敗しました ({})。'.format(
+                        exc))
 
     def _execute_on_robot(self):
         """計画済みの waypoint 列を実機に送る。
@@ -2761,6 +2948,9 @@ def main():
     parser.add_argument(
         '--no-robot-interface', action='store_true',
         help='実機 (AeroROSRobotInterface) に接続しない。')
+    parser.add_argument(
+        '--no-head-tracking', dest='head_tracking', action='store_false',
+        help='ARMED 中に首を人の方へ向けたり、見渡して人を探したりしない。')
     # roslaunch が付ける引数 (__name 等) は無視する。
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
