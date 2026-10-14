@@ -1041,33 +1041,72 @@ class StageBuilder(object):
             np.dot(axis, to_palm / np.linalg.norm(to_palm)), -1, 1))))
         self_dist, self_pair = self.self_min_distance()
         offered = spik.offered_hand_obstacle_indices(p.hand)
+        # 押し込み区間 (曲線上の点を腕の IK で解き、台車も指先を押し出すのと
+        # 同時に近づく) の各点を、押し込みと同じ検証 (自己干渉と、差し出した
+        # 手まわり以外の人体 5 cm) にかける。
+        press_names = post['joint_names']
+        path_wps = [dict(joint_angle_vector=av, base_position=[b[0], b[1], 0.0],
+                         base_yaw=b[2])
+                    for av, b in zip(post.get('press_in_path') or [],
+                                     post.get('press_in_base_path') or [])]
+        press_thresholds = self.thresholds(
+            spik.PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
+        worst = None
+        for k, w in enumerate(path_wps + [wp]):
+            set_both(self.robots, w, press_names)
+            r = self.shortfall(p.collision_joints, press_thresholds)
+            if r is not None and (worst is None or r[2] < worst[2]):
+                worst = r + (k + 1,)
+        self.pose(wp)
+        shift = np.asarray(wp['base_position'][:2]) - np.asarray(
+            p.handshake['base_position'][:2])
         stage = Stage(
-            '04_press_in', '4. 第2段: 押し込み姿勢 + 視線 (台車は動かさない)',
-            ['腕: 掌 - 法線 × 0.01 m (掌に 1 cm めり込む位置) へ、第 1 段と同じ向きで '
-             '6 自由度 (0.01 m / 5°)。首: カメラ光軸を掌へ (5°、首ロールは 0° 固定)。'
-             'この人の視線のずれ {:.1f}°{}。'.format(
+            '04_press_in', '4. 第2段: 押し込み (曲線上の手先目標を順に解く) + 視線',
+            ['hover 目標から最終目標 (掌 - 法線 × 0.01 m) まで、指先を {:.0f} cm '
+             '押し出しながら法線方向に {:.0f} cm 詰める曲線上の {} 点を、腕の IK で順に'
+             '解く (最後の点は第 2 段の後処理 IK)。台車は押し出すのと同時に指先の'
+             '方向へ {:.2f} m 近づく (向きは変えない)。'.format(
+                 100 * spik.PRESS_IN_SLIDE, 100 * spik.PRESS_IN_LIFT,
+                 len(path_wps) + 1, float(np.linalg.norm(shift))),
+             '首: カメラ光軸を掌へ (5°、首ロールは 0° 固定)。この人の視線のずれ '
+             '{:.1f}°{}。'.format(
                  gaze_err, '、腕だけで解いた代替' if post.get('arm_only') else ''),
-             '人体との判定はしない (人の掌に触れる姿勢のため)。'
-             '自己干渉だけ検証 (最小 {:+.1f} mm: {} × {})。'.format(
-                 1000.0 * self_dist, *self_pair),
-             'hover → 押し込みの区間も経路としては計画・検証しない。'
-             '実機では hover 到着後に掌を検出し直して押し込みを解き直す '
+             '検証: 各点で自己干渉 (最終姿勢の最小 {:+.1f} mm: {} × {}) と、'
+             '差し出した手まわり以外の人体から {:.0f} cm。手まわりは掌に触れるので'
+             '見ない。この人の余裕が最小の点: {}。'.format(
+                 1000.0 * self_dist, *self_pair,
+                 100 * spik.PRESS_IN_HUMAN_CLEARANCE,
+                 '{} 点目で {} まで {:.1f} cm (余裕 {:+.1f} cm)'.format(
+                     worst[3], spik.human_obstacle_names()[worst[0]],
+                     100.0 * worst[1], 100.0 * worst[2])
+                 if worst is not None else '-'),
+             '実機では hover 到着後に掌を検出し直して、同じ曲線で押し込みを解き直す '
              '(refine_post_process)。'])
         stage.set_robot(wp, self.joint_names, '押し込み')
         s = stage.scene
-        s.layer('visual', 'ロボット (押し込み姿勢)')
+        s.layer('visual', 'ロボット (押し込みの最終姿勢)')
         s.add(robot_visual_mesh(self.visual), ROBOT_COLOR)
+        s.layer('path_ghosts', 'ロボット: 押し込みの途中の点',
+                'hover → 最終姿勢の曲線上の点 (半透明)。台車も一緒に近づく')
+        for w in path_wps:
+            set_both(self.robots, w, press_names)
+            s.add(robot_visual_mesh(self.visual), ROBOT_GHOST_COLOR)
+        self.pose(wp)
         s.layer('coll', 'ロボットの干渉形状 (自己干渉の判定)',
                 default=False, colors=[ROBOT_COLL_COLOR])
         add_robot_collision(s, self.ik)
         s.layer('excluded', '判定しない: 差し出した手・前腕',
-                '掌に触れる姿勢なので当たるのが正しい (人体との判定は全身しない)',
-                colors=[EXCLUDED_COLOR])
-        s.layer('cyl', '人体のその他の円柱 (この段階は判定なし)',
-                colors=[(80, 140, 220, 40)])
+                '掌に触れるので当たるのが正しい', colors=[EXCLUDED_COLOR])
+        s.layer('cyl', '人体のその他の円柱 (5 cm で検証)',
+                colors=[HUMAN_CYL_COLOR])
+        s.layer('shell', '人体 + 5 cm (近づけない範囲)',
+                '押し込み区間の各点で、差し出した手まわり以外はこの範囲に入らない',
+                colors=[HUMAN_SHELL_COLOR])
         colors = {i: EXCLUDED_COLOR for i in offered}
         add_human_cylinders(s, p.collision_joints, colors,
-                            default=(80, 140, 220, 40))
+                            shell=hand_shell(p.hand,
+                                             spik.PRESS_IN_HUMAN_CLEARANCE,
+                                             None))
         s.layer('smpl', '人 (SMPL)')
         s.add(p.smpl_mesh(cam_pos), SKIN_FADED_COLOR)
         self.palm_markers(s, hover=True)
@@ -1076,31 +1115,38 @@ class StageBuilder(object):
                 'ずれ {:.1f}°'.format(gaze_err))
         s.add(tube([cam_pos, cam_pos + axis * np.linalg.norm(
             to_palm) * 1.05], 0.006), GAZE_COLOR)
-        # hover の手先からの押し込みの向き。
-        self.pose(hover_wp(p))
-        hover_hand = self.end_coords().worldpos()
-        self.pose(wp)
-        s.layer('press_dir', 'hover → 押し込みの手先の動き',
-                '経路としては計画・検証しない区間')
-        s.add(arrow(hover_hand, self.end_coords().worldpos(),
-                    radius=0.006), TARGET_PRESS_COLOR)
         base = np.asarray(wp['base_position'])
         self.default_view(stage, base, turn=25.0, elevation=18.0)
         zoom(stage, p.palm, 0.9)
 
+        hover_base = np.asarray(p.handshake['base_position'][:2])
+
         def draw(ax):
-            self.top_common(ax, robot_wps=[(wp, {})], human_colors=colors)
+            self.top_common(ax, robot_wps=[(wp, {})], human_colors=colors,
+                            shell=hand_shell(p.hand,
+                                             spik.PRESS_IN_HUMAN_CLEARANCE,
+                                             None))
             ax.plot([cam_pos[0], p.palm[0]], [cam_pos[1], p.palm[1]],
                     color=rgba(GAZE_COLOR)[:3], lw=2, zorder=9)
             ax.annotate('視線', (cam_pos[:2] + p.palm[:2]) / 2.0,
                         fontsize=9, color='goldenrod', zorder=9)
+            ax.plot(p.press_curve[:, 0], p.press_curve[:, 1], '-',
+                    color=rgba(PRESS_CURVE_COLOR)[:3], lw=2, zorder=9)
+            pts = np.array([hover_base] + [w['base_position'][:2]
+                                           for w in path_wps]
+                           + [wp['base_position'][:2]])
+            ax.plot(pts[:, 0], pts[:, 1], '.-', color='tab:purple', lw=1.5,
+                    zorder=9)
         stage.draw_top = draw
-        stage.top_limits = self.top_limits_around([p.standing, base, p.palm],
-                                                  margin=0.6)
+        stage.top_limits = self.top_limits_around(
+            [p.standing, base, hover_base, p.palm], margin=0.6)
         stage.legend = [
             legend_handle(EXCLUDED_COLOR, '判定しない (差し出した手・前腕)'),
+            legend_handle(HUMAN_SHELL_COLOR, '人体 + 5 cm'),
             legend_handle(GAZE_COLOR, 'カメラ光軸', 'line'),
-            legend_handle(TARGET_PRESS_COLOR, '押し込み目標', 'marker')]
+            legend_handle(PRESS_CURVE_COLOR, '手先目標の曲線', 'line'),
+            legend_handle((160, 32, 240, 255), '台車の動き (hover → 押し込み)',
+                          'line')]
         return stage
 
     # -- 5. 接近軌道 ------------------------------------------------------
@@ -1117,15 +1163,17 @@ class StageBuilder(object):
             orbit_center=center)
         radius = (float(np.linalg.norm(base_goal[:2] - center))
                   + phm.DEFAULT_APPROACH_DISTANCE)
-        # 各 waypoint の人体までの最短距離 (検証と同じ指ありモデル)。
-        closest = (float('inf'), None, None)
+        # 各 waypoint の人体までの余裕 (検証と同じ指ありモデル・同じ判定:
+        # 全身 5 cm、差し出した手まわりだけ 2 cm)。
+        clearance = phm.DEFAULT_HUMAN_CLEARANCE
+        hand_clearance = spik.OFFERED_HAND_CLEARANCE
+        approach_thresholds = self.thresholds(clearance, hand_clearance)
+        closest = (float('inf'), None, None, None)  # (余裕, k, 部位, 距離)
         for k, wp in enumerate(waypoints):
             self.pose(wp)
-            clearances = self.clearances(p.collision_joints)
-            if clearances:
-                index = min(clearances, key=clearances.get)
-                if clearances[index] < closest[0]:
-                    closest = (clearances[index], k, index)
+            r = self.shortfall(p.collision_joints, approach_thresholds)
+            if r is not None and r[2] < closest[0]:
+                closest = (r[2], k, r[0], r[1])
         kinds = {'pretouch': 'pre-touch 経由', 'linear': '線形補間',
                  'optimized': 'jaxls 最適化'}
         stage = Stage(
@@ -1138,11 +1186,15 @@ class StageBuilder(object):
              '採る (この人: {}、角度 {:.0f}°)。台車の経路の範囲は制限しない。'.format(
                  kinds.get(motion['kind'], motion['kind']),
                  math.degrees(motion.get('approach_angle') or 0.0)),
-             '検証: 全 waypoint で人体から 5 cm・自己干渉 0 mm。lead-in は'
+             '検証: 全 waypoint で人体から {:.0f} cm (差し出した手・前腕だけ '
+             '{:.0f} cm。hover が掌から約 2 cm のため)・自己干渉 0 mm。lead-in は'
              '人から 1.0 m 以内の waypoint だけ検証。'
-             'この人の経路の最短: waypoint {} で {} まで {:.1f} cm。'.format(
+             'この人の余裕が最小の点: waypoint {} で {} まで {:.1f} cm '
+             '(余裕 {:+.1f} cm)。'.format(
+                 100 * clearance, 100 * hand_clearance,
                  closest[1], spik.human_obstacle_names()[closest[2]]
-                 if closest[2] is not None else '-', 100.0 * closest[0])])
+                 if closest[2] is not None else '-',
+                 100.0 * (closest[3] or 0.0), 100.0 * closest[0])])
         stage.set_robot(waypoints[0], self.joint_names, '接近開始')
         s = stage.scene
         s.layer('ghosts', 'ロボット: 接近の途中 (waypoint 0, 1/3, 2/3)',
@@ -1157,8 +1209,12 @@ class StageBuilder(object):
         s.layer('shell', '人体 + 5 cm (経路が入ってはいけない範囲)',
                 'hover の IK は 6 cm、経路の検証は 1 cm 緩い 5 cm',
                 colors=[HUMAN_SHELL_COLOR])
+        s.layer('hand_shell', '差し出した手まわり + 2 cm',
+                '掌・指・同じ側の前腕だけは 2 cm', colors=[HAND_SHELL_COLOR])
         add_human_cylinders(s, p.collision_joints,
-                            shell=phm.DEFAULT_HUMAN_CLEARANCE)
+                            shell=hand_shell(p.hand, clearance,
+                                             hand_clearance),
+                            hand_shell_color=HAND_SHELL_COLOR, hand=p.hand)
         s.layer('smpl', '人 (SMPL)')
         s.add(p.smpl_mesh(self.end_coords().worldpos()), SKIN_FADED_COLOR)
         z = FLOOR_Z * 3
@@ -1203,7 +1259,8 @@ class StageBuilder(object):
             ax.add_patch(patches.Circle(center, radius, fc='none', ec='0.4',
                                         lw=1.0, ls=':', zorder=1))
             self.top_common(ax, robot_wps=[(waypoints[-1], {})],
-                            shell=phm.DEFAULT_HUMAN_CLEARANCE)
+                            shell=hand_shell(p.hand, clearance,
+                                             hand_clearance))
             for wp in (lead_in[:1] if lead_in else []):
                 self.pose(wp)
                 top_robot(ax, self.ik, color=(150, 150, 150, 70))
@@ -1242,7 +1299,7 @@ class StageBuilder(object):
         stage.legend = [
             legend_handle(LEAD_IN_COLOR, 'lead-in (回転 → 直進)', 'dash'),
             legend_handle(PATH_COLOR, '接近の台車の経路', 'line'),
-            legend_handle(HUMAN_SHELL_COLOR, '人体 + 5 cm'),
+            legend_handle(HUMAN_SHELL_COLOR, '人体 + 5 cm (手まわりは 2 cm)'),
             legend_handle((220, 60, 60, 60), 'lead-in の検証範囲'),
             plt.Line2D([], [], color='tab:blue', marker='*', ls='', ms=12,
                        label='接近開始位置 (角度 0)'),

@@ -4,7 +4,8 @@
 その間に挟む干渉の事後検証、接近軌道の計画で、それぞれ何を制約・コストに
 入れているかをまとめる。値はすべて 2026-10-13 時点のコードの既定値。定数名は `solve_palm_ik.py` (`spik`)、
 `plan_handshake_motion.py` (`phm`)、`side_by_side_transition.py` (`sbs`)
-のもの。
+のもの。各段階で考慮する干渉・台車の可動域を図で見るには
+[handshake_pipeline_stages.md](handshake_pipeline_stages.md)。
 
 全体の流れ:
 
