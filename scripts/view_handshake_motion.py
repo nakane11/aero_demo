@@ -54,6 +54,7 @@ from solve_palm_ik import build_collision_verification_pairs  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
 from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402,E501
+from solve_palm_ik import press_in_target_position  # noqa: E402
 from solve_palm_ik import translate_joint_positions  # noqa: E402
 
 from skrobot.viewers import ViserViewer  # noqa: E402
@@ -275,8 +276,15 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
                 '握りの向き {:.0f} 度\n\nこの waypoint の人の腕: {}\n\n'.format(
                     wp['turn_deg'], sbs.human_arm_text(wp['human_arm'])))
     else:
-        body = ('掌への押し込み (solve_palm_ik.py の後処理判定, 表示のみ '
-                '-- 経路の検証対象ではない)\n\n')
+        n_press = sum(1 for wp in display_waypoints
+                      if not wp.get('transition')) - n_approach
+        body = ('掌への押し込み {}/{} (hover からロボットの指先を押し出し'
+                'ながら掌を詰める。赤線: 手先目標の曲線。solve_palm_ik.py で'
+                '自己干渉と手まわり以外の人体距離を検証済み)\n\n'.format(
+                    waypoint_index - n_approach + 1, n_press))
+    if waypoint_index == n_approach - 1 and has_post_process:
+        body += ('**hover**: 押し込みの最終姿勢から掌の法線方向に浮かせ、'
+                 'ロボットの指先と逆向きにずらした姿勢\n\n')
     return header + body + collision_text
 
 
@@ -380,6 +388,27 @@ def main():
             set_link_visible(obstacle_link,
                              show_collision_models_checkbox.value)
 
+    press_in_line = [None]
+
+    def set_press_in_line(handshake):
+        # hover 目標から最終目標までの押し込みの手先目標の曲線を赤線で描く。
+        if press_in_line[0] is not None:
+            press_in_line[0].remove()
+            press_in_line[0] = None
+        post = handshake.get('post_process')
+        if (post is None or post.get('press_in_path') is None
+                or handshake.get('palm_position') is None):
+            return
+        palm = dict(position=handshake['palm_position'],
+                    y_axis=handshake['palm_normal'])
+        points = np.array([
+            press_in_target_position(palm, np.asarray(post['target_rot']), u)
+            for u in np.linspace(0.0, 1.0, 31)], dtype=np.float32)
+        press_in_line[0] = viewer._server.scene.add_line_segments(
+            '/press_in_target_path',
+            points=np.stack([points[:-1], points[1:]], axis=1),
+            colors=(230, 40, 40), line_width=4.0)
+
     def refresh_person():
         name = names[controls.person_index]
         skeleton_path = os.path.join(args.skeleton_dir, name)
@@ -423,6 +452,7 @@ def main():
                       joint_positions=joint_positions,
                       human_arm=human_arm, obstacle_arm=None)
         set_obstacles(joint_positions)
+        set_press_in_line(handshake)
 
         # set_waypoint_count は同期的に refresh_waypoint を呼び得るので、
         # current/障害物を更新し終えてから呼ぶ。
