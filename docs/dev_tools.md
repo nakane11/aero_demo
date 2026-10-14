@@ -144,6 +144,26 @@ python3 tools/plot_handshake_motion_2d.py 20 --seed 3 \
     --initial-base-pose 5 0 3.14
 ```
 
+### `tools/render_pipeline_stages.py`
+
+`run_pipeline_test.py --plan-motion --side-by-side-transition` の作業
+ディレクトリから 1 人を選び、横並びまでの各段階 (差し出した手 → 第 1 段 IK →
+hover の事後検証 → 押し込み → 接近軌道 → 横並び移動) で考慮する干渉ペア・
+人体からの距離・台車の可動域・経路を、3 次元の描画 + 真上から見た図 + 説明の
+PNG にする。`--viser` で同じシーンを viser にも出す (全段階のロボットの全体表示で
+ロボットをクリックするとその段階の詳細、項目はチェックボックスで表示を切り替え。
+`--no-images` で PNG を省く)。
+出力例と説明は [`handshake_pipeline_stages.md`](handshake_pipeline_stages.md)。
+WSL では EGL のソフトウェア描画を指定する。
+
+```bash
+export PYOPENGL_PLATFORM=egl LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe EGL_PLATFORM=surfaceless JAX_PLATFORMS=cpu
+python3 tools/render_pipeline_stages.py \
+    --work-dir /tmp/aero_demo_pipeline_xxxx --name human_324 \
+    --output-dir docs/images/pipeline_stages [--viser]
+```
+
 ### `tools/summarize_final_base_placement.py`
 
 `run_pipeline_test.py` の作業ディレクトリ (複数可) を読み、IK が決めた
