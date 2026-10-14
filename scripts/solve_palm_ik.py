@@ -120,12 +120,31 @@ DEFAULT_SELF_COLLISION_MARGIN = 0.02
 # 同じ箱・円柱・球) または 'spheres' (skrobot 既定の球近似)。
 DEFAULT_IK_COLLISION_GEOMETRY = 'primitive'
 
-# IK の目標を掌から法線方向に浮かせる距離 [m] (目標は手の内部の点なので、
-# 表面間距離はこれより 2〜3 cm 短い)。
-TARGET_HOVER_OFFSET = 0.10  # [m]
+# hover 目標 (IK の目標) は、押し込みの最終目標を掌の法線方向に
+# PRESS_IN_LIFT 浮かせ (人の掌と約 2 cm 離れる)、ロボットの指先と逆向きに
+# PRESS_IN_SLIDE ずらした位置 (手先の向きは最終目標と同じ)。押し込みは
+# 指先を PRESS_IN_SLIDE 押し出しながら PRESS_IN_LIFT 詰める曲線
+# (press_in_target_position)。
+PRESS_IN_LIFT = 0.03  # [m]
+PRESS_IN_SLIDE = 0.15  # [m]
+# 指先方向の進み u (0 -> 1) に対し、法線方向は 1 - u**指数 で詰める
+# (大きいほど押し出しの終盤で詰める、1 で直線)。
+PRESS_IN_CURVE_EXPONENT = 3.0
+# 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。各点で IK を
+# 解いた waypoint 列にする (関節空間の補間では曲線にならないため)。
+PRESS_IN_PATH_POINTS = 8
 
 # hover 姿勢でロボットと人体 (全身) の間に空ける距離 [m]。
 DEFAULT_HOVER_HUMAN_CLEARANCE = DEFAULT_COLLISION_MARGIN  # [m]
+
+# 差し出した手 (掌・指) と同じ側の前腕 (offered_hand_obstacle_indices) だけ
+# に空ける距離 [m] (hover・接近)。hover が人の掌から約 2 cm なので全身と
+# 同じ距離は取れない。
+OFFERED_HAND_CLEARANCE = 0.02  # [m]
+
+# 押し込み区間 (最終姿勢を含む) で、差し出した手まわり以外の人体に空ける
+# 距離 [m] (接近の検証と同じ 5 cm)。手まわりには触れるので見ない。
+PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 
 # 後処理判定の目標の掌からのオフセット [m] (負 = 掌にわずかにめり込む)。
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
@@ -439,12 +458,30 @@ def palm_target_rot(palm, turn_deg, robot_arm):
     return _correct_grasp_frame(_turn_about_y(base_rot, turn_deg), robot_arm)
 
 
-def palm_target_position(palm):
-    """掌から ``TARGET_HOVER_OFFSET`` だけ浮かせた位置 (法線方向) を IK の
-    目標位置として返す。"""
+def press_in_slide_direction(palm, target_rot):
+    """押し込みで手先を押し出す向き: ロボットの指先方向 (手先の +Z) から
+    掌の法線成分を除いた単位ベクトル。"""
+    normal = np.asarray(palm['y_axis'], dtype=np.float64)
+    finger = np.asarray(target_rot, dtype=np.float64)[:, 2]
+    along = finger - normal * float(normal.dot(finger))
+    norm = float(np.linalg.norm(along))
+    return finger if norm < 1e-6 else along / norm
+
+
+def press_in_target_position(palm, target_rot, u):
+    """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover 目標、
+    1 = 最終目標)。"""
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
-    return position + normal * TARGET_HOVER_OFFSET
+    final = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+    slide = press_in_slide_direction(palm, target_rot)
+    return (final - slide * PRESS_IN_SLIDE * (1.0 - u)
+            + normal * PRESS_IN_LIFT * (1.0 - u ** PRESS_IN_CURVE_EXPONENT))
+
+
+def palm_target_position(palm, target_rot):
+    """向き ``target_rot`` の hover 目標位置 (IK の目標位置) を返す。"""
+    return press_in_target_position(palm, target_rot, 0.0)
 
 
 def human_standing_xy(joint_positions):
@@ -985,6 +1022,43 @@ def offered_hand_obstacle_indices(hand):
 # 差し出された手・前腕とのペナルティを掛けるロボット側のリンク ({} は腕)。
 OFFERED_HAND_PENALTY_LINKS = ('{}_hand_link', '{}_thumb_box_link',
                               '{}_hand_yaw_link', '{}_forearm_link')
+
+
+def human_clearance_thresholds(hand, clearance,
+                               hand_clearance=OFFERED_HAND_CLEARANCE):
+    """人体の障害物ごとに空ける距離 [m] の配列 (``human_obstacle_names`` の
+    順)。差し出した手 ``hand`` の手まわりだけ ``hand_clearance`` (None なら
+    見ない = -inf) にする。"""
+    thresholds = np.full(len(human_obstacle_names()), float(clearance))
+    if hand is not None:
+        indices = sorted(offered_hand_obstacle_indices(hand))
+        thresholds[indices] = (-np.inf if hand_clearance is None
+                               else min(hand_clearance, clearance))
+    return thresholds
+
+
+def clearance_shortfall(clearances, thresholds):
+    """``human_obstacle_clearances`` の結果 ``{添字: 距離}`` で、距離から
+    ``thresholds`` を引いた余裕が最小の ``(添字, 余裕)`` (無ければ
+    ``(None, inf)``)。"""
+    best = (None, float('inf'))
+    for index, distance in clearances.items():
+        margin = distance - thresholds[index]
+        if margin < best[1]:
+            best = (index, margin)
+    return best
+
+
+def offered_hand_penalty_obstacle(obstacle, margin,
+                                  hand_clearance=OFFERED_HAND_CLEARANCE):
+    """バッチ IK の干渉ペナルティ (全体で 1 つのマージン ``margin``) で、
+    前腕の円柱との距離を ``hand_clearance`` にするために半径と長さを
+    ``margin - hand_clearance`` だけ細らせた円柱を返す。"""
+    shrink = max(margin - hand_clearance, 0.0)
+    return Cylinder(radius=max(obstacle.radius - shrink, 1e-3),
+                    height=max(obstacle.height - 2.0 * shrink, 1e-3),
+                    pos=obstacle.worldpos().tolist(),
+                    rot=obstacle.worldrot())
 
 
 def human_obstacle_names():
@@ -2227,6 +2301,65 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     )
 
 
+def solve_press_in(robot, robot_arm, palm, target_rot,
+                   stop=DEFAULT_POST_PROCESS_IK_STOP,
+                   thre=DEFAULT_POST_PROCESS_IK_THRE,
+                   rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
+                   gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
+                   gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
+                   gaze=True, arm_only_fallback=True,
+                   n_points=PRESS_IN_PATH_POINTS):
+    """hover 姿勢の ``robot`` から押し込みの曲線
+    (``press_in_target_position``) を ``n_points`` 等分した手先目標を、途中は
+    腕だけの IK、最終目標は ``solve_post_process`` で順に解く (台車は固定).
+
+    途中の点の首は最終姿勢の角度にする (接近区間の終盤で首は最終姿勢の
+    角度へ補間済み)。``solve_post_process`` の結果に、途中の点の関節角
+    (``robot.joint_list`` 順、最終姿勢は含まない) のリスト ``press_in_path``
+    を足して返す。どこかで解けなければ ``robot`` を元に戻して None。
+    """
+    start_time = time.time()
+    initial_angle_vector = robot.angle_vector().copy()
+    whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
+    move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+    path = []
+    for k in range(1, n_points):
+        target_coords = Coordinates(
+            pos=press_in_target_position(
+                palm, target_rot, k / float(n_points)).tolist(),
+            rot=target_rot)
+        try:
+            result = robot.inverse_kinematics(
+                target_coords, move_target=move_target,
+                link_list=whole_body.link_list,
+                stop=stop, thre=thre, rthre=rthre, revert_if_fail=True)
+        except Exception as e:
+            print('  [press-in] 押し込み区間の IK で例外が発生したため棄却'
+                  'します: {}'.format(e))
+            result = False
+        if result is False:
+            robot.angle_vector(initial_angle_vector)
+            return None
+        path.append(robot.angle_vector().copy())
+    post = solve_post_process(
+        robot, robot_arm, palm, target_rot, stop=stop, thre=thre,
+        rthre=rthre, gaze_ik_stop=gaze_ik_stop, gaze_ik_rthre=gaze_ik_rthre,
+        gaze=gaze, arm_only_fallback=arm_only_fallback)
+    if post is None:
+        robot.angle_vector(initial_angle_vector)
+        return None
+    final_angle_vector = robot.angle_vector()
+    head_joints = [link.joint for link in robot.head.link_list]
+    head_indices = [i for i, joint in enumerate(robot.joint_list)
+                    if joint in head_joints]
+    for angle_vector in path:
+        angle_vector[head_indices] = final_angle_vector[head_indices]
+    post['press_in_path'] = [[float(v) for v in angle_vector]
+                             for angle_vector in path]
+    post['compute_time'] = time.time() - start_time
+    return post
+
+
 def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post):
     """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終
     補正.
@@ -2254,8 +2387,8 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post):
         info.update(reason='too_large', compute_time=time.time() - start_time)
         return info
     # 腕だけの解き直しは下で首を計画時の角度にして行う。
-    post = solve_post_process(robot, robot_arm, palm, target_rot,
-                              arm_only_fallback=False)
+    post = solve_press_in(robot, robot_arm, palm, target_rot,
+                          arm_only_fallback=False)
     reason = 'ok'
     if post is None:
         # 首が可動域の端で視線 IK が収束しないことが多いので、首は計画時の
@@ -2265,8 +2398,7 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post):
         for link in robot.head.link_list:
             if link.joint.name in planned_angles:
                 link.joint.joint_angle(planned_angles[link.joint.name])
-        post = solve_post_process(robot, robot_arm, palm, target_rot,
-                                  gaze=False)
+        post = solve_press_in(robot, robot_arm, palm, target_rot, gaze=False)
         reason = 'ok_arm_only' if post is not None else 'ik_failed'
     info.update(post_process=post, reason=reason,
                 compute_time=time.time() - start_time)
@@ -2361,7 +2493,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             placement_joint_positions=None):
     """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、
     収束・事後検証 (自己干渉の貫通なし、人体から ``hover_human_clearance``
-    以上) ・後処理判定をすべて通る候補をコストの低い順に探す.
+    以上、差し出した手まわりだけ ``OFFERED_HAND_CLEARANCE`` 以上) ・後処理
+    判定 (``solve_press_in`` の押し込み区間が解け、自己干渉と手まわり以外の
+    人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) をすべて通る候補を
+    コストの低い順に探す.
 
     コストは関節の曲げ量に、台車の人の正面方向へのずれ x
     ``front_offset_weight`` と向きのずれ x ``facing_yaw_weight`` を足した
@@ -2444,23 +2579,52 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     early_clearance_pairs = _subset(
         lambda pair: not _involves_other_arm(pair), clearance_source)
     other_arm_clearance_pairs = _subset(_involves_other_arm, clearance_source)
+    # hover は差し出した手まわりだけ OFFERED_HAND_CLEARANCE、押し込み区間は
+    # 手まわりを見ずにそれ以外を PRESS_IN_HUMAN_CLEARANCE。
+    hover_thresholds = None if hover_human_clearance is None else \
+        human_clearance_thresholds(hand, hover_human_clearance)
+    press_thresholds = human_clearance_thresholds(
+        hand, PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
 
-    def _too_close_to_human(pairs, label):
-        if (hover_human_clearance is None or not obstacle_links
-                or pairs is None):
+    def _too_close_to_human(pairs, label, thresholds=hover_thresholds,
+                            what='hover-clearance'):
+        if thresholds is None or not obstacle_links or pairs is None:
             return False
         clearances = human_obstacle_clearances(
             robot, pairs, obstacle_links,
-            cull_distance=hover_human_clearance)
-        if not clearances:
+            cull_distance=float(np.max(thresholds)))
+        index, margin = clearance_shortfall(clearances, thresholds)
+        if index is None or margin >= 0.0:
             return False
-        index = min(clearances, key=clearances.get)
-        if clearances[index] >= hover_human_clearance:
-            return False
-        print('  [hover-clearance] {} の候補は人体 ({}) まで {:.3f} m しか '
-              '離れていないため棄却します。'.format(
-                  label, human_obstacle_names()[index], clearances[index]))
+        print('  [{}] {} の候補は人体 ({}) まで {:.3f} m しか離れていない'
+              'ため棄却します。'.format(
+                  what, label, human_obstacle_names()[index],
+                  clearances[index]))
         return True
+
+    def _press_in_path_rejected(path, posture, label):
+        # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの) を
+        # 自己干渉と手まわり以外の人体距離で検証し、差し替えた関節角の
+        # リストを返す (通らなければ None)。
+        replaced = []
+        for k, angle_vector in enumerate(path):
+            angle_vector = with_other_arm_posture(
+                robot, angle_vector, robot_arm, posture)
+            dist, pair = collision_pairs_min_distance(
+                robot, self_verification_pairs, joint_positions,
+                obstacle_links=obstacle_links,
+                obstacle_samples=obstacle_samples, return_pair=True)
+            dist = min(dist, other_hand_base_clearance(robot, robot_arm))
+            if dist < -collision_verify_tolerance:
+                print('  [collision-verify] {} の候補は押し込み区間の {} 点目'
+                      'で {:.4f} m 自己干渉していたため、後処理判定を失敗扱い'
+                      'にします。'.format(label, k + 1, dist))
+                return None
+            if _too_close_to_human(clearance_source, label, press_thresholds,
+                                   'press-in-clearance'):
+                return None
+            replaced.append([float(v) for v in angle_vector])
+        return replaced
 
     fallback = None
     examined = 0
@@ -2491,10 +2655,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             continue
         # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決めて
         # hover・押し込みの両方に差し替える。
-        post_result = solve_post_process(
+        post_result = solve_press_in(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop,
             thre=post_process_thre, rthre=post_process_rthre)
+        if post_result is None:
+            print('  [press-in] {} の候補は押し込み区間の IK が解けません'
+                  'でした。'.format(label))
         if post_result is None or \
                 float(robot.waist_link.worldpos()[2]) >= hover_waist_z:
             robot.angle_vector(hover_av)
@@ -2519,23 +2686,18 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             fallback = (turn_index, hover_av, base_poses[candidate_index],
                         cost)
         if post_result is not None:
-            # 押し込み姿勢は人に触れるので自己干渉だけを検証する。
-            press_av = with_other_arm_posture(
-                robot, post_result['joint_angle_vector'], robot_arm, posture)
-            press_dist, pair = collision_pairs_min_distance(
-                robot, self_verification_pairs, joint_positions,
-                obstacle_links=obstacle_links,
-                obstacle_samples=obstacle_samples, return_pair=True)
-            if press_dist < -collision_verify_tolerance:
-                print('  [collision-verify] {} の候補は押し込み姿勢で {:.4f} m '
-                      '自己干渉 ({} x {}) していたため、後処理判定を失敗扱いに'
-                      'します。'.format(label, press_dist,
-                                       *collision_pair_name(pair)))
+            # 押し込み区間 (最終姿勢を含む) は差し出した手まわりに触れるので、
+            # 自己干渉と手まわり以外の人体距離だけを検証する。
+            replaced = _press_in_path_rejected(
+                post_result['press_in_path']
+                + [post_result['joint_angle_vector']], posture, label)
+            if replaced is None:
                 post_result = None
             else:
                 post_result = dict(
                     post_result,
-                    joint_angle_vector=[float(v) for v in press_av],
+                    press_in_path=replaced[:-1],
+                    joint_angle_vector=replaced[-1],
                     other_arm_posture=list(OTHER_ARM_POSTURES_DEG[posture]))
         if post_result is not None:
             return (turn_index, hover_av, base_poses[candidate_index],
@@ -2599,10 +2761,10 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
-    target_pos = palm_target_position(palm)
     rots = palm_to_target_rots(palm, hand, robot_arm)[:n_turn_candidates]
-    target_coords = [Coordinates(pos=target_pos.tolist(), rot=rot)
-                     for rot in rots]
+    target_coords = [Coordinates(
+        pos=palm_target_position(palm, rot).tolist(), rot=rot)
+        for rot in rots]
     # 人体の障害物が無いときは、人体との組 (添字が範囲外になる) を除く。
     effective_collision_pairs = collision_pairs
     effective_self_collision = self_collision
@@ -2623,15 +2785,22 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
             # 空リストだと ValueError になるので自己干渉を無効にする。
             effective_self_collision = False
     else:
-        # 差し出された手・前腕とロボットの手先側のリンクの組を足す。
-        offered = sorted(offered_hand_obstacle_indices(hand))
+        # 差し出された前腕とロボットの手先側のリンクの組を足す。hover は
+        # 人の掌から約 2 cm なので、掌・指は組に入れず (事後検証で
+        # OFFERED_HAND_CLEARANCE を見る)、前腕は細らせて同じ距離にする。
+        forearm = human_obstacle_names().index(
+            '{0}Elbow-{0}Wrist'.format(hand))
+        effective_collision_obstacles = list(collision_obstacles)
+        effective_collision_obstacles[forearm] = \
+            offered_hand_penalty_obstacle(
+                collision_obstacles[forearm], collision_margin)
         links_by_name = {link.name: link for link in
                          list(robot.link_list)
                          + list(getattr(robot, 'extra_collision_links', []))}
         effective_collision_pairs = list(collision_pairs) + [
-            (links_by_name[name.format(robot_arm)], i)
+            (links_by_name[name.format(robot_arm)], forearm)
             for name in OFFERED_HAND_PENALTY_LINKS
-            if name.format(robot_arm) in links_by_name for i in offered]
+            if name.format(robot_arm) in links_by_name]
     restore_joint_range = restrict_joint_range_margin(
         whole_body.link_list, collision_joint_limit_margin_ratio)
     collision_ik_start = time.time()
@@ -2768,7 +2937,15 @@ def base_movable_region(base_limits):
     )
 
 
-def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
+def _palm_fields(palm):
+    """結果 dict に入れる掌の位置・法線 (hover 目標は掌から指先方向にも
+    ずれるので、掌の向きはこちらを使う)。"""
+    return dict(
+        palm_position=[float(v) for v in palm['position']],
+        palm_normal=[float(v) for v in palm['y_axis']])
+
+
+def solved_result(robot, robot_arm, target_rot, turn_index,
                   angle_vector, base_pose, base_limits, post_process_result,
                   collision_ik_time, candidate_selection_time, hand, palm):
     """採用した解をロボットに反映して結果 dict を組む (後処理の結果は
@@ -2781,8 +2958,10 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
         target=True,
         solved=True,
         turn_deg=turn_candidates_deg(hand, palm)[turn_index],
-        target_position=[float(v) for v in target_pos],
+        target_position=[float(v) for v in
+                         palm_target_position(palm, target_rot)],
         target_rot=[[float(v) for v in row] for row in target_rot],
+        **_palm_fields(palm),
         hand_position=[float(v) for v in hand_coords.worldpos()],
         hand_rot=[[float(v) for v in row] for row in hand_coords.worldrot()],
         base_position=[float(v) for v in robot.base_link.worldpos()],
@@ -2797,7 +2976,7 @@ def solved_result(robot, robot_arm, target_pos, target_rot, turn_index,
     return result
 
 
-def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
+def unsolved_result(robot, robot_arm, target_rot, base_limits,
                     collision_ik_time, candidate_selection_time, hand, palm):
     """解けなかった人物の結果 dict (種の姿勢、向きは最後の候補)。"""
     seed_arm_pose(robot, robot_arm)
@@ -2807,8 +2986,10 @@ def unsolved_result(robot, robot_arm, target_pos, target_rot, base_limits,
         target=True,
         solved=False,
         turn_deg=turn_candidates_deg(hand, palm)[-1],
-        target_position=[float(v) for v in target_pos],
+        target_position=[float(v) for v in
+                         palm_target_position(palm, target_rot)],
         target_rot=[[float(v) for v in row] for row in target_rot],
+        **_palm_fields(palm),
         hand_position=[float(v) for v in hand_coords.worldpos()],
         hand_rot=[[float(v) for v in row] for row in hand_coords.worldrot()],
         base_position=[float(v) for v in robot.base_link.worldpos()],
@@ -2865,7 +3046,7 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 
 def main():
-    global TARGET_HOVER_OFFSET
+    global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -2978,16 +3159,27 @@ def main():
         help='hover 姿勢でロボットと人体の間に空ける距離 [m] (既定 {}、'
             '負で無効)。'.format(DEFAULT_HOVER_HUMAN_CLEARANCE))
     parser.add_argument(
-        '--target-hover-offset', type=float, default=TARGET_HOVER_OFFSET,
-        help='IK の目標を掌から法線方向に浮かせる距離 [m] (既定 {})。'
-            .format(TARGET_HOVER_OFFSET))
+        '--press-in-slide', type=float, default=PRESS_IN_SLIDE,
+        help='hover 目標を押し込みの最終目標からロボットの指先と逆向きに '
+            'ずらす距離 [m] (既定 {})。'.format(PRESS_IN_SLIDE))
+    parser.add_argument(
+        '--press-in-lift', type=float, default=PRESS_IN_LIFT,
+        help='hover 目標を押し込みの最終目標から掌の法線方向に浮かせる距離 '
+            '[m] (既定 {})。'.format(PRESS_IN_LIFT))
+    parser.add_argument(
+        '--press-in-curve-exponent', type=float,
+        default=PRESS_IN_CURVE_EXPONENT,
+        help='押し込みの曲線の指数 (1 で直線、既定 {})。'.format(
+            PRESS_IN_CURVE_EXPONENT))
     parser.add_argument(
         '--torso-surface-offset', type=float, default=0.0,
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '
             '[m]。実カメラの骨格では {} を指定する (既定 0)。'.format(
                 DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
-    TARGET_HOVER_OFFSET = args.target_hover_offset
+    PRESS_IN_SLIDE = args.press_in_slide
+    PRESS_IN_LIFT = args.press_in_lift
+    PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
 
     files = iter_palm_files(args.input_dir)
     if not files:
@@ -3130,7 +3322,6 @@ def main():
                        else human_standing_xy(joint_positions))
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
-        target_pos = palm_target_position(palm)
         rots = palm_to_target_rots(palm, human_hand, robot_arm)
         (picked, collision_ik_time, candidate_selection_time,
          person_base_limits, x_margin) = solve_person_ik_side_by_side(
@@ -3143,14 +3334,14 @@ def main():
             placement_joint_positions=joint_positions, **ik_kwargs)
         if picked is None:
             result = unsolved_result(
-                robot, robot_arm, target_pos, rots[-1], person_base_limits,
+                robot, robot_arm, rots[-1], person_base_limits,
                 collision_ik_time, candidate_selection_time, human_hand,
                 palm)
         else:
             turn_index, angle_vector, base_pose, post_process_result \
                 = picked
             result = solved_result(
-                robot, robot_arm, target_pos, rots[turn_index],
+                robot, robot_arm, rots[turn_index],
                 turn_index, angle_vector, base_pose,
                 person_base_limits, post_process_result, collision_ik_time,
                 candidate_selection_time, human_hand, palm)

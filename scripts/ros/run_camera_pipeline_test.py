@@ -574,7 +574,6 @@ class HandshakePipelineNode(object):
         motion_args.collision_verify_tolerance = \
             args.motion_collision_verify_tolerance
         motion_args.force_optimize = True
-        target_pos = spik.palm_target_position(self._WARMUP_PALM)
         # 差し出し手は実際の自動割り当てで各腕が担当する側に合わせる。
         robot_arm_to_hand = {arm: hand
                              for hand, arm in spik.DEFAULT_ROBOT_ARM.items()}
@@ -599,7 +598,7 @@ class HandshakePipelineNode(object):
             turn_index, angle_vector, base_pose, post_process_result = picked
             rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
             handshake = spik.solved_result(
-                self.robot, robot_arm, target_pos, rots[turn_index],
+                self.robot, robot_arm, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
             t0 = time.time()
@@ -1026,7 +1025,6 @@ class HandshakePipelineNode(object):
         standing_xy = spik.human_standing_xy(translated_joints)
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
-        target_pos = spik.palm_target_position(translated_palm)
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
         (picked, collision_ik_time, candidate_selection_time,
          person_base_limits, x_margin) = \
@@ -1045,13 +1043,13 @@ class HandshakePipelineNode(object):
 
         if picked is None:
             result = spik.unsolved_result(
-                self.robot, robot_arm, target_pos, rots[-1],
+                self.robot, robot_arm, rots[-1],
                 person_base_limits, collision_ik_time,
                 candidate_selection_time, offered_hand, translated_palm)
         else:
             turn_index, angle_vector, base_pose, post_process_result = picked
             result = spik.solved_result(
-                self.robot, robot_arm, target_pos, rots[turn_index],
+                self.robot, robot_arm, rots[turn_index],
                 turn_index, angle_vector, base_pose, person_base_limits,
                 post_process_result, collision_ik_time,
                 candidate_selection_time, offered_hand, translated_palm)

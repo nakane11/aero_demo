@@ -310,8 +310,12 @@ class PrintPalmPositionsNode(object):
             lines.append('  {}: 掌位置 (base_link) = {}{}'.format(
                 side, _fmt_xyz(palm['position']), marker))
         if offered_hand is not None:
-            target = spik.palm_target_position(palms[offered_hand])
-            lines.append('  IK目標 (掌 + ホバーオフセット) = {}'.format(
+            # hover 目標は手先の向きで変わるので、向きの第 1 候補で表示する。
+            rot = spik.palm_to_target_rots(
+                palms[offered_hand], offered_hand,
+                spik.DEFAULT_ROBOT_ARM[offered_hand])[0]
+            target = spik.palm_target_position(palms[offered_hand], rot)
+            lines.append('  IK目標 (hover、向きの第 1 候補) = {}'.format(
                 _fmt_xyz(target)))
             diff_z = target[2] - robot_hand_position[2]
             lines.append(
