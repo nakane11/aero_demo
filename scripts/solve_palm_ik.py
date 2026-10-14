@@ -145,6 +145,10 @@ DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
 # 後処理判定の視線 IK (首 3 関節、rotation_mask='xy') の反復回数・収束閾値。
 DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
+# 腕と視線の同時 IK が解けないときは腕だけで押し込みを解き、首だけで掌へ
+# 向け直す。視線のずれがこれ未満なら採用する (カメラの縦の画角の半分 約 21
+# 度より内側で、掌が画面に入る)。
+POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE = math.radians(15.0)  # [rad]
 
 # head_link -> camera_link (launch/decompress.launch の head_to_camera_link と
 # 同じ値、四元数は (x, y, z, w))。head_end_coords の +Z は実機カメラの光軸と
@@ -2102,16 +2106,22 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
                        rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
                        gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
                        gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
-                       gaze=True):
+                       gaze=True, arm_only_fallback=True):
     """後処理判定: 台車を動かさずに、腕で掌から
     ``POST_PROCESS_TARGET_HOVER_OFFSET`` の位置 (わずかにめり込む) へ
     ``target_rot`` で押し付けるのと、カメラの光軸を掌へ向ける
     (``gaze=False`` なら省く) のを同時に解く.
 
+    同時に解けなければ (首の可動域で視線が届かないことが多い)、
+    ``arm_only_fallback`` なら腕だけで押し込みを解いてから首だけで掌へ
+    向け直し、視線のずれが ``POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE`` 未満
+    なら採用する (結果の ``arm_only`` が True)。
+
     ``robot`` の現在の姿勢を初期値に書き換える (失敗時は元に戻る)。両方
     収束したら結果 dict、そうでなければ None を返す。
     """
     start_time = time.time()
+    initial_angle_vector = robot.angle_vector().copy()
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
     target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
@@ -2122,6 +2132,13 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     head_move_target = camera_optical_coords(robot)
     head_target = _gaze_target(head_move_target, position)
 
+    def solve_arm_only():
+        return robot.inverse_kinematics(
+            target_coords, move_target=move_target,
+            link_list=whole_body.link_list,
+            stop=stop, thre=thre, rthre=rthre, revert_if_fail=True)
+
+    arm_only = False
     try:
         if gaze:
             # タスクごとのマスクは normalize_mask 済みのリストで渡す (そう
@@ -2135,20 +2152,25 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
                 stop=max(stop, gaze_ik_stop),
                 thre=[thre, thre], rthre=[rthre, gaze_ik_rthre],
                 revert_if_fail=True)
+            if result is False and arm_only_fallback:
+                result = solve_arm_only()
+                arm_only = result is not False
         else:
-            result = robot.inverse_kinematics(
-                target_coords, move_target=move_target,
-                link_list=whole_body.link_list,
-                stop=stop, thre=thre, rthre=rthre, revert_if_fail=True)
+            result = solve_arm_only()
     except Exception as e:
         print('  [post-process] 押し付け/視線 IK で例外が発生したため '
               '棄却します: {}'.format(e))
+        robot.angle_vector(initial_angle_vector)
         return None
     if result is False:
         return None
     if gaze:
         _reaim_gaze(robot, head_move_target, position,
                     gaze_ik_stop, gaze_ik_rthre)
+        if arm_only and (_gaze_error(head_move_target, position)
+                         >= POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE):
+            robot.angle_vector(initial_angle_vector)
+            return None
 
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
     return dict(
@@ -2160,6 +2182,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         base_yaw=float(yaw),
         joint_names=[j.name for j in robot.joint_list],
         joint_angle_vector=[float(v) for v in robot.angle_vector()],
+        arm_only=arm_only,
         compute_time=time.time() - start_time,
     )
 
@@ -2190,7 +2213,9 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post):
             or rotation_change > REFINE_MAX_ROTATION_CHANGE):
         info.update(reason='too_large', compute_time=time.time() - start_time)
         return info
-    post = solve_post_process(robot, robot_arm, palm, target_rot)
+    # 腕だけの解き直しは下で首を計画時の角度にして行う。
+    post = solve_post_process(robot, robot_arm, palm, target_rot,
+                              arm_only_fallback=False)
     reason = 'ok'
     if post is None:
         # 首が可動域の端で視線 IK が収束しないことが多いので、首は計画時の
