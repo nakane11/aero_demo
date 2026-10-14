@@ -50,6 +50,15 @@ class PeoplePoseEstimator(object):
         ('LHip', 'LKnee'), ('LKnee', 'LAnkle'),
     ]
 
+    # 手・前腕に隠れて深度が手前に飛びやすい体幹の関節と、
+    # 深度を補う相手 (反対側の同じ関節, 同じ側のもう一方の体幹関節)。
+    _TORSO_JOINT_PARTNERS = {
+        'RHip': ('LHip', 'RShoulder'),
+        'LHip': ('RHip', 'LShoulder'),
+        'RShoulder': ('LShoulder', 'RHip'),
+        'LShoulder': ('RShoulder', 'LHip'),
+    }
+
     mp_indices = {
         "Nose": 0,
         "RShoulder": 12,
@@ -84,6 +93,8 @@ class PeoplePoseEstimator(object):
                  max_hand_reach=0.22,
                  max_hand_wrist_offset=0.08,
                  depth_patch_size=3,
+                 occlusion_radius=0.06,
+                 occlusion_depth_tolerance=0.10,
                  history_duration=1.0,
                  history_distance=1.0):
         """
@@ -101,6 +112,12 @@ class PeoplePoseEstimator(object):
             Pose の手首と Hand の手首 (Hand0) がこれ以上ずれたら手全体を捨てる [m]。
         depth_patch_size : int
             深度を取る近傍の一辺 [px] (有効画素の中央値)。
+        occlusion_radius, occlusion_depth_tolerance : float
+            体幹の関節 (肩・腰) が画像上で手・前腕からこの距離 [m] (その深度
+            での画素数に換算) 以内にあり、深度も手・前腕と
+            ``occlusion_depth_tolerance`` [m] 以内なら、手の深度を拾ったと
+            みなして他の体幹の関節から深度を補う。``occlusion_radius`` が
+            0 以下なら補正しない。
         history_duration, history_distance : float
             直近の検出位置付近 [m] を一定時間 [s] 人物として信頼する。
         """
@@ -117,6 +134,8 @@ class PeoplePoseEstimator(object):
         self.max_hand_reach = max_hand_reach
         self.max_hand_wrist_offset = max_hand_wrist_offset
         self.depth_patch_size = max(1, int(depth_patch_size))
+        self.occlusion_radius = occlusion_radius
+        self.occlusion_depth_tolerance = occlusion_depth_tolerance
         self.history_duration = history_duration
         self.history_distance = history_distance
         self.recent_human_positions = []
@@ -370,12 +389,15 @@ class PeoplePoseEstimator(object):
     def _to_joint_positions(self, person_joint_positions, depth_img, intrinsics):
         """検出できた関節だけを持つ ``{limb_name: (3,) ndarray}`` を作る."""
         positions = {}
+        pixels = {}
         for joint_pos in person_joint_positions:
             if joint_pos['score'] < 0:
                 continue
             if not (0 <= joint_pos['y'] < depth_img.shape[0]
                     and 0 <= joint_pos['x'] < depth_img.shape[1]):
                 continue
+            pixels[joint_pos['limb']] = np.array(
+                [joint_pos['x'], joint_pos['y']], dtype=np.float64)
             z = self._sample_depth(
                 depth_img, int(joint_pos['x']), int(joint_pos['y']))
             if z is None:
@@ -383,9 +405,90 @@ class PeoplePoseEstimator(object):
             x = (joint_pos['x'] - intrinsics.cx) * z / intrinsics.fx
             y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
             positions[joint_pos['limb']] = np.array([x, y, z], dtype=np.float64)
+        # 腰→膝の長さで膝を落とす前に、手の深度を拾った体幹の関節を直す。
+        positions = self._repair_occluded_torso_joints(
+            positions, pixels, intrinsics)
         positions = self._prune_implausible_limbs(positions)
         positions = self._prune_implausible_hand_landmarks(positions)
         positions = self._prune_implausible_hand_wrist_offset(positions)
+        return positions
+
+    def _occluder_segments(self, positions, pixels):
+        """手・前腕の 2D 線分と深度 ``(p0, p1, z)`` のリスト (カメラ座標系)."""
+        bones = [('RElbow', 'RWrist'), ('LElbow', 'LWrist')]
+        if self.use_hand:
+            for prefix in ('RHand', 'LHand'):
+                bones.extend(('{}{}'.format(prefix, a), '{}{}'.format(prefix, b))
+                             for a, b in self.hand_sequence)
+        segments = []
+        for name_a, name_b in bones:
+            if name_a not in positions or name_b not in positions:
+                continue
+            segments.append((pixels[name_a], pixels[name_b],
+                             min(positions[name_a][2], positions[name_b][2])))
+        return segments
+
+    @staticmethod
+    def _pixel_distance_to_segment(point, end_a, end_b):
+        along = end_b - end_a
+        length_sq = float(np.dot(along, along))
+        t = 0.0 if length_sq < 1e-9 else min(1.0, max(
+            0.0, float(np.dot(point - end_a, along)) / length_sq))
+        return float(np.linalg.norm(point - (end_a + t * along)))
+
+    def _is_occluded_by_hand(self, name, positions, pixels, segments,
+                             intrinsics):
+        """``name`` の深度が手・前腕の深度を拾っているか."""
+        z = positions[name][2]
+        for end_a, end_b, segment_z in segments:
+            if abs(z - segment_z) > self.occlusion_depth_tolerance:
+                continue
+            radius_px = intrinsics.fx * self.occlusion_radius / segment_z
+            if self._pixel_distance_to_segment(
+                    pixels[name], end_a, end_b) <= radius_px:
+                return True
+        return False
+
+    def _repair_occluded_torso_joints(self, positions, pixels, intrinsics):
+        """手・前腕に隠れて深度が手前に飛んだ肩・腰の深度を補う.
+
+        腰の前に手を差し出すと、腰の画素の深度が手の深度になり、腰が
+        手の位置 (数十 cm 手前) に出てしまう。その関節は画素の位置は
+        そのままに、深度を「同じ側のもう一方の体幹関節 + 反対側の
+        同じ組の深度差」(体の左右の線が平行とみなす)、それが無ければ
+        反対側の同じ関節の深度で置き換える。どちらも無ければ落とす。
+        """
+        if self.occlusion_radius <= 0.0:
+            return positions
+        segments = self._occluder_segments(positions, pixels)
+        if not segments:
+            return positions
+        occluded = [name for name in self._TORSO_JOINT_PARTNERS
+                    if name in positions and self._is_occluded_by_hand(
+                        name, positions, pixels, segments, intrinsics)]
+        if not occluded:
+            return positions
+        positions = dict(positions)
+        for name in occluded:
+            opposite, same_side = self._TORSO_JOINT_PARTNERS[name]
+            opposite_other = self._TORSO_JOINT_PARTNERS[opposite][1]
+            reliable = [n for n in (opposite, same_side, opposite_other)
+                        if n in positions and n not in occluded]
+            if len(reliable) == 3:
+                z = (positions[same_side][2] + positions[opposite][2]
+                     - positions[opposite_other][2])
+            elif opposite in reliable:
+                z = positions[opposite][2]
+            else:
+                logger.debug("Joint %s dropped: occluded by a hand", name)
+                del positions[name]
+                continue
+            logger.debug("Joint %s depth repaired: %.2fm -> %.2fm "
+                         "(occluded by a hand)", name, positions[name][2], z)
+            u, v = pixels[name]
+            positions[name] = np.array([
+                (u - intrinsics.cx) * z / intrinsics.fx,
+                (v - intrinsics.cy) * z / intrinsics.fy, z], dtype=np.float64)
         return positions
 
     def _prune_implausible_limbs(self, positions):
