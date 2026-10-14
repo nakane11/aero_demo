@@ -218,6 +218,14 @@ JOINT_BEND_COST_JOINTS = {
 }
 
 
+# 候補のコストに足す hover の腰の沈み込み (CROUCH_REFERENCE_WAIST_Z からの
+# 下がり量 [m]) の重み (0 で無効)。hover が低い姿勢だと、しゃがんでから掌に
+# 近づく不自然な動きになるため。
+CROUCH_WEIGHT = 0.0
+# 沈み込みの基準にする腰の高さ [m] (接近の始点の姿勢: 足首 30°・膝 -30°)。
+CROUCH_REFERENCE_WAIST_Z = 0.853
+
+
 def _joint_bend_cost_indices(robot, robot_arm):
     """曲げ量コストの各関節の ``robot.angle_vector()`` 中のインデックスと
     重みのリストを返す。"""
@@ -2553,9 +2561,24 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         standing_xy = human_standing_xy(placement_joint_positions)
         facing = human_facing_direction(placement_joint_positions)
 
+    leg_indices = [i for i, joint in enumerate(robot.joint_list)
+                   if joint.name in ('ankle_joint', 'knee_joint')]
+    waist_z_cache = {}
+
+    def waist_drop(angle_vector):
+        # 腰の高さは脚の角度だけで決まる (台車は床面)。同じ脚の角度は 1 回だけ。
+        key = tuple(round(float(angle_vector[i]), 4) for i in leg_indices)
+        if key not in waist_z_cache:
+            robot.angle_vector(angle_vector)
+            waist_z_cache[key] = float(robot.waist_link.worldpos()[2]) \
+                - float(robot.base_link.worldpos()[2])
+        return max(0.0, CROUCH_REFERENCE_WAIST_Z - waist_z_cache[key])
+
     def candidate_cost(candidate_index):
         cost = _joint_bend_cost_from_vector(
             angle_vectors[candidate_index], bend_cost_indices)
+        if CROUCH_WEIGHT > 0.0:
+            cost += CROUCH_WEIGHT * waist_drop(angle_vectors[candidate_index])
         if standing_xy is not None and facing is not None:
             # 台車の置き方は押し込み後 (台車も近づいた後) の位置で見る。
             hover_base = base_poses[candidate_index]
@@ -3097,7 +3120,7 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 def main():
     global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
-        PRESS_IN_BASE_RATIO
+        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3218,6 +3241,10 @@ def main():
         help='hover 目標を押し込みの最終目標から掌の法線方向に浮かせる距離 '
             '[m] (既定 {})。'.format(PRESS_IN_LIFT))
     parser.add_argument(
+        '--crouch-weight', type=float, default=CROUCH_WEIGHT,
+        help='hover の腰の沈み込み [m] を候補のコストに足す重み '
+            '(0 で無効、既定 {})。'.format(CROUCH_WEIGHT))
+    parser.add_argument(
         '--press-in-base-ratio', type=float, default=PRESS_IN_BASE_RATIO,
         help='押し込み中に台車も動かす割合 (指先方向の押し出しの水平成分に '
             '対する割合、0 で台車固定、既定 {})。'.format(PRESS_IN_BASE_RATIO))
@@ -3236,6 +3263,7 @@ def main():
     PRESS_IN_LIFT = args.press_in_lift
     PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
     PRESS_IN_BASE_RATIO = args.press_in_base_ratio
+    CROUCH_WEIGHT = args.crouch_weight
 
     files = iter_palm_files(args.input_dir)
     if not files:
