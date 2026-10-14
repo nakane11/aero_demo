@@ -27,7 +27,7 @@
 ひねりの変化を記録し、腕が届かなくなる手前で止める。ビューアはこれを使って
 人の腕をロボットの手に追従させる。
 
-干渉の検証は人体との距離 (6 cm) と自己干渉。人の差し出した腕は waypoint
+干渉の検証は人体との距離 (5 cm、``TRANSITION_HUMAN_CLEARANCE``) と自己干渉。人の差し出した腕は waypoint
 ごとに動かした骨格で見る。ロボットの差し出す腕の肘から先と、人の差し出した
 手・前腕は手を合わせているので距離を見ない。
 """
@@ -728,6 +728,16 @@ def _below_elbow(link, robot_arm):
     return False
 
 
+# 横並び移動の検証で人体 (車輪と脚を含む) から空ける距離 [m]。hover の IK
+# (6 cm、DEFAULT_HOVER_HUMAN_CLEARANCE) より 1 cm 緩め、接近の検証
+# (plan_handshake_motion.DEFAULT_HUMAN_CLEARANCE) と同じ値。実機 2026-10-13 の
+# 13 人を解き直すと、押し込み直後に胴体の円柱へ 6 cm を割る人が多く、移動先まで
+# 100% は 6 cm で 5/13、5 cm で 7/13 (3〜4 cm でも 7/13、1 cm で 9/13)。合成
+# データは 6 cm で全員通り、差が出ない。移動先のバッチ IK のマージン
+# (DEFAULT_COLLISION_MARGIN) も緩めても成功数は増えないので 6 cm のまま。
+TRANSITION_HUMAN_CLEARANCE = 0.05
+
+
 class TransitionChecker(object):
     """横並び移動の各姿勢の干渉検証 (自己干渉の貫通・人体からの距離)。
     ロボットの差し出す腕の肘から先と、人の差し出した手・前腕
@@ -735,7 +745,7 @@ class TransitionChecker(object):
     見ない。"""
 
     def __init__(self, robot_arm, hand, verification_pairs,
-                 clearance=spik.DEFAULT_HOVER_HUMAN_CLEARANCE,
+                 clearance=TRANSITION_HUMAN_CLEARANCE,
                  tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
         self.clearance = clearance
         self.tolerance = tolerance

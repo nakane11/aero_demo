@@ -111,8 +111,13 @@ DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
     spik.DEFAULT_COLLISION_VERIFY_TOLERANCE)  # [m]
 
-# 押し込み前 (lead-in・接近軌道・hover) にロボットと人体の間に空ける距離 [m]。
-DEFAULT_HUMAN_CLEARANCE = spik.DEFAULT_HOVER_HUMAN_CLEARANCE  # [m]
+# 押し込み前 (lead-in・接近軌道) の検証でロボットと人体の間に空ける距離 [m]。
+# hover の IK (DEFAULT_HOVER_HUMAN_CLEARANCE、6 cm) と軌道最適化の効き始め
+# (6 cm) より 1 cm 緩め、横並び移動 (TRANSITION_HUMAN_CLEARANCE) と揃える。
+# hover が 6 cm ちょうどに来るため、6 cm だと経路が差し出した掌・前腕へ数 mm
+# 入るだけで落ちていた。実機 2026-10-13 の 13 試行を解き直すと 6 cm で 8/13、
+# 5 cm で 11/13。合成 400 人 (seed 0) はどちらも 49/49。
+DEFAULT_HUMAN_CLEARANCE = 0.05  # [m]
 
 # 接近区間のこの割合以降で首を押し込み姿勢の角度へ補間する。
 HEAD_GAZE_BLEND_START = 0.5

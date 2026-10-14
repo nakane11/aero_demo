@@ -33,7 +33,8 @@
 
 | 項目 | 値 | どこで使うか |
 |---|---|---|
-| 人体から離す距離 | **6 cm** (`spik.DEFAULT_COLLISION_MARGIN` = `DEFAULT_HOVER_HUMAN_CLEARANCE` = `phm.DEFAULT_HUMAN_CLEARANCE` = `phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE`) | IK のペナルティの効き始め、hover 姿勢の事後検証、軌道最適化の効き始め、軌道 (lead-in・全 waypoint・hover) の事後検証 |
+| 人体から離す距離 | **6 cm** (`spik.DEFAULT_COLLISION_MARGIN` = `DEFAULT_HOVER_HUMAN_CLEARANCE` = `phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE`) | IK のペナルティの効き始め、hover 姿勢の事後検証、軌道最適化の効き始め |
+| 人体から離す距離 (経路の検証) | **5 cm** (`phm.DEFAULT_HUMAN_CLEARANCE`、`sbs.TRANSITION_HUMAN_CLEARANCE`) | 接近軌道 (lead-in・全 waypoint) と横並び移動の事後検証 (下の「接近の検証を 5 cm に」) |
 | 自己干渉の許容貫通 | **0 mm** (`DEFAULT_COLLISION_VERIFY_TOLERANCE` = `phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE`) | IK・軌道の事後検証 |
 | ロボットの形状 | 指なしモデル + 手の箱 2 個 (下の「干渉ジオメトリ」) | IK・軌道最適化・自己干渉の事後検証 |
 | 人体との距離を測るモデル | 指ありモデル (`--collision-verify-model mixed`) | IK・軌道の事後検証 |
@@ -44,9 +45,9 @@
 ほぼ 0 以下 (符号付きなので内部なら負) になり、6 cm 未満として捕まるため。
 
 差し出された手も含めて全身を対象にする。hover 姿勢は掌から 10 cm 浮かせた目標で、
-全身から 6 cm 離れた候補だけを採用するので、軌道の最後の waypoint まで一律に 6 cm を
-要求できる。掌へ触れる押し込み姿勢 (第2段) と hover → 押し込みの区間は、人体との判定の
-対象外 (6 節)。
+全身から 6 cm 離れた候補だけを採用する。軌道の検証はそれより 1 cm 緩い 5 cm で、hover は
+6 cm、経路の途中は 5 cm まで許す。掌へ触れる押し込み姿勢 (第2段) と hover → 押し込みの
+区間は、人体との判定の対象外 (6 節)。
 
 ### 関節可動域 (全段階共通)
 
@@ -445,10 +446,31 @@ jaxls の軌道最適化 (`build_problem`):
 - lead-in (1 m 以内) と全 waypoint (hover を含む) で、IK の事後検証と同じ 2 つを見る:
   - 自己干渉の組の貫通 (許容 0 mm、`verify_waypoints`)。差し出さない手の指先と台車の箱の
     距離 (`other_hand_base_clearance`) も含める。
-  - 人体 (全身) から **6 cm** 以上離れているか (指ありモデル、`verify_human_clearance`)。
+  - 人体 (全身) から **5 cm** 以上離れているか (指ありモデル、`verify_human_clearance`、
+    `phm.DEFAULT_HUMAN_CLEARANCE`)。hover の IK の 6 cm より 1 cm 緩い (下の「接近の検証を
+    5 cm に」)。
 - **`verified` の条件: 上の 2 つを全 waypoint で満たす** (`motion_passes`)。結果の
   `waypoint_min_distances` は自己干渉の最小距離、`waypoint_human_clearance_margins`/
-  `lead_in_human_clearance_margins` は人体との距離から 6 cm を引いた余裕。
+  `lead_in_human_clearance_margins` は人体との距離から 5 cm を引いた余裕 (5 cm より遠い組は
+  計算を省くので、余裕 0 は「5 cm 以上」の意味)。
+
+### 接近の検証を 5 cm に (2026-10-14)
+
+hover の IK は人体から 6 cm で解くので、hover は 6 cm ちょうど付近に来る。接近の検証も
+6 cm だと、経路が差し出した掌・前腕へ数 mm 入るだけで落ちていた (実機 2026-10-13 の試行
+1・2・9 は 1〜8 mm 不足)。経路の検証だけ 5 cm に緩めた (hover の IK・軌道最適化の効き始め・
+差し出さない腕を差し替えた後の hover の再検証以外は 6 cm のまま。差し替え後の再検証
+(`handshake_with_other_arm_posture`) は `phm.DEFAULT_HUMAN_CLEARANCE` を使うので 5 cm)。
+
+| 接近の検証 | 実機 10/13 の 13 試行を解き直し | 合成 400 人 (seed 0、押し込み・軌道まで) | 合成で経路が 6 cm 未満に寄った人 |
+|---|---|---|---|
+| 6 cm | 8/13 | 49/49 (最適化 2 人) | 0 |
+| **5 cm** | **11/13** (試行 1・9・14 が通る) | 49/49 (最適化 0 人)、横並び 48/49 | 6 (膝・胴体・差し出した前腕に 5.0〜5.9 cm) |
+| 差し出した手・前腕だけ 5 cm | 11/13 | 49/49、横並び 48/49 | 2 (差し出した前腕に 5.9 cm) |
+
+- 5 cm でも残る 2 試行は距離と関係ない (試行 11 は自己干渉 -6 mm、試行 12 は接近の途中で
+  差し出した手まで 1.1 cm)。
+- 「手・前腕だけ 5 cm」でも救える数は同じだが、横並び移動と値を揃えるため全身 5 cm にした。
 - 軌道が通らず、その原因に指先と台車の干渉が含まれるときは、差し出さない腕を
   `OTHER_ARM_POSTURES_DEG` の 1 段曲げた姿勢に差し替えて (hover・押し込み姿勢の事後検証を
   やり直した上で) 計画し直す。通れば IK 結果もその姿勢に書き換える (`other_arm_posture_replanned`)。
@@ -621,8 +643,9 @@ slerp、肘の曲げとひねりを線形に補間するので (`lowering_pose`)
 
 ### 検証 (`TransitionChecker`)
 
-移動先と全 waypoint で、自己干渉の貫通 (許容 0 mm) と人体から **6 cm** 以上 (4 節の
-事後検証と同じモデル)。人の差し出した腕は waypoint ごとに動かした骨格で見る。
+移動先と全 waypoint で、自己干渉の貫通 (許容 0 mm) と人体から **5 cm** 以上
+(`TRANSITION_HUMAN_CLEARANCE`、台車の経路の車輪と脚も同じ。4 節の事後検証と同じ
+モデル)。hover の IK の 6 cm より 1 cm 緩め、接近の検証と同じ値 (下の「人体との距離を 5 cm に」)。人の差し出した腕は waypoint ごとに動かした骨格で見る。
 ロボットの差し出す腕の肘から先と、人の差し出した手・前腕の組は手を合わせているので
 見ない。人体の円柱 (skrobot の `Cylinder`) は、メッシュ (collision_mesh・visual_mesh・
 連結メッシュ) を**初めて読まれたときに作る** (遅延生成、scikit-robot の `Link` の
@@ -740,6 +763,28 @@ slerp、肘の曲げとひねりを線形に補間するので (`lowering_pose`)
 - 計画時間の最大は経路が途中で止まって次の候補を試す人 (6〜7 本)。接近の軌道計画の
   最大 (seed0 human_030 の直線 12 秒、seed2 human_025 の最適化 9 秒) は変更前から
   同じ人で、横並び移動とは別。
+
+### 人体との距離を 5 cm に (2026-10-14)
+
+実機 (2026-10-13) では横並び移動の成功率が低かった。保存した骨格・押し込み姿勢
+(押し込みまで解けた 13 人、体幹のずらし 7 cm) から `plan_transition` だけを解き直し、
+検証の人体との距離を変えて比べた (6 cm の結果は実機ログの試行 10・13・15・18 と一致)。
+
+| 人体との距離 | 6 cm | **5 cm** | 4 cm | 3 cm | 2 cm | 1 cm | 0 cm |
+|---|---|---|---|---|---|---|---|
+| 移動先まで 100% | 5/13 | **7/13** | 7/13 | 7/13 | 8/13 | 9/13 | 9/13 |
+| 成功した経路の人体との最短距離 | 8.7 cm | 5.6 cm | 5.6 cm | 7.8 cm | 1.9 cm | 2.9 cm | 1.8 cm |
+
+- 6 cm で落ちるのは、ほとんどが押し込み直後 (経路の最初の waypoint) に胴体の円柱
+  (肩〜腰) へ 0.4〜4.5 cm まで近づくもの。
+- 0 cm でも残る 4 人は距離と関係ない (自己干渉: 左前腕 x 太もも・親指の箱 x 胴体、
+  腕が掌に届かない、関節角の飛び)。
+- 移動先のバッチ IK の人体マージンも同じ値に緩めても成功数は同じか減り、時間が延びる
+  ので 6 cm のまま。
+- 合成データ (seed 0〜4 各 50 人、押し込みまで解けた 21 人) は 6 cm で 21/21 で、0 cm まで
+  緩めても変わらない (実機の失敗を再現しない)。
+- 1〜2 cm まで緩めればさらに 1〜2 人増えるが、人に 2 cm 前後まで近づく経路が選ばれる
+  ので 5 cm にした。
 
 ### 円柱のメッシュの遅延生成 (2026-10-04)
 
