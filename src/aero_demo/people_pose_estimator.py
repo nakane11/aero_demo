@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
+from aero_demo.palm_plane import PLANE_LANDMARKS as PALM_LANDMARKS
 from aero_demo.people_pose_types import CameraIntrinsics
 from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2LIMBNAME
 
@@ -257,10 +258,12 @@ class PeoplePoseEstimator(object):
         joint_positions = []
         if hand_landmarks:
             for idx, lm in enumerate(hand_landmarks.landmark):
+                # z は手首を原点とする MediaPipe の推定深度 (x と同じ縮尺)。
                 joint_positions.append(dict(
                     limb="{}{}".format(prefix, idx),
                     x=lm.x * w,
                     y=lm.y * h,
+                    z=lm.z * w,
                     score=1.0
                 ))
         else:
@@ -390,6 +393,7 @@ class PeoplePoseEstimator(object):
         """検出できた関節だけを持つ ``{limb_name: (3,) ndarray}`` を作る."""
         positions = {}
         pixels = {}
+        model_depths = {}
         for joint_pos in person_joint_positions:
             if joint_pos['score'] < 0:
                 continue
@@ -398,6 +402,8 @@ class PeoplePoseEstimator(object):
                 continue
             pixels[joint_pos['limb']] = np.array(
                 [joint_pos['x'], joint_pos['y']], dtype=np.float64)
+            if 'z' in joint_pos:
+                model_depths[joint_pos['limb']] = joint_pos['z']
             z = self._sample_depth(
                 depth_img, int(joint_pos['x']), int(joint_pos['y']))
             if z is None:
@@ -411,7 +417,42 @@ class PeoplePoseEstimator(object):
         positions = self._prune_implausible_limbs(positions)
         positions = self._prune_implausible_hand_landmarks(positions)
         positions = self._prune_implausible_hand_wrist_offset(positions)
+        positions.update(self._model_palm_points(
+            positions, pixels, model_depths, intrinsics))
         return positions
+
+    def _model_palm_points(self, positions, pixels, model_depths, intrinsics):
+        """MediaPipe の推定深度で作った掌の点 ``{side}PalmModel{i}`` を返す.
+
+        手を縦にして指を斜め下に出すと、カメラの深度では掌の点 (手首と
+        指の付け根) がほぼ一直線になり掌の平面が作れない。MediaPipe が
+        ランドマークごとに推定する手首からの相対深度 (画素単位) を、
+        カメラで測れた掌の点の深度に合わせて [m] に直して使う
+        (掌の向きの代わりに使うだけで、深度の点は置き換えない)。
+        """
+        if not self.use_hand:
+            return {}
+        model_points = {}
+        for side in ('R', 'L'):
+            names = ['{}Hand{}'.format(side, i) for i in PALM_LANDMARKS]
+            if not all(name in pixels and name in model_depths
+                       for name in names):
+                continue
+            # 実測の深度 = 基準の深度 * (1 + 相対深度 / fx) から基準を推定する。
+            anchors = [positions[name][2]
+                       / (1.0 + model_depths[name] / intrinsics.fx)
+                       for name in names if name in positions]
+            if not anchors:
+                continue
+            anchor = float(np.median(anchors))
+            for i, name in zip(PALM_LANDMARKS, names):
+                z = anchor * (1.0 + model_depths[name] / intrinsics.fx)
+                u, v = pixels[name]
+                model_points['{}PalmModel{}'.format(side, i)] = np.array([
+                    (u - intrinsics.cx) * z / intrinsics.fx,
+                    (v - intrinsics.cy) * z / intrinsics.fy, z],
+                    dtype=np.float64)
+        return model_points
 
     def _occluder_segments(self, positions, pixels):
         """手・前腕の 2D 線分と深度 ``(p0, p1, z)`` のリスト (カメラ座標系)."""
@@ -586,6 +627,9 @@ class PeoplePoseEstimator(object):
                 break
 
         if not is_valid_by_history:
+            # 推定深度の掌の点は実測の関節ではないので数えない。
+            positions = {name: p for name, p in positions.items()
+                         if 'PalmModel' not in name}
             if len(positions) < self.min_joints:
                 return False
             z_values = [p[2] for p in positions.values()]

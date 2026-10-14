@@ -545,12 +545,16 @@ class PalmPoseEstimator(object):
         return self._estimate_one(joints, side)
 
     def _estimate_one(self, joints, side):
-        points = {}
-        for i in palm_plane.PLANE_LANDMARKS:
-            key = '{}Hand{}'.format(side, i)
-            if key in joints:
-                points[i] = joints[key]
-        plane = palm_plane.fit_palm_plane(points, hand=side)
+        plane = self._fit_plane(joints, '{}Hand{{}}'.format(side), side)
+        # 実カメラでは PeoplePoseEstimator が MediaPipe の推定深度で作った
+        # 掌の点も渡す。カメラの深度で平面が作れない (掌の点がほぼ一直線)
+        # か、向きが裏返っている (90 度超の食い違い) ときはそちらを使う。
+        model_plane = self._fit_plane(
+            joints, '{}PalmModel{{}}'.format(side), side)
+        if model_plane is not None and (
+                plane is None
+                or float(np.dot(plane.normal, model_plane.normal)) < 0.0):
+            plane = model_plane
         if plane is None:
             return None
 
@@ -565,7 +569,17 @@ class PalmPoseEstimator(object):
             x_axis=[float(v) for v in x_axis],
             y_axis=[float(v) for v in y_axis],
             z_axis=[float(v) for v in z_axis],
-            rot=[[float(v) for v in row] for row in rot])
+            rot=[[float(v) for v in row] for row in rot],
+            from_model_depth=plane is model_plane)
+
+    @staticmethod
+    def _fit_plane(joints, key_format, side):
+        points = {}
+        for i in palm_plane.PLANE_LANDMARKS:
+            key = key_format.format(i)
+            if key in joints:
+                points[i] = joints[key]
+        return palm_plane.fit_palm_plane(points, hand=side)
 
 
 def save_json(palms, path):
