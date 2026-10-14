@@ -15,7 +15,8 @@ aero_demo/
     scripts/       本番。run_pipeline_test.py/run_camera_pipeline_test.py
                     とその依存 (generate_random_human_poses.py/
                     estimate_palm_poses.py/solve_palm_ik.py/
-                    plan_handshake_motion.py/view_handshake_poses.py/
+                    plan_handshake_motion.py/side_by_side_transition.py/
+                    view_handshake_poses.py/
                     view_handshake_motion.py/handshake_viewer_common.py/
                     collision_pairs.json、ROS ノードは scripts/ros/ 以下)
     tools/         開発・デバッグ用 (このページの対象)
@@ -49,15 +50,19 @@ _SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')  # tools/ros/ 以下は 
 ### `tools/grid_search_collision_ik.py`
 
 `solve_palm_ik.py` の速度・成功率トレードオフ (初期値の数・干渉回避ペア
-設定・最大反復回数・台車の可動域半幅・向き候補数・後処理 IK の閾値等) を
-グリッドサーチし、段階A (事後干渉検証まで)・段階B (押し込み・視線の IK
-まで) の成功率・所要時間でランキング表示する (ファイル出力はしない)。
+設定・最大反復回数・干渉の重み/マージン・台車の可動域半幅・向き候補数・
+後処理 IK の閾値等) を、各軸の全組み合わせで `solve_palm_ik.py` を
+サブプロセス実行してグリッドサーチし、成功人数・1 人あたりの時間
+(warmup 除く)・事後検証の棄却内訳を集計する。初回は jax の再コンパイルに
+なるので各組を `--repeat` 回 (既定 2) 実行し最後の回を使う。
+`--dataset` (必須、複数可) には `skeletons/`・`palms/` を持つディレクトリを
+渡す。`--output` を指定すると結果を JSON Lines で追記する。
 
 ```bash
 python3 tools/grid_search_collision_ik.py \
-    --attempts-per-pose 16 64 \
-    --collision-ik-stop 100 500 \
-    --collision-pairs none-gd collision_pairs.json
+    --dataset /tmp/data/tune \
+    --collision-pairs scripts/collision_pairs.json pairs16.json \
+    --attempts-per-pose 512 256 --output results.json
 ```
 
 ### `tools/grid_search_handshake_motion.py`
@@ -83,6 +88,35 @@ IK 結果から実際に干渉した頻度でランキングし直して作り�
 
 ```bash
 python3 tools/build_collision_pairs.py --num-pairs 8
+```
+
+### `tools/handshake_reachability_map.py`
+
+人が手をどこに・どの向きで差し出せば差し出しと判定され IK が解けるかを
+格子状に調べる (reachability map)。体格を固定した骨格で掌の位置 (前方・
+外側・高さ) と向きを振り、格子点ごとに差し出し判定 (`OfferedHandSelector`)
+と IK (事後検証・後処理まで、軌道計画なし) を評価する。結果は JSON Lines で
+`--output` に追記し、再実行すると続きから解く。
+
+```bash
+# 位置の格子 (既定の向き = 握手の向き: 指先は前、親指が上)
+python3 tools/handshake_reachability_map.py --mode position \
+    --hands R L --output /tmp/reach_position.jsonl
+# 向きの格子 (位置は --orientation-position に固定)
+python3 tools/handshake_reachability_map.py --mode orientation \
+    --hands R L --output /tmp/reach_orientation.jsonl
+```
+
+### `tools/build_hand_offer_reachability.py`
+
+`handshake_reachability_map.py` の結果 (JSON Lines) から、IK 失敗時の手の
+出し方の助言 (`aero_demo.hand_offer_advice`、`run_camera_pipeline_test.py`
+の `--hand-offer-table`) が使う `config/hand_offer_reachability.json` を作る。
+
+```bash
+python3 tools/build_hand_offer_reachability.py \
+    /tmp/handshake_reachability/position*.jsonl \
+    /tmp/handshake_reachability/orientation.jsonl
 ```
 
 ## 中間結果の可視化
@@ -146,6 +180,21 @@ python3 tools/view_aero_collision_model.py
 
 ```bash
 python3 tools/ros/print_palm_positions.py
+```
+
+### `tools/ros/compare_hand_detectors.py`
+
+同じフレームに MediaPipe Holistic (計画時の掌推定) と Hands (押し込み直前の
+再認識) をかけ、掌の位置・向きの差 (検出器の差) を測る。首を計画時と同じ
+下向きにした後は台車・首とも動かさないので、人は肩〜手が映る距離
+(0.8〜1.5m) で手を差し出して静止する。結果は `--out-dir` (既定
+`data/palm_detector_compare/<日時>/`) に frames.jsonl / summary.json /
+overlay_*.png (Holistic=赤、Hands=緑) として保存する。共通処理は
+`tools/ros/palm_check_common.py` にある。
+
+```bash
+python3 tools/ros/compare_hand_detectors.py --side R
+python3 tools/ros/compare_hand_detectors.py --side L --frames 100
 ```
 
 ## 実カメラデータの収集・ラベル付け

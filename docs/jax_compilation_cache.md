@@ -94,8 +94,9 @@ jaxls が計算グラフに焼き込む FK 由来の定数が実行ごとに微�
   取得して diff する。`JAX_COMPILATION_CACHE_DIR` を実行ごとに空
   ディレクトリにすれば必ずコンパイルさせられる。
 - HLO の diff よりも先に、jaxls へ渡す**入力側**(FK パラメータ)を diff
-  する方が早い。`scratch/warmup_fk_dump.py`/`scratch/compare_fk_dump.py`
-  で量子化後 FK 定数の最大絶対差・符号付き ULP 差を出せる。
+  する方が早い。調査時は使い捨てのスクリプト (`scratch/warmup_fk_dump.py`/
+  `scratch/compare_fk_dump.py`、リポジトリには含めていない) で量子化後 FK
+  定数の最大絶対差・符号付き ULP 差を出した。
 - GPU 版 jax は起動時にデバイスメモリ確保に失敗するたびに
   `RESOURCE_EXHAUSTED: CUDA_ERROR_OUT_OF_MEMORY` の警告を出しながら要求
   サイズを縮小することがある(正常動作、キャッシュとは無関係)。気になる
@@ -155,12 +156,13 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 バッチIK自体が呼ばれずウォームアップが無駄になるため、`main()` は事前に
 対象の有無を確認し、**0人ならウォームアップ自体をスキップする**。
 
-`plan_handshake_motion.py`(jaxls の軌道最適化)へは移植しなかった。この
-スクリプトは1回の起動につき1回だけ実行される使い捨てプロセスで、
-pre-touch/線形補間の幾何的な軌道が事後検証を通ればそこで早期returnし
-jaxls 自体を呼ばないことが多いため、一律ウォームアップすると無条件に
-数秒〜十数秒(lower 6〜8秒+compile 数秒)を追加するだけで、典型的な使い方
-(変更のたびに素早く回す回帰テスト)にとってはむしろ悪化になる。
+`plan_handshake_motion.py`(jaxls の軌道最適化)へは当初移植しなかった
+(pre-touch/線形補間の幾何的な軌道が事後検証を通れば jaxls 自体を呼ばない
+ことが多く、一律ウォームアップは使い捨てプロセスでは悪化になると判断した)。
+その後、軌道計画の高速化 (2026-09-17) で方針を変え、現在は `main()` が
+人物ループの前に `_warmup_solver` (左右の腕の軌道最適化) を実行し、
+`--side-by-side-transition` 指定時は `sbs.warmup_batch_ik` (横並び移動の
+バッチ IK) も実行する。いずれもスキップするオプションは無い。
 
 ### 効果測定(`run_pipeline_test.py --plan-motion`、`--seed 42`、20人生成・
 3人が対象)
@@ -171,8 +173,10 @@ jaxls 自体を呼ばないことが多いため、一律ウォームアップ�
 | IK 2段階目(事後検証+後処理判定) | 0.338 秒/人 | 0.485 秒/人(誤差範囲) |
 | 掌推定込み全体 | 3.015 秒/人 | 0.632 秒/人 |
 
-IK 2段階目のばらつきはウォームアップとは無関係(`solve_palm_ik.py` に
-`--seed` が渡らずバッチIKの初期値サンプリングが実行のたびに変わるため)。
+IK 2段階目のばらつきはウォームアップとは無関係(当時は `solve_palm_ik.py`
+に `--seed` が渡らずバッチIKの初期値サンプリングが実行のたびに変わったため。
+現在は `main()` で `np.random.seed(0)` し、人物ごとにファイル名の
+`zlib.crc32` で乱数シードを決めるので、結果は実行・処理順によらない)。
 
 ### 実ノード(`run_camera_pipeline_test.py --auto-arm`、rosbag 1人分)での
 最終確認
@@ -209,7 +213,7 @@ HLO フィンガープリントが変わり、`_warmup_batch_ik` が固定の
 | 条件 | 3人分のIK所要時間(warmup除く) | キャッシュファイル増分 |
 |---|---|---|
 | 既定 (動的制約あり) | 約26.5秒 (≒8.8秒/人) | +4 |
-| `--no-facing-base-constraint --no-hand-side-base-constraint` | 約3.7秒 (≒1.2秒/人) | +1 |
+| `--no-facing-base-constraint --no-hand-side-base-constraint` (当時の検証用オプション、現在は削除済み) | 約3.7秒 (≒1.2秒/人) | +1 |
 
 約7倍の差があり、再コンパイルが支配的であることを確認した。
 

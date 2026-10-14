@@ -136,7 +136,8 @@ source ~/venv/aero-uv/bin/activate
 ```
 
 GPU が無い環境では `pyproject.toml` の `dependencies` にある
-`"jax[cuda12]>=0.10"` を `"jax>=0.10"` に変更してから sync し直す。
+`"jax[cuda12]==0.10.2; ..."`/`"jax[cuda12]==0.11.1; ..."` の 2 行の
+`jax[cuda12]` を `jax` に変更してから sync し直す。
 
 `plan_handshake_motion.py` の軌道最適化バックエンド (`jaxls`) は PyPI に
 無いため既定では入らない。使う場合は `--extra motion` を付けて sync する:
@@ -288,6 +289,13 @@ python3 scripts/ros/run_camera_pipeline_test.py \
     --auto-arm --no-wait-for-client
 ```
 
+**注意 (未修正の既知の問題):** 現在の実装は `HandshakePipelineNode` の構築
+(TF 待ちを含む) が終わってから `rosbag play --clock` を起動するため、
+`/clock` が来ないまま起動処理で止まることがある。その場合は
+`rosbag play <bag> --clock` を先に別プロセスで起動しておき、ノードは
+`--bag` を付けずに起動する
+([`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 6 節)。
+
 - `--bag <path>`: 実カメラの代わりに指定した rosbag を再生する
   (内部で `rosbag play --clock` をサブプロセスとして起動し、
   `/use_sim_time` をあわせて有効にする)。`--bag-rate` で再生速度、
@@ -342,7 +350,7 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 
 押し込みの後は、既定で横並び移動 (つないだ手を人の体の横へ下ろしながら
 横並びへ移る) を続けて行う。計画が移動先の 3 割以上まで進めた人だけで、
-押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 2.0) 後に
+押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 4.0) 後に
 「一緒に横に並びますね」(`--speech-transition-text`) と発話して動き出す。
 人の手を引いて動くので、各区間は `--side-by-side-segment-time` 秒 (既定 0.2)
 以上かける。押し込み後の画像の保存 (`--grasp-capture-duration`) は動き出す
