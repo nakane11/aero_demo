@@ -209,9 +209,10 @@ def _joint_bend_cost_from_vector(angle_vector, bend_cost_indices):
         cost += weight * float(angle_vector[index]) ** 2
     return cost
 
-# 人体の干渉回避用の円柱: (関節名 A, 関節名 B, 半径 [m])。
+# 人体の干渉回避用の円柱: (関節名 A, 関節名 B, 半径 [m])。HeadCenter は
+# _fill_missing_joints_straight_down が補う頭の中心。
 HUMAN_COLLISION_SEGMENTS = (
-    ('Nose', 'Neck', 0.10),
+    ('HeadCenter', 'Neck', 0.10),
     ('Neck', 'RShoulder', 0.09),
     ('Neck', 'LShoulder', 0.09),
     ('RShoulder', 'RElbow', 0.06),
@@ -235,8 +236,12 @@ _TORSO_SEGMENT_WIDTH_JOINTS = {
 }
 # 体幹の前後の厚み / 左右の幅 (経験則)。
 TORSO_DEPTH_TO_WIDTH_RATIO = 0.55
-# 衣服等の安全マージン [m]。
+# 衣服等の安全マージン [m]。実カメラの骨格 (``SURFACE_SHIFTED_MARKER``
+# あり) は深度と比べると 0.03 では胴体が正面・横へ数 cm はみ出していたため
+# 0 にする。合成データは 0 にすると IK の終点が胴体に寄り接近経路の検証で
+# 落ちる人が増えたので 0.03 のまま。
 TORSO_RADIUS_MARGIN = 0.03
+SURFACE_TORSO_RADIUS_MARGIN = 0.0
 # 誤検出対策の半径のクリップ範囲 [m]。
 MIN_TORSO_RADIUS = 0.08
 MAX_TORSO_RADIUS = 0.20
@@ -254,7 +259,10 @@ def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
     width = float(np.linalg.norm(
         np.asarray(joint_positions[joint_a], dtype=np.float64)
         - np.asarray(joint_positions[joint_b], dtype=np.float64)))
-    radius = 0.5 * width * TORSO_DEPTH_TO_WIDTH_RATIO + TORSO_RADIUS_MARGIN
+    margin = (SURFACE_TORSO_RADIUS_MARGIN
+              if SURFACE_SHIFTED_MARKER in joint_positions
+              else TORSO_RADIUS_MARGIN)
+    radius = 0.5 * width * TORSO_DEPTH_TO_WIDTH_RATIO + margin
     return float(np.clip(radius, MIN_TORSO_RADIUS, MAX_TORSO_RADIUS))
 
 
@@ -262,17 +270,39 @@ def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
 # カメラから離れる水平方向へずらす (合成データの関節は体内にあるので不要)。
 TORSO_SURFACE_JOINTS = ('Neck', 'RShoulder', 'LShoulder', 'RHip', 'LHip')
 DEFAULT_TORSO_SURFACE_OFFSET = 0.07  # [m]
+# 頭・腕・脚の関節も表面の点なので、体幹をずらすときは部位の太さ程度
+# 奥へずらす [m] (Nose は鼻先なので頭の中心まで。頭の円柱に Nose を使うのは
+# 耳が欠けたときだけ)。
+LIMB_SURFACE_OFFSETS = {
+    'Nose': 0.08,
+    'REar': 0.05, 'LEar': 0.05,
+    'RElbow': 0.04, 'LElbow': 0.04,
+    'RWrist': 0.03, 'LWrist': 0.03,
+    'RKnee': 0.05, 'LKnee': 0.05,
+    'RAnkle': 0.05, 'LAnkle': 0.05,
+}
+# ``shift_torso_joints_from_surface`` でずらした (実カメラの) 骨格の目印。
+# 骨格は座標変換されながら引き回されるので、値は点 (首と同じ位置) にする。
+SURFACE_SHIFTED_MARKER = 'SurfaceShifted'
 
 
 def shift_torso_joints_from_surface(joint_positions, viewpoint_xy,
-                                    offset=DEFAULT_TORSO_SURFACE_OFFSET):
+                                    offset=DEFAULT_TORSO_SURFACE_OFFSET,
+                                    limb_offsets=None):
     """体幹の関節を ``viewpoint_xy`` (カメラの x/y、骨格と同じ座標系) から
-    離れる水平方向へ ``offset`` [m] ずらしたコピーを返す (干渉判定用)。"""
+    離れる水平方向へ ``offset`` [m]、頭・腕・脚の関節を ``limb_offsets``
+    (既定 ``LIMB_SURFACE_OFFSETS``) ずつずらし、目印
+    ``SURFACE_SHIFTED_MARKER`` を加えたコピーを返す (干渉判定用)。
+    ``offset`` が 0 以下 (合成データ) なら何もしない。"""
     if offset <= 0.0 or not joint_positions:
         return joint_positions
+    if limb_offsets is None:
+        limb_offsets = LIMB_SURFACE_OFFSETS
+    offsets = dict(limb_offsets)
+    offsets.update((name, offset) for name in TORSO_SURFACE_JOINTS)
     viewpoint_xy = np.asarray(viewpoint_xy, dtype=np.float64)[:2]
     shifted = dict(joint_positions)
-    for name in TORSO_SURFACE_JOINTS:
+    for name, joint_offset in offsets.items():
         if name not in shifted:
             continue
         pos = np.array(shifted[name], dtype=np.float64)
@@ -280,8 +310,9 @@ def shift_torso_joints_from_surface(joint_positions, viewpoint_xy,
         norm = float(np.linalg.norm(direction))
         if norm < 1e-6:
             continue
-        pos[:2] += direction / norm * offset
+        pos[:2] += direction / norm * joint_offset
         shifted[name] = pos.tolist()
+    shifted[SURFACE_SHIFTED_MARKER] = list(shifted.get('Neck', [0.0, 0.0, 0.0]))
     return shifted
 
 
@@ -303,13 +334,22 @@ _CHAIN_FALLBACK_OFFSETS = (
 
 
 def _fill_missing_joints_straight_down(joint_positions):
-    """欠けた関節を ``_CHAIN_FALLBACK_OFFSETS`` で親関節から補い、前腕の
-    手首端を掌の円柱の表面まで延ばしたコピーを返す。"""
+    """欠けた関節を ``_CHAIN_FALLBACK_OFFSETS`` で親関節から補い、頭の
+    中心 ``HeadCenter`` を加え、前腕の手首端を掌の円柱の表面まで延ばした
+    コピーを返す。"""
     filled = dict(joint_positions)
     for parent_name, child_name, z_offset in _CHAIN_FALLBACK_OFFSETS:
         if parent_name in filled and child_name not in filled:
             parent_pos = np.asarray(filled[parent_name], dtype=np.float64)
             filled[child_name] = parent_pos + np.array([0.0, 0.0, z_offset])
+    # 頭の中心は両耳の中点 (Nose は顔の表面にあり頭の円柱が前に出るため)。
+    # 耳が欠けたら Nose で代用する。
+    if 'REar' in filled and 'LEar' in filled:
+        filled['HeadCenter'] = 0.5 * (
+            np.asarray(filled['REar'], dtype=np.float64)
+            + np.asarray(filled['LEar'], dtype=np.float64))
+    elif 'Nose' in filled:
+        filled['HeadCenter'] = filled['Nose']
     # 骨格の手首と掌の landmark は別の推定器由来なので、前腕の端を掌の円柱に
     # 接する位置へ置き直す (点が足りなければ Hand0 で代用)。
     for side in ('R', 'L'):
