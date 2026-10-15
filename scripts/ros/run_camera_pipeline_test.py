@@ -307,6 +307,380 @@ def log_debug(text):
 
 
 
+def log_debug_event(record):
+    """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
+    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
+
+
+def motion_verified(motion):
+    """経路計画の区間と lead-in の両方が干渉検証に通っているか。"""
+    return bool(motion['verified']) and bool(motion['lead_in_verified'])
+
+
+def untranslate_result(result, offset):
+    """人物を平行移動した仮想座標系の ``result`` を実際の base_link 系へ
+    戻す (破壊的)。忘れると仮想の人物に向かって台車が動く。"""
+    dx, dy = offset
+    for key in ('target_position', 'hand_position', 'base_position',
+                'palm_position'):
+        if key in result and result[key] is not None:
+            result[key][0] -= dx
+            result[key][1] -= dy
+    region = result.get('base_movable_region')
+    if region:
+        region['x_range'] = [v - dx for v in region['x_range']]
+        region['y_range'] = [v - dy for v in region['y_range']]
+    post_process = result.get('post_process')
+    if post_process:
+        for key in ('target_position', 'hand_position', 'base_position'):
+            if key in post_process and post_process[key] is not None:
+                post_process[key][0] -= dx
+                post_process[key][1] -= dy
+        # 押し込み中の台車 [x, y, yaw] (戻し忘れると実機の台車が押し込み
+        # 中に平行移動量だけ動く)。
+        for base in post_process.get('press_in_base_path') or []:
+            base[0] -= dx
+            base[1] -= dy
+
+
+def untranslate_motion(motion, offset):
+    """``motion`` の各 waypoint の台車位置 (横並び移動は人の腕も) を実際の
+    base_link 系へ戻す (破壊的)。"""
+    dx, dy = offset
+    transition = motion.get('transition') or {}
+    for wp in (motion['waypoints'] + motion.get('lead_in_waypoints', [])
+               + transition.get('waypoints', [])):
+        wp['base_position'][0] -= dx
+        wp['base_position'][1] -= dy
+    arms = [wp.get('human_arm') for wp in transition.get('waypoints', [])]
+    for arm in [transition.get('press_arm')] + arms:
+        if not arm:
+            continue
+        for key in ('elbow', 'wrist', 'palm_position'):
+            if arm.get(key) is not None:
+                arm[key][0] -= dx
+                arm[key][1] -= dy
+
+
+class HandshakePlanner(object):
+    """差し出された掌に対する IK -> 軌道計画 -> 横並び移動の計画。
+
+    カメラ・画面・実機に依存しない部分で、実機ノード
+    (``HandshakePipelineNode``) と保存した試行の解き直し
+    (``tools/ros/resolve_saved_trials.py``) が共有する。``self.robot`` の
+    姿勢は IK で書き換わる。
+    """
+
+    _WARMUP_PALM = dict(
+        position=[0.5, 0.0, 1.0],
+        x_axis=[1.0, 0.0, 0.0],
+        y_axis=[0.0, 1.0, 0.0],
+    )
+
+    # ウォームアップ中だけ固定する numpy の乱数シード (後で元に戻す)。
+    _WARMUP_SEED = 0
+
+    def __init__(self, args):
+        self.args = args
+        # IK は指なしで解く。
+        self.robot = Aero(use_hand=False)
+        spik.restrict_elbow_range(self.robot)
+        spik.restrict_leg_range(self.robot)
+        spik.restrict_waist_range(self.robot)
+        spik.restrict_neck_range(self.robot)
+        spik.lock_fixed_joints(self.robot)
+        spik.apply_collision_model(self.robot)
+        spik.apply_hand_box(self.robot)
+        # 指の点群のキャッシュを先に作る (約 1 秒)。
+        spik.other_hand_points('r')
+        # 事後検証用の総当たりペア (--collision-pairs の有無によらず必要)。
+        self.verification_pairs = spik.build_verification_pairs_for_model(
+            self.robot, args.collision_verify_model)
+        self.motion_verification_pairs = self.verification_pairs
+        # JIT キャッシュを効かせるためノードの寿命で使い回す。
+        self.solver = create_solver(
+            'jaxls', max_iterations=args.max_iterations, verbose=False)
+        self.collision_pairs = None
+        if os.path.exists(args.collision_pairs):
+            self.collision_pairs = spik.load_collision_pairs(
+                args.collision_pairs, self.robot)
+            log_debug('[collision-pairs] {} 組を読み込みました。'.format(
+                len(self.collision_pairs)))
+        else:
+            print('[collision-pairs] {} が見つからないため、干渉回避なしで '
+                  '解きます。'.format(args.collision_pairs))
+        self.base_limits = [tuple(args.base_x_range),
+                            tuple(args.base_y_range),
+                            tuple(args.base_yaw_range)]
+
+    def warmup(self):
+        """左右の腕で IK と軌道最適化をダミー目標で 1 回ずつ解き、JAX の
+        トレース・コンパイルを起動時に済ませる。
+
+        ``plan`` の呼び出しと引数を完全に一致させること
+        (1 つでも違うと別関数としてトレースし直され、キャッシュミスする)。
+        """
+        random_state = np.random.get_state()
+        np.random.seed(self._WARMUP_SEED)
+        try:
+            self._warmup_body()
+        finally:
+            np.random.set_state(random_state)
+
+    def _pin_warmup_fixed_joints(self, robot_arm, handshake):
+        """軌道最適化に渡す ``handshake`` の、軌道で動かさない関節 (差し出さ
+        ない腕・頭など) の角度を IK の結果に依らない固定値にする。
+
+        これらの角度は軌道問題の FK 定数として jit_solve に焼き込まれるので、
+        IK の出力が少し変わるだけで軌道最適化のキャッシュが外れ、再コンパイル
+        (左右で約 60 秒) になっていた。差し出さない腕は最初の姿勢候補にする。
+        """
+        chain = {link.joint.name for link in getattr(
+            self.robot, '{}arm_whole_body'.format(robot_arm)).link_list}
+        other = 'l' if robot_arm == 'r' else 'r'
+        shoulder_p, elbow = spik.OTHER_ARM_POSTURES_DEG[0]
+        posture = {'{}_shoulder_p_joint'.format(other): np.radians(shoulder_p),
+                   '{}_elbow_joint'.format(other): np.radians(elbow)}
+        joints = {j.name: j for j in self.robot.joint_list}
+        names = handshake['joint_names']
+        angles = list(handshake['joint_angle_vector'])
+        for i, name in enumerate(names):
+            if name in chain:
+                continue
+            joint = joints[name]
+            angle = posture.get(name, 0.0)
+            angles[i] = float(np.clip(angle, joint.min_angle, joint.max_angle))
+        handshake['joint_angle_vector'] = angles
+
+    def _warmup_body(self):
+        """``warmup`` の本体 (乱数固定は呼び出し側が行う)。"""
+        args = self.args
+        print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
+              'います (数秒~数十秒かかります)...')
+        warmup_t0 = time.time()
+        collision_obstacles = (
+            [] if self.collision_pairs is None
+            else spik.human_body_obstacles({}))
+        warmup_human_xy = np.array([args.human_front_distance, 0.0])
+        motion_args = copy.copy(args)
+        motion_args.collision_verify_tolerance = \
+            args.motion_collision_verify_tolerance
+        motion_args.force_optimize = True
+        # 差し出し手は実際の自動割り当てで各腕が担当する側に合わせる。
+        robot_arm_to_hand = {arm: hand
+                             for hand, arm in spik.DEFAULT_ROBOT_ARM.items()}
+        for robot_arm, label in (('l', '左'), ('r', '右')):
+            hand = robot_arm_to_hand[robot_arm]
+            t0 = time.time()
+            picked, _, _ = spik.solve_person_ik(
+                self.robot, self._WARMUP_PALM, hand, robot_arm,
+                collision_obstacles,
+                attempts_per_pose=args.attempts_per_pose,
+                base_limits=self.base_limits,
+                self_collision=self.collision_pairs is not None,
+                collision_pairs=self.collision_pairs,
+                joint_positions={},
+                verification_pairs=self.verification_pairs)
+            log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
+                label, time.time() - t0))
+            if picked is None:
+                print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
+                      '軌道最適化のトレースはスキップします。'.format(label))
+                continue
+            turn_index, angle_vector, base_pose, post_process_result = picked
+            rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
+            handshake = spik.solved_result(
+                self.robot, robot_arm, rots[turn_index],
+                turn_index, angle_vector, base_pose, self.base_limits,
+                post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
+            self._pin_warmup_fixed_joints(robot_arm, handshake)
+            t0 = time.time()
+            phm.plan_person_motion(
+                self.robot, robot_arm, handshake, {}, warmup_human_xy,
+                motion_args, self.motion_verification_pairs, self.solver)
+            log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
+                label, time.time() - t0))
+            if args.side_by_side_transition:
+                # 横並び移動のバッチ IK (回転の拘束が違い別にコンパイルされる)。
+                t0 = time.time()
+                sbs.warmup_batch_ik(
+                    self.robot, robot_arm, hand, angle_vector,
+                    self.collision_pairs, self.base_limits)
+                log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
+                          .format(label, time.time() - t0))
+        print('[warmup] 完了しました ({:.1f} 秒)。'.format(
+            time.time() - warmup_t0))
+
+    def plan(self, joint_positions, palms, offered_hand, attempt):
+        """差し出された掌 ``palms[offered_hand]`` に対して IK -> 軌道計画 ->
+        横並び移動の計画を行う (``attempt`` はログ用の試行番号)。
+
+        戻り値は ``result`` (base_link 系に戻した IK 結果)、``motion``
+        (軌道。押し込み姿勢まで解けなければ None)、``robot_arm`` の dict。
+        """
+        args = self.args
+        robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
+        palm = palms[offered_hand]
+
+        offset = spik.human_translation_offset(
+            joint_positions, front_distance=args.human_front_distance)
+        translated_joints = spik.translate_joint_positions(
+            joint_positions, offset)
+        translated_palm = spik.translate_palm(palm, offset)
+        # 関節は体の表面の点なので、干渉判定だけは体幹を奥へずらした骨格を
+        # 使う (立ち位置・向きの判定は translated_joints)。
+        collision_joints = spik.shift_torso_joints_from_surface(
+            translated_joints, offset, args.torso_surface_offset)
+        collision_obstacles = (
+            [] if self.collision_pairs is None
+            else spik.human_body_obstacles(collision_joints))
+
+        # 差し出し手の側・人の正面方向に合わせた台車の可動域。
+        person_base_limits = self.base_limits
+        side_sign = spik.offered_hand_side_sign(
+            offered_hand, translated_joints, translated_palm)
+        if side_sign is not None:
+            person_base_limits = [
+                person_base_limits[0],
+                spik.restrict_base_y_range_to_hand_side(
+                    person_base_limits[1], side_sign),
+                person_base_limits[2]]
+        human_yaw = spik.human_facing_yaw(translated_joints)
+        if human_yaw is not None:
+            person_base_limits = [
+                person_base_limits[0],
+                person_base_limits[1],
+                spik.restrict_base_yaw_range_to_human_facing(
+                    person_base_limits[2], human_yaw,
+                    margin=math.radians(
+                        spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
+        # 台車の前後位置を人の立ち位置付近に絞る (解けなければ窓を広げる)。
+        standing_xy = spik.human_standing_xy(translated_joints)
+        standing_x = None if standing_xy is None else float(standing_xy[0])
+
+        rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
+        (picked, collision_ik_time, candidate_selection_time,
+         person_base_limits, x_margin) = \
+            spik.solve_person_ik_side_by_side(
+                self.robot, translated_palm, offered_hand, robot_arm,
+                collision_obstacles, person_base_limits, standing_x,
+                x_margins=args.base_x_standing_margins,
+                front_offset_weight=args.front_offset_weight,
+                facing_yaw_weight=args.facing_yaw_weight,
+                attempts_per_pose=args.attempts_per_pose,
+                self_collision=self.collision_pairs is not None,
+                collision_pairs=self.collision_pairs,
+                joint_positions=collision_joints,
+                placement_joint_positions=translated_joints,
+                verification_pairs=self.verification_pairs)
+
+        if picked is None:
+            result = spik.unsolved_result(
+                self.robot, robot_arm, rots[-1],
+                person_base_limits, collision_ik_time,
+                candidate_selection_time, offered_hand, translated_palm)
+        else:
+            turn_index, angle_vector, base_pose, post_process_result = picked
+            result = spik.solved_result(
+                self.robot, robot_arm, rots[turn_index],
+                turn_index, angle_vector, base_pose, person_base_limits,
+                post_process_result, collision_ik_time,
+                candidate_selection_time, offered_hand, translated_palm)
+        result['offered_hand'] = offered_hand
+        result['robot_arm'] = robot_arm
+        result['base_x_standing_margin'] = x_margin
+
+        # 押し込み姿勢まで解けたら軌道計画する。IK と同じ平行移動後の座標系
+        # のまま (untranslate する前に) 行うこと。
+        motion = None
+        if result['solved'] and result.get('post_process') is None:
+            print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
+                  'かったため、軌道計画をしません。'.format(attempt))
+        elif result['solved']:
+            human_xy = spik.human_standing_xy(translated_joints)
+            if human_xy is None:
+                human_xy = np.array([args.human_front_distance, 0.0])
+            # 同名フラグは画面表示用なので、軌道用の許容誤差に差し替えて渡す。
+            motion_args = copy.copy(args)
+            motion_args.collision_verify_tolerance = \
+                args.motion_collision_verify_tolerance
+            # 実機の現在地 (base_link 原点) を平行移動後の座標系で渡す。
+            initial_base_pose = np.array([offset[0], offset[1], 0.0])
+            motion = phm.plan_person_motion(
+                self.robot, robot_arm, result, collision_joints, human_xy,
+                motion_args, self.motion_verification_pairs, self.solver,
+                initial_base_pose=initial_base_pose)
+            log_debug_event(dict(
+                event='motion', person=attempt,
+                verified=motion['verified'],
+                lead_in_verified=motion['lead_in_verified'],
+                min_dist=float(min(motion['waypoint_min_distances'])),
+                waypoint_min_distances=[
+                    float(d) for d in motion['waypoint_min_distances']],
+                kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
+                compute_time=motion['compute_time']))
+            # 押し込み後に手を下ろしながら横並びになる区間 (実行可能なときだけ)。
+            if (args.side_by_side_transition
+                    and result.get('post_process') is not None
+                    and motion_verified(motion)):
+                transition = sbs.plan_transition(
+                    self.robot, robot_arm, offered_hand,
+                    result['post_process'], result['turn_deg'],
+                    translated_joints, collision_joints,
+                    self.verification_pairs,
+                    self.collision_pairs, self.base_limits)
+                motion['transition'] = transition
+                print('[transition] 試行{}: 横並び移動 {}'.format(
+                    attempt, sbs.transition_summary(transition)))
+                log_debug_event(dict(
+                    event='transition', person=attempt,
+                    verified=transition['verified'],
+                    fraction=transition['fraction'],
+                    x_margin=transition['x_margin'],
+                    placement_before=transition['placement_before'],
+                    placement_after=transition['placement_after'],
+                    reason=transition['reason'],
+                    compute_time=transition['compute_time']))
+
+        # 最終の台車位置と人の位置関係 (untranslate の前に求める)。
+        placement = (spik.base_placement_metrics(
+            translated_joints, result['base_position'], result['base_yaw'])
+            if result['solved'] else None)
+
+        untranslate_result(result, offset)
+        if motion is not None:
+            untranslate_motion(motion, offset)
+
+        log_debug_event(dict(
+            event='result', person=attempt, offered_hand=offered_hand,
+            robot_arm=robot_arm, solved=result['solved'],
+            base_position=[result['base_position'][0],
+                          result['base_position'][1]],
+            base_x_standing_margin=x_margin,
+            placement=placement,
+            collision_ik_time=collision_ik_time,
+            candidate_selection_time=candidate_selection_time))
+        if not result['solved']:
+            print('[result] 試行{} ({}手/{}腕): IK 失敗 ({:.1f} 秒)。'.format(
+                attempt, offered_hand, robot_arm,
+                collision_ik_time + candidate_selection_time))
+        elif motion is None:
+            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし{}。'.format(
+                attempt, offered_hand, robot_arm,
+                ' (押し込み姿勢が解けない)'
+                if result.get('post_process') is None else ''))
+        else:
+            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画{} '
+                  '({}、IK {:.1f} 秒 + 軌道 {:.1f} 秒)。'.format(
+                      attempt, offered_hand, robot_arm,
+                      '成功' if motion_verified(motion)
+                      else '失敗 (干渉検証 NG)',
+                      phm.KIND_LABELS.get(motion['kind'], motion['kind']),
+                      collision_ik_time + candidate_selection_time,
+                      motion['compute_time']))
+        return dict(result=result, motion=motion, robot_arm=robot_arm)
+
+
 class HandshakePipelineNode(object):
     """カメラ入力 -> 骨格推定 -> (ARM ボタン押下時) 掌推定・IK を行うノード."""
 
@@ -336,17 +710,16 @@ class HandshakePipelineNode(object):
             np.zeros((240, 320), dtype=np.float32),
             CameraIntrinsics(fx=300.0, fy=300.0, cx=160.0, cy=120.0))
 
-        # IK は指なしで解き、画面には指ありモデル (display_robot) を表示する。
-        self.robot = Aero(use_hand=False)
-        spik.restrict_elbow_range(self.robot)
-        spik.restrict_leg_range(self.robot)
-        spik.restrict_waist_range(self.robot)
-        spik.restrict_neck_range(self.robot)
-        spik.lock_fixed_joints(self.robot)
-        spik.apply_collision_model(self.robot)
-        spik.apply_hand_box(self.robot)
-        # 指の点群のキャッシュを先に作る (約 1 秒)。
-        spik.other_hand_points('r')
+        # IK・軌道計画 (画面・実機に依存しない部分)。IK は指なしで解き、
+        # 画面には指ありモデル (display_robot) を表示する。
+        self.planner = HandshakePlanner(args)
+        self.robot = self.planner.robot
+        self.verification_pairs = self.planner.verification_pairs
+        self.motion_verification_pairs = \
+            self.planner.motion_verification_pairs
+        self.solver = self.planner.solver
+        self.collision_pairs = self.planner.collision_pairs
+        self.base_limits = self.planner.base_limits
         self._attach_camera_optical_coords()
         # 初期姿勢 (両腕を下ろした姿勢) の関節角。self.robot は以後 IK で
         # 上書きされるのでここで確保する。
@@ -358,26 +731,6 @@ class HandshakePipelineNode(object):
         # 初期位置 (台車はワールド原点、両腕を下ろした姿勢)。
         phm.arms_down_angles(self.display_robot, self.display_robot.joint_list)
         self._initial_base_coords = self.display_robot.base_link.copy_worldcoords()
-        # 事後検証用の総当たりペア (--collision-pairs の有無によらず必要)。
-        self.verification_pairs = spik.build_verification_pairs_for_model(
-            self.robot, args.collision_verify_model)
-        self.motion_verification_pairs = self.verification_pairs
-        # JIT キャッシュを効かせるためノードの寿命で使い回す。
-        self.solver = create_solver(
-            'jaxls', max_iterations=args.max_iterations, verbose=False)
-        self.collision_pairs = None
-        if os.path.exists(args.collision_pairs):
-            self.collision_pairs = spik.load_collision_pairs(
-                args.collision_pairs, self.robot)
-            log_debug('[collision-pairs] {} 組を読み込みました。'.format(
-                len(self.collision_pairs)))
-        else:
-            print('[collision-pairs] {} が見つからないため、干渉回避なしで '
-                  '解きます。'.format(args.collision_pairs))
-        self.base_limits = [tuple(args.base_x_range),
-                            tuple(args.base_y_range),
-                            tuple(args.base_yaw_range)]
-
         # TF 未解決時のフォールバック値 (起動時に 1 回だけ計算)。
         self._robot_hand_position_fallback = \
             self._compute_robot_hand_position_fallback()
@@ -448,7 +801,7 @@ class HandshakePipelineNode(object):
         self._last_skeleton_redraw_time = 0.0
         self._attempt_count = 0  # 試行番号 (ログ用)
 
-        self._warmup_ik()
+        self.planner.warmup()
 
         # 実機接続は --auto-execute によらず試みる (ARM 時の初期姿勢復帰・
         # うなずきに使う)。失敗しても viewer として動作を続ける。表示スレッド
@@ -536,113 +889,6 @@ class HandshakePipelineNode(object):
 
         if args.auto_arm:
             self._arm('--auto-arm', move_to_initial_pose=False)
-
-    _WARMUP_PALM = dict(
-        position=[0.5, 0.0, 1.0],
-        x_axis=[1.0, 0.0, 0.0],
-        y_axis=[0.0, 1.0, 0.0],
-    )
-
-    # ウォームアップ中だけ固定する numpy の乱数シード (後で元に戻す)。
-    _WARMUP_SEED = 0
-
-    def _warmup_ik(self):
-        """左右の腕で IK と軌道最適化をダミー目標で 1 回ずつ解き、JAX の
-        トレース・コンパイルを起動時に済ませる。
-
-        ``_solve_handshake`` の呼び出しと引数を完全に一致させること
-        (1 つでも違うと別関数としてトレースし直され、キャッシュミスする)。
-        """
-        random_state = np.random.get_state()
-        np.random.seed(self._WARMUP_SEED)
-        try:
-            self._warmup_ik_body()
-        finally:
-            np.random.set_state(random_state)
-
-    def _pin_warmup_fixed_joints(self, robot_arm, handshake):
-        """軌道最適化に渡す ``handshake`` の、軌道で動かさない関節 (差し出さ
-        ない腕・頭など) の角度を IK の結果に依らない固定値にする。
-
-        これらの角度は軌道問題の FK 定数として jit_solve に焼き込まれるので、
-        IK の出力が少し変わるだけで軌道最適化のキャッシュが外れ、再コンパイル
-        (左右で約 60 秒) になっていた。差し出さない腕は最初の姿勢候補にする。
-        """
-        chain = {link.joint.name for link in getattr(
-            self.robot, '{}arm_whole_body'.format(robot_arm)).link_list}
-        other = 'l' if robot_arm == 'r' else 'r'
-        shoulder_p, elbow = spik.OTHER_ARM_POSTURES_DEG[0]
-        posture = {'{}_shoulder_p_joint'.format(other): np.radians(shoulder_p),
-                   '{}_elbow_joint'.format(other): np.radians(elbow)}
-        joints = {j.name: j for j in self.robot.joint_list}
-        names = handshake['joint_names']
-        angles = list(handshake['joint_angle_vector'])
-        for i, name in enumerate(names):
-            if name in chain:
-                continue
-            joint = joints[name]
-            angle = posture.get(name, 0.0)
-            angles[i] = float(np.clip(angle, joint.min_angle, joint.max_angle))
-        handshake['joint_angle_vector'] = angles
-
-    def _warmup_ik_body(self):
-        """``_warmup_ik`` の本体 (乱数固定は呼び出し側が行う)。"""
-        args = self.args
-        print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
-              'います (数秒~数十秒かかります)...')
-        warmup_t0 = time.time()
-        collision_obstacles = (
-            [] if self.collision_pairs is None
-            else spik.human_body_obstacles({}))
-        warmup_human_xy = np.array([args.human_front_distance, 0.0])
-        motion_args = copy.copy(args)
-        motion_args.collision_verify_tolerance = \
-            args.motion_collision_verify_tolerance
-        motion_args.force_optimize = True
-        # 差し出し手は実際の自動割り当てで各腕が担当する側に合わせる。
-        robot_arm_to_hand = {arm: hand
-                             for hand, arm in spik.DEFAULT_ROBOT_ARM.items()}
-        for robot_arm, label in (('l', '左'), ('r', '右')):
-            hand = robot_arm_to_hand[robot_arm]
-            t0 = time.time()
-            picked, _, _ = spik.solve_person_ik(
-                self.robot, self._WARMUP_PALM, hand, robot_arm,
-                collision_obstacles,
-                attempts_per_pose=args.attempts_per_pose,
-                base_limits=self.base_limits,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions={},
-                verification_pairs=self.verification_pairs)
-            log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
-                label, time.time() - t0))
-            if picked is None:
-                print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
-                      '軌道最適化のトレースはスキップします。'.format(label))
-                continue
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
-            handshake = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, self.base_limits,
-                post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
-            self._pin_warmup_fixed_joints(robot_arm, handshake)
-            t0 = time.time()
-            phm.plan_person_motion(
-                self.robot, robot_arm, handshake, {}, warmup_human_xy,
-                motion_args, self.motion_verification_pairs, self.solver)
-            log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
-                label, time.time() - t0))
-            if args.side_by_side_transition:
-                # 横並び移動のバッチ IK (回転の拘束が違い別にコンパイルされる)。
-                t0 = time.time()
-                sbs.warmup_batch_ik(
-                    self.robot, robot_arm, hand, angle_vector,
-                    self.collision_pairs, self.base_limits)
-                log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
-                          .format(label, time.time() - t0))
-        print('[warmup] 完了しました ({:.1f} 秒)。'.format(
-            time.time() - warmup_t0))
 
     def _setup_viewer(self, args):
         """viser ビューアに ARM/RESET ボタン・状態表示・waypoint スライダー・
@@ -1001,7 +1247,7 @@ class HandshakePipelineNode(object):
 
     def _log_debug(self, record):
         """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
-        log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
+        log_debug_event(record)
 
     def _solve_handshake(self, joint_positions, palms, offered_hand):
         args = self.args
@@ -1012,165 +1258,10 @@ class HandshakePipelineNode(object):
               '(ログ: {})。'.format(attempt, offered_hand, log_path))
         self._log_debug(dict(event='armed', person=attempt,
                              offered_hand=offered_hand))
-        robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
+        planned = self.planner.plan(
+            joint_positions, palms, offered_hand, attempt)
+        result, motion = planned['result'], planned['motion']
         palm = palms[offered_hand]
-
-        offset = spik.human_translation_offset(
-            joint_positions, front_distance=args.human_front_distance)
-        translated_joints = spik.translate_joint_positions(
-            joint_positions, offset)
-        translated_palm = spik.translate_palm(palm, offset)
-        # 関節は体の表面の点なので、干渉判定だけは体幹を奥へずらした骨格を
-        # 使う (立ち位置・向きの判定は translated_joints)。
-        collision_joints = spik.shift_torso_joints_from_surface(
-            translated_joints, offset, args.torso_surface_offset)
-        collision_obstacles = (
-            [] if self.collision_pairs is None
-            else spik.human_body_obstacles(collision_joints))
-
-        # 差し出し手の側・人の正面方向に合わせた台車の可動域。
-        person_base_limits = self.base_limits
-        side_sign = spik.offered_hand_side_sign(
-            offered_hand, translated_joints, translated_palm)
-        if side_sign is not None:
-            person_base_limits = [
-                person_base_limits[0],
-                spik.restrict_base_y_range_to_hand_side(
-                    person_base_limits[1], side_sign),
-                person_base_limits[2]]
-        human_yaw = spik.human_facing_yaw(translated_joints)
-        if human_yaw is not None:
-            person_base_limits = [
-                person_base_limits[0],
-                person_base_limits[1],
-                spik.restrict_base_yaw_range_to_human_facing(
-                    person_base_limits[2], human_yaw,
-                    margin=math.radians(
-                        spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))]
-        # 台車の前後位置を人の立ち位置付近に絞る (解けなければ窓を広げる)。
-        standing_xy = spik.human_standing_xy(translated_joints)
-        standing_x = None if standing_xy is None else float(standing_xy[0])
-
-        rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
-        (picked, collision_ik_time, candidate_selection_time,
-         person_base_limits, x_margin) = \
-            spik.solve_person_ik_side_by_side(
-                self.robot, translated_palm, offered_hand, robot_arm,
-                collision_obstacles, person_base_limits, standing_x,
-                x_margins=args.base_x_standing_margins,
-                front_offset_weight=args.front_offset_weight,
-                facing_yaw_weight=args.facing_yaw_weight,
-                attempts_per_pose=args.attempts_per_pose,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions=collision_joints,
-                placement_joint_positions=translated_joints,
-                verification_pairs=self.verification_pairs)
-
-        if picked is None:
-            result = spik.unsolved_result(
-                self.robot, robot_arm, rots[-1],
-                person_base_limits, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        else:
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            result = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, person_base_limits,
-                post_process_result, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        result['offered_hand'] = offered_hand
-        result['robot_arm'] = robot_arm
-        result['base_x_standing_margin'] = x_margin
-
-        # 押し込み姿勢まで解けたら軌道計画する。IK と同じ平行移動後の座標系
-        # のまま (untranslate する前に) 行うこと。
-        motion = None
-        if result['solved'] and result.get('post_process') is None:
-            print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
-                  'かったため、軌道計画をしません。'.format(attempt))
-        elif result['solved']:
-            human_xy = spik.human_standing_xy(translated_joints)
-            if human_xy is None:
-                human_xy = np.array([args.human_front_distance, 0.0])
-            # 同名フラグは画面表示用なので、軌道用の許容誤差に差し替えて渡す。
-            motion_args = copy.copy(args)
-            motion_args.collision_verify_tolerance = \
-                args.motion_collision_verify_tolerance
-            # 実機の現在地 (base_link 原点) を平行移動後の座標系で渡す。
-            initial_base_pose = np.array([offset[0], offset[1], 0.0])
-            motion = phm.plan_person_motion(
-                self.robot, robot_arm, result, collision_joints, human_xy,
-                motion_args, self.motion_verification_pairs, self.solver,
-                initial_base_pose=initial_base_pose)
-            self._log_debug(dict(
-                event='motion', person=attempt,
-                verified=motion['verified'],
-                lead_in_verified=motion['lead_in_verified'],
-                min_dist=float(min(motion['waypoint_min_distances'])),
-                waypoint_min_distances=[
-                    float(d) for d in motion['waypoint_min_distances']],
-                kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
-                compute_time=motion['compute_time']))
-            # 押し込み後に手を下ろしながら横並びになる区間 (実行可能なときだけ)。
-            if (args.side_by_side_transition
-                    and result.get('post_process') is not None
-                    and self._motion_verified(motion)):
-                transition = sbs.plan_transition(
-                    self.robot, robot_arm, offered_hand,
-                    result['post_process'], result['turn_deg'],
-                    translated_joints, collision_joints,
-                    self.verification_pairs,
-                    self.collision_pairs, self.base_limits)
-                motion['transition'] = transition
-                print('[transition] 試行{}: 横並び移動 {}'.format(
-                    attempt, sbs.transition_summary(transition)))
-                self._log_debug(dict(
-                    event='transition', person=attempt,
-                    verified=transition['verified'],
-                    fraction=transition['fraction'],
-                    x_margin=transition['x_margin'],
-                    placement_before=transition['placement_before'],
-                    placement_after=transition['placement_after'],
-                    reason=transition['reason'],
-                    compute_time=transition['compute_time']))
-
-        # 最終の台車位置と人の位置関係 (untranslate の前に求める)。
-        placement = (spik.base_placement_metrics(
-            translated_joints, result['base_position'], result['base_yaw'])
-            if result['solved'] else None)
-
-        self._untranslate_result(result, offset)
-        if motion is not None:
-            self._untranslate_motion(motion, offset)
-
-        self._log_debug(dict(
-            event='result', person=attempt, offered_hand=offered_hand,
-            robot_arm=robot_arm, solved=result['solved'],
-            base_position=[result['base_position'][0],
-                          result['base_position'][1]],
-            base_x_standing_margin=x_margin,
-            placement=placement,
-            collision_ik_time=collision_ik_time,
-            candidate_selection_time=candidate_selection_time))
-        if not result['solved']:
-            print('[result] 試行{} ({}手/{}腕): IK 失敗 ({:.1f} 秒)。'.format(
-                attempt, offered_hand, robot_arm,
-                collision_ik_time + candidate_selection_time))
-        elif motion is None:
-            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし{}。'.format(
-                attempt, offered_hand, robot_arm,
-                ' (押し込み姿勢が解けない)'
-                if result.get('post_process') is None else ''))
-        else:
-            print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画{} '
-                  '({}、IK {:.1f} 秒 + 軌道 {:.1f} 秒)。'.format(
-                      attempt, offered_hand, robot_arm,
-                      '成功' if self._motion_verified(motion)
-                      else '失敗 (干渉検証 NG)',
-                      phm.KIND_LABELS.get(motion['kind'], motion['kind']),
-                      collision_ik_time + candidate_selection_time,
-                      motion['compute_time']))
 
         # 軌道が無ければ後処理前の姿勢を 1 waypoint だけ表示する。
         if motion is not None:
@@ -1289,55 +1380,7 @@ class HandshakePipelineNode(object):
             return 'near_hand'
         return 'approach'
 
-    @staticmethod
-    def _motion_verified(motion):
-        """経路計画の区間と lead-in の両方が干渉検証に通っているか。"""
-        return bool(motion['verified']) and bool(motion['lead_in_verified'])
-
-    @staticmethod
-    def _untranslate_result(result, offset):
-        """人物を平行移動した仮想座標系の ``result`` を実際の base_link 系へ
-        戻す (破壊的)。忘れると仮想の人物に向かって台車が動く。"""
-        dx, dy = offset
-        for key in ('target_position', 'hand_position', 'base_position',
-                    'palm_position'):
-            if key in result and result[key] is not None:
-                result[key][0] -= dx
-                result[key][1] -= dy
-        region = result.get('base_movable_region')
-        if region:
-            region['x_range'] = [v - dx for v in region['x_range']]
-            region['y_range'] = [v - dy for v in region['y_range']]
-        post_process = result.get('post_process')
-        if post_process:
-            for key in ('target_position', 'hand_position', 'base_position'):
-                if key in post_process and post_process[key] is not None:
-                    post_process[key][0] -= dx
-                    post_process[key][1] -= dy
-            # 押し込み中の台車 [x, y, yaw] (戻し忘れると実機の台車が押し込み
-            # 中に平行移動量だけ動く)。
-            for base in post_process.get('press_in_base_path') or []:
-                base[0] -= dx
-                base[1] -= dy
-
-    @staticmethod
-    def _untranslate_motion(motion, offset):
-        """``motion`` の各 waypoint の台車位置 (横並び移動は人の腕も) を実際の
-        base_link 系へ戻す (破壊的)。"""
-        dx, dy = offset
-        transition = motion.get('transition') or {}
-        for wp in (motion['waypoints'] + motion.get('lead_in_waypoints', [])
-                   + transition.get('waypoints', [])):
-            wp['base_position'][0] -= dx
-            wp['base_position'][1] -= dy
-        arms = [wp.get('human_arm') for wp in transition.get('waypoints', [])]
-        for arm in [transition.get('press_arm')] + arms:
-            if not arm:
-                continue
-            for key in ('elbow', 'wrist', 'palm_position'):
-                if arm.get(key) is not None:
-                    arm[key][0] -= dx
-                    arm[key][1] -= dy
+    _motion_verified = staticmethod(motion_verified)
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
@@ -2766,7 +2809,8 @@ class HandshakePipelineNode(object):
         self.viewer.close()
 
 
-def main():
+def build_arg_parser():
+    """ノードのオプション (保存した試行の解き直しツールも同じ既定値を使う)。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--color-topic', type=str,
                         default='/camera/color/image_raw/decompressed')
@@ -2990,6 +3034,11 @@ def main():
     parser.add_argument(
         '--no-head-tracking', dest='head_tracking', action='store_false',
         help='ARMED 中に首を人の方へ向けたり、見渡して人を探したりしない。')
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     # roslaunch が付ける引数 (__name 等) は無視する。
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
