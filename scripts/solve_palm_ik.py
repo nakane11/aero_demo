@@ -230,6 +230,11 @@ CROUCH_REFERENCE_WAIST_Z = 0.853
 
 def _joint_bend_cost_indices(robot, robot_arm):
     """曲げ量コストの各関節の ``robot.angle_vector()`` 中のインデックスと
+# 候補のコストに足す hover の腰の前傾 (waist_p が正、お辞儀) [rad] の二乗の
+# 重み (0 で無効)。沈み込みを避けるとお辞儀が増えるため (CROUCH_WEIGHT 参照)。
+# 合成 400 人 (seed 0) で 0〜1000 を掃引し、200 で前傾 20° 超の人が 17 -> 8 人、
+# 横並び 56 -> 58。400 以上は前傾の減りが鈍く、沈み込みが再び増える。
+BOW_WEIGHT = 200.0
     重みのリストを返す。"""
     index_by_name = {joint.name: i for i, joint in enumerate(robot.joint_list)}
     return [(index_by_name['{}_{}_joint'.format(robot_arm, suffix)], weight)
@@ -2609,6 +2614,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     obstacle_samples = (
         [cylinder_surface_samples(o) for o in obstacle_links]
         if obstacle_links else None)
+    waist_p_index = [i for i, joint in enumerate(robot.joint_list)
+                     if joint.name == 'waist_p_joint'][0]
 
     # 差し出さない腕 (後で姿勢を差し替える) に関わる組とそれ以外に分け、
     # それ以外は後処理の前に検証して安く落とす。
@@ -2625,6 +2632,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     def _involves_other_arm(pair):
         link_a, other = pair
         return link_a.name.startswith(other_prefix) or (
+        if BOW_WEIGHT > 0.0:
+            cost += BOW_WEIGHT * max(0.0, float(
+                angle_vectors[candidate_index][waist_p_index])) ** 2
             not isinstance(other, int) and other.name.startswith(other_prefix))
 
     early_verification_pairs = _subset(
@@ -3291,6 +3301,10 @@ def main():
     if os.path.exists(args.collision_pairs):
         collision_pairs = load_collision_pairs(args.collision_pairs, robot)
         print('[collision-pairs] {} 組の干渉ペアを {} から読み込みました。'
+    parser.add_argument(
+        '--bow-weight', type=float, default=BOW_WEIGHT,
+        help='hover の腰の前傾 [rad] の二乗を候補のコストに足す重み '
+            '(0 で無効、既定 {})。'.format(BOW_WEIGHT))
               .format(len(collision_pairs), args.collision_pairs))
         # 事後検証は総当たりの組で行う。
         verification_pairs = build_verification_pairs_for_model(
@@ -3317,6 +3331,7 @@ def main():
         self_collision_margin=args.self_collision_margin,
         collision_ik_stop=args.collision_ik_stop,
         collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
+    BOW_WEIGHT = args.bow_weight
         collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
         collision_joint_limit_margin_ratio=(
             DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
