@@ -130,6 +130,13 @@ HEAD_SCAN_YAW_DEG = 60.0
 HEAD_SCAN_PITCH_OFFSETS_DEG = (0.0, 15.0)
 HEAD_SCAN_DWELL = 1.0  # [秒] 止まった各向きで骨格を検出する時間
 HEAD_SCAN_SPEED_DEG = 30.0  # [deg/s] 見渡すときの首の速さ
+# 実機の実行中 (初期位置 -> hover と横並び移動) に人の顔を追う首の動き
+# (_execute_on_robot が _head_face_tracking を立てる)。顔は鼻、なければ
+# 両耳の中点、それも無ければ体幹。台車が動くので見えた位置を odom 系で
+# 覚え、見失っても最後に見えた位置を向き続ける (見渡さない)。
+HEAD_FACE_TRACK_DEADBAND_DEG = 4.0
+HEAD_FACE_TRACK_SPEED_DEG = 80.0  # [deg/s] (実機の首ヨーの上限は約 92 deg/s)
+ODOM_FRAME = 'odom'
 
 # 実機再生時の waypoint 間の所要時間の下限 [秒] (腕の制御周期 15Hz の 1 周期)。
 MIN_SEGMENT_TIME = 1.0 / 15.0
@@ -207,6 +214,18 @@ def collision_pairs_text(colliding):
     """指先まで含めた事後検証であることを示す見出しを付けた干渉ペア表示。"""
     return common_collision_pairs_text(
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
+
+
+def face_point(joint_positions):
+    """骨格の顔の位置 (鼻、なければ両耳の中点、どちらも無ければ None)。"""
+    nose = joint_positions.get('Nose')
+    if nose is not None:
+        return np.asarray(nose, dtype=np.float64)[:3]
+    ears = [joint_positions.get(name) for name in ('LEar', 'REar')]
+    if all(ear is not None for ear in ears):
+        return (np.asarray(ears[0], dtype=np.float64)[:3]
+                + np.asarray(ears[1], dtype=np.float64)[:3]) / 2.0
+    return None
 
 
 def project_base_point(frame, point):
@@ -789,8 +808,12 @@ class HandshakePipelineNode(object):
         self._initial_pose_done.set()
         # 首の追従の指令とうなずきの開始を排他にする (_head_tracking_loop)。
         self._head_lock = threading.Lock()
-        # (time.time(), 体幹の base_link 座標) 直近に人が見えた時刻と位置 or None
+        # (time.time(), 体幹の base_link 座標, 顔の base_link 座標 or None,
+        #  そのフレームの odom <- base_link の 4x4 or None) 直近に人が
+        # 見えた時刻と位置 or None
         self._head_person_seen = None
+        # set の間は状態によらず首で人の顔を追う (実機の実行中)。
+        self._head_face_tracking = threading.Event()
         # 直近に人の方へ向けた首ヨーの指令 [rad] (見渡し中・停止中は None)。
         # うなずきはこの向きのまま行う。
         self._head_tracking_yaw = None
@@ -1044,6 +1067,19 @@ class HandshakePipelineNode(object):
         return lookup_camera_to_base(
             self.tf_buffer, self.args.base_frame, header)
 
+    def _lookup_odom_from_base(self, stamp=None):
+        """``stamp`` (None なら最新) の odom <- base_link の 4x4 を返す
+        (引けなければ None)。stamp で引けなければ最新で引き直す。"""
+        for when in ([stamp] if stamp is not None else []) + [rospy.Time(0)]:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    ODOM_FRAME, self.args.base_frame, when)
+                return transform_to_matrix(transform.transform)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                continue
+        return None
+
     # ------------------------------------------------------------------
     # camera callback
     # ------------------------------------------------------------------
@@ -1092,13 +1128,18 @@ class HandshakePipelineNode(object):
         torso_points = [
             armed_joint_positions[name] for name in HEAD_TRACK_TARGET_JOINTS
             if armed_joint_positions and name in armed_joint_positions]
+        person_seen = None
+        if torso_points:
+            person_seen = (
+                time.time(), np.mean(np.asarray(torso_points), axis=0),
+                face_point(armed_joint_positions),
+                self._lookup_odom_from_base(color_msg.header.stamp))
 
         with self._lock:
             self._latest_joint_positions = preview_joint_positions
             self._latest_is_base_frame = is_base_frame
-            if torso_points:
-                self._head_person_seen = (
-                    time.time(), np.mean(np.asarray(torso_points), axis=0))
+            if person_seen is not None:
+                self._head_person_seen = person_seen
             hand_frames_requested = self._hand_frames_requested
         if hand_frames_requested and is_base_frame:
             hands = self.pose_estimator.estimate_hands_3d(
@@ -1582,6 +1623,21 @@ class HandshakePipelineNode(object):
                 and self._nod_done.is_set()
                 and self._initial_pose_done.is_set())
 
+    def _face_target(self, seen):
+        """``self._head_person_seen`` の顔 (無ければ体幹) を、見えたときの
+        odom 系を介して今の base_link 系に直した点 (見えていなければ None)。"""
+        if seen is None:
+            return None
+        _, torso, face, odom_from_base_then = seen
+        point = torso if face is None else face
+        if odom_from_base_then is None:
+            return point
+        odom_from_base_now = self._lookup_odom_from_base()
+        if odom_from_base_now is None:
+            return point
+        point_odom = odom_from_base_then @ np.append(point, 1.0)
+        return np.linalg.solve(odom_from_base_now, point_odom)[:3]
+
     def _head_tracking_loop(self):
         """ARMED 中、人が見えていればカメラ光軸を体幹へ向け、見えなくなって
         ``HEAD_SCAN_START_DELAY`` 秒たったら首ヨーを往復させて人を探す
@@ -1590,6 +1646,9 @@ class HandshakePipelineNode(object):
         ``head_controller`` だけに送る。差し出し手が決まると
         ``_try_handshake`` が ``self._head_lock`` の中で止める (うなずきの
         ゴールを追従のゴールで打ち切らないため)。
+
+        ``self._head_face_tracking`` が set の間 (実機の実行中) は状態に
+        よらず人の顔を追う (``_face_target``、見失っても見渡さない)。
         """
         joint_list = self.real_robot.joint_list
         neck_y_index = joint_list.index(self.real_robot.neck_y_joint)
@@ -1597,11 +1656,19 @@ class HandshakePipelineNode(object):
         neck_r_index = joint_list.index(self.real_robot.neck_r_joint)
         gaze_robot = self._gaze_robot
         gaze_coords = spik.camera_optical_coords(gaze_robot)
+        # 首以外 (腰・脚など) は毎回実機の角度に合わせる (実行中は動くため)。
+        real_index = {joint.name: i for i, joint in enumerate(joint_list)}
+        head_joint_names = {self.real_robot.neck_y_joint.name,
+                            self.real_robot.neck_p_joint.name,
+                            self.real_robot.neck_r_joint.name}
+        body_joints = [
+            (joint, real_index[joint.name]) for joint in gaze_robot.joint_list
+            if joint.name in real_index and joint.name not in head_joint_names]
         initial_neck_p = gaze_robot.neck_p_joint.joint_angle()
         scan_yaw = np.deg2rad(HEAD_SCAN_YAW_DEG)
         scan_pitches = [initial_neck_p + np.deg2rad(offset)
                         for offset in HEAD_SCAN_PITCH_OFFSETS_DEG]
-        mode = None  # 'track' / 'scan' / None (止めている)
+        mode = None  # 'face' / 'track' / 'scan' / None (止めている)
         # 見渡しの (首ヨー, 首ピッチ) の止まる向きの列と次の添字。
         scan_steps = []
         scan_index = 0
@@ -1610,7 +1677,8 @@ class HandshakePipelineNode(object):
             time.sleep(HEAD_TRACK_PERIOD)
             try:
                 with self._head_lock:
-                    if not self._head_tracking_allowed():
+                    face = self._head_face_tracking.is_set()
+                    if not face and not self._head_tracking_allowed():
                         if mode is not None:
                             log_debug('[head] 首の追従・見渡しを止めました。')
                         # _head_tracking_yaw はうなずきが読むので残す。
@@ -1621,9 +1689,35 @@ class HandshakePipelineNode(object):
                     now = time.time()
                     current_av = np.asarray(
                         self.ri.angle_vector(), dtype=np.float64)
+                    for joint, index in body_joints:
+                        joint.joint_angle(current_av[index])
                     target_av = current_av.copy()
                     target_av[neck_r_index] = spik.NECK_ROLL_FIXED_ANGLE
-                    if (seen is not None
+                    if face:
+                        # 実行中は人の顔を追う。見えていなければ待つ。
+                        target = self._face_target(seen)
+                        if target is None:
+                            continue
+                        if mode != 'face':
+                            gaze_robot.neck_y_joint.joint_angle(
+                                current_av[neck_y_index])
+                            gaze_robot.neck_p_joint.joint_angle(
+                                current_av[neck_p_index])
+                        elif (spik._gaze_error(gaze_coords, target)
+                              < np.deg2rad(HEAD_FACE_TRACK_DEADBAND_DEG)):
+                            continue
+                        spik._reaim_gaze(
+                            gaze_robot, gaze_coords, target,
+                            HEAD_TRACK_IK_STOP, HEAD_TRACK_IK_RTHRE)
+                        target_av[neck_y_index] = \
+                            gaze_robot.neck_y_joint.joint_angle()
+                        target_av[neck_p_index] = \
+                            gaze_robot.neck_p_joint.joint_angle()
+                        speed = np.deg2rad(HEAD_FACE_TRACK_SPEED_DEG)
+                        if mode != 'face':
+                            log_debug('[head] 人の顔を追います。')
+                        mode = 'face'
+                    elif (seen is not None
                             and now - seen[0] < HEAD_SCAN_START_DELAY):
                         # 人の方を向く。追従中は前回の指令から解く。
                         if mode != 'track':
@@ -1683,13 +1777,55 @@ class HandshakePipelineNode(object):
                     5.0, '[head] 首の追従・見渡しに失敗しました ({})。'.format(
                         exc))
 
+    def _set_face_tracking(self, enabled):
+        """実行中の首の顔追従を始める/止める (首の追従が無効なら何もしない)。
+        止めるときは ``self._head_lock`` の中で行い、戻った後に追従の
+        ゴールが届かないようにする。"""
+        if self._gaze_robot is None:
+            return
+        with self._head_lock:
+            if enabled:
+                self._head_face_tracking.set()
+            else:
+                self._head_face_tracking.clear()
+
+    def _send_head_to_waypoint(self, waypoint, joint_names):
+        """首だけを ``waypoint`` の角度へ向かわせる (待たない)。"""
+        name_to_angle = dict(zip(joint_names, waypoint['joint_angle_vector']))
+        joint_list = self.real_robot.joint_list
+        current_av = np.asarray(self.ri.angle_vector(), dtype=np.float64)
+        target_av = current_av.copy()
+        for joint in (self.real_robot.neck_y_joint,
+                      self.real_robot.neck_p_joint,
+                      self.real_robot.neck_r_joint):
+            if joint.name in name_to_angle:
+                target_av[joint_list.index(joint)] = name_to_angle[joint.name]
+        delta = float(np.max(np.abs(target_av - current_av)))
+        time_list = self._limited_time_list(
+            [target_av], None,
+            [max(HEAD_TRACK_MIN_MOVE_TIME,
+                 delta / np.deg2rad(HEAD_FACE_TRACK_SPEED_DEG))])
+        self.ri.angle_vector_sequence(
+            [target_av], time_list, controller_type='head_controller')
+
     def _execute_on_robot(self):
+        """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
+        途中で例外になっても首の顔追従は止める。"""
+        try:
+            self._execute_on_robot_body()
+        finally:
+            self._set_face_tracking(False)
+
+    def _execute_on_robot_body(self):
         """計画済みの waypoint 列を実機に送る。
 
         接近区間 (初期位置 -> hover 目標) を 1 ゴールで送り、台車の位置ずれを
         補正してから押し込み区間、必要なら横並び移動を実行する。台車は
         costmap を使わず ``move_trajectory_sequence`` で直接送る (干渉は
         計画側で検証済み)。
+
+        首は接近中と横並び移動中は人の顔を追い (``_head_tracking_loop``)、
+        hover に着いたら計画の角度 (掌を見る) に戻して押し込む。
         """
         with self._lock:
             result = self._current_result
@@ -1753,8 +1889,17 @@ class HandshakePipelineNode(object):
                 exclude_centers = np.array(
                     [p[:2] for p in frozen.values()], dtype=np.float64)
 
+        # 接近中は首で人の顔を追う (全身のゴールを送った後に始める)。
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
-            display_waypoints[:reach_boundary], joint_names)
+            display_waypoints[:reach_boundary], joint_names,
+            on_sent=lambda: self._set_face_tracking(True))
+        # hover に着いたら首を計画の角度 (掌を見る) へ戻す。台車の補正と
+        # 並行に動かし、手の検出し直しの前に待つ。
+        self._set_face_tracking(False)
+        head_to_hover = self._gaze_robot is not None
+        if head_to_hover:
+            self._send_head_to_waypoint(
+                display_waypoints[reach_boundary - 1], joint_names)
 
         if self.args.base_correction != 'none':
             self._correct_base_residual(
@@ -1766,6 +1911,8 @@ class HandshakePipelineNode(object):
         self._wait_joint_settle(
             'hover', display_waypoints[reach_boundary - 1], joint_names,
             robot_arm)
+        if head_to_hover:
+            self.ri.wait_interpolation(controller_type='head_controller')
 
         if reach_boundary < len(display_waypoints):
             press_waypoints = display_waypoints[reach_boundary - 1:]
@@ -1821,11 +1968,14 @@ class HandshakePipelineNode(object):
         self._say(self.args.speech_transition_text)
         print('[execute] 手を下ろしながら横並びの位置へ移動します '
               '(waypoint {} 個)。'.format(len(waypoints)))
+        # 横並び移動の間は首で人の顔を追う (押し込み後の画像の保存は済んでいる)。
         self._execute_waypoint_segment(
             segment, joint_names,
-            min_segment_time=self.args.side_by_side_segment_time)
+            min_segment_time=self.args.side_by_side_segment_time,
+            on_sent=lambda: self._set_face_tracking(True))
         self._wait_joint_settle(
             '横並び移動終了', segment[-1], joint_names, robot_arm)
+        self._set_face_tracking(False)
 
     def _collect_hand_frames(self, n_frames, timeout):
         """以降のフレームで手だけの検出を行い、``n_frames`` 枚分 (None なら
@@ -2251,9 +2401,11 @@ class HandshakePipelineNode(object):
             pass
 
     def _execute_waypoint_segment(self, waypoints, joint_names,
-                                  min_segment_time=MIN_SEGMENT_TIME):
+                                  min_segment_time=MIN_SEGMENT_TIME,
+                                  on_sent=None):
         """``waypoints`` (先頭が現在の姿勢) を 1 つの滑らかな軌道として
-        台車・腕を並行に実行する。
+        台車・腕を並行に実行する。``on_sent`` はゴールを送った直後 (完了を
+        待つ前) に呼ぶ。
 
         Returns: ``(start_odom_coords, final_traj_point)`` (送信時の odom と
         最終 waypoint の先頭基準 ``[dx, dy, dyaw]``、台車移動なしなら None)。
@@ -2309,6 +2461,8 @@ class HandshakePipelineNode(object):
                       ', '.join('{:.2f}'.format(t) for t in time_list)))
             self._send_base_trajectory(
                 base_trajectory_points, time_list, wait=False)
+        if on_sent is not None:
+            on_sent()
 
         if arm_angle_vectors:
             self.ri.wait_interpolation()
