@@ -221,8 +221,10 @@ def project_base_point(frame, point):
 
 
 # 重要なログは print で画面とファイルへ、詳細は log_debug でファイルだけへ。
-# ファイルは起動時が LOG_STARTUP_NAME、以後は試行ごと。起動時に全削除する。
-LOG_DIR = '/tmp/run_camera_pipeline_test_logs'
+# ファイルは起動時が LOG_STARTUP_NAME、以後は試行ごと。起動ごとに
+# LOG_ROOT/<起動時刻> を作り (消さない)、LOG_ROOT/latest をそこへ向ける。
+LOG_ROOT = '/tmp/run_camera_pipeline_test_logs'
+LOG_DIR = LOG_ROOT  # setup_log_dir() で起動ごとのディレクトリに置き換わる
 LOG_STARTUP_NAME = 'startup.log'
 LOG_PERSON_TEMPLATE = 'person_{:02d}.log'
 
@@ -280,11 +282,18 @@ _tee_stream = None
 
 
 def setup_log_dir():
-    """``LOG_DIR`` を作り直し、標準出力をファイルへも書くようにする。
-    ログファイルのパスを返す。"""
-    global _tee_stream
-    shutil.rmtree(LOG_DIR, ignore_errors=True)
+    """起動ごとのログディレクトリ (``LOG_ROOT/<起動時刻>``、既存のものは消さない)
+    を作り、標準出力をファイルへも書くようにする。ログファイルのパスを返す。"""
+    global _tee_stream, LOG_DIR
+    LOG_DIR = os.path.join(LOG_ROOT, time.strftime('%Y%m%d_%H%M%S'))
     os.makedirs(LOG_DIR, exist_ok=True)
+    latest = os.path.join(LOG_ROOT, 'latest')
+    try:
+        if os.path.lexists(latest):
+            os.remove(latest)
+        os.symlink(LOG_DIR, latest)
+    except OSError:
+        pass
     path = os.path.join(LOG_DIR, LOG_STARTUP_NAME)
     _tee_stream = _TeeStream(sys.stdout, open(path, 'w', encoding='utf-8'))
     sys.stdout = _tee_stream
@@ -1408,7 +1417,7 @@ class HandshakePipelineNode(object):
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
-        ``--save-dir``、無ければ ``LOG_DIR`` (起動時に消える)。保存に
+        ``--save-dir``、無ければ ``LOG_DIR`` (起動ごとのディレクトリ)。保存に
         失敗しても試行は続ける。"""
         try:
             self._save_attempt_files(joint_positions, palms, result, motion)
@@ -2958,8 +2967,8 @@ def build_arg_parser():
     parser.add_argument(
         '--save-dir', type=str, default=None,
         help='試行ごとに骨格/掌/IK 結果/軌道の JSON を保存するディレクトリ '
-             '(既定: {}、起動時に消える)。指定したときは押し込みの解き直しの '
-             '失敗・把持画像もここに保存する。'.format(LOG_DIR))
+             '(既定: {}/<起動時刻>、消さない)。指定したときは押し込みの解き直しの '
+             '失敗・把持画像もここに保存する。'.format(LOG_ROOT))
     # --- 軌道計画 (plan_handshake_motion.py と同じオプション・既定値) ---
     parser.add_argument(
         '--approach-distance', type=float,
