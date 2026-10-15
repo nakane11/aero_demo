@@ -315,6 +315,64 @@ JSON を、ノードと同じ `HandshakePlanner` (IK -> 軌道計画 -> 横並�
 python3 tools/ros/resolve_saved_trials.py data/real/2026-10-13/logs
 ```
 
+## 頭カメラの外部パラメータの較正
+
+`launch/decompress.launch` の `head_to_camera_link` (と同じ値を持つ
+`scripts/solve_palm_ik.py` の `HEAD_TO_CAMERA_LINK_*`) を、深度画像を床と
+/scan に合わせて推定する。経緯と推定結果は
+[`head_camera_calibration.md`](head_camera_calibration.md)。
+
+### `tools/ros/record_head_calibration_sweep.py`
+
+実機の首を格子状に動かして各姿勢で止め、較正用の bag (深度・camera_info・
+TF・/scan・/joint_states・/odom、`--with-color` でカラーも) を録る。
+腕・腰・脚には指令を送らない。首は head_controller に送り、ゴールが
+SUCCEEDED でないか目標に届かなければ中止し、最後に元の角度へ戻す。
+`--base-yaws` を付けると台車をその場で回して (開始時の向きから
+`--max-base-yaw` 以内、/teleop/cmd_vel に低速の回転だけ) 各向きで同じ
+首の動きを繰り返し、最後に元の向きへ戻す。台車中心から
+`--obstacle-min`〜`--obstacle-radius` に /scan の点があれば回さない
+(既定 0.40〜0.70m は狭い場所では止まるので、周りを確認して調整する)。
+実機を動かすので、実行前に周囲を確認すること。`--dry-run` は動かさず
+姿勢の列と最も近い障害物の距離だけ表示する。decompress.launch を先に
+起動しておく。
+
+```bash
+rossetmaster 192.168.96.215; rossetip
+python3 tools/ros/record_head_calibration_sweep.py \
+    --output data/bags/head_calib.bag --dry-run
+python3 tools/ros/record_head_calibration_sweep.py \
+    --output data/bags/head_calib.bag            # 首 ±60deg x 15〜30deg の 28 姿勢
+python3 tools/ros/record_head_calibration_sweep.py \
+    --output data/bags/head_calib_rot.bag --base-yaws=-40,40
+```
+
+床と、レーザーの高さ (約 20cm) の壁・棚の面が 1〜3m に広く見える場所が
+向いている (椅子の脚などが多い場所は /scan との対応が取りにくい)。首ピッチ
+0deg は床が映らないので使わない。
+
+### `tools/ros/calibrate_head_camera.py`
+
+bag (複数可) から台車・首・腰・脚が止まっている時刻を選び、深度点群を
+今の head_link -> camera_link に補正 (camera_link 系の回転・並進) を掛けて
+base_link に置いたとき、床の点が z = `--floor-z` (ピッチ・ロール・高さ)、
+/scan と同じ高さの断面の点が /scan の線上 (ヨー・x・y) になるよう、全時刻
+まとめて最小二乗で解く (外れ値に強い soft_l1、並進には
+`--translation-sigma` の事前分布、`--fix-translation` で回転のみ)。床が
+映っていない時刻 (当てはめた平面が `--max-floor-tilt-deg` より傾く) は床に
+使わない。時刻ごとの補正前後の残差 (床の高さ・傾き、/scan までの距離、
+3cm 以内の割合、補正を base_link 系に直した回転) と、decompress.launch と
+solve_palm_ik.py に書く値を表示する。`--no-optimize --head-to-camera ...` で
+指定した値を別の bag で検証できる。roscore 不要。
+
+```bash
+python3 tools/ros/calibrate_head_camera.py \
+    --bag data/bags/head_calib_a.bag data/bags/head_calib_b.bag
+# 推定した値を別の bag で検証する
+python3 tools/ros/calibrate_head_camera.py --bag other.bag --no-optimize \
+    --head-to-camera 0.02918 0.00703 0.19434 -0.004963 -0.024023 0.012764 0.999618
+```
+
 ## 実機の動作確認
 
 ### `tools/ros/test_base_velocity.py`
