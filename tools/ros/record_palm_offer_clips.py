@@ -422,7 +422,9 @@ def main():
                         help='検出後に含める秒数。')
     parser.add_argument('--cooldown-seconds', type=float, default=3.0,
                         help='保存後、次のトリガーを受け付けるまでの秒数。')
-    parser.add_argument('--save-dir', type=str, default='palm_offer_clips',
+    parser.add_argument('--save-dir', type=str,
+                        default=os.path.join(_REPO_ROOT, 'data',
+                                             'palm_offer_clips'),
                         help='クリップ (.bag/.json/.png) の保存先。')
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 

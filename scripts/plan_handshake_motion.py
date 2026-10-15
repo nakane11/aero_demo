@@ -29,6 +29,7 @@ import time
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 _PKG_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'src')
@@ -1198,15 +1199,15 @@ def main():
         description='握手姿勢へ至る干渉回避付きの軌道を計画し JSON に保存する。')
     parser.add_argument(
         '--input-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_handshake_poses'),
         help='solve_palm_ik.py の出力 JSON のディレクトリ。')
     parser.add_argument(
         '--skeleton-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_human_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'),
         help='骨格 JSON のディレクトリ (--input-dir と同じファイル名で対応)。')
     parser.add_argument(
         '--output-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_motion_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_motion_poses'),
         help='軌道 JSON の保存先ディレクトリ。')
     parser.add_argument(
         '--approach-distance', type=float,

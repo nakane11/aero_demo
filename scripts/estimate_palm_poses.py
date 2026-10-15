@@ -27,6 +27,7 @@ from collections import namedtuple
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -599,11 +600,11 @@ def main():
                     'JSON に保存する。')
     parser.add_argument(
         '--input-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_human_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'),
         help='骨格 JSON の入力ディレクトリ。')
     parser.add_argument(
         '--output-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_palm_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_palm_poses'),
         help='掌の位置姿勢 JSON の保存先ディレクトリ。')
     args = parser.parse_args()
 

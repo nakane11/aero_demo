@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 .claude/
-scripts/random*
 tools/grid_search_handshake_motion_results*.csv
 src/aero_demo.egg-info/
 data/

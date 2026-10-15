@@ -119,7 +119,7 @@ jaxls が計算グラフに焼き込む FK 由来の定数が実行ごとに微�
 
 ```bash
 rosparam set /use_sim_time true
-rosbag play data/session1.bag --clock &
+rosbag play data/real/2026-09-17_session1/session1.bag --clock &
 python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 ```
 
@@ -255,7 +255,7 @@ cache` のファイル数増分 0 = 追加コンパイルなしを確認):
 「実運用でも同様に当てはまる可能性がある (未検証)」という懸念は誤りで、
 実際には該当しない。
 
-rosbag (`data/session1.bag`、実カメラ・実オペレータ1人分) を使った実ノード
+rosbag (`data/real/2026-09-17_session1/session1.bag`、実カメラ・実オペレータ1人分) を使った実ノード
 での確認 (`--auto-arm --no-wait-for-client`、rosbag を `/use_sim_time`
 込みで先行再生): warmup 左腕 IK 2.1秒+軌道最適化12.1秒、右腕 IK 1.6秒+
 軌道最適化11.0秒 (いずれも 3節の「ヒット」実測値と同水準)。本番 (warmup
@@ -274,7 +274,7 @@ rosbag (`data/session1.bag`、実カメラ・実オペレータ1人分) を使�
 `_solve_handshake` (旧963〜1010行付近) にも同じ制限を追加し、
 `solve_palm_ik.py` の `main()` と挙動を揃えた。
 
-rosbag (`data/session1.bag`) でこの変更後を再検証
+rosbag (`data/real/2026-09-17_session1/session1.bag`) でこの変更後を再検証
 (`--auto-arm --no-wait-for-client`、手順は上記と同一): warmup 左腕 IK
 2.1秒+軌道最適化12.1秒、右腕 IK 1.6秒+軌道最適化10.7秒。本番 (実際に
 手を差し出した1人、`offered_hand: "R"`、`robot_arm: "l"`): IK 合計0.20秒

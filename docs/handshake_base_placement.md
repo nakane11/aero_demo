@@ -161,7 +161,7 @@ python3 tools/summarize_final_base_placement.py <seed 0 の作業ディレクト
   (人に背を向けないか、human_028 のような逆向きが残るか)。
 - 実カメラの骨格での最終台車位置の評価 (`run_camera_pipeline_test.py` も
   同じ処理 (`solve_person_ik_side_by_side`) と同名のオプションを使う。
-  2026-10-13 に data2/data の正解ラベル付きフレーム 98 枚を実ノードの
+  2026-10-13 に data/real/2026-09-30_session1 (旧 data2) と旧 data の正解ラベル付きフレーム 98 枚を実ノードの
   `_solve_handshake` に流したときは、IK が解けた 32 枚の窓は ±0.15 m が
   15・±0.3 m が 3・無制限が 14 で、合成データより無制限の窓が多かった。
   前方ずれ・向きのずれは集計していない)。

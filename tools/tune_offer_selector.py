@@ -24,6 +24,7 @@ import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -204,10 +205,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--skeleton-dir', type=str,
-        default=os.path.join(_SCRIPTS_DIR, 'random_human_poses'))
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'))
     parser.add_argument(
         '--palm-dir', type=str,
-        default=os.path.join(_SCRIPTS_DIR, 'random_palm_poses'))
+        default=os.path.join(_SYNTHETIC_DIR, 'random_palm_poses'))
     parser.add_argument(
         '--n-random', type=int, default=200,
         help='ランダムに選ぶ候補数 (0 で格子を全探索)。')

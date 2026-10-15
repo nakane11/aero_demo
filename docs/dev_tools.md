@@ -40,7 +40,7 @@ _SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')  # tools/ros/ 以下は 
 ```
 
 `--input-dir`/`--skeleton-dir` 等の既定値も、`scripts/` 側のパイプラインが
-既定で書き出す `scripts/random_human_poses/`/`scripts/random_palm_poses/`
+既定で書き出す `data/synthetic/random_human_poses/`/`data/synthetic/random_palm_poses/`
 等をそのまま指すようにしてある (指定を省略すれば `scripts/` 側で
 `generate_random_human_poses.py`/`estimate_palm_poses.py` 等を実行した
 結果をそのまま読める)。
@@ -231,11 +231,15 @@ python3 tools/ros/compare_hand_detectors.py --side L --frames 100
 の既定値)。
 
 ```bash
-rosbag record -O session1.bag \
+mkdir -p data/real/2026-09-30_session1
+rosbag record -O data/real/2026-09-30_session1/session1.bag \
     /camera/color/image_raw/decompressed \
     /camera/depth/image_raw/decompressed \
     /camera/color/camera_info /tf /tf_static
 ```
+
+保存先は `data/real/<日付>_<セッション名>/` にする
+([`docs/test_data.md`](test_data.md))。
 
 `/tf_static` は latched なので、ロボット側が起動済みでも録画開始時に
 受け取れる。
@@ -250,7 +254,8 @@ rosbag record -O session1.bag \
 
 ```bash
 python3 tools/ros/extract_skeletons_from_bag.py \
-    --bag session1.bag --output-dir /tmp/offer_dataset
+    --bag data/real/2026-09-30_session1/session1.bag \
+    --output-dir data/real/2026-09-30_session1
 ```
 
 保存先には `skeletons/`/`palms/`/`images/` の 3 サブディレクトリができる
@@ -283,6 +288,31 @@ python3 tools/label_offer_images.py \
 ```bash
 python3 tools/tune_offer_selector.py \
     --skeleton-dir /path/to/skeletons --palm-dir /path/to/palms
+```
+
+## 実機データでの回帰テスト
+
+どのデータを使うかは [`docs/test_data.md`](test_data.md) にまとめてある。
+
+### `tools/ros/clip_bag.py`
+
+録画した全体 bag から再生テスト用の区間を切り出す。`/tf_static` は時刻を
+区間先頭に付け替えて先頭に入れる。
+
+```bash
+python3 tools/ros/clip_bag.py <全体 bag> <出力 bag> \
+    --start '2026-10-15 17:12:08.5' --end '2026-10-15 17:12:46.0'
+```
+
+### `tools/ros/resolve_saved_trials.py`
+
+`run_camera_pipeline_test.py` が試行ごとに保存した skeletons/palms の
+JSON を、ノードと同じ `HandshakePlanner` (IK -> 軌道計画 -> 横並び移動の
+計画) で解き直し、到達段階と保存時から変わった試行を出す。骨格検出の
+揺れが入らないので変更前後の比較に使う。
+
+```bash
+python3 tools/ros/resolve_saved_trials.py data/real/2026-10-13/logs
 ```
 
 ## 実機の動作確認

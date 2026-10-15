@@ -25,6 +25,7 @@ import trimesh
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_DIR = os.path.join(_THIS_DIR, '..', 'scripts')
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -140,11 +141,11 @@ def main():
                     '人モデル・骨格 JSON を読み込み、viser で表示する。')
     parser.add_argument(
         '--input-dir', type=str,
-        default=os.path.join(_SCRIPTS_DIR, 'random_human_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'),
         help='人物 JSON の入力ディレクトリ。')
     parser.add_argument(
         '--palm-dir', type=str,
-        default=os.path.join(_SCRIPTS_DIR, 'random_palm_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_palm_poses'),
         help='掌 JSON のディレクトリ (骨格と同じファイル名、無ければ省略)。')
     parser.add_argument(
         '--model-path', type=str,

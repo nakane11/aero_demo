@@ -4,16 +4,19 @@
        decompressed の画像は decompress.launch が出すので、先に起動しておくこと。
 
        使い方:
-         mkdir -p ~/bags
+         mkdir -p $(rospack find aero_demo)/data/bags
          roslaunch aero_demo record_camera_pipeline.launch
          # 保存先を変える場合
          roslaunch aero_demo record_camera_pipeline.launch prefix:=/tmp/session1
+
+       録画した全体 bag は data/bags/ に溜まる。テストに使う区間は切り出して
+       data/real/<日付>/ に置き、元 bag は消してよい (docs/test_data.md)。
   -->
 
   <!-- 保存先 (rosbag record -o の接頭辞。末尾に日時が付く)。
        roslaunch では相対パスが ~/.ros 基準になるので絶対パスで指定する。
        ディレクトリは自動では作られない。 -->
-  <arg name="prefix" default="$(env HOME)/bags/camera_pipeline" />
+  <arg name="prefix" default="$(find aero_demo)/data/bags/camera_pipeline" />
   <!-- 圧縮画像 (decompress 前) も一緒に残す -->
   <arg name="record_compressed" default="false" />
   <!-- 追加で録るトピック (スペース区切り) -->

@@ -88,11 +88,13 @@ view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handsha
 `generate_random_human_poses.py`/`estimate_palm_poses.py`/
 `solve_palm_ik.py`/`plan_handshake_motion.py`/`view_handshake_poses.py`
 の `--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
-`--handshake-dir` は、いずれも `scripts/` 直下の
+`--handshake-dir` は、いずれも `data/synthetic/` 直下の
 `random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/`/
 `random_motion_poses/` が既定値になっているため、指定を省略すれば 1〜5
 はそのままつながる ([`docs/dev_tools.md`](docs/dev_tools.md) の開発用
 ツール群も、既定ではこれらと同じディレクトリを読み書きする)。
+`data/` は git 管理外で、実機の bag などテストデータの置き場所と一覧は
+[`docs/test_data.md`](docs/test_data.md) にまとめてある。
 
 ## 環境構築
 
@@ -179,10 +181,10 @@ SMPL のモデルファイル (`.pkl`) はライセンス上リポジトリに�
 ```bash
 cd scripts
 
-# 1. ランダムな人物姿勢を 100 体生成 (既定の保存先 scripts/random_human_poses/ に保存)
+# 1. ランダムな人物姿勢を 100 体生成 (既定の保存先 data/synthetic/random_human_poses/ に保存)
 python3 generate_random_human_poses.py --num-samples 100
 
-# 2. 骨格から左右の掌の位置姿勢を推定 (既定で 1. の出力を読み、scripts/random_palm_poses/ に保存)
+# 2. 骨格から左右の掌の位置姿勢を推定 (既定で 1. の出力を読み、data/synthetic/random_palm_poses/ に保存)
 python3 estimate_palm_poses.py
 
 # 3. (開発用) viser で表示して 1./2. の結果を目視確認したい場合
@@ -245,7 +247,7 @@ python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 で次々に保存し続ける(判定基準は `run_camera_pipeline_test.py` の ARMED 中の判定と同じ
 既定値に揃えてある)。掌の差し出しを検出すると、その時刻の `--pre-seconds` 秒前 (既定 2.0) 
 から `--post-seconds` 秒後(既定 2.0) までの color/depth/camera_info/tf/tf_static を 1 本の
-`.bag` にまとめて `--save-dir` (既定 `palm_offer_clips/`) に保存する。
+`.bag` にまとめて `--save-dir` (既定 `data/palm_offer_clips/`) に保存する。
 同じ差し出し動作を 2 回に分けて録らないよう、1 クリップ保存後
 `--cooldown-seconds` 秒 (既定 3.0) は次のトリガーを無視する。
 
@@ -258,7 +260,7 @@ python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
 保存されるファイルはクリップごとに 3 つ:
 
 ```
-palm_offer_clips/
+data/palm_offer_clips/
     20260911_214500_R_000.bag   # color/depth/camera_info/tf/tf_static (4秒分)
     20260911_214500_R_000.json  # trigger_stamp/offered_hand/pre_seconds/post_seconds/topics/bag_path/snapshot_path
     20260911_214500_R_000.png   # 差し出しを検出した瞬間のカラー画像 + 骨格描画 (差し出し手は赤)
@@ -285,7 +287,7 @@ base_link 座標系ではロボット自身がおよそ原点付近 (=人物よ�
 
 ```bash
 python3 scripts/ros/run_camera_pipeline_test.py \
-    --bag palm_offer_clips/20260911_214500_R_000.bag \
+    --bag data/palm_offer_clips/20260911_214500_R_000.bag \
     --auto-arm --no-wait-for-client
 ```
 

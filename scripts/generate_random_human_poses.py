@@ -21,6 +21,7 @@ import sys
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
@@ -392,7 +393,7 @@ def main():
                         help='生成する人物 (JSON) の数。')
     parser.add_argument(
         '--output-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_human_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'),
         help='JSON の保存先ディレクトリ。')
     parser.add_argument(
         '--model-path', type=str,

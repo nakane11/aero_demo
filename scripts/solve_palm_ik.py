@@ -17,7 +17,7 @@ Usage
     rosrun aero_demo estimate_palm_poses.py
     rosrun aero_demo solve_palm_ik.py
 
-(既定の入出力先は scripts/ 直下の random_human_poses/ ->
+(既定の入出力先は data/synthetic/ 直下の random_human_poses/ ->
 random_palm_poses/ -> random_handshake_poses/)
 """
 
@@ -33,6 +33,7 @@ import zlib
 import numpy as np
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SYNTHETIC_DIR = os.path.join(_THIS_DIR, '..', 'data', 'synthetic')
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 _PKG_SRC_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'src')
@@ -3183,11 +3184,11 @@ def main():
                     'を人物ごとに解いて JSON に保存する。')
     parser.add_argument(
         '--input-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_palm_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_palm_poses'),
         help='掌の位置姿勢 JSON の入力ディレクトリ。')
     parser.add_argument(
         '--output-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_handshake_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_handshake_poses'),
         help='IK の結果 JSON の保存先 (入力と同じファイル名)。')
     parser.add_argument(
         '--attempts-per-pose', type=int,
@@ -3196,7 +3197,7 @@ def main():
             DEFAULT_ATTEMPTS_PER_POSE))
     parser.add_argument(
         '--skeleton-dir', type=str,
-        default=os.path.join(_THIS_DIR, 'random_human_poses'),
+        default=os.path.join(_SYNTHETIC_DIR, 'random_human_poses'),
         help='骨格 JSON のディレクトリ (--input-dir と同じファイル名で対応)。'
             '人体の障害物を作るのに使う。')
     parser.add_argument(

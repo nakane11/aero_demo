@@ -13,11 +13,12 @@
 Usage
 -----
     python3 tools/ros/extract_skeletons_from_bag.py \
-        --bag session1.bag --output-dir /tmp/offer_dataset
+        --bag data/real/2026-09-30_session1/session1.bag \
+        --output-dir data/real/2026-09-30_session1
 
     # record_palm_offer_clips.py が切り出した bag から 1 本 1 サンプル
     python3 tools/ros/extract_skeletons_from_bag.py \
-        --bag palm_offer_clips/*.bag --output-dir /tmp/offer_dataset \
+        --bag data/palm_offer_clips/*.bag --output-dir /tmp/offer_dataset \
         --single-sample
 """
 
