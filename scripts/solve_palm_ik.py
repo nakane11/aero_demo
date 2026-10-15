@@ -154,6 +154,12 @@ PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 # 後処理判定の目標の掌からのオフセット [m] (負 = 掌にわずかにめり込む)。
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
+# 後処理 IK・押し込み区間の IK (どちらも脚を含めて解く) の直後に、脚のミミック
+# 関節を主関節に合わせて、脚を固定して腕・腰だけ解き直すか (settle_legs)。しない
+# と、実機に送る関節角 (主関節だけ) では手先が目標から IK の許容 (10 mm) を超えて
+# 離れる (保存した押し込み姿勢で中央値 14〜22 mm、最大 59 mm)。
+POST_PROCESS_SETTLE_LEGS = True
+
 # 後処理判定の腕 IK (ヤコビアン法、干渉回避・台車なし) の反復回数・収束閾値。
 DEFAULT_POST_PROCESS_IK_STOP = 40
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
@@ -2213,6 +2219,34 @@ def _gaze_error(gaze_coords, position):
         np.dot(gaze_coords.worldrot()[:, 2], direction), -1.0, 1.0)))
 
 
+LEG_JOINT_NAMES = ('ankle_joint', 'ankle_joint_mimic', 'knee_joint',
+                   'knee_joint_mimic')
+
+
+def sync_leg_mimics(robot):
+    """脚の平行リンクのミミック関節 (``joint_list`` に無く、主関節のフックで
+    だけ更新される) を、主関節 (足首・膝) に合わせ直す。脚を含む IK はミミック
+    を主関節と食い違った角度で終えることがあり (最大 0.25 rad)、実機に送る
+    関節角は主関節だけなので、その姿勢の手先は IK の結果から最大 10 cm 動く。"""
+    for name in ('ankle_joint', 'knee_joint'):
+        joint = getattr(robot, name, None)
+        if joint is not None:
+            joint.joint_angle(float(joint.joint_angle()))
+
+
+def settle_legs(robot, target_coords, move_target, whole_body, stop, thre,
+                rthre):
+    """脚を含む IK の直後に、ミミックを主関節に合わせ、脚を固定して腕・腰だけ
+    で ``target_coords`` へ解き直す。解けなければ False (ロボットは合わせた
+    直後の姿勢、手先は目標から離れている)。"""
+    sync_leg_mimics(robot)
+    upper = [link for link in whole_body.link_list
+             if link.joint.name not in LEG_JOINT_NAMES]
+    return robot.inverse_kinematics(
+        target_coords, move_target=move_target, link_list=upper,
+        stop=stop, thre=thre, rthre=rthre, revert_if_fail=True) is not False
+
+
 # _reaim_gaze の最大繰り返し回数。
 POST_PROCESS_GAZE_REAIM_ROUNDS = 3
 
@@ -2306,6 +2340,11 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         return None
     if result is False:
         return None
+    if POST_PROCESS_SETTLE_LEGS and not settle_legs(
+            robot, target_coords, move_target, whole_body, stop, thre, rthre):
+        robot.angle_vector(initial_angle_vector)
+        sync_leg_mimics(robot)
+        return None
     if gaze:
         _reaim_gaze(robot, head_move_target, position,
                     gaze_ik_stop, gaze_ik_rthre)
@@ -2383,6 +2422,11 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
                   'します: {}'.format(e))
             result = False
         if result is False:
+            restore()
+            return None
+        if POST_PROCESS_SETTLE_LEGS and not settle_legs(
+                robot, target_coords, move_target, whole_body, stop, thre,
+                rthre):
             restore()
             return None
         path.append(robot.angle_vector().copy())
@@ -3132,7 +3176,8 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 def main():
     global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
-        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT
+        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT, \
+        POST_PROCESS_SETTLE_LEGS
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3274,7 +3319,13 @@ def main():
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '
             '[m]。実カメラの骨格では {} を指定する (既定 0)。'.format(
                 DEFAULT_TORSO_SURFACE_OFFSET))
+    parser.add_argument(
+        '--no-settle-legs', action='store_true',
+        help='後処理 IK・押し込み区間の IK の直後に、脚のミミック関節を主関節に '
+            '合わせて腕だけ解き直す処理 (POST_PROCESS_SETTLE_LEGS) を無効にする '
+            '(比較用)。')
     args = parser.parse_args()
+    POST_PROCESS_SETTLE_LEGS = not args.no_settle_legs
     PRESS_IN_SLIDE = args.press_in_slide
     PRESS_IN_LIFT = args.press_in_lift
     PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
