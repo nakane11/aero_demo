@@ -1295,12 +1295,16 @@ class HandshakePipelineNode(object):
             args.auto_execute and self.ri is not None and result['solved']
             and has_post_process
             and motion is not None and display_waypoints is not None
-            and self._motion_verified(motion))
+            and self._execution_verified(motion))
         if motion is not None and not self._motion_verified(motion):
             print('[execute] 軌道の干渉検証に通らなかったため (verified={}, '
                   'lead_in_verified={})、--auto-execute でも実機を動かし'
                   'ません。'.format(
                       motion['verified'], motion['lead_in_verified']))
+        elif motion is not None and not self._execution_verified(motion):
+            print('[execute] 横並び移動が解けなかったため ({})、'
+                  '--auto-execute でも実機を動かしません。'.format(
+                      (motion.get('transition') or {}).get('reason')))
         if result['solved'] and not has_post_process:
             print('[execute] 後処理 (押し付け/視線 IK) が解けず押し込み区間が'
                   'ないため、--auto-execute でも実機を動かしません。')
@@ -1319,7 +1323,8 @@ class HandshakePipelineNode(object):
                   '(--auto-execute)。')
             return 'execute'
         if not (result['solved'] and has_post_process
-                and motion is not None and self._motion_verified(motion)):
+                and motion is not None
+                and self._execution_verified(motion)):
             speech = self._failure_speech(
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
@@ -1333,7 +1338,8 @@ class HandshakePipelineNode(object):
         """実機を動かせなかったときに発話する文を返す。
 
         手の出し方が原因なら reachability map で近い解ける出し方との差を
-        助言し、接近途中の干渉なら ``--speech-approach-fail-text`` を返す。
+        助言し、接近途中の干渉なら ``--speech-approach-fail-text``、横並び移動が
+        解けなかったなら ``--speech-transition-fail-text`` を返す。
         """
         args = self.args
         cause = self._failure_cause(result, motion)
@@ -1342,6 +1348,11 @@ class HandshakePipelineNode(object):
                   '助言しません。'.format(attempt))
             self._log_debug(dict(event='advice', person=attempt, cause=cause))
             return args.speech_approach_fail_text
+        if cause == 'transition':
+            print('[advice] 試行{}: 横並び移動が解けなかったため、手の出し方は'
+                  '助言しません。'.format(attempt))
+            self._log_debug(dict(event='advice', person=attempt, cause=cause))
+            return args.speech_transition_fail_text
         measure = hand_offer_advice.measure_offer(
             joint_positions, palm, offered_hand)
         advice, target = [], None
@@ -1370,6 +1381,9 @@ class HandshakePipelineNode(object):
             return 'no_press'
         if motion is None or not motion['lead_in_verified']:
             return 'approach'
+        if motion_verified(motion):
+            # 接近・押し込みは通ったので、横並び移動が解けなかった。
+            return 'transition'
         distances = motion['waypoint_min_distances']
         margins = motion.get('waypoint_human_clearance_margins') or \
             [None] * len(distances)
@@ -1381,6 +1395,16 @@ class HandshakePipelineNode(object):
         return 'approach'
 
     _motion_verified = staticmethod(motion_verified)
+
+    def _execution_verified(self, motion):
+        """実機で実行してよい軌道か。接近・押し込みが検証に通り、横並び
+        移動をする設定なら横並び移動も解けていること。"""
+        if not motion_verified(motion):
+            return False
+        if self.args.side_by_side_transition:
+            transition = motion.get('transition')
+            return bool(transition and transition.get('verified'))
+        return True
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
@@ -1682,6 +1706,10 @@ class HandshakePipelineNode(object):
             print('[execute] 軌道の干渉検証に通っていないため実機を動かせ '
                   'ません (verified={}, lead_in_verified={})。'.format(
                       motion['verified'], motion['lead_in_verified']))
+            return
+        if not self._execution_verified(motion):
+            print('[execute] 横並び移動が解けていないため実機を動かせ '
+                  'ません。')
             return
 
         # うなずきが終わるまで待つ。
@@ -2998,6 +3026,11 @@ def build_arg_parser():
         default='ごめんなさい、近づく道が見つかりませんでした。'
                 'もう一度手を出してください',
         help='接近途中の干渉で実機を動かせなかったときの発話。')
+    parser.add_argument(
+        '--speech-transition-fail-text', type=str,
+        default='ごめんなさい、横に並ぶ道が見つかりませんでした。'
+                'もう一度手を出してください',
+        help='横並び移動が解けず実機を動かせなかったときの発話。')
     parser.add_argument(
         '--no-side-by-side-transition', dest='side_by_side_transition',
         action='store_false',
