@@ -560,6 +560,31 @@ class HandshakePipelineNode(object):
         finally:
             np.random.set_state(random_state)
 
+    def _pin_warmup_fixed_joints(self, robot_arm, handshake):
+        """軌道最適化に渡す ``handshake`` の、軌道で動かさない関節 (差し出さ
+        ない腕・頭など) の角度を IK の結果に依らない固定値にする。
+
+        これらの角度は軌道問題の FK 定数として jit_solve に焼き込まれるので、
+        IK の出力が少し変わるだけで軌道最適化のキャッシュが外れ、再コンパイル
+        (左右で約 60 秒) になっていた。差し出さない腕は最初の姿勢候補にする。
+        """
+        chain = {link.joint.name for link in getattr(
+            self.robot, '{}arm_whole_body'.format(robot_arm)).link_list}
+        other = 'l' if robot_arm == 'r' else 'r'
+        shoulder_p, elbow = spik.OTHER_ARM_POSTURES_DEG[0]
+        posture = {'{}_shoulder_p_joint'.format(other): np.radians(shoulder_p),
+                   '{}_elbow_joint'.format(other): np.radians(elbow)}
+        joints = {j.name: j for j in self.robot.joint_list}
+        names = handshake['joint_names']
+        angles = list(handshake['joint_angle_vector'])
+        for i, name in enumerate(names):
+            if name in chain:
+                continue
+            joint = joints[name]
+            angle = posture.get(name, 0.0)
+            angles[i] = float(np.clip(angle, joint.min_angle, joint.max_angle))
+        handshake['joint_angle_vector'] = angles
+
     def _warmup_ik_body(self):
         """``_warmup_ik`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
@@ -601,6 +626,7 @@ class HandshakePipelineNode(object):
                 self.robot, robot_arm, rots[turn_index],
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
+            self._pin_warmup_fixed_joints(robot_arm, handshake)
             t0 = time.time()
             phm.plan_person_motion(
                 self.robot, robot_arm, handshake, {}, warmup_human_xy,
@@ -1273,7 +1299,8 @@ class HandshakePipelineNode(object):
         """人物を平行移動した仮想座標系の ``result`` を実際の base_link 系へ
         戻す (破壊的)。忘れると仮想の人物に向かって台車が動く。"""
         dx, dy = offset
-        for key in ('target_position', 'hand_position', 'base_position'):
+        for key in ('target_position', 'hand_position', 'base_position',
+                    'palm_position'):
             if key in result and result[key] is not None:
                 result[key][0] -= dx
                 result[key][1] -= dy
@@ -1287,16 +1314,30 @@ class HandshakePipelineNode(object):
                 if key in post_process and post_process[key] is not None:
                     post_process[key][0] -= dx
                     post_process[key][1] -= dy
+            # 押し込み中の台車 [x, y, yaw] (戻し忘れると実機の台車が押し込み
+            # 中に平行移動量だけ動く)。
+            for base in post_process.get('press_in_base_path') or []:
+                base[0] -= dx
+                base[1] -= dy
 
     @staticmethod
     def _untranslate_motion(motion, offset):
-        """``motion`` の各 waypoint の台車位置を実際の base_link 系へ戻す (破壊的)。"""
+        """``motion`` の各 waypoint の台車位置 (横並び移動は人の腕も) を実際の
+        base_link 系へ戻す (破壊的)。"""
         dx, dy = offset
         transition = motion.get('transition') or {}
         for wp in (motion['waypoints'] + motion.get('lead_in_waypoints', [])
                    + transition.get('waypoints', [])):
             wp['base_position'][0] -= dx
             wp['base_position'][1] -= dy
+        arms = [wp.get('human_arm') for wp in transition.get('waypoints', [])]
+        for arm in [transition.get('press_arm')] + arms:
+            if not arm:
+                continue
+            for key in ('elbow', 'wrist', 'palm_position'):
+                if arm.get(key) is not None:
+                    arm[key][0] -= dx
+                    arm[key][1] -= dy
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
