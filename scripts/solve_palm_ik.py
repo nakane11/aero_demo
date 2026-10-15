@@ -2586,6 +2586,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             angle_vectors[candidate_index], bend_cost_indices)
         if CROUCH_WEIGHT > 0.0:
             cost += CROUCH_WEIGHT * waist_drop(angle_vectors[candidate_index])
+        if BOW_WEIGHT > 0.0:
+            cost += BOW_WEIGHT * max(0.0, float(
+                angle_vectors[candidate_index][waist_p_index])) ** 2
         if standing_xy is not None and facing is not None:
             # 台車の置き方は押し込み後 (台車も近づいた後) の位置で見る。
             hover_base = base_poses[candidate_index]
@@ -2632,9 +2635,6 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     def _involves_other_arm(pair):
         link_a, other = pair
         return link_a.name.startswith(other_prefix) or (
-        if BOW_WEIGHT > 0.0:
-            cost += BOW_WEIGHT * max(0.0, float(
-                angle_vectors[candidate_index][waist_p_index])) ** 2
             not isinstance(other, int) and other.name.startswith(other_prefix))
 
     early_verification_pairs = _subset(
