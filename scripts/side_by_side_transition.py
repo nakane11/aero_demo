@@ -1319,8 +1319,16 @@ FORWARD_GAZE_DEFAULT_HEIGHT = 1.4
 
 
 def forward_gaze_point(joint_positions):
-    """横並びで前を見る点: 人の立ち位置から人の正面方向へ
-    ``FORWARD_GAZE_DISTANCE`` 先の、人の目 (鼻) の高さの点。"""
+    """横並びで見る点: 人の顔 (鼻、なければ両耳の中点)。顔が骨格から
+    求まらないときだけ、人の立ち位置から人の正面方向へ
+    ``FORWARD_GAZE_DISTANCE`` 先の、人の目 (鼻) の高さの点を使う。"""
+    nose = joint_positions.get('Nose')
+    if nose is not None:
+        return np.asarray(nose, dtype=np.float64)[:3].copy()
+    ears = [joint_positions.get(name) for name in ('LEar', 'REar')]
+    if all(ear is not None for ear in ears):
+        return (np.asarray(ears[0], dtype=np.float64)[:3]
+                + np.asarray(ears[1], dtype=np.float64)[:3]) / 2.0
     standing = spik.human_standing_xy(joint_positions)
     facing = spik.human_facing_direction(joint_positions)
     nose = joint_positions.get('Nose')
