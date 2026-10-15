@@ -72,6 +72,14 @@ LOWERED_ARM_GROUPS = tuple(
 LOWERED_PALM_FACINGS = ('inward', 'forward', 'backward')
 LOWERED_TARGET_COUNT = 3
 
+# 腕を下ろす途中で上腕を外へ膨らませる角度 [度] (0 なら押し込み時から下ろし
+# きった腕へ最短の回転)。つないだ手が人の腰の横を通るとき、ロボットの前腕が
+# 人の胴体・太ももに近づくのをよける。両端の姿勢は変えない。実機 2026-10-13
+# の 13 人で 0 -> 10 -> 20 度: 移動先まで 100% は 6 -> 7 -> 6 人、上腕の角度の
+# 中央値 45 -> 40 -> 34 度。合成 21 人は 0・10 度で 21/21 (結果ほぼ同じ)、
+# 20 度は 17/21 に減るので 10 度。
+LOWERED_BULGE_DEG = 10.0
+
 # 掌の向きの最初の候補 'natural': 前腕をひねらず (ひねり 0)、腕を下ろす回転
 # だけで手を動かした向き。人側・前・後ろのどれかに合わせようと前腕をひねると、
 # 親指が上へ回り指先が下を向きにくい。ひねらなければ手は親指側の軸まわりに
@@ -485,6 +493,14 @@ class HumanArm(object):
         腕) の (肘, 手首, 掌の位置, 掌の回転行列)。"""
         frame = Slerp([0.0, 1.0], Rotation.from_matrix(
             [goal['start_frame'], goal['frame']]))([s]).as_matrix()[0]
+        if LOWERED_BULGE_DEG > 0.0:
+            # 途中で上腕を外へ膨らませる (両端は変えない)。
+            ua = frame[:, 0] + (math.sin(math.pi * s)
+                                * math.tan(math.radians(LOWERED_BULGE_DEG))
+                                * self.outward)
+            ua = _unit(ua)
+            n = frame[:, 1] - np.dot(frame[:, 1], ua) * ua
+            frame = _arm_frame(ua, _unit(n))
         flex = goal['start_flex'] + (goal['flex'] - goal['start_flex']) * s
         ramp = min(1.0, max(0.0, (s - LOWERED_TWIST_START)
                             / max(1.0 - LOWERED_TWIST_START, 1e-6)))
@@ -581,8 +597,15 @@ class BasePath(object):
             abs(self.goal[2] - self.start[2]) / MAX_ANGLE_STEP))))
 
 
+def _sync_leg_mimics(robot):
+    """脚の平行リンクのミミック関節を、主関節 (足首・膝) に合わせ直す。
+    実機に送る関節角は主関節だけで、ミミックは主関節から決まる。"""
+    spik.sync_leg_mimics(robot)
+
+
 def _place(robot, angle_vector, base):
     robot.angle_vector(np.asarray(angle_vector, dtype=np.float64))
+    _sync_leg_mimics(robot)
     robot.newcoords(Coordinates(pos=[float(base[0]), float(base[1]), 0.0],
                                 rot=rpy_matrix(float(base[2]), 0.0, 0.0)))
 
@@ -653,7 +676,29 @@ def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
     角度に固定する (呼び出し側が補間して与える)。``free_turn`` なら掌の
     法線まわりの回転 (握りの向き) は拘束しない。視線が解けなければ首は
     そのままで腕だけを解く (``gaze_point`` が None なら視線は解かない)。
-    腕が解けなければ ``False`` (ロボットは呼び出し前の姿勢に戻る)。"""
+    腕が解けなければ ``False`` (ロボットは呼び出し前の姿勢に戻る)。
+
+    ``free_legs`` のときは、IK が脚のミミック関節を主関節と食い違った角度で
+    終える (実機の姿勢では掌が最大 10 cm 離れる) ので、ミミックを主関節に
+    合わせてから、脚を固定して腕だけ解き直す。解き直せなければ ``False``。"""
+    if free_legs:
+        before = robot.angle_vector().copy()
+        if not _press_ik_once(robot, robot_arm, target, gaze_point,
+                              free_legs=True, free_turn=free_turn):
+            return False
+        _sync_leg_mimics(robot)
+        if _press_ik_once(robot, robot_arm, target, gaze_point,
+                          free_legs=False, free_turn=free_turn):
+            return True
+        robot.angle_vector(before)
+        _sync_leg_mimics(robot)
+        return False
+    return _press_ik_once(robot, robot_arm, target, gaze_point,
+                          free_legs=False, free_turn=free_turn)
+
+
+def _press_ik_once(robot, robot_arm, target, gaze_point, free_legs=False,
+                   free_turn=False):
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     link_list = [link for link in whole_body.link_list
                  if free_legs or link.joint.name not in LEG_JOINT_NAMES]
