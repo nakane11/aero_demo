@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """``run_pipeline_test.py`` の作業ディレクトリ (複数可) を読み、IK が決めた
 最終の台車位置と人の位置関係 (方位・前方ずれ・向きのずれ)・IK の計算時間を
-集計する。指標の定義は docs/handshake_base_placement.md。
+集計する。
 
 usage::
 

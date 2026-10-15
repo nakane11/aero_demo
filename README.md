@@ -28,38 +28,27 @@ MediaPipe 形式の骨格・掌の
    干渉回避付きバッチ IK → 干渉の事後検証 → 掌へ押し込む後処理 IK の
    二段階で、制約・重み・解の優先順位・棄却条件は
    [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)
-   にまとめてある。最終台車位置の決め方の背景と合成データでの比較は
-   [`docs/handshake_base_placement.md`](docs/handshake_base_placement.md)
-   参照。
+   にまとめてある。
 
 4.5. **`scripts/plan_handshake_motion.py`**
-   手順 4 の握手姿勢を目標として、そこへ至る接近の軌道 (waypoints) を干渉回避
-   付きで生成し JSON として保存する。
-
-   台車は人の手を中心に公転+自転して人の横に並び、腕は掌の法線方向から
-   pre-touch 姿勢を経由して寄る。幾何的に作った軌道で干渉が残ったときだけ
-   jaxls で最適化し、全 waypoint を事後検証して `verified` に入れる
-   (初期位置から接近開始位置までの直進は `lead_in_verified`、経路全体の
-   成否は両方を見る)。接近開始位置の候補と優先順位・最適化の重み・棄却
-   条件は [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)
-   参照。`--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
+   手順 4 の握手姿勢 (hover) を目標として、そこへ至る接近の軌道 (waypoints) を
+   干渉回避付きで生成し JSON として保存する。台車は人の手を中心に公転+自転して
+   人の横に並び、腕は pre-touch 姿勢を経由して寄る。幾何的に作った軌道で干渉が
+   残ったときだけ jaxls で最適化し、全 waypoint を事後検証して `verified` に入れる
+   (初期位置から接近開始位置までの直進は `lead_in_verified`)。
+   `--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
    (`run_pipeline_test.py` にも同名のオプション)。
-
    `--side-by-side-transition` を付けると、押し込み (掌を合わせた姿勢) の後に、
-   つないだ手を人が肩から体の横へ下ろす (できるだけ真下まで) のに合わせて
-   ロボットも人と横並びになる区間も計画し、
-   軌道 JSON の `transition` に保存する (`scripts/side_by_side_transition.py`)。
-   押し込みまでは握りの向きを決めて合わせ、そこから手を下ろしやすい向きへ少しずつ
-   回す。移動先の決め方・棄却条件・合成データでの結果は
-   [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md) の 5 節
-   参照。`run_pipeline_test.py --plan-motion --side-by-side-transition --viewer` で
-   見ると、押し込みに続けて再生され、人の腕もロボットの手に追従する。
-
-   `--force-optimize` (既定 False) を付けると、pre-touch/線形補間の
-   候補が事後検証に通っていても early return せず、必ず jaxls の軌道
-   最適化まで実行する。通常運用では最適化を経ずに済むケースがほとんど
-   なので、jaxls の軌道最適化そのものの計算時間を単独で計測したいとき
-   (ベンチマーク・回帰確認用) に使う。
+   つないだ手を人が肩から体の横へ下ろすのに合わせてロボットも人と横並びになる
+   区間も計画し、軌道 JSON の `transition` に保存する
+   (`scripts/side_by_side_transition.py`)。
+   `--force-optimize` は jaxls の軌道最適化の計算時間を単独で計測するための
+   ベンチマーク用オプションで、通常は付けない
+   ([`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 11 節)。
+   接近開始位置の候補・優先順位・最適化の重み・棄却条件・横並び移動の決め方は
+   [`docs/ik_and_motion_constraints.md`](docs/ik_and_motion_constraints.md)、
+   段階ごとの図と数値は
+   [`docs/handshake_pipeline_stages.md`](docs/handshake_pipeline_stages.md) 参照。
 
 5. **`scripts/view_handshake_poses.py`**
    手順 1 の骨格 JSONと、手順 4 の IK 結果 JSONを読み込み、SMPL の人体メッシュと
@@ -67,9 +56,10 @@ MediaPipe 形式の骨格・掌の
    干渉回避に使ったのと同じ近似ジオメトリを半透明で
    重ねて表示でき、テキストパネルの事後検証 (指先まで含めた貫通の再チェック)
    もこの表示中のメッシュをそのまま使って判定する。
+   軌道 (手順 4.5) を再生するときは `scripts/view_handshake_motion.py` を使う。
 
 ```
-generate_random_human_poses.py  (既定の出力先: random_human_poses/)
+generate_random_human_poses.py  (既定の出力先: data/synthetic/random_human_poses/)
         │  (skeleton.joint_positions + smpl.pose/betas/root_pos/gender)
         ▼
 estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: random_palm_poses/)
@@ -87,8 +77,8 @@ view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handsha
 
 `generate_random_human_poses.py`/`estimate_palm_poses.py`/
 `solve_palm_ik.py`/`plan_handshake_motion.py`/`view_handshake_poses.py`
-の `--input-dir`/`--output-dir`/`--palm-dir`/`--skeleton-dir`/
-`--handshake-dir` は、いずれも `data/synthetic/` 直下の
+の `--input-dir`/`--output-dir`/`--skeleton-dir`/`--handshake-dir` は、
+いずれも `data/synthetic/` 直下の
 `random_human_poses/`/`random_palm_poses/`/`random_handshake_poses/`/
 `random_motion_poses/` が既定値になっているため、指定を省略すれば 1〜5
 はそのままつながる ([`docs/dev_tools.md`](docs/dev_tools.md) の開発用
@@ -114,8 +104,8 @@ fork を使う:
   `skrobot.data.aero_urdfpath`
 * `batch_inverse_kinematics` の `use_base='planar'` +
   `base_limits` (台車の平面移動を含む全身バッチ IK と、その移動範囲の
-  指定 -- `--base-x-range`/`--base-y-range`/`--base-yaw-range` はこれを
-  渡している)
+  指定 -- `run_camera_pipeline_test.py` の
+  `--base-x-range`/`--base-y-range`/`--base-yaw-range` はこれを渡している)
 * `batch_inverse_kinematics` の `collision_link_list`/
   `collision_obstacles` (干渉回避付きバッチ IK。
   `backend='jax'` の勾配降下法でしか使えない)
@@ -195,24 +185,28 @@ python3 ../tools/draw_random_human_poses.py
 python3 solve_palm_ik.py
 
 # 4.5. 握手姿勢へ至る「最後の接近」の軌道を干渉回避付きで生成 (4. の結果を目標にする)
+#      押し込み後の横並び移動も計画するなら --side-by-side-transition を付ける
 python3 plan_handshake_motion.py
 
 # 5. SMPL メッシュ + ロボットモデルを viser で表示 (4. の結果と、1. の骨格を対応づける)
 python3 view_handshake_poses.py
 ```
 
-`scripts/run_pipeline_test.py` は 1/2/4 (と `--viewer` 指定時は 5) を
-順に実行する回帰テストで、`--plan-motion` を付けると 4.5 も実行して
-「経路上の干渉も含めて検証できた人数 (verified)」を集計に加える。この
-とき `--viewer` も指定すると、5 は `view_handshake_poses.py` の代わりに
-軌道を再生できる `view_handshake_motion.py` を開く。
-`--base-x-standing-margins`/`--front-offset-weight`/`--facing-yaw-weight` はそのまま
-`solve_palm_ik.py` に渡される (最終台車位置の比較に使う、
-[`docs/handshake_base_placement.md`](docs/handshake_base_placement.md)
-参照)。
+`scripts/run_pipeline_test.py <人数>` は 1/2/4 (と `--viewer` 指定時は 5) を
+順に実行する回帰テストで、毎回 `/tmp/aero_demo_pipeline_*` に作業ディレクトリを
+作る (`--seed` で再現できる)。`--plan-motion` を付けると 4.5 も実行して
+「経路上の干渉も含めて検証できた人数 (verified)」を集計に加え、
+`--side-by-side-transition` を併せて付けると横並び移動も計画する。
+`--plan-motion --viewer` なら、5 は `view_handshake_poses.py` の代わりに
+軌道を再生できる `view_handshake_motion.py` を開く (横並び移動は押し込みに続けて
+再生され、人の腕もロボットの手に追従する)。
+`--base-x-standing-margins`/`--front-offset-weight`/`--facing-yaw-weight` は
+そのまま `solve_palm_ik.py` に渡される (最終台車位置の比較に使う)。
+各段階の図と数値は
+[`docs/handshake_pipeline_stages.md`](docs/handshake_pipeline_stages.md)。
 
 保存先を変えたい場合は、各スクリプトの `--input-dir`/`--output-dir`/
-`--palm-dir`/`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
+`--skeleton-dir`/`--handshake-dir` で明示的に指定できる
 (例: `--output-dir /tmp/random_human_poses`)。`solve_palm_ik.py` が対象に
 する人間の手は掌 JSON の `offered_hand` で決まる。
 使うロボットの腕は人間の手の反対側。
@@ -222,68 +216,21 @@ python3 view_handshake_poses.py
 `tools/ros/`) にまとめてある。一覧・使い方は
 [`docs/dev_tools.md`](docs/dev_tools.md) を参照。
 
-## 実カメラ入力: 掌差し出しクリップの収集とカメラ無しでのテスト
+## 実カメラ入力
 
-実カメラで動かすパイプライン (`scripts/ros/run_camera_pipeline_test.py`)
-に加えて、(開発用) `tools/ros/record_palm_offer_clips.py` を常時起動して
-おくと、掌の差し出しを検出するたびにその前後を rosbag クリップとして
-自動で切り出して保存できる。保存したクリップは `run_camera_pipeline_
-test.py` に `--bag` で渡せば、実カメラ・実ロボットの TF 配信なしに
-パイプライン全体をそのままテストできる (このデータ収集・ラベル付け系の
-開発用ツール一式は [`docs/dev_tools.md`](docs/dev_tools.md) にまとめて
-ある)。
+実カメラ・実ロボットで動かすのは `scripts/ros/run_camera_pipeline_test.py`。
+カメラ画像から骨格・掌を推定し、ARM を押す (または `--auto-arm`) と差し出し手の
+判定 → IK → 軌道計画 → 横並び移動の計画までを行い、`--auto-execute` を付けたときだけ
+実機 (台車・腕・首) を動かす (付けなければ viewer で確認するだけ)。
+横並び移動をする設定 (既定) では、横並び移動が解けていない試行は実機を動かさない
+(`--no-side-by-side-transition` で押し込みまでにできる)。
 
-### 1. `record_palm_offer_clips.py`: クリップの録画
+詳細ログ (`[debug]` など) は画面には出さず、
+`/tmp/run_camera_pipeline_test_logs/<起動時刻>/` に起動時 (`startup.log`) と
+試行 (人) ごと (`person_01.log`, ...) のファイルで保存する
+(起動ごとに別のディレクトリで、最新は `latest` からたどれる)。
 
-実カメラ・実ロボットが動いている状態で実行する:
-
-```bash
-python3 tools/ros/record_palm_offer_clips.py
-# 保存先を変えたい場合
-python3 tools/ros/record_palm_offer_clips.py --save-dir /tmp/palm_offer_clips
-```
-
-`Ctrl-C` などで止めるまで無期限に動き続け、その間に検出した掌の差し出しを連番のファイル名
-で次々に保存し続ける(判定基準は `run_camera_pipeline_test.py` の ARMED 中の判定と同じ
-既定値に揃えてある)。掌の差し出しを検出すると、その時刻の `--pre-seconds` 秒前 (既定 2.0) 
-から `--post-seconds` 秒後(既定 2.0) までの color/depth/camera_info/tf/tf_static を 1 本の
-`.bag` にまとめて `--save-dir` (既定 `data/palm_offer_clips/`) に保存する。
-同じ差し出し動作を 2 回に分けて録らないよう、1 クリップ保存後
-`--cooldown-seconds` 秒 (既定 3.0) は次のトリガーを無視する。
-
-このノードは今の判定器が認識できた差し出ししか保存しないので、「差し出した
-のに認識されなかった」場面を集めるには使えない。その場合は `rosbag record`
-で連続録画してから `tools/ros/extract_skeletons_from_bag.py` で抽出する
-([`docs/dev_tools.md`](docs/dev_tools.md) の「実カメラデータの収集・
-ラベル付け」参照)。
-
-保存されるファイルはクリップごとに 3 つ:
-
-```
-data/palm_offer_clips/
-    20260911_214500_R_000.bag   # color/depth/camera_info/tf/tf_static (4秒分)
-    20260911_214500_R_000.json  # trigger_stamp/offered_hand/pre_seconds/post_seconds/topics/bag_path/snapshot_path
-    20260911_214500_R_000.png   # 差し出しを検出した瞬間のカラー画像 + 骨格描画 (差し出し手は赤)
-```
-
-`~skeleton_image` には、購読者がいれば骨格・掌の有無や録画中かどうかに
-関わらず毎フレーム同じ骨格描画画像を publish する (差し出し手は赤で描く)。
-クリップを保存し終えてからの `--cooldown-seconds` の間だけ publish を
-止める。`rqt_image_view` 等で購読すれば、常時の検出状況とどのフレームが
-実際にクリップへ書き込まれているかをリアルタイムに確認できる。
-
-差し出し手判定の基準にするロボット手先の base_link 座標は、既定では
-`--robot-hand-frame` (既定 `r_eef_grasp_link`、skrobot Aero モデルの
-`rarm_end_coords` に対応する実リンクで、実機では `/aero_state_publisher`
-が配信する) を毎フレーム TF で引いて使う (`estimate_palm_poses.
-OfferedHandSelector` 自身の既定動作 (未指定/`None`) は合成骨格向けの
-「人物より world +x 側にロボットがいる」という前提で、実カメラ・
-base_link 座標系ではロボット自身がおよそ原点付近 (=人物より -x 側)
-にいることが多く食い違うため使わない)。ロボット未接続などでまだ TF が
-引けない間だけ概算値 `(0.32, -0.55, 0.93)` にフォールバックする。ARM を押しても差し出し手が見つからないときと
-同じ理由で判定が届かない場合は `--offer-score-min` (既定 0.65) を調整する。
-
-### 2. `run_camera_pipeline_test.py --bag`: 保存したクリップで実カメラ無しテスト
+rosbag を再生すれば実カメラ・実ロボットなしで同じパイプラインを試せる:
 
 ```bash
 python3 scripts/ros/run_camera_pipeline_test.py \
@@ -291,84 +238,18 @@ python3 scripts/ros/run_camera_pipeline_test.py \
     --auto-arm --no-wait-for-client
 ```
 
-**注意 (未修正の既知の問題):** 現在の実装は `HandshakePipelineNode` の構築
-(TF 待ちを含む) が終わってから `rosbag play --clock` を起動するため、
-`/clock` が来ないまま起動処理で止まることがある。その場合は
-`rosbag play <bag> --clock` を先に別プロセスで起動しておき、ノードは
-`--bag` を付けずに起動する
-([`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 6 節)。
+ただし現在の実装は `--bag` を付けると初期化中に `/clock` が来ず止まることがある
+(未修正、回避策は [`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 6 節
+と各試行の `replay.sh`)。
 
-- `--bag <path>`: 実カメラの代わりに指定した rosbag を再生する
-  (内部で `rosbag play --clock` をサブプロセスとして起動し、
-  `/use_sim_time` をあわせて有効にする)。`--bag-rate` で再生速度、
-  `--bag-loop` で繰り返し再生を指定できる。
-- `--auto-arm`: viser 画面の ARM ボタンを押す代わりに起動直後から
-  ARMED 状態にする (無人でのバッグ再生テスト用)。ARMED は差し出し手が
-  決まるまで時間制限なく待つ。`--auto-execute` で IK・軌道計画に失敗して
-  動かせなかったときは ARMED のまま次の差し出しを待つ (今の手を動かすか
-  向きを変えるまで次の差し出しは受け付けない)。
-- `--no-wait-for-client`: viser のブラウザクライアント接続を待たずに
-  起動を続ける (既定では接続まで無期限に待つため、無人テストでは必須)。
-  表示自体は見たい場合はこのオプションを外して普段どおり viser の URL
-  をブラウザで開けばよい。
-- `--force-optimize` (既定 False): 実際の握手試行でも pre-touch/線形
-  補間の候補が事後検証に通っていても early return せず、必ず jaxls の
-  軌道最適化まで実行させる (`plan_handshake_motion.py` の同名オプション
-  参照)。通常運用では付けない -- jaxls の計算時間そのものを単独で
-  計測したいベンチマーク用。
+次の詳細は [`docs/dev_tools.md`](docs/dev_tools.md) にまとめてある。
 
-`--auto-execute` を指定しなければ実機は一切動かさず viewer 上での
-確認のみになるので、このテストに実ロボットは不要 (`--bag` のクリップに
-`tf`/`tf_static` も含めているため、実ロボットの TF 配信も不要)。
+- 掌の差し出しを自動で切り出して保存する `tools/ros/record_palm_offer_clips.py` と、
+  保存したクリップを使う `--bag`/`--auto-arm`/`--no-wait-for-client` の使い方
+- `--auto-execute` で実機を動かすときの再生速度の決め方 (`BASE_MAX_VEL` など)・
+  横並び移動の実行・ログの読み方
 
-### 3. `--auto-execute`: 実機での実行速度
-
-`--auto-execute` で実機を動かすとき、waypoint 間の所要時間は固定の
-刻み幅ではなく、区間ごとに `run_camera_pipeline_test.py` 冒頭の定数から
-決める (`_limited_time_list`)。軌道計画の `dt`
-(`plan_handshake_motion.DEFAULT_DT`) は最適化のコスト正規化に使うだけで、
-実行速度には関係しない (以前あった `--dt` 引数は実際にはどこからも
-使われていなかったため削除した)。
-
-- 速度の上限: 台車は `BASE_MAX_VEL`/`BASE_MAX_ANGVEL` (並進 0.3 m/s・
-  回頭 1.0 rad/s、ロボット本体側の `aero_base_link.yaml` の
-  `max_velocity` と必ず一致させる)、腕・首・腰・リフターは URDF の
-  `velocity`。指令ではこれに `VEL_LIMIT_RATIO` (既定 0.9) を掛けた値まで
-  しか使わない。
-- 加速度の上限: 上記の速度まで `ACCEL_TIME` 秒 (既定 0.4) かけて加速する
-  値。大きくするほどゆるやかに加減速するが、全体の所要時間は延びる。
-- 各区間の所要時間は、その区間で律速する軸 (台車の並進・回頭、各関節)
-  の速度または加速度がちょうど上限になる長さにする。実機のコントローラ
-  (腕は JointTrajectoryController、台車は pr2_base_trajectory_action) が
-  各点の位置・速度から 3 次補間する際の瞬間値で判定するので、上限を超えた
-  指令を実機側で頭打ちにされることはない。ほとんど動かない区間は
-  `MIN_SEGMENT_TIME` (1/15 秒) を下限にする。
-- 台車と腕には同じ時間列を送り、律速しない側はその区間だけ上限より遅く
-  動く (タイミングがずれて干渉検証済みの経路から外れないようにするため)。
-- 台車の各点の速度は腕と同じ規則 (始点・終点 0、途中は前後区間の平均
-  速度の平均) で付け直して送る (`_send_base_trajectory`)。skrobot の
-  `move_trajectory_sequence` のままだと、静止状態から最初の区間の速度へ
-  いきなり跳ぶため。
-
-押し込みの後は、既定で横並び移動 (つないだ手を人の体の横へ下ろしながら
-横並びへ移る) を続けて行う。計画が移動先の 3 割以上まで進めた人だけで、
-押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 4.0) 後に
-「一緒に横に並びますね」(`--speech-transition-text`) と発話して動き出す。
-人の手を引いて動くので、各区間は `--side-by-side-segment-time` 秒 (既定 0.2)
-以上かける。押し込み後の画像の保存 (`--grasp-capture-duration`) は動き出す
-までで打ち切る。`--no-side-by-side-transition` で行わない。
-
-`[debug]` などの詳細なログは画面には出さず、
-`/tmp/run_camera_pipeline_test_logs/<起動時刻>/` 以下に起動時 (`startup.log`) と
-試行 (人) ごと (`person_01.log`, ...) のファイルで保存する (画面に出る
-成功/失敗などのログも同じファイルに時刻付きで入る。起動ごとに別の
-ディレクトリになり前回のものは消えない。最新は `latest` からたどれる)。
-区間ごとの所要時間と律速した軸は次のようにログに出る
-(`〜の加速度` は加速度で、`下限` は `MIN_SEGMENT_TIME` で決まった区間):
-
-```
-[debug][segment] 速度上限 (×0.9, 加速 0.4s) で決めた所要時間 (合計 8.94s): 0:0.35s(base_yawの加速度), 1:0.31s(base_yawの加速度), ..., 19:0.13s(ankle_joint), ...
-```
+テストに使う実機データの一覧は [`docs/test_data.md`](docs/test_data.md)。
 
 ## 座標系
 

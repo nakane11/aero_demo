@@ -7,7 +7,8 @@
 
 ```
 data/
-  bags/                 録画した全体 bag の一時置き場 (record_camera_pipeline.launch の既定)
+  bags/                 録画した全体 bag の一時置き場 (record_camera_pipeline.launch の既定)。
+                        頭カメラ較正用の head_calib_*.bag もここ (dev_tools.md)
   real/                 実機・実カメラのデータ (日付ごと)
     <YYYY-MM-DD>_<名前>/  連続録画のセッション (bag + 抽出フレーム)
     <YYYY-MM-DD>/         実機デモの日 (logs/、試行の切り出し bag、画像)
@@ -46,11 +47,14 @@ data/
 - 切り出した試行には、同じディレクトリに `replay.sh` (再生手順と期待結果)、
   実機の `person_NN.log`、その試行の handshakes/motions/palms/skeletons の
   JSON を一緒に置く。
-- `run_camera_pipeline_test.py` のログ (`/tmp/run_camera_pipeline_test_logs`)
-  は次の起動で消える。また、押し込み後の画像 (`/tmp/aero_demo_grasp_captures`)
-  と手の再検出に失敗したときの画像 (`/tmp/aero_demo_refine_failures`) も
-  /tmp に出る。実機デモの後に `data/real/<日付>/` の `logs/`・
-  `grasp_captures/`・`refine_failures/` へ移す。
+- `run_camera_pipeline_test.py` のログは起動ごとに
+  `/tmp/run_camera_pipeline_test_logs/<起動時刻>/` に残る (消えないが、/tmp なので
+  再起動で失われる)。試行ごとの skeletons/palms/handshakes/motions の JSON も、
+  `--save-dir` を指定しなければ同じディレクトリに保存される。押し込み後の画像
+  (`/tmp/aero_demo_grasp_captures`) と手の再検出に失敗したときの画像
+  (`/tmp/aero_demo_refine_failures`) は `--save-dir` を指定しないと別に /tmp に出る。
+  実機デモの後に `data/real/<日付>/` の `logs/`・`grasp_captures/`・
+  `refine_failures/` へ移す。
 
 ## 実機・実カメラ (`data/real/`)
 
