@@ -37,6 +37,6 @@
 
 <node name="head_to_camera_link"
       pkg="tf" type="static_transform_publisher"
-      args="0.06700 0.01038  0.18521 0.032565 -0.0105949 -0.012757 0.999332 head_link camera_link 100" />
+      args="0.02918 0.00703 0.19434 -0.004963 -0.024023 0.012764 0.999618 head_link camera_link 100" />
 
 </launch>

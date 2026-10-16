@@ -186,9 +186,11 @@ POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE = math.radians(15.0)  # [rad]
 
 # head_link -> camera_link (launch/decompress.launch の head_to_camera_link と
 # 同じ値、四元数は (x, y, z, w))。head_end_coords の +Z は実機カメラの光軸と
-# 11.3 度ずれているため、視線 IK はこちらの光軸を使う。
-HEAD_TO_CAMERA_LINK_POS = (0.06700, 0.01038, 0.18521)  # [m]
-HEAD_TO_CAMERA_LINK_QUAT_XYZW = (0.032565, -0.0105949, -0.012757, 0.999332)
+# 12.8 度ずれているため、視線 IK はこちらの光軸を使う。値は
+# tools/ros/calibrate_head_camera.py で 10/15 の較正用 bag 2 本から推定した
+# もの (深度を床と /scan に合わせる。旧値は /scan に対し約 4 度ヨーがずれていた)。
+HEAD_TO_CAMERA_LINK_POS = (0.02918, 0.00703, 0.19434)  # [m]
+HEAD_TO_CAMERA_LINK_QUAT_XYZW = (-0.004963, -0.024023, 0.012764, 0.999618)
 # camera_link -> optical frame の回転 (REP 103、列が optical の各軸)。
 CAMERA_LINK_TO_OPTICAL_ROT = np.array([[0.0, 0.0, 1.0],
                                        [-1.0, 0.0, 0.0],
