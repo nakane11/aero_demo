@@ -201,9 +201,10 @@ PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 # 接近中に人の手が 20cm 余り動くことがある (10/16 試行6)。
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は score が低いと位置がずれ、掌と甲を取り違えて法線が反転する
-# ことがある (score が高くても起きる) ので両方で弾く。
+# ことがある (score が高くても起きる) ので両方で弾く。取り違えは 146〜180 度
+# なので、法線は手が本当に回った分 (10/16 夜に約 50 度) を残して 70 度で弾く。
 PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
-PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 45.0
+PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
 
 # 骨格が未検出になってもこの秒数は直前の骨格を表示し続ける (ちらつき防止)。
 SKELETON_HOLD_TIMEOUT = 1.0

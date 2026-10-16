@@ -168,10 +168,11 @@ DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 押し込み直前の最終補正で、目標の変化がこれを超えたら補正しない (誤検出対策)。
 # 実機の bag (10/13〜10/16 の 10 試行、tools/ros/replay_press_in_refine.py)
-# で必要だった補正は位置 133〜220mm・回転 7〜28 度。48 度以上は hover で
-# 指先が切れて向きの推定が怪しいので含めない。
+# で必要だった補正は位置 133〜220mm・回転 7〜28 度。10/16 夜の実機では
+# 手が本当に 46 度回っていた試行が 2 回あった (hover と押し込み後の画像で
+# 確認、bag の再現で IK は 48 度まで解けた) ので回転は 60 度まで許す。
 REFINE_MAX_POSITION_CHANGE = 0.25  # [m]
-REFINE_MAX_ROTATION_CHANGE = math.radians(35.0)  # [rad]
+REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
 DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
