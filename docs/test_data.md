@@ -79,6 +79,7 @@ data/
 | `2026-10-02/`, `2026-10-05/` | `grasp_captures/` (押し込み後の画像)、`refine_failures/` (手の再検出に失敗したときの画像) |
 | `2026-10-13/` | `logs/` (試行 1〜22 の実機ログと JSON。実機 22 人の IK・横並びの再現ベンチに使う)、`grasp_captures/`、`refine_failures/`、`trial22_side_by_side/` |
 | `2026-10-15/` | `logs/` (試行 1・2)、`grasp_captures/`、`refine_failures/`、`trial1_side_by_side/`、`trial2_side_by_side/` |
+| `2026-10-16/` | `trial3_side_by_side/`、`trial6_side_by_side/` (試行 3・6 の person_NN.log・JSON と、その試行の `grasp_captures/`・`refine_failures/` を中に置いた) |
 
 ### 試行の切り出し bag (再生テスト用)
 
@@ -94,6 +95,8 @@ data/
 | `2026-10-13/trial22_side_by_side/` | 22:08:46.0〜22:09:20.0 (34 秒) | L手/r腕、横並びまで成功 | 0.5 倍速 2/2、等速 4/5 成功 (等速は掌の向きが 6〜20° ずれる) |
 | `2026-10-15/trial1_side_by_side/` | 17:12:08.5〜17:12:46.0 (37.5 秒) | R手/l腕、横並びまで成功 | 3/3 成功 |
 | `2026-10-15/trial2_side_by_side/` | 17:13:50.2〜17:14:25.5 (35.3 秒) | R手/l腕、横並びまで成功 (scan 補正 16 cm、押し込みの解き直しは too_large) | 2/5 成功。掌の向き次第で解けるかが変わる境界のケース |
+| `2026-10-16/trial3_side_by_side/` | 20:07:01.1〜20:07:35.8 (34.7 秒、元は 20-06-35.bag) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正は 1 回目だけ採用) | 未確認 |
+| `2026-10-16/trial6_side_by_side/` | 20:11:14.7〜20:11:52.3 (37.6 秒) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正 2 回) | 未確認 |
 
 再生でつまずく点 (詳しくは各 `replay.sh` の冒頭):
 
