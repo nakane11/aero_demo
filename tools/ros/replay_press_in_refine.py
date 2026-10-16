@@ -296,7 +296,9 @@ def run(args):
                 print('    frame {} {} score {:.2f}{}: 距離 {:.0f}mm 法線 {:.0f}deg'
                       .format(len(frames) - 1, hand['side'], hand['score'],
                               ' (推定深度)' if palm['from_model_depth']
-                              else ' (真横)' if palm['edge_on'] else '',
+                              else ' (真横、親指 {:+.0f}mm)'.format(
+                                  palm['edge_on_thumb_depth'] * 1e3)
+                              if palm['edge_on'] else '',
                               np.linalg.norm(np.asarray(palm['position'])
                                              - expected_position) * 1e3,
                               math.degrees(math.acos(np.clip(np.dot(

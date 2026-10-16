@@ -125,6 +125,21 @@ def test_edge_on_palm_contains_view_ray():
     assert palm['position'][2] < 1.015
 
 
+def test_edge_on_sign_from_thumb_ignores_reference():
+    """親指 (人差し指側、+z) が手前なら、参照の法線が逆でも表裏は親指で
+    決まり、掌を正面から見たときの平面と同じ向きになる。"""
+    joints = _edge_on_joints()
+    for i in (2, 3, 4):
+        joints['LPalmModel{}'.format(i)] = np.array(
+            [1.5 - 0.02 * (i - 1), 0.0, 1.05])
+    estimator = epp.PalmPoseEstimator()
+    expected = _estimate(_palm_points('LHand'))['y_axis']
+    for reference in ([0.0, 1.0, 0.0], [0.0, -1.0, 0.0]):
+        palm = estimator.estimate_palm(joints, 'L', EDGE_ON_CAMERA, reference)
+        assert palm['edge_on']
+        assert float(np.dot(palm['y_axis'], expected)) > 0.95
+
+
 def test_edge_on_only_when_no_plane():
     estimator = epp.PalmPoseEstimator()
     # 画像上で掌の点が広がっていれば、推定深度の平面が使える。

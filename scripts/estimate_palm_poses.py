@@ -540,6 +540,9 @@ EDGE_ON_MAX_SPAN_RATIO = 0.15
 EDGE_ON_MAX_FINGER_RAY_COS = math.cos(math.radians(30.0))
 # 深度で見えるのは手の手前の縁。掌の中心はおよそ掌の幅の半分だけ奥。
 EDGE_ON_DEPTH_OFFSET = 0.03  # [m]
+# 親指と付け根の視線方向の差がこれ以上なら表裏を親指で決める。10/16 試行3
+# (計画時の掌が裏返っていた) では親指が 17〜23mm 手前だった。
+EDGE_ON_MIN_THUMB_DEPTH = 0.005  # [m]
 
 
 def hand_joint_positions(hand, side):
@@ -609,9 +612,12 @@ class PalmPoseEstimator(object):
         """掌を真横から見ている (掌の点が画像上でほぼ一直線) ときの掌.
 
         真横から見ると掌の平面は視線を含むので、法線は指先方向 (手首 ->
-        指の付け根、深度で測れる) と視線の両方に垂直になる。表裏は見え方から
-        決まらないので ``reference_normal`` に近い側を採る。見えているのは手の
-        手前の縁なので、中心は視線の奥へ ``EDGE_ON_DEPTH_OFFSET`` ずらす。
+        指の付け根、深度で測れる) と視線の両方に垂直になる。表裏は親指が
+        付け根より手前か奥か (MediaPipe の推定深度) で決め、差が
+        ``EDGE_ON_MIN_THUMB_DEPTH`` 未満なら ``reference_normal`` に近い側を
+        採る (計画時の掌が裏返っていると一緒に裏返るので最後の手段)。
+        見えているのは手の手前の縁なので、中心は視線の奥へ
+        ``EDGE_ON_DEPTH_OFFSET`` ずらす。
         """
         wrist = joints.get('{}Hand{}'.format(side, palm_plane.WRIST_INDEX))
         mcps = [joints[name] for name in (
@@ -641,7 +647,25 @@ class PalmPoseEstimator(object):
                 or abs(float(np.dot(x_axis, ray))) > EDGE_ON_MAX_FINGER_RAY_COS:
             return None
         y_axis = _unit(np.cross(x_axis, ray))
-        if float(np.dot(y_axis, reference_normal)) < 0.0:
+        # 親指は人差し指側にあるので、親指が付け根より手前なら人差し指側が
+        # カメラを向いている (fit_palm_plane と同じ左右の決まりで法線へ)。
+        thumb = [joints[name] for name in (
+            '{}PalmModel{}'.format(side, i)
+            for i in palm_plane.THUMB_LANDMARKS) if name in joints]
+        model_mcps = [joints[name] for name in (
+            '{}PalmModel{}'.format(side, i) for i in palm_plane.MCP_INDICES)
+            if name in joints]
+        thumb_depth = (float(np.dot(np.mean(thumb, axis=0)
+                                    - np.mean(model_mcps, axis=0), ray))
+                       if thumb and model_mcps else 0.0)
+        if abs(thumb_depth) >= EDGE_ON_MIN_THUMB_DEPTH:
+            index_side = -ray if thumb_depth < 0.0 else ray
+            anatomical = (np.cross(index_side, x_axis) if side == 'R'
+                          else np.cross(x_axis, index_side))
+            flip = float(np.dot(y_axis, anatomical)) < 0.0
+        else:
+            flip = float(np.dot(y_axis, reference_normal)) < 0.0
+        if flip:
             y_axis = -y_axis
         z_axis = np.cross(x_axis, y_axis)
         center = center + EDGE_ON_DEPTH_OFFSET * ray
@@ -652,7 +676,8 @@ class PalmPoseEstimator(object):
             z_axis=[float(v) for v in z_axis],
             rot=[[float(v) for v in row]
                  for row in np.column_stack([x_axis, y_axis, z_axis])],
-            from_model_depth=False, edge_on=True)
+            from_model_depth=False, edge_on=True,
+            edge_on_thumb_depth=thumb_depth)
 
     def _estimate_one(self, joints, side):
         plane = self._fit_plane(joints, '{}Hand{{}}'.format(side), side)

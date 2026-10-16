@@ -15,6 +15,7 @@ import numpy as np
 import mediapipe as mp
 
 from aero_demo.palm_plane import PLANE_LANDMARKS as PALM_LANDMARKS
+from aero_demo.palm_plane import THUMB_LANDMARKS
 from aero_demo.people_pose_types import CameraIntrinsics
 from aero_demo.people_pose_types import HAND_SEQUENCE, INDEX2LIMBNAME
 
@@ -440,6 +441,8 @@ class PeoplePoseEstimator(object):
         ランドマークごとに推定する手首からの相対深度 (画素単位) を、
         カメラで測れた掌の点の深度に合わせて [m] に直して使う
         (掌の向きの代わりに使うだけで、深度の点は置き換えない)。
+        親指 (``THUMB_LANDMARKS``) の点も同じ縮尺で作る (真横から見た掌の
+        表裏を決めるのに使う)。
         """
         if not self.use_hand:
             return {}
@@ -456,7 +459,10 @@ class PeoplePoseEstimator(object):
             if not anchors:
                 continue
             anchor = float(np.median(anchors))
-            for i, name in zip(PALM_LANDMARKS, names):
+            for i in PALM_LANDMARKS + THUMB_LANDMARKS:
+                name = '{}Hand{}'.format(side, i)
+                if name not in pixels or name not in model_depths:
+                    continue
                 z = anchor * (1.0 + model_depths[name] / intrinsics.fx)
                 u, v = pixels[name]
                 model_points['{}PalmModel{}'.format(side, i)] = np.array([

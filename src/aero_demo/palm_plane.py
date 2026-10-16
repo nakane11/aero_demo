@@ -17,6 +17,8 @@ MCP_INDICES = (5, 9, 13, 17)          # index / middle / ring / pinky knuckles
 
 # Only these are rigid with the palm (fingers and thumb leave the plane).
 PLANE_LANDMARKS = (WRIST_INDEX,) + MCP_INDICES
+# Thumb MCP / IP / tip; they sit on the index side of the palm.
+THUMB_LANDMARKS = (2, 3, 4)
 
 # Knuckle order from thumb side to pinky side; used to resolve the normal sign.
 MCP_LATERAL_RANK = {5: 1.5, 9: 0.5, 13: -0.5, 17: -1.5}
