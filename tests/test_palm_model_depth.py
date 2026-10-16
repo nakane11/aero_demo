@@ -94,6 +94,50 @@ def test_uses_model_plane_when_depth_normal_is_flipped():
                         _estimate(_palm_points('LHand'))['y_axis'])) > 0.99
 
 
+def _edge_on_joints():
+    """掌 (_palm_points の x-z 平面) を真上 (+z) から見たときの点。深度で
+    見えるのは手前の縁だけで、付け根 4 点は同じ視線上に重なる。"""
+    joints = {}
+    for prefix in ('LHand', 'LPalmModel'):
+        for name, p in _palm_points(prefix).items():
+            if not name.endswith('Hand0') and not name.endswith('Model0'):
+                p = np.array([p[0], p[1], 1.03])
+            joints[name] = p
+    return joints
+
+
+EDGE_ON_CAMERA = np.array([1.45, 0.0, 2.0])
+
+
+def test_edge_on_palm_contains_view_ray():
+    joints = _edge_on_joints()
+    assert _estimate(joints) is None
+    estimator = epp.PalmPoseEstimator()
+    for sign in (1.0, -1.0):
+        palm = estimator.estimate_palm(joints, 'L', EDGE_ON_CAMERA,
+                                       [0.0, sign * 0.8, 0.6])
+        assert palm['edge_on']
+        np.testing.assert_allclose(palm['y_axis'], [0.0, sign, 0.0],
+                                   atol=0.05)
+        # 手首は掌の中央、付け根は手前の縁なので指先方向は少し傾く。
+        assert float(np.dot(palm['x_axis'], [-1.0, 0.0, 0.0])) > 0.9
+    # 中心は見えている縁から視線の奥 (-z) へずらす。
+    assert palm['position'][2] < 1.015
+
+
+def test_edge_on_only_when_no_plane():
+    estimator = epp.PalmPoseEstimator()
+    # 画像上で掌の点が広がっていれば、推定深度の平面が使える。
+    joints = _edge_on_joints()
+    joints.update(_palm_points('LPalmModel'))
+    palm = estimator.estimate_palm(joints, 'L', EDGE_ON_CAMERA,
+                                   [0.0, 1.0, 0.0])
+    assert palm['from_model_depth'] and not palm['edge_on']
+    # 視線が指先方向に近いと平面が決まらない。
+    assert estimator.estimate_palm(_edge_on_joints(), 'L',
+                                   [3.0, 0.0, 1.02], [0.0, 1.0, 0.0]) is None
+
+
 def test_keeps_depth_plane_when_it_agrees_with_model():
     joints = _palm_points('LHand', normal_tilt=0.5)
     joints.update(_palm_points('LPalmModel'))

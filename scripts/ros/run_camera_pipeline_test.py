@@ -2019,20 +2019,23 @@ class HandshakePipelineNode(object):
         名前で返す。Hands の左右判定は誤りうるので位置で選ぶ。score の低い手・
         法線が ``expected_normal`` から大きく傾いた手は除く。
 
-        Returns: ``(joint_positions or None, distances [m], candidates)``。
-        ``candidates`` はフレームごとの全候補の内訳 (ログ・保存用)。
+        Returns: ``(joint_positions or None, distances [m], candidates,
+        camera_position)``。``candidates`` はフレームごとの全候補の内訳
+        (ログ・保存用)、``camera_position`` は選んだフレームのカメラ位置の
+        中央値 (掌を真横から見たときの推定に使う)。
         """
         chosen = []
+        cameras = []
         distances = []
         candidates = []
         for frame in hand_frames:
             best = None
             frame_candidates = []
+            camera_position = np.asarray(frame['camera_to_base'])[:3, 3]
             for hand in frame['hands']:
-                prefix = '{}Hand'.format(hand['side'])
-                joints = {'{}Hand{}'.format(side, name[len(prefix):]): p
-                          for name, p in hand['positions'].items()}
-                palm = self.palm_estimator.estimate_palm(joints, side)
+                joints = epp.hand_joint_positions(hand, side)
+                palm = self.palm_estimator.estimate_palm(
+                    joints, side, camera_position, expected_normal)
                 dist = normal_angle = rejected = None
                 if palm is not None:
                     dist = float(np.linalg.norm(
@@ -2049,6 +2052,7 @@ class HandshakePipelineNode(object):
                     palm_position=(None if palm is None
                                    else [float(v) for v in palm['position']]),
                     distance=dist, normal_angle_deg=normal_angle,
+                    edge_on=palm is not None and palm['edge_on'],
                     rejected=rejected))
                 if (dist is not None and rejected is None
                         and (best is None or dist < best[0])):
@@ -2057,14 +2061,16 @@ class HandshakePipelineNode(object):
             if best is not None and best[0] <= PRESS_IN_REFINE_MAX_HAND_DISTANCE:
                 distances.append(best[0])
                 chosen.append(best[1])
+                cameras.append(camera_position)
         if not chosen:
-            return None, distances, candidates
+            return None, distances, candidates, None
         names = [name for name in chosen[0]
                  if sum(name in joints for joints in chosen) * 2
                  >= len(chosen)]
         return ({name: np.median([joints[name] for joints in chosen
                                   if name in joints], axis=0).tolist()
-                 for name in names}, distances, candidates)
+                 for name in names}, distances, candidates,
+                np.median(cameras, axis=0))
 
     def _save_refine_failure(self, hand_frames, expected_position, candidates,
                              record):
@@ -2204,7 +2210,10 @@ class HandshakePipelineNode(object):
                                     cy=intr.cy),
                     hands=[dict(side=hand['side'], score=float(hand['score']),
                                 positions={k: [float(x) for x in p] for k, p
-                                           in hand['positions'].items()})
+                                           in hand['positions'].items()},
+                                model_positions={
+                                    k: [float(x) for x in p] for k, p
+                                    in hand.get('model_positions', {}).items()})
                            for hand in frame['hands']]))
             json_io.save_json(os.path.join(out_dir, 'record.json'),
                               dict(record, frames=frames))
@@ -2244,13 +2253,15 @@ class HandshakePipelineNode(object):
         expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
         hand_frames = self._collect_hand_frames(
             PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
-        joint_positions, distances, candidates = self._select_offered_hand(
-            hand_frames, offered_hand, expected_position, expected_normal)
+        joint_positions, distances, candidates, camera_position = \
+            self._select_offered_hand(hand_frames, offered_hand,
+                                      expected_position, expected_normal)
         wait_time = time.time() - t0
         palm = None
         if joint_positions is not None:
             palm = self.palm_estimator.estimate_palm(
-                joint_positions, offered_hand)
+                joint_positions, offered_hand, camera_position,
+                expected_normal)
         if palm is None:
             nearest = [c['distance'] for frame in candidates for c in frame
                        if c['distance'] is not None and c['rejected'] is None]
@@ -2297,7 +2308,7 @@ class HandshakePipelineNode(object):
             wait_time=wait_time, ik_time=ik_time,
             n_frames=len(hand_frames), hand_distances=distances,
             expected_position=[float(v) for v in expected_position],
-            candidates=candidates,
+            candidates=candidates, edge_on=palm['edge_on'],
             palm_shift=[float(v) for v in palm_shift],
             position_change=info['position_change'],
             rotation_change_deg=math.degrees(info['rotation_change'])))
@@ -2308,9 +2319,10 @@ class HandshakePipelineNode(object):
                                  info['position_change'] * 1e3,
                                  math.degrees(info['rotation_change'])))
             return None
-        print('[execute][refine] 検出し直した手に合わせて押し込み姿勢を '
+        print('[execute][refine] 検出し直した手{}に合わせて押し込み姿勢を '
               '補正しました ({}、目標の変化 {:.1f}mm/{:.1f}deg、待機 {:.2f}s '
               '+ IK {:.3f}s)。'.format(
+                  ' (真横から見た掌)' if palm['edge_on'] else '',
                   info['reason'], info['position_change'] * 1e3,
                   math.degrees(info['rotation_change']), wait_time, ik_time))
         return build_press_in_waypoints(

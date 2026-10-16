@@ -160,14 +160,13 @@ def select_hand(palm_estimator, frames, side, expected_position,
                 expected_normal, max_distance, flip):
     """実機ノードの ``_select_offered_hand`` と同じ選び方 (``flip`` なら
     裏返った手も使う)。``(palm or None, distances, flipped)``。"""
-    chosen, distances, flips = [], [], []
-    for hands in frames:
+    chosen, distances, flips, cameras = [], [], [], []
+    for hands, camera_position in frames:
         best = None
         for hand in hands:
-            prefix = '{}Hand'.format(hand['side'])
-            joints = {'{}Hand{}'.format(side, name[len(prefix):]): p
-                      for name, p in hand['positions'].items()}
-            palm = palm_estimator.estimate_palm(joints, side)
+            joints = epp.hand_joint_positions(hand, side)
+            palm = palm_estimator.estimate_palm(
+                joints, side, camera_position, expected_normal)
             if palm is None or hand['score'] < rcpt.PRESS_IN_REFINE_MIN_HAND_SCORE:
                 continue
             dist = float(np.linalg.norm(
@@ -186,13 +185,15 @@ def select_hand(palm_estimator, frames, side, expected_position,
             distances.append(best[0])
             chosen.append(best[1])
             flips.append(best[2])
+            cameras.append(camera_position)
     if not chosen:
         return None, distances, False
     names = [n for n in chosen[0]
              if sum(n in j for j in chosen) * 2 >= len(chosen)]
     joints = {n: np.median([j[n] for j in chosen if n in j], axis=0).tolist()
               for n in names}
-    palm = palm_estimator.estimate_palm(joints, side)
+    palm = palm_estimator.estimate_palm(
+        joints, side, np.median(cameras, axis=0), expected_normal)
     flipped = sum(flips) * 2 > len(flips)
     if palm is not None and flipped:
         palm = flip_palm(palm)
@@ -282,19 +283,20 @@ def run(args):
         # warmup 区間は Hands の追跡を温めるだけで評価には使わない。
         if t_color < t0:
             continue
-        frames.append(hands)
+        frames.append((hands, c2b[:3, 3]))
         if args.verbose:
             for hand in hands:
-                prefix = '{}Hand'.format(hand['side'])
-                joints = {'{}Hand{}'.format(side, n[len(prefix):]): p
-                          for n, p in hand['positions'].items()}
-                palm = palm_estimator.estimate_palm(joints, side)
+                joints = epp.hand_joint_positions(hand, side)
+                palm = palm_estimator.estimate_palm(
+                    joints, side, c2b[:3, 3], expected_normal)
                 if palm is None:
                     print('    frame {} {} score {:.2f}: 掌を推定できない'.format(
                         len(frames) - 1, hand['side'], hand['score']))
                     continue
-                print('    frame {} {} score {:.2f}: 距離 {:.0f}mm 法線 {:.0f}deg'
+                print('    frame {} {} score {:.2f}{}: 距離 {:.0f}mm 法線 {:.0f}deg'
                       .format(len(frames) - 1, hand['side'], hand['score'],
+                              ' (推定深度)' if palm['from_model_depth']
+                              else ' (真横)' if palm['edge_on'] else '',
                               np.linalg.norm(np.asarray(palm['position'])
                                              - expected_position) * 1e3,
                               math.degrees(math.acos(np.clip(np.dot(

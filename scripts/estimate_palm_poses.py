@@ -19,6 +19,7 @@ Usage
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -531,6 +532,28 @@ def format_offer_scores(selection, score_min):
     return ', '.join(parts)
 
 
+# --- 掌を真横から見たときの推定 (PalmPoseEstimator._estimate_edge_on) -------
+# 掌の 5 点の視線方向の広がりの比 (2 番目/1 番目) がこれ以下なら真横。
+# 10/16 試行3 (付け根 4 点が同じ画素に重なった) で 0.01〜0.03、正面なら 0.5 前後。
+EDGE_ON_MAX_SPAN_RATIO = 0.15
+# 指先方向が視線に近い (指をカメラへ向けている) と平面が決まらない。
+EDGE_ON_MAX_FINGER_RAY_COS = math.cos(math.radians(30.0))
+# 深度で見えるのは手の手前の縁。掌の中心はおよそ掌の幅の半分だけ奥。
+EDGE_ON_DEPTH_OFFSET = 0.03  # [m]
+
+
+def hand_joint_positions(hand, side):
+    """``PeoplePoseEstimator.estimate_hands_3d`` の手 1 つを、``side`` の手
+    として ``estimate_palm`` に渡せる関節名 -> 位置にする (Hands の左右判定は
+    誤りうるので、呼び出し側が決めた ``side`` の名前に付け替える)。"""
+    joints = {}
+    for key in ('positions', 'model_positions'):
+        for name, p in hand.get(key, {}).items():
+            # '{side}Hand{i}' / '{side}PalmModel{i}' の先頭 1 文字が左右。
+            joints[side + name[1:]] = p
+    return joints
+
+
 class PalmPoseEstimator(object):
     """骨格から左右の掌の位置姿勢と、手繋ぎに使う手を推定する."""
 
@@ -563,11 +586,73 @@ class PalmPoseEstimator(object):
         result['offered_hand'] = selection['side']
         return result
 
-    def estimate_palm(self, joint_positions, side):
-        """``side`` ('R'/'L') の掌 1 つだけを推定する (差し出し判定なし)."""
+    def estimate_palm(self, joint_positions, side, camera_position=None,
+                      reference_normal=None):
+        """``side`` ('R'/'L') の掌 1 つだけを推定する (差し出し判定なし).
+
+        ``camera_position`` と ``reference_normal`` (関節と同じ座標系) を
+        渡すと、掌を真横から見て平面が作れないときも
+        ``_estimate_edge_on`` で推定する。
+        """
         joints = {name: np.asarray(p, dtype=np.float64)
                  for name, p in joint_positions.items()}
-        return self._estimate_one(joints, side)
+        palm = self._estimate_one(joints, side)
+        if palm is None and camera_position is not None \
+                and reference_normal is not None:
+            palm = self._estimate_edge_on(
+                joints, side, np.asarray(camera_position, dtype=np.float64),
+                np.asarray(reference_normal, dtype=np.float64))
+        return palm
+
+    @staticmethod
+    def _estimate_edge_on(joints, side, camera_position, reference_normal):
+        """掌を真横から見ている (掌の点が画像上でほぼ一直線) ときの掌.
+
+        真横から見ると掌の平面は視線を含むので、法線は指先方向 (手首 ->
+        指の付け根、深度で測れる) と視線の両方に垂直になる。表裏は見え方から
+        決まらないので ``reference_normal`` に近い側を採る。見えているのは手の
+        手前の縁なので、中心は視線の奥へ ``EDGE_ON_DEPTH_OFFSET`` ずらす。
+        """
+        wrist = joints.get('{}Hand{}'.format(side, palm_plane.WRIST_INDEX))
+        mcps = [joints[name] for name in (
+            '{}Hand{}'.format(side, i) for i in palm_plane.MCP_INDICES)
+            if name in joints]
+        # 画像上の並びは推定深度の掌の点 (各ランドマークの画素の視線上に
+        # ある) から見る。
+        model = [joints[name] for name in (
+            '{}PalmModel{}'.format(side, i)
+            for i in palm_plane.PLANE_LANDMARKS) if name in joints]
+        if wrist is None or not mcps \
+                or len(model) < palm_plane.MIN_PALM_POINTS:
+            return None
+        rays = np.array([_unit(p - camera_position) for p in model])
+        mean_ray = _unit(rays.mean(axis=0))
+        lateral = rays - np.outer(rays @ mean_ray, mean_ray)
+        s = np.linalg.svd(lateral - lateral.mean(axis=0), compute_uv=False)
+        if s[0] < 1e-9 or s[1] / s[0] > EDGE_ON_MAX_SPAN_RATIO:
+            return None
+
+        mcp_center = np.mean(mcps, axis=0)
+        center = (1.0 - palm_plane.PALM_CENTER_MCP_WEIGHT) * wrist \
+            + palm_plane.PALM_CENTER_MCP_WEIGHT * mcp_center
+        ray = _unit(center - camera_position)
+        x_axis = _unit(mcp_center - wrist)
+        if ray is None or x_axis is None \
+                or abs(float(np.dot(x_axis, ray))) > EDGE_ON_MAX_FINGER_RAY_COS:
+            return None
+        y_axis = _unit(np.cross(x_axis, ray))
+        if float(np.dot(y_axis, reference_normal)) < 0.0:
+            y_axis = -y_axis
+        z_axis = np.cross(x_axis, y_axis)
+        center = center + EDGE_ON_DEPTH_OFFSET * ray
+        return dict(
+            position=[float(v) for v in center],
+            x_axis=[float(v) for v in x_axis],
+            y_axis=[float(v) for v in y_axis],
+            z_axis=[float(v) for v in z_axis],
+            rot=[[float(v) for v in row]
+                 for row in np.column_stack([x_axis, y_axis, z_axis])],
+            from_model_depth=False, edge_on=True)
 
     def _estimate_one(self, joints, side):
         plane = self._fit_plane(joints, '{}Hand{{}}'.format(side), side)
@@ -595,7 +680,7 @@ class PalmPoseEstimator(object):
             y_axis=[float(v) for v in y_axis],
             z_axis=[float(v) for v in z_axis],
             rot=[[float(v) for v in row] for row in rot],
-            from_model_depth=plane is model_plane)
+            from_model_depth=plane is model_plane, edge_on=False)
 
     @staticmethod
     def _fit_plane(joints, key_format, side):

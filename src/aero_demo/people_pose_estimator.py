@@ -333,7 +333,9 @@ class PeoplePoseEstimator(object):
         list of dict
             手ごとに ``side`` ('R'/'L'、人物自身の左右)、``score``、
             ``positions`` ({side}Hand0..20 -> [x, y, z]、深度が取れた点のみ)、
-            ``pixels`` (同じ名前 -> [u, v]、全 21 点)。
+            ``pixels`` (同じ名前 -> [u, v]、全 21 点)、``model_positions``
+            (MediaPipe の推定深度で作った掌の点 ``{side}PalmModel{i}``、
+            ``_model_palm_points`` を参照)。
         """
         if self.hands is None:
             self.hands = mp.solutions.hands.Hands(
@@ -365,12 +367,21 @@ class PeoplePoseEstimator(object):
                 y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
                 positions[joint_pos['limb']] = np.array([x, y, z])
             positions = self._prune_implausible_hand_landmarks(positions)
+            # 手を真横から見ると深度の掌の点が一直線に並び平面が作れない。
+            model_positions = self._model_palm_points(
+                positions,
+                {j['limb']: (j['x'], j['y']) for j in joints_2d},
+                {j['limb']: j['z'] for j in joints_2d}, intrinsics)
             if output_transform is not None:
                 positions = self._apply_transform(positions, output_transform)
+                model_positions = self._apply_transform(
+                    model_positions, output_transform)
             hands.append(dict(
                 side=side, score=float(classification.score),
                 positions={name: [float(v) for v in p]
                            for name, p in positions.items()},
+                model_positions={name: [float(v) for v in p]
+                                 for name, p in model_positions.items()},
                 pixels={joint_pos['limb']: [float(joint_pos['x']),
                                             float(joint_pos['y'])]
                         for joint_pos in joints_2d}))

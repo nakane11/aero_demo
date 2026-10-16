@@ -175,9 +175,7 @@ class PalmDetector(object):
         hands = []
         for hand in self.estimator.estimate_hands_3d(
                 color, depth, intr, output_transform=cam):
-            label_prefix = '{}Hand'.format(hand['side'])
-            joints = {'{}{}'.format(prefix, name[len(label_prefix):]): p
-                      for name, p in hand['positions'].items()}
+            joints = epp.hand_joint_positions(hand, side)
             hands.append(dict(
                 label=hand['side'], score=hand['score'],
                 n_points=len(hand['positions']),
