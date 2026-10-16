@@ -198,7 +198,8 @@ JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
 # ことが多いので MediaPipe Hands で手だけ検出し、複数フレームの中央値を使う。
 PRESS_IN_REFINE_FRAMES = 3
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
-PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.15  # [m] 計画時の掌からの距離
+# 接近中に人の手が 20cm 余り動くことがある (10/16 試行6)。
+PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は score が低いと位置がずれ、掌と甲を取り違えて法線が反転する
 # ことがある (score が高くても起きる) ので両方で弾く。
 PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
@@ -791,6 +792,9 @@ class HandshakePipelineNode(object):
         # _refine_press_in の要求中だけ手の検出結果を溜める。
         self._hand_frames_requested = False
         self._hand_frames = []
+        # 接近中から hover まで Hands を毎フレーム走らせて追跡を保つ (要求時
+        # だけ呼ぶと画像の端で切れた手を一から検出できない)。
+        self._hand_tracking = False
         self._current_palm = None         # 直近の IK に使った掌 (base_link、平行移動前) or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 or None
         # 'idle' -> 'armed' -> 'solving' -> 'result' (RESET で 'idle')。
@@ -1141,7 +1145,8 @@ class HandshakePipelineNode(object):
             if person_seen is not None:
                 self._head_person_seen = person_seen
             hand_frames_requested = self._hand_frames_requested
-        if hand_frames_requested and is_base_frame:
+            hand_tracking = self._hand_tracking
+        if (hand_frames_requested or hand_tracking) and is_base_frame:
             hands = self.pose_estimator.estimate_hands_3d(
                 color, depth_m, intrinsics, output_transform=camera_to_base)
             with self._lock:
@@ -1789,6 +1794,11 @@ class HandshakePipelineNode(object):
             else:
                 self._head_face_tracking.clear()
 
+    def _set_hand_tracking(self, enabled):
+        """手の追跡 (毎フレームの Hands 検出) を始める/止める。"""
+        with self._lock:
+            self._hand_tracking = bool(enabled)
+
     def _send_head_to_waypoint(self, waypoint, joint_names):
         """首だけを ``waypoint`` の角度へ向かわせる (待たない)。"""
         name_to_angle = dict(zip(joint_names, waypoint['joint_angle_vector']))
@@ -1810,11 +1820,12 @@ class HandshakePipelineNode(object):
 
     def _execute_on_robot(self):
         """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
-        途中で例外になっても首の顔追従は止める。"""
+        途中で例外になっても首の顔追従・手の追跡は止める。"""
         try:
             self._execute_on_robot_body()
         finally:
             self._set_face_tracking(False)
+            self._set_hand_tracking(False)
 
     def _execute_on_robot_body(self):
         """計画済みの waypoint 列を実機に送る。
@@ -1890,6 +1901,8 @@ class HandshakePipelineNode(object):
                     [p[:2] for p in frozen.values()], dtype=np.float64)
 
         # 接近中は首で人の顔を追う (全身のゴールを送った後に始める)。
+        # 押し込み直前の補正まで手の追跡も続ける。
+        self._set_hand_tracking(self.args.press_in_refine)
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
             display_waypoints[:reach_boundary], joint_names,
             on_sent=lambda: self._set_face_tracking(True))
@@ -1921,6 +1934,7 @@ class HandshakePipelineNode(object):
                     press_waypoints[0], joint_names, result)
                 if refined is not None:
                     press_waypoints = [press_waypoints[0]] + refined
+            self._set_hand_tracking(False)
             self._execute_waypoint_segment(press_waypoints, joint_names)
             self._wait_joint_settle(
                 '押し込み終了', press_waypoints[-1], joint_names,

@@ -216,6 +216,24 @@ python3 tools/ros/compare_hand_detectors.py --side R
 python3 tools/ros/compare_hand_detectors.py --side L --frames 100
 ```
 
+### `tools/ros/replay_press_in_refine.py`
+
+実機試行の bag で、押し込み直前の補正 (`_refine_press_in`) をやり直す。
+hover で止まっている区間の画像で実機ノードと同じく Hands で手を検出し、
+3 フレームずつ掌を選んで押し込み姿勢を解き直す。補正量の上限
+(`REFINE_MAX_*`) は外して、必要だった補正量と IK が解けるかを出し、実機
+ノードの上限で採用されるかに `*` を付ける。`--warmup approach` (既定) は
+実機ノードと同じく接近の開始から Hands を走らせて追跡を温め、`--warmup 0`
+は補正のときだけ Hands を呼ぶ (2026-10-16 までの実機ノード)。入力は試行の
+`person_NN.log` (同じディレクトリに `palms/`・`handshakes/`・`motions/`) と
+bag。roscore は不要。
+
+```bash
+python3 tools/ros/replay_press_in_refine.py \
+    data/real/2026-10-16/trial6_side_by_side/person_06.log \
+    data/real/2026-10-16/trial6_side_by_side/*.bag
+```
+
 ## 実カメラデータの収集・ラベル付け
 
 以下の 3 つは、実カメラでの `offered_hand` (差し出し手) 判定
