@@ -62,6 +62,12 @@ FACE_AWAY_PENALTY = 0.15
 APPROACH_RAMP = (0.0, 0.45)
 SEPARATION_RAMP = (0.35, 0.55)
 FINGER_TO_ROBOT_RAMP = (0.0, 0.90)
+# 手を体の横に下げて差し出す (手繋ぎ) と指先が下を向き、ロボットへの cos が
+# 小さくなる。指先の下向き (-finger・up) と、脱力した掌からロボット側へ
+# 出た距離 [m] の両方のランプの積も finger_to_robot の候補にする
+# (腕を垂らしただけでは後者が 0 なので点が入らない)。
+DOWN_FINGER_RAMP = (0.40, 0.70)
+DOWN_FINGER_APPROACH_RAMP = (0.08, 0.20)
 # 親指が明らかに下向きの不自然な差し出しを弾く。
 THUMB_ROLL_RAMP = (-0.20, 0.30)
 FACE_TO_ROBOT_RAMP = (-0.20, 0.50)
@@ -231,7 +237,8 @@ class OfferedHandSelector(object):
     特徴量 (距離は身長で正規化しない [m]):
       ``approach``: 脱力して垂らした掌に比べてロボットへどれだけ近づいたか。
       ``separation``: 掌と胴体 (腰-肩の線分) の距離。
-      ``finger_to_robot``: 指先方向と掌->ロボット方向の cos。
+      ``finger_to_robot``: 指先方向と掌->ロボット方向の cos。指先が下向きで
+      掌がロボット側へ出ていれば、その度合い (``DOWN_FINGER_*``) も認める。
       ``thumb_roll``: 指先軸まわりのロール (親指が上=1, 水平=0, 下=-1)。
       ``face_to_robot``: 顔の前方向と顔->ロボット方向の cos (減点のみ。
       顔が取れなければ 1.0 扱い)。
@@ -247,6 +254,8 @@ class OfferedHandSelector(object):
                  finger_to_robot_axis_blend=0.0,
                  finger_to_robot_ramp=FINGER_TO_ROBOT_RAMP,
                  approach_height_scale=1.0,
+                 down_finger_ramp=DOWN_FINGER_RAMP,
+                 down_finger_approach_ramp=DOWN_FINGER_APPROACH_RAMP,
                  stillness_window=STILLNESS_WINDOW,
                  stillness_max_displacement=STILLNESS_MAX_DISPLACEMENT,
                  stillness_max_gap=STILLNESS_MAX_GAP):
@@ -262,6 +271,9 @@ class OfferedHandSelector(object):
             ``finger_to_robot`` の軸を指先 (0.0) から掌の法線 (1.0) へ寄せる率。
         approach_height_scale : float
             ``approach`` の距離計算で z 差分に掛ける倍率 (0 で水平のみ)。
+        down_finger_ramp, down_finger_approach_ramp : tuple or None
+            下向きの指先を認めるランプ (下向きの cos と、ロボット側へ出た
+            距離 [m])。``None`` なら認めない (cos だけ)。
         stillness_window : float
             0.0 以下なら静止判定をしない。
         """
@@ -276,6 +288,11 @@ class OfferedHandSelector(object):
         self.finger_to_robot_axis_blend = float(finger_to_robot_axis_blend)
         self.finger_to_robot_ramp = tuple(finger_to_robot_ramp)
         self.approach_height_scale = float(approach_height_scale)
+        self.down_finger_ramp = (None if down_finger_ramp is None
+                                 else tuple(down_finger_ramp))
+        self.down_finger_approach_ramp = (
+            None if down_finger_approach_ramp is None
+            else tuple(down_finger_approach_ramp))
         self.stillness_window = float(stillness_window)
         self.stillness_max_displacement = float(stillness_max_displacement)
         self.stillness_max_gap = float(stillness_max_gap)
@@ -437,9 +454,9 @@ class OfferedHandSelector(object):
 
         # 脱力して真下に垂れた掌の位置。
         rest = shoulder - arm * body.up
-        approach = _ramp(self._robot_distance(robot, rest)
-                         - self._robot_distance(robot, center),
-                         *APPROACH_RAMP)
+        approach_distance = (self._robot_distance(robot, rest)
+                             - self._robot_distance(robot, center))
+        approach = _ramp(approach_distance, *APPROACH_RAMP)
         separation = _ramp(
             _distance_to_segment(center, body.hip_center,
                                  body.shoulder_center),
@@ -450,6 +467,13 @@ class OfferedHandSelector(object):
         else:
             finger_to_robot = _ramp(float(np.dot(offer_dir, to_robot)),
                                     *self.finger_to_robot_ramp)
+        if (finger is not None and self.down_finger_ramp is not None
+                and self.down_finger_approach_ramp is not None):
+            down = (_ramp(-float(np.dot(finger, WORLD_UP)),
+                          *self.down_finger_ramp)
+                    * _ramp(approach_distance,
+                            *self.down_finger_approach_ramp))
+            finger_to_robot = max(finger_to_robot, down)
         thumb_roll = _ramp(self._thumb_roll(palm, side, finger),
                            *THUMB_ROLL_RAMP)
         face_to_robot = _ramp(self._face_to_robot(joints, body, robot),
