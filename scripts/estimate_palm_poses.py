@@ -545,6 +545,16 @@ EDGE_ON_DEPTH_OFFSET = 0.03  # [m]
 EDGE_ON_MIN_THUMB_DEPTH = 0.005  # [m]
 
 
+def flip_palm(palm):
+    """掌と甲を取り違えた掌を裏返す (指先方向はそのまま)。"""
+    flipped = dict(palm)
+    for key in ('y_axis', 'z_axis'):
+        flipped[key] = [-float(v) for v in palm[key]]
+    flipped['rot'] = np.column_stack([
+        palm['x_axis'], flipped['y_axis'], flipped['z_axis']]).tolist()
+    return flipped
+
+
 def hand_joint_positions(hand, side):
     """``PeoplePoseEstimator.estimate_hands_3d`` の手 1 つを、``side`` の手
     として ``estimate_palm`` に渡せる関節名 -> 位置にする (Hands の左右判定は

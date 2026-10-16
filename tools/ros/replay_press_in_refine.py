@@ -146,14 +146,7 @@ def iter_frames(bag, t0, t1):
             yield colors[i], depth, info, color_times[i]
 
 
-def flip_palm(palm):
-    """掌と甲を取り違えた掌を裏返す (指先方向はそのまま)。"""
-    flipped = dict(palm)
-    for key in ('y_axis', 'z_axis'):
-        flipped[key] = [-float(v) for v in palm[key]]
-    flipped['rot'] = np.column_stack([
-        palm['x_axis'], flipped['y_axis'], flipped['z_axis']]).tolist()
-    return flipped
+flip_palm = epp.flip_palm
 
 
 def select_hand(palm_estimator, frames, side, expected_position,

@@ -19,6 +19,7 @@ Usage
 """
 
 import argparse
+import collections
 import copy
 import json
 import math
@@ -196,6 +197,14 @@ JOINT_SETTLE_POLL_PERIOD = 0.05  # [s]
 
 # hover 後の押し込み姿勢の補正 (_refine_press_in)。体が画角に入らない
 # ことが多いので MediaPipe Hands で手だけ検出し、複数フレームの中央値を使う。
+# 差し出し判定の時点で、直近 OFFER_HANDS_WINDOW 秒の Hands の左右の判定が
+# 差し出し手と食い違うフレームが過半数なら、Holistic も手を鏡に映した形
+# (掌と甲の取り違え) で捉えているとみなして掌を裏返す。10/16 21:32 試行3
+# (下げた手で掌が外向きに出た) は 14/14 が食い違い、正しい試行は多くて 3/12。
+OFFER_HANDS_WINDOW = 1.0  # [s]
+OFFER_HANDS_MIN_FRAMES = 5
+OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
+
 PRESS_IN_REFINE_FRAMES = 3
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 # 接近中に人の手が 20cm 余り動くことがある (10/16 試行6)。
@@ -796,6 +805,8 @@ class HandshakePipelineNode(object):
         # 接近中から hover まで Hands を毎フレーム走らせて追跡を保つ (要求時
         # だけ呼ぶと画像の端で切れた手を一から検出できない)。
         self._hand_tracking = False
+        # ARMED 中の Hands の結果 [(stamp, hands, カメラ位置)] (直近だけ)。
+        self._offer_hands = collections.deque()
         self._current_palm = None         # 直近の IK に使った掌 (base_link、平行移動前) or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 or None
         # 'idle' -> 'armed' -> 'solving' -> 'result' (RESET で 'idle')。
@@ -1147,10 +1158,19 @@ class HandshakePipelineNode(object):
                 self._head_person_seen = person_seen
             hand_frames_requested = self._hand_frames_requested
             hand_tracking = self._hand_tracking
-        if (hand_frames_requested or hand_tracking) and is_base_frame:
+        armed = self.state == 'armed'
+        if (hand_frames_requested or hand_tracking or armed) and is_base_frame:
             hands = self.pose_estimator.estimate_hands_3d(
                 color, depth_m, intrinsics, output_transform=camera_to_base)
+            stamp = color_msg.header.stamp.to_sec()
             with self._lock:
+                if armed:
+                    # 差し出し判定で手の取り違えを調べる (_correct_mirrored_offer)。
+                    self._offer_hands.append(
+                        (stamp, hands, np.asarray(camera_to_base)[:3, 3]))
+                    while (self._offer_hands and self._offer_hands[0][0]
+                           < stamp - OFFER_HANDS_WINDOW):
+                        self._offer_hands.popleft()
                 if self._hand_frames_requested:
                     # 画像保存用に画像・カメラ姿勢・内部パラメータも持つ。
                     self._hand_frames.append(dict(
@@ -1269,6 +1289,8 @@ class HandshakePipelineNode(object):
         offered_hand = palms['offered_hand']
         if offered_hand is None:
             return
+        palms, offer_check = self._correct_mirrored_offer(
+            palms, offered_hand, stamp)
         # 首の追従の指令の送信中でないときに止める (うなずきのゴールの後に
         # 追従のゴールが届くとうなずきが打ち切られるため)。
         with self._head_lock:
@@ -1285,7 +1307,8 @@ class HandshakePipelineNode(object):
         self.reset_button.visible = True
         outcome = None
         try:
-            outcome = self._solve_handshake(joint_positions, palms, offered_hand)
+            outcome = self._solve_handshake(joint_positions, palms,
+                                            offered_hand, offer_check)
         finally:
             self._busy = False
             self.state = 'result'
@@ -1301,11 +1324,54 @@ class HandshakePipelineNode(object):
             self._arm('失敗', move_to_initial_pose=False,
                       wait_offer_change=True)
 
+    def _correct_mirrored_offer(self, palms, side, stamp):
+        """差し出し手 ``side`` の掌を Hands の左右の判定と照合し、取り違え
+        (手を鏡に映した形) なら裏返した ``palms`` を返す (``(palms,
+        ログ用の内訳)``)。
+
+        右手の甲側の見え方は左手の掌側と同じ形なので、Hands が差し出し手と
+        逆の手と判定し続けるときは、同じ形を捉えた Holistic の掌も裏返って
+        いる (10/16 21:32 試行3)。Hands が手を捉えていなければ何もしない。
+        """
+        palm = palms[side]
+        with self._lock:
+            recent = [(hands, camera) for t, hands, camera in self._offer_hands
+                      if stamp - OFFER_HANDS_WINDOW <= t <= stamp]
+        labels = []
+        for hands, camera in recent:
+            best = None
+            for hand in hands:
+                if hand['score'] < PRESS_IN_REFINE_MIN_HAND_SCORE:
+                    continue
+                hand_palm = self.palm_estimator.estimate_palm(
+                    epp.hand_joint_positions(hand, side), side, camera,
+                    palm['y_axis'])
+                if hand_palm is None:
+                    continue
+                dist = float(np.linalg.norm(np.asarray(hand_palm['position'])
+                                            - np.asarray(palm['position'])))
+                if dist <= OFFER_HANDS_MAX_DISTANCE and (
+                        best is None or dist < best[0]):
+                    best = (dist, hand['side'])
+            if best is not None:
+                labels.append(best[1])
+        mismatched = sum(label != side for label in labels)
+        record = dict(
+            event='offer_hands_check', side=side, n_frames=len(recent),
+            n_hands=len(labels), n_mismatched=mismatched,
+            mirrored=(len(labels) >= OFFER_HANDS_MIN_FRAMES
+                      and mismatched * 2 > len(labels)))
+        if record['mirrored']:
+            palms = dict(palms)
+            palms[side] = dict(epp.flip_palm(palm), flipped_by_hands=True)
+        return palms, record
+
     def _log_debug(self, record):
         """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
         log_debug_event(record)
 
-    def _solve_handshake(self, joint_positions, palms, offered_hand):
+    def _solve_handshake(self, joint_positions, palms, offered_hand,
+                         offer_check=None):
         args = self.args
         self._attempt_count += 1
         attempt = self._attempt_count
@@ -1314,6 +1380,14 @@ class HandshakePipelineNode(object):
               '(ログ: {})。'.format(attempt, offered_hand, log_path))
         self._log_debug(dict(event='armed', person=attempt,
                              offered_hand=offered_hand))
+        if offer_check is not None:
+            self._log_debug(offer_check)
+            if offer_check['mirrored']:
+                print('[ARMED][WARN] Hands が {} フレーム中 {} フレームで逆の手'
+                      'と判定したため、掌と甲を取り違えているとみなして{}手の'
+                      '掌を裏返します。'.format(
+                          offer_check['n_hands'],
+                          offer_check['n_mismatched'], offered_hand))
         planned = self.planner.plan(
             joint_positions, palms, offered_hand, attempt)
         result, motion = planned['result'], planned['motion']
