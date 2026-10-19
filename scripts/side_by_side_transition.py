@@ -139,9 +139,30 @@ GOAL_FACING_YAW_WEIGHT = spik.DEFAULT_FACING_YAW_WEIGHT
 GOAL_LEG_OFFSET_WEIGHT = 10.0
 
 # 移動先のコストで、しゃがみ量 ankle + |knee| [rad] (どちらも 0 で脚を
-# 伸ばしきった一番高い姿勢) に掛ける重み。横並びではできるだけしゃがまない
-# 解を優先する。
-GOAL_CROUCH_WEIGHT = 30.0
+# 伸ばしきった一番高い姿勢) に掛ける重み。以前は横並びでしゃがまない解を
+# 優先して 30 だったが、腰を上げずに (GOAL_LEG_RISE) 前に倒すよりしゃがむ
+# 方を選ぶので 0 (沈み込みは罰しない)。
+GOAL_CROUCH_WEIGHT = 0.0
+# 移動先のコストで、腰の前傾 (waist_p が正、お辞儀) [rad] の二乗に掛ける重み
+# (hover の BOW_WEIGHT と同じ形)。合成 400 人 (seed 0) で 0・200・1000 を比べ、
+# 横並び終了時の前傾 平均 6.4° -> 4.3° -> 3.7° (p90 14.2° -> 9.9° -> 8.5°)、
+# 解ける人数は同じなので 1000。
+GOAL_BOW_WEIGHT = 1000.0
+# 横並び移動で腰 (脚) を押し込み終了時より上げないか: 'strict' なら移動先の
+# 候補を腰の高さが押し込み終了時以下 (許容 GOAL_LEG_RISE_TOLERANCE) のものに
+# 絞り、経路で脚も IK で動かすときは足首の下限・膝の上限をその waypoint の
+# 脚の角度にする (腰が高くなる側へ動かさない)。'fallback' は移動先の候補が
+# 絞った結果なくなるときだけ絞らない。'off' は制限しない。
+GOAL_LEG_RISE = 'strict'
+GOAL_LEG_RISE_MODES = ('off', 'strict', 'fallback')
+GOAL_LEG_RISE_TOLERANCE = 0.01  # [m]
+# 移動先の候補の腰が押し込み終了時より高い量がこの範囲 (許容を超えて、この
+# 値以下) なら、候補を捨てずに脚を押し込み終了時の角度に直す [m]。腰を上げ
+# ない候補が 1 つも出ない人が、最小で 1〜3 cm 高いだけで外れていたため。
+GOAL_LEG_RISE_REPAIR_MAX = 0.10
+# 経路の各 waypoint で、腰が直前の waypoint より高くならないよう脚を補正
+# するときの許容 [m]。
+PATH_LEG_RISE_TOLERANCE = 0.003
 
 # 移動先のコストで、差し出す腕の手首ヨー・ロールが可動域の端に近いほど
 # 増やす項。手首が端にあると、経路で手首をそれ以上曲げられず掌を回せない
@@ -610,6 +631,47 @@ def _place(robot, angle_vector, base):
                                 rot=rpy_matrix(float(base[2]), 0.0, 0.0)))
 
 
+def waist_height(robot):
+    """台車 (床面) から腰までの高さ [m] (脚の角度だけで決まる)。"""
+    return float(robot.waist_link.worldpos()[2]
+                 - robot.base_link.worldpos()[2])
+
+
+def _waist_height_for_legs(robot, ankle, knee):
+    """足首・膝を ``ankle``/``knee`` [rad] にしたときの腰の高さ [m]
+    (ロボットの脚の角度も変わる)。"""
+    robot.ankle_joint.joint_angle(float(ankle))
+    robot.knee_joint.joint_angle(float(knee))
+    return waist_height(robot)
+
+
+def cap_leg_rise(robot, ankle, knee, z_cap):
+    """腰の高さが ``z_cap`` 以下になる足首・膝の角度 ``(ankle, knee)`` を、
+    与えた角度に一番近いもの (まず膝をより曲げ、それでも足りなければ膝を
+    曲げきって足首を上げる) で返す。もともと ``z_cap`` 以下ならそのまま。
+    腰は膝を曲げる (knee が小さい)・足首を上げる (ankle が大きい) ほど低い。"""
+    if _waist_height_for_legs(robot, ankle, knee) <= z_cap:
+        return float(ankle), float(knee)
+    knee_min = float(robot.knee_joint.min_angle)
+    if _waist_height_for_legs(robot, ankle, knee_min) <= z_cap:
+        lo, hi = knee_min, float(knee)  # lo は z_cap 以下、hi は超える
+        for _ in range(20):
+            mid = (lo + hi) / 2.0
+            if _waist_height_for_legs(robot, ankle, mid) <= z_cap:
+                lo = mid
+            else:
+                hi = mid
+        return float(ankle), lo
+    lo, hi = float(ankle), float(robot.ankle_joint.max_angle)
+    for _ in range(20):
+        mid = (lo + hi) / 2.0
+        if _waist_height_for_legs(robot, mid, knee_min) <= z_cap:
+            hi = mid
+        else:
+            lo = mid
+    return hi, knee_min
+
+
 LEG_JOINT_NAMES = ('ankle_joint', 'ankle_joint_mimic', 'knee_joint',
                    'knee_joint_mimic')
 
@@ -669,7 +731,7 @@ def down_turn_deg(palm, robot_arm):
 
 
 def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
-              free_turn=False):
+              free_turn=False, leg_floor=None):
     """台車をいまの位置に固定し、腕・腰を押し込み目標 ``target`` に、カメラ
     の光軸を ``gaze_point`` に向ける (``solve_palm_ik.solve_post_process``
     と同じ IK)。脚 (``LEG_JOINT_NAMES``) は ``free_legs`` でなければいまの
@@ -680,11 +742,24 @@ def _press_ik(robot, robot_arm, target, gaze_point, free_legs=False,
 
     ``free_legs`` のときは、IK が脚のミミック関節を主関節と食い違った角度で
     終える (実機の姿勢では掌が最大 10 cm 離れる) ので、ミミックを主関節に
-    合わせてから、脚を固定して腕だけ解き直す。解き直せなければ ``False``。"""
+    合わせてから、脚を固定して腕だけ解き直す。解き直せなければ ``False``。
+
+    ``leg_floor`` (足首, 膝の角度 [rad]) を与えると、``free_legs`` の IK 中は
+    足首の下限・膝の上限をその角度にして、腰が高くなる側へ脚を動かさない。"""
     if free_legs:
         before = robot.angle_vector().copy()
-        if not _press_ik_once(robot, robot_arm, target, gaze_point,
-                              free_legs=True, free_turn=free_turn):
+        limits = spik._leg_limits(robot)
+        if leg_floor is not None:
+            robot.ankle_joint.min_angle = max(
+                limits[0][0], float(leg_floor[0]) - spik.LEG_RISE_PIN_TOLERANCE)
+            robot.knee_joint.max_angle = min(
+                limits[1][1], float(leg_floor[1]) + spik.LEG_RISE_PIN_TOLERANCE)
+        try:
+            solved = _press_ik_once(robot, robot_arm, target, gaze_point,
+                                    free_legs=True, free_turn=free_turn)
+        finally:
+            spik._restore_leg_limits(robot, limits)
+        if not solved:
             return False
         _sync_leg_mimics(robot)
         if _press_ik_once(robot, robot_arm, target, gaze_point,
@@ -1079,12 +1154,19 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           turn_degs=GOAL_TURN_DEGS,
                           attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
                           branch_range_deg=GOAL_BRANCH_JOINT_RANGE_DEG,
-                          free_turn=False, lowered_arms=()):
+                          free_turn=False, lowered_arms=(),
+                          max_waist_z=None):
     """下ろした手の候補 ``goal_palms`` (腕の低い順の 3 つの ``(位置,
     回転行列)``) への押し込み目標を、握りの向き ``turn_degs`` ごとに 1 回の
     バッチ IK で解き、移動先の台車・姿勢の候補を前後の窓の狭い方から
     (候補が出るまで) 集めて、腕の低い目標から、同じ目標ではコスト (曲げ量
-    + 前方ずれ + 向きのずれ + 上体の前後ずれ + しゃがみ量) の安い順に返す。
+    + 前方ずれ + 向きのずれ + 上体の前後ずれ + しゃがみ量 + 腰の前傾) の
+    安い順に返す。
+
+    ``max_waist_z`` (腰の高さ [m]、押し込み終了時の値) を与え、
+    ``GOAL_LEG_RISE`` が 'off' でなければ、腰がそれより
+    ``GOAL_LEG_RISE_TOLERANCE`` を超えて高い候補は外す ('fallback' は全部
+    外れるときだけ外さない)。
 
     台車の可動域 (ワールドの x/y に沿った箱) で人の前後を絞れるよう、人の
     立ち位置まわりに回して人の正面方向が +x の座標系で解き、解いた台車の
@@ -1133,6 +1215,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
         margin=math.radians(spik.DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
     names = [joint.name for joint in robot.joint_list]
     ankle, knee = names.index('ankle_joint'), names.index('knee_joint')
+    waist_p = names.index('waist_p_joint')
     bend_cost_indices = spik._joint_bend_cost_indices(robot, robot_arm)
     wrist = _wrist_limit_table(robot, robot_arm, names)
     end_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
@@ -1144,6 +1227,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
             limits[0], standing[0], x_margin), limits[1], limits[2]]
         candidates = []
         finger_zs = []
+        waist_zs = []
         for turn_deg in turn_degs:
             for palm_index, av, base in _batch_ik(
                     robot, robot_arm, hand, local_targets(turn_deg), seed_av,
@@ -1154,6 +1238,15 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     continue
                 # 指先の上下は台車の yaw に依らないので、解いた座標系のまま。
                 _place(robot, av, base)
+                if max_waist_z is not None and GOAL_LEG_RISE != 'off':
+                    # 腰が少しだけ高い候補は、脚を押し込み終了時の角度に直す
+                    # (腕は、このあと脚を固定した押し込み IK で解き直す)。
+                    rise = waist_height(robot) - max_waist_z
+                    if (GOAL_LEG_RISE_TOLERANCE < rise
+                            <= GOAL_LEG_RISE_REPAIR_MAX):
+                        av = av.copy()
+                        av[ankle], av[knee] = seed[ankle], seed[knee]
+                        _place(robot, av, base)
                 finger = finger_direction(end_coords.worldrot())
                 xy = to_world.transform_point([base[0], base[1], 0.0])[:2]
                 base = (float(xy[0]), float(xy[1]), base[2] + human_yaw)
@@ -1163,6 +1256,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                         + GOAL_LEG_OFFSET_WEIGHT * abs(av[ankle] + av[knee])
                         + GOAL_CROUCH_WEIGHT * (abs(av[ankle])
                                                 + abs(av[knee]))
+                        + GOAL_BOW_WEIGHT * max(0.0, float(av[waist_p])) ** 2
                         + GOAL_WRIST_WEIGHT * wrist_limit_penalty(av, wrist)
                         + GOAL_ROBOT_FINGER_DOWN_WEIGHT
                         * (1.0 + float(finger[2]))
@@ -1170,6 +1264,13 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                         * sum(abs(av[index]) for index, _, _ in wrist))
                 candidates.append((cost, av, base, turn_deg, palm_index))
                 finger_zs.append(float(finger[2]))
+                waist_zs.append(waist_height(robot))
+        if max_waist_z is not None and GOAL_LEG_RISE != 'off':
+            keep = [i for i, z in enumerate(waist_zs)
+                    if z <= max_waist_z + GOAL_LEG_RISE_TOLERANCE]
+            if keep or GOAL_LEG_RISE == 'strict':
+                candidates = [candidates[i] for i in keep]
+                finger_zs = [finger_zs[i] for i in keep]
         down = [c for c, z in zip(candidates, finger_zs)
                 if z <= GOAL_FINGER_DOWN_MAX_Z]
         if down:
@@ -1236,6 +1337,8 @@ def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
     jump_check = np.array([name not in head and name not in other_names
                            for name in names])
     prev = start_av
+    z_start = z_prev = _waist_height_for_legs(
+        robot, start_av[legs[0]], start_av[legs[1]])
     waypoints = []
     reason = None
     for k in range(1, n + 1):
@@ -1255,6 +1358,12 @@ def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
         # 角度に固定して解く。解けなければ脚も IK で動かす (以後はそこから
         # 移動先へ近づける)。
         leg_angles = prev[legs] + (goal_av[legs] - prev[legs]) / (n - k + 1)
+        if GOAL_LEG_RISE != 'off':
+            # 補間の途中で腰が膨らんで高くならないよう、直前・押し込み終了時
+            # より高くなるときは膝をより曲げる。
+            leg_angles = np.array(cap_leg_rise(
+                robot, leg_angles[0], leg_angles[1],
+                min(z_prev, z_start) + PATH_LEG_RISE_TOLERANCE))
         # 初期値は、直前の解を移動先の姿勢へ 1 区間分寄せたものを先に試す
         # (直前の解からだと手首などが直前の曲げに留まり、移動先へ向かわない)。
         for seed, free_legs in ((prev + step_av, False), (prev, False),
@@ -1265,7 +1374,9 @@ def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
             if _press_ik(robot, robot_arm, target,
                          None if PATH_INTERPOLATE_NECK else gaze_point,
                          free_legs=free_legs,
-                         free_turn=free_turn and not PATH_INTERPOLATE_TURN):
+                         free_turn=free_turn and not PATH_INTERPOLATE_TURN,
+                         leg_floor=(leg_angles if GOAL_LEG_RISE != 'off'
+                                    else None)):
                 break
         else:
             reason = '{}/{} で腕が掌に届かない'.format(k, n)
@@ -1309,6 +1420,7 @@ def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
             joint_angle_vector=[float(v) for v in av],
             turn_deg=float(turn_deg), human_arm=arm))
         prev = av
+        z_prev = _waist_height_for_legs(robot, av[legs[0]], av[legs[1]])
     return waypoints, len(waypoints) / float(n), reason
 
 
@@ -1395,6 +1507,9 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     start_av = np.asarray(post['joint_angle_vector'], dtype=np.float64)
     result['placement_before'] = spik.base_placement_metrics(
         translated_joints, post['base_position'], post['base_yaw'])
+    # 腰は押し込み終了時より上げない (GOAL_LEG_RISE)。
+    _place(robot, start_av, start_base)
+    start_waist_z = waist_height(robot)
 
     palm = human_palm_from_press(post, turn_deg, robot_arm)
     human_arm = HumanArm(translated_joints, hand, palm)
@@ -1422,7 +1537,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                 translated_joints, collision_joints, collision_pairs,
                 base_limits, turn_degs=turn_degs,
                 attempts_per_pose=attempts_per_pose, free_turn=free_turn,
-                lowered_arms=lowered_arms)
+                lowered_arms=lowered_arms, max_waist_z=start_waist_z)
             if not candidates:
                 reasons.append('移動先の IK が解けない (腕 {} 度、握りの向き '
                                '{})'.format(

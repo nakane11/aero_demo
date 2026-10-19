@@ -139,6 +139,14 @@ PRESS_IN_BASE_RATIO = 1.0
 # 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。各点で IK を
 # 解いた waypoint 列にする (関節空間の補間では曲線にならないため)。
 PRESS_IN_PATH_POINTS = 8
+# 押し込み区間で腰を上げないか: 'strict' なら各点の IK で足首の下限・膝の上限を
+# 直前の姿勢の角度にして (腰が高くなる側へ脚を動かさない)、hover で沈んだ
+# 腰を押し込みで浮かせない。解けなければ押し込みの失敗。'fallback' は解けない
+# ときだけ制限なしで解き直す。'off' は制限しない。
+PRESS_IN_LEG_RISE = 'strict'
+PRESS_IN_LEG_RISE_MODES = ('off', 'strict', 'fallback')
+# 脚の下限・上限を直前の角度に合わせるときの許容 [rad]。
+LEG_RISE_PIN_TOLERANCE = 1e-6
 
 # hover 姿勢でロボットと人体 (全身) の間に空ける距離 [m]。
 DEFAULT_HOVER_HUMAN_CLEARANCE = DEFAULT_COLLISION_MARGIN  # [m]
@@ -233,15 +241,17 @@ JOINT_BEND_COST_JOINTS = {
 
 # 候補のコストに足す hover の腰の沈み込み (CROUCH_REFERENCE_WAIST_Z からの
 # 下がり量 [m]) の重み (0 で無効)。hover が低い姿勢だと、しゃがんでから掌に
-# 近づく不自然な動きになるため。合成 400 人 (seed 0) で 0〜3000 を掃引し、
-# 1000 までは成功数が減らず (3000 で横並び 59 -> 58)、300 を超えると沈み込みは
-# ほとんど減らないので 300 (hover で 10 cm 超下がる人 34 -> 14 人)。
-CROUCH_WEIGHT = 300.0
+# 近づく不自然な動きになるため。以前は沈み込みを避けて 300 にしていたが、
+# 押し込み・横並びで腰を上げない (PRESS_IN_LEG_RISE・GOAL_LEG_RISE) ように
+# してから、沈んだ腰を浮かせ直す無駄な動きは無くなったので、腰を前に倒す
+# より沈む方を選ぶ向きに寄せて 100 にした。合成 400 人 (seed 0) の掃引は
+# docs/ik_and_motion_constraints.md の「腰を上げない」の節。
+CROUCH_WEIGHT = 100.0
 # 候補のコストに足す hover の腰の前傾 (waist_p が正、お辞儀) [rad] の二乗の
-# 重み (0 で無効)。沈み込みを避けるとお辞儀が増えるため (CROUCH_WEIGHT 参照)。
-# 合成 400 人 (seed 0) で 0〜1000 を掃引し、200 で前傾 20° 超の人が 17 -> 8 人、
-# 横並び 56 -> 58。400 以上は前傾の減りが鈍く、沈み込みが再び増える。
-BOW_WEIGHT = 200.0
+# 重み (0 で無効)。CROUCH_WEIGHT と合わせて、沈み込みよりお辞儀を嫌う。
+# 200 から 1000 に上げた (横並び終了時の前傾 平均 5.5° -> 4.3°、p90 10.6° ->
+# 9.9°、横並びまで解ける人数は同じ)。
+BOW_WEIGHT = 1000.0
 # 沈み込みの基準にする腰の高さ [m] (接近の始点の姿勢: 足首 30°・膝 -30°)。
 CROUCH_REFERENCE_WAIST_Z = 0.853
 
@@ -2375,14 +2385,60 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     )
 
 
-def solve_press_in(robot, robot_arm, palm, target_rot,
-                   stop=DEFAULT_POST_PROCESS_IK_STOP,
-                   thre=DEFAULT_POST_PROCESS_IK_THRE,
-                   rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
-                   gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
-                   gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
-                   gaze=True, arm_only_fallback=True,
-                   n_points=PRESS_IN_PATH_POINTS):
+def _pin_leg_floor(robot, limits):
+    """脚の可動域を、いまの足首・膝の角度から腰が高くなる側へ動けないよう
+    に狭める (``limits`` は ``_leg_limits`` の元の可動域)。"""
+    (ankle_min, _), (_, knee_max) = limits
+    robot.ankle_joint.min_angle = max(
+        ankle_min, float(robot.ankle_joint.joint_angle())
+        - LEG_RISE_PIN_TOLERANCE)
+    robot.knee_joint.max_angle = min(
+        knee_max, float(robot.knee_joint.joint_angle())
+        + LEG_RISE_PIN_TOLERANCE)
+
+
+def _leg_limits(robot):
+    return ((robot.ankle_joint.min_angle, robot.ankle_joint.max_angle),
+            (robot.knee_joint.min_angle, robot.knee_joint.max_angle))
+
+
+def _restore_leg_limits(robot, limits):
+    (robot.ankle_joint.min_angle, robot.ankle_joint.max_angle), \
+        (robot.knee_joint.min_angle, robot.knee_joint.max_angle) = limits
+
+
+def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
+                   **kwargs):
+    """``_solve_press_in`` を ``leg_rise`` (None なら ``PRESS_IN_LEG_RISE``)
+    の方針で解く。'strict' は押し込みで腰を上げない (脚を hover より腰が
+    高くなる側へ動かさない) 解だけ、'fallback' はそれが解けないときだけ
+    制限なしで解き直す、'off' は制限しない。"""
+    if leg_rise is None:
+        leg_rise = PRESS_IN_LEG_RISE
+    if leg_rise == 'off':
+        return _solve_press_in(robot, robot_arm, palm, target_rot,
+                               limit_legs=False, **kwargs)
+    start_time = time.time()
+    post = _solve_press_in(robot, robot_arm, palm, target_rot,
+                           limit_legs=True, **kwargs)
+    if post is None and leg_rise == 'fallback':
+        post = _solve_press_in(robot, robot_arm, palm, target_rot,
+                               limit_legs=False, **kwargs)
+        if post is not None:
+            post['leg_rise_fallback'] = True
+    if post is not None:
+        post['compute_time'] = time.time() - start_time
+    return post
+
+
+def _solve_press_in(robot, robot_arm, palm, target_rot,
+                    stop=DEFAULT_POST_PROCESS_IK_STOP,
+                    thre=DEFAULT_POST_PROCESS_IK_THRE,
+                    rthre=DEFAULT_POST_PROCESS_IK_RTHRE,
+                    gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
+                    gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
+                    gaze=True, arm_only_fallback=True,
+                    n_points=PRESS_IN_PATH_POINTS, limit_legs=False):
     """hover 姿勢の ``robot`` から押し込みの曲線
     (``press_in_target_position``) を ``n_points`` 等分した手先目標を、途中は
     腕だけの IK、最終目標は ``solve_post_process`` で順に解く.
@@ -2394,7 +2450,25 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
     のリスト ``press_in_path`` と台車 ``[x, y, yaw]`` のリスト
     ``press_in_base_path`` を足して返す。どこかで解けなければ ``robot`` を
     元に戻して None。
+
+    ``limit_legs`` なら、各点の IK の前に脚の可動域を直前の姿勢の角度から
+    腰が高くなる側へ動けないように狭める (終わったら元に戻す)。
     """
+    leg_limits = _leg_limits(robot)
+    if limit_legs:
+        _pin_leg_floor(robot, leg_limits)
+    try:
+        return _solve_press_in_path(
+            robot, robot_arm, palm, target_rot, stop, thre, rthre,
+            gaze_ik_stop, gaze_ik_rthre, gaze, arm_only_fallback, n_points,
+            leg_limits if limit_legs else None)
+    finally:
+        _restore_leg_limits(robot, leg_limits)
+
+
+def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
+                         rthre, gaze_ik_stop, gaze_ik_rthre, gaze,
+                         arm_only_fallback, n_points, pin_limits):
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
     initial_coords = robot.copy_worldcoords()
@@ -2402,6 +2476,9 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
 
     def restore():
+        # 狭めた可動域のままだと元の脚の角度を戻せない。
+        if pin_limits is not None:
+            _restore_leg_limits(robot, pin_limits)
         robot.newcoords(initial_coords)
         robot.angle_vector(initial_angle_vector)
 
@@ -2437,6 +2514,8 @@ def solve_press_in(robot, robot_arm, palm, target_rot,
             restore()
             return None
         path.append(robot.angle_vector().copy())
+        if pin_limits is not None:
+            _pin_leg_floor(robot, pin_limits)
         yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
         base_path.append([float(v) for v in robot.base_link.worldpos()[:2]]
                          + [float(yaw)])
@@ -3183,7 +3262,7 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 def main():
     global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
-        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT, \
+        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT, PRESS_IN_LEG_RISE, \
         POST_PROCESS_SETTLE_LEGS
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
@@ -3313,6 +3392,12 @@ def main():
         help='hover の腰の前傾 [rad] の二乗を候補のコストに足す重み '
             '(0 で無効、既定 {})。'.format(BOW_WEIGHT))
     parser.add_argument(
+        '--press-in-leg-rise', choices=PRESS_IN_LEG_RISE_MODES,
+        default=PRESS_IN_LEG_RISE,
+        help='押し込みで腰を上げるか (off: 制限なし、strict: 脚を腰が高く'
+            'なる側へ動かさない、fallback: 解けないときだけ制限なし、'
+            '既定 {})。'.format(PRESS_IN_LEG_RISE))
+    parser.add_argument(
         '--press-in-base-ratio', type=float, default=PRESS_IN_BASE_RATIO,
         help='押し込み中に台車も動かす割合 (指先方向の押し出しの水平成分に '
             '対する割合、0 で台車固定、既定 {})。'.format(PRESS_IN_BASE_RATIO))
@@ -3339,6 +3424,7 @@ def main():
     PRESS_IN_BASE_RATIO = args.press_in_base_ratio
     CROUCH_WEIGHT = args.crouch_weight
     BOW_WEIGHT = args.bow_weight
+    PRESS_IN_LEG_RISE = args.press_in_leg_rise
 
     files = iter_palm_files(args.input_dir)
     if not files:

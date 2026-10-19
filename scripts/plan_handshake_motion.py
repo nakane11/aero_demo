@@ -1251,7 +1251,24 @@ def main():
         '--collision-pairs', type=str,
         default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
         help='横並び移動のバッチ IK で使う干渉ペア。')
+    parser.add_argument(
+        '--goal-leg-rise', choices=sbs.GOAL_LEG_RISE_MODES,
+        default=sbs.GOAL_LEG_RISE,
+        help='横並び移動で腰を押し込み終了時より上げるか (off: 制限なし、'
+            'strict: 上げない、fallback: 候補がなくなるときだけ制限なし、'
+            '既定 {})。'.format(sbs.GOAL_LEG_RISE))
+    parser.add_argument(
+        '--goal-crouch-weight', type=float, default=sbs.GOAL_CROUCH_WEIGHT,
+        help='横並び移動先のしゃがみ量の重み (既定 {})。'.format(
+            sbs.GOAL_CROUCH_WEIGHT))
+    parser.add_argument(
+        '--goal-bow-weight', type=float, default=sbs.GOAL_BOW_WEIGHT,
+        help='横並び移動先の腰の前傾 [rad] の二乗の重み (既定 {})。'.format(
+            sbs.GOAL_BOW_WEIGHT))
     args = parser.parse_args()
+    sbs.GOAL_LEG_RISE = args.goal_leg_rise
+    sbs.GOAL_CROUCH_WEIGHT = args.goal_crouch_weight
+    sbs.GOAL_BOW_WEIGHT = args.goal_bow_weight
 
     files = json_io.iter_json_files(args.input_dir)
     if not files:

@@ -224,6 +224,14 @@ def main():
     parser.add_argument(
         '--side-by-side-transition', action='store_true',
         help='plan_handshake_motion.py に --side-by-side-transition を渡す。')
+    parser.add_argument(
+        '--solve-args', default='',
+        help='solve_palm_ik.py にそのまま渡す引数 (空白区切りの 1 文字列、'
+            '例: "--bow-weight 500 --press-in-leg-rise off")。')
+    parser.add_argument(
+        '--motion-args', default='',
+        help='plan_handshake_motion.py にそのまま渡す引数 (空白区切りの '
+            '1 文字列)。')
     args = parser.parse_args()
 
     base_dir = tempfile.mkdtemp(prefix='aero_demo_pipeline_', dir='/tmp')
@@ -272,6 +280,7 @@ def main():
     if args.collision_verify_model is not None:
         solve_args += ['--collision-verify-model',
                        args.collision_verify_model]
+    solve_args += args.solve_args.split()
     solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
                                            solve_args)
     warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)
@@ -308,6 +317,7 @@ def main():
                             args.collision_verify_model]
         if args.side_by_side_transition:
             motion_args.append('--side-by-side-transition')
+        motion_args += args.motion_args.split()
         motion_elapsed, motion_stdout = run_step(
             '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
