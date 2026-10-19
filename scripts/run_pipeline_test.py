@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,18 @@ _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
 if _PKG_SRC_DIR not in sys.path:
     sys.path.insert(0, _PKG_SRC_DIR)
 
+# 子プロセスが GPU メモリを 75% ずつ一括確保すると、solve_palm_ik.py と
+# plan_handshake_motion.py の同時実行で後から起動した方が確保に失敗する。
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+
 from aero_demo import json_io  # noqa: E402  (パス追加後に import)
+
+
+def report_step_failure(label, script_name, returncode, output):
+    print(output[-4000:])
+    print('[{}] {} が exit code {} で失敗しました。'.format(
+        label, script_name, returncode))
+    sys.exit(1)
 
 
 def run_step(label, script_name, extra_args):
@@ -40,11 +52,49 @@ def run_step(label, script_name, extra_args):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     elapsed = time.time() - t0
     if result.returncode != 0:
-        print(result.stdout[-4000:])
-        print('[{}] {} が exit code {} で失敗しました。'.format(
-            label, script_name, result.returncode))
-        sys.exit(1)
+        report_step_failure(label, script_name, result.returncode,
+                            result.stdout)
     return elapsed, result.stdout
+
+
+class BackgroundStep(object):
+    """``script_name`` を子プロセスでバックグラウンド起動する。標準出力は
+    パイプが詰まらないよう ``log_path`` のファイルへ書く。"""
+
+    def __init__(self, label, script_name, extra_args, log_path):
+        self.label = label
+        self.script_name = script_name
+        self.log_path = log_path
+        self._log = open(log_path, 'w')
+        self.t0 = time.time()
+        self.process = subprocess.Popen(
+            [sys.executable, os.path.join(_THIS_DIR, script_name)]
+            + extra_args, cwd=_THIS_DIR,
+            stdout=self._log, stderr=subprocess.STDOUT)
+
+    def wait(self):
+        """終了を待って ``(起動からの経過秒, 標準出力)`` を返す (失敗したら
+        出力の末尾を表示して終了)。"""
+        returncode = self.process.wait()
+        elapsed = time.time() - self.t0
+        self._log.close()
+        with open(self.log_path) as f:
+            output = f.read()
+        if returncode != 0:
+            report_step_failure(self.label, self.script_name, returncode,
+                                output)
+        return elapsed, output
+
+    def stop(self):
+        """別の段階が失敗したときの後始末。SIGKILL は jax の永続キャッシュを
+        壊すので SIGINT で終わらせる。"""
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGINT)
+            try:
+                self.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self._log.close()
 
 
 def extract_warmup_lines(stdout):
@@ -225,6 +275,10 @@ def main():
         '--side-by-side-transition', action='store_true',
         help='plan_handshake_motion.py に --side-by-side-transition を渡す。')
     parser.add_argument(
+        '--no-parallel-warmup', action='store_true',
+        help='--plan-motion のとき plan_handshake_motion.py を solve_palm_ik.py '
+            'と並行して先に起動する (warmup を重ねる) のをやめ、順に実行する。')
+    parser.add_argument(
         '--solve-args', default='',
         help='solve_palm_ik.py にそのまま渡す引数 (空白区切りの 1 文字列、'
             '例: "--bow-weight 500 --press-in-leg-rise off")。')
@@ -281,8 +335,47 @@ def main():
         solve_args += ['--collision-verify-model',
                        args.collision_verify_model]
     solve_args += args.solve_args.split()
-    solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
-                                           solve_args)
+
+    # plan_handshake_motion.py の warmup は入力 (握手姿勢 JSON) に依存しない
+    # ので、solve_palm_ik.py の実行中に先に起動して warmup を重ねる。入力が
+    # 揃った (solve_done_path ができた) ら本処理に入る。
+    motion_args = None
+    motion_step = None
+    solve_done_path = os.path.join(base_dir, 'solve_done')
+    if args.plan_motion:
+        motion_args = ['--input-dir', handshake_dir,
+                      '--output-dir', motion_dir,
+                      '--skeleton-dir', skeleton_dir]
+        if args.force_optimize:
+            motion_args.append('--force-optimize')
+        if args.initial_base_pose is not None:
+            motion_args += ['--initial-base-pose'] + [
+                str(v) for v in args.initial_base_pose]
+        if args.approach_distance is not None:
+            motion_args += ['--approach-distance', str(args.approach_distance)]
+        if args.collision_verify_model is not None:
+            motion_args += ['--collision-verify-model',
+                            args.collision_verify_model]
+        if args.side_by_side_transition:
+            motion_args.append('--side-by-side-transition')
+        motion_args += args.motion_args.split()
+        if not args.no_parallel_warmup:
+            print('[4.5/5] plan_handshake_motion.py を warmup のため '
+                  'solve_palm_ik.py と並行して先に起動します。')
+            motion_step = BackgroundStep(
+                '4.5/5', 'plan_handshake_motion.py',
+                motion_args + ['--wait-file', solve_done_path],
+                os.path.join(base_dir, 'plan_handshake_motion.log'))
+
+    try:
+        solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
+                                               solve_args)
+    except BaseException:
+        if motion_step is not None:
+            motion_step.stop()
+        raise
+    if motion_step is not None:
+        open(solve_done_path, 'w').close()
     warmup_lines, warmup_total = extract_warmup_lines(solve_stdout)
     summary = summarize_handshakes(handshake_dir)
     print('[4/5] solve_palm_ik.py: IK 対象 {} 人中 {} 人 solved '
@@ -302,24 +395,15 @@ def main():
     # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
     motion_summary = None
     if args.plan_motion:
-        motion_args = ['--input-dir', handshake_dir,
-                      '--output-dir', motion_dir,
-                      '--skeleton-dir', skeleton_dir]
-        if args.force_optimize:
-            motion_args.append('--force-optimize')
-        if args.initial_base_pose is not None:
-            motion_args += ['--initial-base-pose'] + [
-                str(v) for v in args.initial_base_pose]
-        if args.approach_distance is not None:
-            motion_args += ['--approach-distance', str(args.approach_distance)]
-        if args.collision_verify_model is not None:
-            motion_args += ['--collision-verify-model',
-                            args.collision_verify_model]
-        if args.side_by_side_transition:
-            motion_args.append('--side-by-side-transition')
-        motion_args += args.motion_args.split()
-        motion_elapsed, motion_stdout = run_step(
-            '4.5/5', 'plan_handshake_motion.py', motion_args)
+        if motion_step is not None:
+            after_solve_t0 = time.time()
+            motion_elapsed, motion_stdout = motion_step.wait()
+            print('[4.5/5] plan_handshake_motion.py は solve_palm_ik.py と並行'
+                  'して起動済み (solve_palm_ik.py の終了後 {:.1f} 秒で完了)。'
+                  .format(time.time() - after_solve_t0))
+        else:
+            motion_elapsed, motion_stdout = run_step(
+                '4.5/5', 'plan_handshake_motion.py', motion_args)
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
             motion_stdout)
         motion_summary = summarize_motions(motion_dir)

@@ -1210,6 +1210,11 @@ def main():
         default=os.path.join(_SYNTHETIC_DIR, 'random_motion_poses'),
         help='軌道 JSON の保存先ディレクトリ。')
     parser.add_argument(
+        '--wait-file', type=str, default=None,
+        help='warmup を済ませたあと、このファイルができるまで待ってから '
+            '--input-dir を読む (run_pipeline_test.py が solve_palm_ik.py と '
+            '並行して起動し、warmup を重ねるため)。')
+    parser.add_argument(
         '--approach-distance', type=float,
         default=DEFAULT_APPROACH_DISTANCE,
         help='接近開始位置の円の半径への上乗せ [m] (既定 {})。'.format(
@@ -1271,7 +1276,7 @@ def main():
     sbs.GOAL_BOW_WEIGHT = args.goal_bow_weight
 
     files = json_io.iter_json_files(args.input_dir)
-    if not files:
+    if not files and args.wait_file is None:
         print('{} に握手姿勢 JSON が見つかりません。先に solve_palm_ik.py '
               'を実行してください。'.format(args.input_dir))
         return
@@ -1321,6 +1326,19 @@ def main():
                 robot, robot_arm, hand,
                 picked[1] if picked is not None else robot.angle_vector(),
                 transition_pairs, base_limits)
+
+    if args.wait_file is not None:
+        # warmup は入力に依存しないので先に済ませた。入力の完成を待つ。
+        wait_t0 = time.time()
+        while not os.path.exists(args.wait_file):
+            time.sleep(0.1)
+        print('[wait] 入力の握手姿勢 JSON の完成を {:.1f} 秒待ちました。'
+              .format(time.time() - wait_t0))
+        files = json_io.iter_json_files(args.input_dir)
+        if not files:
+            print('{} に握手姿勢 JSON が見つかりません。'.format(
+                args.input_dir))
+            return
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     n_transition = n_transition_verified = 0

@@ -37,7 +37,7 @@ data/
       data/real/2026-10-13/logs data/real/2026-10-15/logs --out /tmp/resolve.json
   ```
 - 連続録画のセッション bag (`real/2026-09-*`) には /odom・/scan・/joint_states が入っていない。差し出し判定や起動・warmup の確認には使えるが、試行の通し確認には使わない。
-- 合成データでの回帰テストは `scripts/run_pipeline_test.py` で行う (`run_camera_pipeline_test.py` は使わない)。
+- 合成データでの回帰テストは `scripts/run_pipeline_test.py` で行う (`run_camera_pipeline_test.py` は使わない)。`--plan-motion` のときは `plan_handshake_motion.py` を `solve_palm_ik.py` と並行して先に起動し、入力に依存しない warmup (約40秒) を重ねる (400 人・`--side-by-side-transition` で 132 秒 → 95 秒、結果は同一。`--no-parallel-warmup` で従来どおり順に実行)。並行実行のため子プロセスには `XLA_PYTHON_CLIENT_PREALLOCATE=false` を渡している (GPU メモリを 75% ずつ確保すると後から起動した方が失敗するため)。
 
 ## 置き方の決まり
 
@@ -87,8 +87,16 @@ data/
 /tf・/tf_static に加えて、実機の /odom・/scan・/joint_states も入っている。
 それぞれの `replay.sh` を実行すると、専用の roscore で bag を再生して、
 差し出し判定から横並び移動の計画までを実機なし (`--no-robot-interface`) で
-確認できる。結果は `/tmp/run_camera_pipeline_test_logs/person_01.log` に出る。
+確認できる。結果は `/tmp/run_camera_pipeline_test_logs/latest/person_01.log` に出る。
 各ディレクトリの `replay_results/` には、過去に再生したときの JSON を置いてある。
+
+`replay.sh` は最初の `[result]` (成功・失敗とも) が出た 3 秒後に残りの再生を打ち切る。
+`--no-robot-interface` では ARMED 後の区間は使われないので、bag を最後まで再生して
+待つだけだった約 1 分が不要になる (trial1 で warmup 済みのとき約 150 秒 → 80 秒)。
+bag の最後まで再生したいときは `EARLY_STOP=0 bash replay.sh`。warmup は jax の
+キャッシュが温まっていれば約 45 秒だが、solve_palm_ik.py などを変更した直後の
+初回はキャッシュミスで約 100 秒かかる。何回も回して成功率を見るときは、初回を
+捨ててから測る。
 
 | ディレクトリ | 区間 (元 bag) | 実機の試行 | 再生の結果 |
 |---|---|---|---|
