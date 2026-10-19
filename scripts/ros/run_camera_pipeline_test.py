@@ -308,6 +308,26 @@ class _TeeStream(object):
         return getattr(self._stream, name)
 
 
+class _StderrTee(object):
+    """標準エラー (rospy.logwarn・警告・トレースバック) を画面に出しつつ、
+    標準出力と同じログファイルへも書く。"""
+
+    def __init__(self, stream, tee_stream):
+        self._stream = stream
+        self._tee_stream = tee_stream
+
+    def write(self, text):
+        self._stream.write(text)
+        self._tee_stream.write_file_only(text)
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 _tee_stream = None
 
 
@@ -327,6 +347,9 @@ def setup_log_dir():
     path = os.path.join(LOG_DIR, LOG_STARTUP_NAME)
     _tee_stream = _TeeStream(sys.stdout, open(path, 'w', encoding='utf-8'))
     sys.stdout = _tee_stream
+    # rospy のログハンドラは rospy.init_node 時点の sys.stderr を掴むので、
+    # init_node より前 (main の先頭) に差し替える。
+    sys.stderr = _StderrTee(sys.stderr, _tee_stream)
     return path
 
 
