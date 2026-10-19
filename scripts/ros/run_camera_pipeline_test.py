@@ -137,6 +137,11 @@ HEAD_SCAN_SPEED_DEG = 30.0  # [deg/s] 見渡すときの首の速さ
 # 覚え、見失っても最後に見えた位置を向き続ける (見渡さない)。
 HEAD_FACE_TRACK_DEADBAND_DEG = 4.0
 HEAD_FACE_TRACK_SPEED_DEG = 80.0  # [deg/s] (実機の首ヨーの上限は約 92 deg/s)
+# 追従の指令がこれ未満しか変わらないときは同じ指令を送り直さない。首が可動域の
+# 端で目標に届かないと、視線のずれが不感帯を超えたまま指令が変わらず、毎周期
+# 送り直して head_controller のゴールが終わらなくなる (10/19 person_03 は
+# wait_interpolation が hover 到着から 12 秒返らなかった)。
+HEAD_TRACK_RESEND_DEG = 0.5
 ODOM_FRAME = 'odom'
 
 # 実機再生時の waypoint 間の所要時間の下限 [秒] (腕の制御周期 15Hz の 1 周期)。
@@ -169,9 +174,12 @@ ACCEL_TIME = 0.4
 TIME_LIMIT_MAX_ITERATIONS = 100
 
 # 押し込み直前の台車の位置補正 (_correct_base_residual)。
-BASE_CORRECTION_MAX_ATTEMPTS = 3
+# 補正ゴールは開始時に yaw が約 4〜5° 跳ね、コントローラが odom 基準で戻しす
+# ぎるので、yaw の補正は数度では収束しない (10/19 の bag 解析)。そのため yaw
+# の許容を 5° に広げ、それ以内なら yaw は補正せず (指令 0)、回数も 2 回にした。
+BASE_CORRECTION_MAX_ATTEMPTS = 2
 BASE_CORRECTION_POSITION_TOLERANCE = 0.025  # [m]
-BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(2.5)  # [rad]
+BASE_CORRECTION_ANGLE_TOLERANCE = math.radians(5.0)  # [rad]
 # /scan 照合による移動量推定 (--base-correction scan)。/odom は指令の
 # 積分なのでスリップが表れない。
 SCAN_CAPTURE_TIMEOUT = 0.5  # [s] 呼び出し後に新しいスキャンが届くまで待つ上限
@@ -186,6 +194,11 @@ ODOM_SETTLE_WINDOW = 0.05  # [s]
 ODOM_SETTLE_POSITION = 0.001  # [m]
 ODOM_SETTLE_ANGLE = math.radians(0.1)  # [rad]
 ODOM_SETTLE_TIMEOUT = 1.0  # [s]
+# 押し込み前の補正1回あたりの時間を詰める (実機 10/19: 1.0s 指令 + 1.0s 待ちで
+# 1回2秒、3回で6秒かかり人が手を動かした)。odom は毎回タイムアウトまで
+# 止まらない (12mm/6deg 以内の微動) ので待ちは短く切る。
+BASE_CORRECTION_MIN_TIME = 0.4  # [s] 補正の移動の下限 (上限速度で延びる)
+BASE_CORRECTION_SETTLE_TIMEOUT = 0.25  # [s]
 GOAL_STATUS_NAMES = {
     0: 'PENDING', 1: 'ACTIVE', 2: 'PREEMPTED', 3: 'SUCCEEDED', 4: 'ABORTED',
     5: 'REJECTED', 6: 'PREEMPTING', 7: 'RECALLING', 8: 'RECALLED', 9: 'LOST'}
@@ -1795,10 +1808,12 @@ class HandshakePipelineNode(object):
         scan_steps = []
         scan_index = 0
         scan_step_end_time = 0.0  # 今の向きで止まり終える時刻
+        last_command = None  # 直近に送った追従の (首ヨー, 首ピッチ) [rad]
         while not rospy.is_shutdown():
             time.sleep(HEAD_TRACK_PERIOD)
             try:
                 with self._head_lock:
+                    prev_mode = mode
                     hand = self._head_hand_following.is_set()
                     face = self._head_face_tracking.is_set() or hand
                     if not face and not self._head_tracking_allowed():
@@ -1806,6 +1821,7 @@ class HandshakePipelineNode(object):
                             log_debug('[head] 首の追従・見渡しを止めました。')
                         # _head_tracking_yaw はうなずきが読むので残す。
                         mode = None
+                        last_command = None
                         continue
                     with self._lock:
                         seen = self._head_person_seen
@@ -1890,6 +1906,13 @@ class HandshakePipelineNode(object):
                         speed = np.deg2rad(HEAD_SCAN_SPEED_DEG)
                         mode = 'scan'
                         self._head_tracking_yaw = None
+                    command = target_av[[neck_y_index, neck_p_index]]
+                    if (mode in ('face', 'hand', 'track')
+                            and prev_mode == mode and last_command is not None
+                            and float(np.max(np.abs(command - last_command)))
+                            < np.deg2rad(HEAD_TRACK_RESEND_DEG)):
+                        continue
+                    last_command = command.copy()
                     delta = float(np.max(np.abs(
                         target_av[[neck_y_index, neck_p_index]]
                         - current_av[[neck_y_index, neck_p_index]])))
@@ -2754,7 +2777,7 @@ class HandshakePipelineNode(object):
             on_sent()
 
         if arm_angle_vectors:
-            self.ri.wait_interpolation()
+            self._wait_body_interpolation()
             self._log_controller_states()
         if base_trajectory_points:
             self.ri.move_base_trajectory_action.wait_for_result()
@@ -2776,14 +2799,36 @@ class HandshakePipelineNode(object):
             base_trajectory_points[-1] if base_trajectory_points else None)
         return start_odom_coords, final_traj_point
 
+    @staticmethod
+    def _action_name(action):
+        return getattr(getattr(action, 'action_client', None), 'ns',
+                       None) or getattr(action, 'name', '?')
+
+    def _wait_body_interpolation(self):
+        """腕・脚・腰などの各コントローラのゴールが終わるまで待つ
+        (``ri.wait_interpolation`` と同じ)。首が顔・掌の追従で動いている間は、
+        追従が指令を送り直し続けて首のゴールが終わらないことがあるので
+        首は待たない。コントローラごとの待ち時間をログに出す。"""
+        skip_head = (self._head_face_tracking.is_set()
+                     or self._head_hand_following.is_set())
+        waited = []
+        for action in self.ri.controller_table[self.ri.controller_type]:
+            name = self._action_name(action)
+            if skip_head and name.startswith('head_controller'):
+                waited.append('{}=待たない'.format(name))
+                continue
+            t0 = time.time()
+            action.wait_for_result(timeout=rospy.Duration(0))
+            waited.append('{}={:.1f}s'.format(name, time.time() - t0))
+        log_debug('[debug][segment] ゴール完了待ち: ' + ', '.join(waited))
+
     def _log_controller_states(self):
         """腕・脚・腰などの各コントローラのゴール終了状態をログに出す
         (ABORTED などで途中で止まった関節を見つけるため)。"""
         parts = []
         for action in self.ri.controller_table[self.ri.controller_type]:
             state = action.get_state()
-            name = getattr(getattr(action, 'action_client', None), 'ns',
-                           None) or getattr(action, 'name', '?')
+            name = self._action_name(action)
             parts.append('{}={}'.format(
                 name, GOAL_STATUS_NAMES.get(state, state)))
         log_debug('[debug][segment] 腕・脚コントローラのゴール終了状態: '
@@ -3069,12 +3114,19 @@ class HandshakePipelineNode(object):
                     ref_scan, odom_delta, exclude_centers, attempt, plan)
                 if scan_delta is not None:
                     actual, source = scan_delta, 'scan'
-            # 今の台車から見た hover 目標 (= 補正で動かす量)。
-            err_x, err_y, err_yaw = scan_matching.relative(actual, plan)
+            # 向きは許容を超えたときだけ直す (yaw の補正はキックで打ち消され
+            # るだけ)。
+            yaw_error = scan_matching.wrap_angle(plan[2] - actual[2])
+            target = plan.copy()
+            if abs(yaw_error) <= angle_tolerance:
+                target[2] = actual[2]
+            # 今の台車から見た目標 (= 補正で動かす量)。
+            err_x, err_y, err_yaw = scan_matching.relative(actual, target)
             err_norm = math.hypot(err_x, err_y)
             log_debug('[execute][correct] attempt={} ({}基準) 目標までの残差 '
-                  '{:+.3f}m {:+.3f}m {:+.1f}deg'.format(
-                      attempt, source, err_x, err_y, math.degrees(err_yaw)))
+                  '{:+.3f}m {:+.3f}m {:+.1f}deg (計画の向きとの差 {:+.1f}deg)'
+                  .format(attempt, source, err_x, err_y,
+                          math.degrees(err_yaw), math.degrees(yaw_error)))
 
             if err_norm <= position_tolerance and abs(err_yaw) <= angle_tolerance:
                 if attempt > 0:
@@ -3089,13 +3141,14 @@ class HandshakePipelineNode(object):
                       err_norm, math.degrees(abs(err_yaw)), attempt + 1,
                       max_attempts))
             sec, = self._limited_time_list(
-                None, [[err_x, err_y, err_yaw]], [1.0])
+                None, [[err_x, err_y, err_yaw]], [BASE_CORRECTION_MIN_TIME])
             before = self._odom_pose(self.ri.odom)
             self._send_base_trajectory(
                 [[err_x, err_y, err_yaw]], [sec], wait=True)
             state = self.ri.move_base_trajectory_action.get_state()
             # ゴール終了後も台車が動き続けることがあるので止まるまで待つ。
-            settle_time, drift = self._wait_odom_settle()
+            settle_time, drift = self._wait_odom_settle(
+                BASE_CORRECTION_SETTLE_TIMEOUT)
             moved = scan_matching.relative(
                 before, self._odom_pose(self.ri.odom))
             log_debug('[execute][correct] 補正の移動: 指令 ({:+.3f}m, {:+.3f}m, '
