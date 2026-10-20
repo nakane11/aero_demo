@@ -222,8 +222,7 @@ python3 view_handshake_poses.py
 カメラ画像から骨格・掌を推定し、ARM を押す (または `--auto-arm`) と差し出し手の
 判定 → IK → 軌道計画 → 横並び移動の計画までを行い、`--auto-execute` を付けたときだけ
 実機 (台車・腕・首) を動かす (付けなければ viewer で確認するだけ)。
-横並び移動をする設定 (既定) では、横並び移動が解けていない試行は実機を動かさない
-(`--no-side-by-side-transition` で押し込みまでにできる)。
+横並び移動が解けていない試行は実機を動かさない。
 
 詳細ログ (`[debug]` など) は画面には出さず、
 `/tmp/run_camera_pipeline_test_logs/<起動時刻>/` に起動時 (`startup.log`) と

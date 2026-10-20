@@ -42,7 +42,7 @@ venv/jax バージョンで同じ形状の計算であればディスクキャ�
 (`_warmup_body`)を実行する。左右それぞれの腕で IK(`solve_person_ik`)と
 `plan_person_motion`(`force_optimize=True` で jaxls の軌道最適化まで必ず
 実行)をダミー目標に対して 1 回ずつ解き、`--side-by-side-transition`(この
-スクリプトでは既定で有効、`--no-side-by-side-transition` で無効)のときは
+スクリプトでは常に有効)のときは
 横並び移動のバッチ IK(`side_by_side_transition.warmup_batch_ik`)も解く。
 乱数は warmup 中だけ固定シードにし、終了後に元へ戻す。
 

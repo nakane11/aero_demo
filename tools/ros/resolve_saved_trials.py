@@ -57,7 +57,7 @@ STAGES = ('no_palm', 'ik_fail', 'no_press', 'motion_ng', 'motion_ok',
           'transition_ok')
 
 
-def trial_stage(result, motion, side_by_side_transition):
+def trial_stage(result, motion):
     """IK 結果 ``result`` と軌道 ``motion`` から到達段階を返す。"""
     if not result['solved']:
         return 'ik_fail'
@@ -66,13 +66,12 @@ def trial_stage(result, motion, side_by_side_transition):
     if not rcpt.motion_verified(motion):
         return 'motion_ng'
     transition = motion.get('transition')
-    if side_by_side_transition and transition is not None \
-            and transition['verified']:
+    if transition is not None and transition['verified']:
         return 'transition_ok'
     return 'motion_ok'
 
 
-def load_saved_stage(data_dir, name, side_by_side_transition):
+def load_saved_stage(data_dir, name):
     """保存時の ``handshakes/``・``motions/`` から段階を求める (無ければ None)。"""
     handshake_path = os.path.join(data_dir, 'handshakes', name)
     if not os.path.exists(handshake_path):
@@ -84,7 +83,7 @@ def load_saved_stage(data_dir, name, side_by_side_transition):
     if os.path.exists(motion_path):
         with open(motion_path) as f:
             motion = json.load(f)
-    return trial_stage(result, motion, side_by_side_transition)
+    return trial_stage(result, motion)
 
 
 def resolve_trial(planner, args, data_dir, name, attempt):
@@ -95,8 +94,7 @@ def resolve_trial(planner, args, data_dir, name, attempt):
         palms = json.load(f)
     record = dict(
         data_dir=data_dir, name=name,
-        saved_stage=load_saved_stage(data_dir, name,
-                                     args.side_by_side_transition))
+        saved_stage=load_saved_stage(data_dir, name))
     offered_hand = palms.get('offered_hand')
     if offered_hand not in ('L', 'R') or palms.get(offered_hand) is None:
         record['stage'] = 'no_palm'
@@ -108,7 +106,7 @@ def resolve_trial(planner, args, data_dir, name, attempt):
     result, motion = planned['result'], planned['motion']
     record.update(
         hand=offered_hand, robot_arm=planned['robot_arm'],
-        stage=trial_stage(result, motion, args.side_by_side_transition),
+        stage=trial_stage(result, motion),
         time=time.time() - t0)
     if motion is not None:
         record['motion_kind'] = motion['kind']

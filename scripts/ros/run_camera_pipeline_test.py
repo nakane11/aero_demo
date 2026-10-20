@@ -23,8 +23,8 @@ import collections
 import copy
 import json
 import math
+import multiprocessing
 import os
-import queue
 import shutil
 import subprocess
 import sys
@@ -503,6 +503,19 @@ class _DeferredSolver(object):
         return getattr(self._solver, name)
 
 
+def _optimizer_warmup_child(args):
+    """軌道最適化の準備を行う別プロセスの本体 (``multiprocessing`` の spawn)。
+
+    裏のスレッドで行うと jaxls のトレース (Python の処理が長い) が GIL を
+    握り、主のスレッドの IK が 1 回 6〜7 秒止まるので、別プロセスで行う。
+    JAX の永続キャッシュに書くだけでよく、ノード本体は最適化が要る人の
+    最初の計画でそれを読む。IK は握手姿勢を作るために解くが、横並び移動の
+    バッチ IK は不要 (ノード本体が行う)。"""
+    planner = HandshakePlanner(args)
+    phm.arms_down_angles(planner.robot, planner.robot.joint_list)
+    planner.warmup(batch_ik=False)
+
+
 class HandshakePlanner(object):
     """差し出された掌に対する IK -> 軌道計画 -> 横並び移動の計画。
 
@@ -562,7 +575,7 @@ class HandshakePlanner(object):
             robot, self.args.collision_verify_model)
         return robot, pairs
 
-    def warmup(self, background_optimizer=False):
+    def warmup(self, background_optimizer=False, batch_ik=True):
         """左右の腕で IK と軌道最適化をダミー目標で 1 回ずつ解き、JAX の
         トレース・コンパイルを起動時に済ませる。
 
@@ -570,21 +583,20 @@ class HandshakePlanner(object):
         (1 つでも違うと別関数としてトレースし直され、キャッシュミスする)。
 
         ``background_optimizer`` なら、軌道最適化の準備 (起動時間の大半、
-        実機で片腕 10〜45 秒) は別のロボットで裏のスレッドが行い、この関数は
-        IK と横並び移動の準備だけで返る。最適化が要る人 (線形補間・pre-touch
-        が全部検証に落ちた人、実機で約 4%) の計画だけが、準備の完了を待つ。
-        ただし準備中は IK が 4〜5 倍遅くなるので、ノードの既定は同期
-        (``--background-optimizer-warmup`` のときだけ裏で行う)。
+        実機で片腕 10〜45 秒) は別プロセス (``_optimizer_warmup_child``) が
+        JAX の永続キャッシュへ書き、この関数は IK と横並び移動の準備だけで
+        返る。最適化が要る人 (線形補間・pre-touch が全部検証に落ちた人、
+        実機で約 4%) の計画だけが、準備の完了を待ってキャッシュを読む。
+        スレッドだと jaxls のトレースが GIL を握り、準備中の IK が 1 回
+        6〜7 秒止まるので別プロセスにしている。
+        ``batch_ik=False`` は横並び移動のバッチ IK の準備を省く (別プロセス用)。
         """
         random_state = np.random.get_state()
         np.random.seed(self._WARMUP_SEED)
         try:
-            self._warmup_body(background_optimizer)
+            self._warmup_body(background_optimizer, batch_ik)
         finally:
             np.random.set_state(random_state)
-            # 裏のスレッドへ「これで全部」を伝える (例外のときも)。
-            if getattr(self, '_optimizer_jobs', None) is not None:
-                self._optimizer_jobs.put(None)
 
     def wait_optimizer_ready(self, timeout=None):
         """軌道最適化の準備が終わるまで待つ (終わっていれば True)。"""
@@ -626,37 +638,42 @@ class HandshakePlanner(object):
         log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
             label, time.time() - t0))
 
-    def _optimizer_warmup_thread(self, jobs, human_xy, motion_args):
-        """裏のスレッド: 別のロボット (IK のロボットは主スレッドが使う) で
-        ``jobs`` (腕・ラベル・握手姿勢の queue、None で終わり) の軌道最適化の
-        準備を順に行い、終わったら ``self.solver`` の待ちを解く。"""
+    def _start_optimizer_warmup_process(self):
+        """軌道最適化の準備を別プロセスで始め、終わったら ``self.solver`` の
+        待ちを解く監視スレッド (待つだけで GIL をほぼ使わない) を立てる。
+        別プロセスが失敗しても待ちは解く (最適化が要る人の最初の計画で
+        コンパイルするので遅いだけで動く)。"""
+        process = multiprocessing.get_context('spawn').Process(
+            target=_optimizer_warmup_child, args=(self.args,),
+            name='optimizer-warmup', daemon=True)
+        self.solver.set_pending()
         t0 = time.time()
-        try:
-            robot, pairs = self._build_robot_and_pairs()
-            while True:
-                job = jobs.get()
-                if job is None:
-                    break
-                robot_arm, label, handshake = job
-                self._optimizer_warmup_job(
-                    robot, pairs, robot_arm, label, handshake, human_xy,
-                    motion_args, self._real_solver)
-            print('[warmup] 軌道最適化の準備が裏で完了しました ({:.1f} 秒)。'
-                  .format(time.time() - t0))
-        except BaseException as exc:  # 失敗しても待ちは解く (遅いだけで動く)
-            print('[warmup] 軌道最適化の裏の準備に失敗しました: {!r}。最適化が'
-                  '要る人の最初の計画でコンパイルします。'.format(exc))
-        finally:
+        process.start()
+
+        def watch():
+            process.join()
+            if process.exitcode == 0:
+                print('[warmup] 軌道最適化の準備が別プロセスで完了しました '
+                      '({:.1f} 秒)。'.format(time.time() - t0))
+            else:
+                print('[warmup] 軌道最適化の別プロセスの準備が失敗しました '
+                      '(終了コード {})。最適化が要る人の最初の計画でコンパイル'
+                      'します。'.format(process.exitcode))
             self.solver.set_ready()
 
-    def _warmup_body(self, background_optimizer=False):
+        threading.Thread(target=watch, name='optimizer-warmup-watch',
+                         daemon=True).start()
+        self._optimizer_process = process
+
+    def _warmup_body(self, background_optimizer=False, batch_ik=True):
         """``warmup`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
         warmup_t0 = time.time()
-        jobs = None
-        self._optimizer_jobs = None
+        self._optimizer_process = None
+        if background_optimizer:
+            self._start_optimizer_warmup_process()
         collision_obstacles = (
             [] if self.collision_pairs is None
             else spik.human_body_obstacles({}))
@@ -693,21 +710,12 @@ class HandshakePlanner(object):
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
             self._pin_warmup_fixed_joints(robot_arm, handshake)
-            if background_optimizer:
-                if jobs is None:
-                    jobs = self._optimizer_jobs = queue.Queue()
-                    self.solver.set_pending()
-                    threading.Thread(
-                        target=self._optimizer_warmup_thread,
-                        args=(jobs, warmup_human_xy, motion_args),
-                        name='optimizer-warmup', daemon=True).start()
-                jobs.put((robot_arm, label, handshake))
-            else:
+            if not background_optimizer:
                 self._optimizer_warmup_job(
                     self.robot, self.motion_verification_pairs, robot_arm,
                     label, handshake, warmup_human_xy, motion_args,
                     self.solver)
-            if args.side_by_side_transition:
+            if batch_ik:
                 # 横並び移動のバッチ IK (回転の拘束が違い別にコンパイルされる)。
                 t0 = time.time()
                 sbs.warmup_batch_ik(
@@ -717,8 +725,8 @@ class HandshakePlanner(object):
                           .format(label, time.time() - t0))
         print('[warmup] 完了しました ({:.1f} 秒)。{}'.format(
             time.time() - warmup_t0,
-            '軌道最適化の準備は裏で続けています。'
-            if self._optimizer_jobs is not None else ''))
+            '軌道最適化の準備は別プロセスで続けています。'
+            if self._optimizer_process is not None else ''))
 
     def plan(self, joint_positions, palms, offered_hand, attempt):
         """差し出された掌 ``palms[offered_hand]`` に対して IK -> 軌道計画 ->
@@ -831,8 +839,7 @@ class HandshakePlanner(object):
                 kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                 compute_time=motion['compute_time']))
             # 押し込み後に手を下ろしながら横並びになる区間 (実行可能なときだけ)。
-            if (args.side_by_side_transition
-                    and result.get('post_process') is not None
+            if (result.get('post_process') is not None
                     and motion_verified(motion)):
                 transition = sbs.plan_transition(
                     self.robot, robot_arm, offered_hand,
@@ -1728,13 +1735,11 @@ class HandshakePipelineNode(object):
 
     def _execution_verified(self, motion):
         """実機で実行してよい軌道か。接近・押し込みが検証に通り、横並び
-        移動をする設定なら横並び移動も解けていること。"""
+        移動も解けていること。"""
         if not motion_verified(motion):
             return False
-        if self.args.side_by_side_transition:
-            transition = motion.get('transition')
-            return bool(transition and transition.get('verified'))
-        return True
+        transition = motion.get('transition')
+        return bool(transition and transition.get('verified'))
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する。保存先は
@@ -3982,11 +3987,11 @@ def build_arg_parser():
     parser.add_argument(
         '--background-optimizer-warmup', dest='background_optimizer_warmup',
         action='store_true',
-        help='軌道最適化 (jaxls) の起動時の準備を裏のスレッドで行い、最適化が'
-             '要る人の計画だけが準備の完了を待つ (warmup が約 58 -> 19 秒)。'
-             '既定は無効: 実機 bag の再生 (trial22) で、準備中の IK が 4〜5 倍'
-             '遅くなった (2.5 -> 11〜13 秒)。準備中の IK が解けなくなるかは、'
-             'trial1 が境界のクリップで回数が少なく判定できていない。')
+        help='軌道最適化 (jaxls) の起動時の準備を別プロセスで行い (JAX の永続'
+             'キャッシュ経由)、最適化が要る人の計画だけが準備の完了を待つ '
+             '(warmup が約 58 -> 19 秒)。別プロセスなので準備中も IK は遅く'
+             'ならない (裏のスレッドだと GIL 競合で IK が 1 回 6〜7 秒止まった)。'
+             '既定は無効 (実機での確認待ち)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='候補が検証に通っても必ず jaxls の軌道最適化まで実行する。')
@@ -4049,10 +4054,6 @@ def build_arg_parser():
         default='ごめんなさい、横に並ぶ道が見つかりませんでした。'
                 'もう一度手を出してください',
         help='横並び移動が解けず実機を動かせなかったときの発話。')
-    parser.add_argument(
-        '--no-side-by-side-transition', dest='side_by_side_transition',
-        action='store_false',
-        help='押し込み後の横並び移動を行わない。')
     parser.add_argument(
         '--side-by-side-segment-time', type=float, default=0.2,
         help='横並び移動の 1 区間にかける最短時間 [秒]。')

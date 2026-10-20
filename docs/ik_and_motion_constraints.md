@@ -598,8 +598,8 @@ IK 段階の hover の事後検証は 6 cm のまま。軌道計画で差し出�
 `sbs.plan_transition`。押し込み (掌を合わせた姿勢、3 節) の後、**つないだ手を人の体の
 横へ下ろしながら**、ロボットも人と横並びの位置・向きへ移る区間。台車だけを後ろへ
 下げる動きにはしない。合成データ (`run_pipeline_test.py --plan-motion
---side-by-side-transition`) と実機ノード (既定で有効、`--no-side-by-side-transition`
-で無効) の両方で計画する。実機ノードは接近の軌道が `verified` の人だけ計画する。
+--side-by-side-transition`) と実機ノード (常に有効)
+の両方で計画する。実機ノードは接近の軌道が `verified` の人だけ計画する。
 
 ### 人の腕のモデル
 
