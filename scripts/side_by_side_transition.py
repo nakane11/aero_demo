@@ -4,39 +4,20 @@
 """掌を押し込んだ後、つないだ手を人の体の横へ下ろしながら、ロボットも人と
 横並びの位置・姿勢へ移る区間 (横並び移動) を計画する。
 
-押し込み (``solve_palm_ik`` の後処理姿勢) までは従来どおりで、ロボットは
-膝を曲げて上体を前に出し (身を乗り出し)、人の手の位置に合わせて立つ。
-押し込んだ後は、
-
-- つないだ手 (人の掌) を、人が肩から腕を下ろした位置
-  (``HumanArm.lowering``: 上腕を真下から前へ ``LOWERED_ARM_DEG_GROUPS``
-  の角度・外へ少し開き、肘を少し曲げた腕。掌は人側・前・後ろのうち前腕の
-  ひねりが一番少ない向き) まで動かす。人が一番低く下ろせる角度を優先する。
-- 同時に、台車を人と前後ずれ 0・同じ向きの位置へ動かし、上体を起こす
-  (移動先は台車も動かすバッチ IK で、前後ずれ・向きのずれ・上体の前後
-  ずれの小さい解を選ぶ、``solve_goal_candidates``)。腕は押し込み時と
-  同じ解の枝 (腕を前に出した形) に限る (``GOAL_BRANCH_JOINT_RANGE_DEG``)。
-- 移動先では握りの向き (人とロボットの指先のなす角) を変えてよく
-  (``GOAL_TURN_DEG_GROUPS``)、しゃがまない (脚を伸ばした) 解を優先する
-  (``GOAL_CROUCH_WEIGHT``)。視線は掌から前 (``forward_gaze_point``) へ移す。
-- 途中の waypoint は、人の腕 (肩まわりの上腕の向き・肘の曲げ・前腕の
-  ひねり)・握りの向き・台車を補間し、ロボットの腕・脚・首を解き直す。
-- 横並びの間、ロボットの上半身 (body_link) は人の正面から
-  ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と同じ前方を見る
-  (``forward_gaze_point``)。人の掌は ``PALM_FACING_ORDER`` の向き (後ろ向き
-  から人側へ回した向き、前腕をひねらない向き、前向き) を試す。
-- 横並びまで進んだら、人の腕・掌を動かさず台車だけを人の方へ寄せる
-  (``plan_approach``、段階 2)。台車の向きは変えず、台車は人の脚などから
-  ``TRANSITION_BASE_CLEARANCE`` 空ける。
+- 段階 1: つないだ手を人が肩から腕を下ろした位置 (``HumanArm.lowering``) へ
+  動かしながら、台車を人と前後ずれ 0・同じ向きの位置へ動かし上体を起こす
+  (移動先は台車も動かすバッチ IK、``solve_goal_candidates``)。腕は押し込み時と
+  同じ解の枝に限る。waypoint は人の腕・握りの向き・台車を補間して解き直す。
+- 上半身 (body_link) は人の正面から ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と
+  同じ前方を見る (``forward_gaze_point``)。
+- 段階 2: 人の腕・掌を動かさず台車だけを人の方へ寄せる (``plan_approach``)。
 
 人の腕は肩を動かさず、手首から先は押し込み時の手に対して剛体 (``HumanArm``)。
-各 waypoint で、人の腕が届くか (``reach``)・肘の曲げ・手首の曲げ・前腕の
-ひねりの変化を記録し、腕が届かなくなる手前で止める。ビューアはこれを使って
-人の腕をロボットの手に追従させる。
+各 waypoint で人の腕が届くか (``reach``) などを記録し、届かなくなる手前で止める。
 
-干渉の検証は人体との距離 (5 cm、``TRANSITION_HUMAN_CLEARANCE``) と自己干渉。人の差し出した腕は waypoint
-ごとに動かした骨格で見る。ロボットの差し出す腕の肘から先と、人の差し出した
-手・前腕は手を合わせているので距離を見ない。
+干渉の検証は人体との距離 (``TRANSITION_HUMAN_CLEARANCE``) と自己干渉。ロボット
+の差し出す腕の肘から先と、人の差し出した手・前腕は手を合わせているので距離を
+見ない。
 """
 
 import contextlib
@@ -56,21 +37,11 @@ from skrobot.coordinates.math import rpy_matrix
 import solve_palm_ik as spik
 
 
-# 下ろした腕 (人が肩から腕を下ろす): 上腕を真下から前へ
-# LOWERED_ARM_DEG_GROUPS の各角度に上げ、外へ LOWERED_ARM_ABDUCTION_DEG
-# 開き、肘は LOWERED_ELBOW_FLEX_DEG だけ曲げる (前腕は上腕より前へ)。
-# 手首から先は押し込み時の手に対して剛体のまま、掌の法線を人側・前・
-# 後ろのうち前腕まわりのひねりが一番少ない向きへ回す
-# (LOWERED_PALM_FACINGS)。肘を曲げて前腕だけを上げる (肘を直角にして
-# 前腕を水平にする) 形は人から見ると手を下ろしていないので使わない。
-# 移動先のバッチ IK は組 ((上腕の角度 3 つ), 脇の開き) ごとに 3 つを目標に
-# し、人が一番低く下ろせる角度の解を優先する。前の組で横並びまで進めなければ
-# 次の組を試す (LOWERED_ARM_GROUPS)。
-# 脇は、胴体の干渉円柱 (肩の関節から横へ約 13 cm) の外に手が出る 25 度開く
-# (10 度だと低い目標が人体との距離 6 cm の検証でほぼ全部落ちる)。25 度で
-# 移動先・経路が人の胴体・下ろした上腕に近すぎる人は 40 度開く組も試す。
-# 腕を低く下ろす方を脇を狭める方より優先し、上腕 0/15/30 度は 25 -> 40 度、
-# その後に 45/60/75 度を 25 -> 40 度の順。
+# 下ろした腕: 上腕を真下から前へ LOWERED_ARM_DEG_GROUPS の角度に上げ、
+# 外へ LOWERED_ARM_ABDUCTION_DEG 開き、肘を LOWERED_ELBOW_FLEX_DEG 曲げる。
+# LOWERED_ARM_GROUPS は移動先のバッチ IK の組 ((上腕の角度 3 つ), 脇の開き)
+# で、腕を低く下ろせる順に試す。脇 25 度は手が胴体の干渉円柱の外に出る角度、
+# 近すぎる人は 40 度も試す。
 LOWERED_ARM_ABDUCTION_DEG = 25.0
 LOWERED_ARM_WIDE_ABDUCTION_DEG = 40.0
 LOWERED_ELBOW_FLEX_DEG = 15.0
@@ -82,174 +53,113 @@ LOWERED_ARM_GROUPS = tuple(
 LOWERED_PALM_FACINGS = ('inward', 'forward', 'backward')
 LOWERED_TARGET_COUNT = 3
 
-# 腕を下ろす途中で上腕を外へ膨らませる角度 [度] (0 なら押し込み時から下ろし
-# きった腕へ最短の回転)。つないだ手が人の腰の横を通るとき、ロボットの前腕が
-# 人の胴体・太ももに近づくのをよける。両端の姿勢は変えない。実機 2026-10-13
-# の 13 人で 0 -> 10 -> 20 度: 移動先まで 100% は 6 -> 7 -> 6 人、上腕の角度の
-# 中央値 45 -> 40 -> 34 度。合成 21 人は 0・10 度で 21/21 (結果ほぼ同じ)、
-# 20 度は 17/21 に減るので 10 度。
+# 腕を下ろす途中で上腕を外へ膨らませる角度 [度] (両端の姿勢は変えない)。
+# 前腕が人の腰・太ももに近づくのをよける。
 LOWERED_BULGE_DEG = 10.0
 
-# 掌の向きの最初の候補 'natural': 前腕をひねらず (ひねり 0)、腕を下ろす回転
-# だけで手を動かした向き。人側・前・後ろのどれかに合わせようと前腕をひねると、
-# 親指が上へ回り指先が下を向きにくい。ひねらなければ手は親指側の軸まわりに
-# 回って指先が下を向く。終点の掌の法線が外向き (ロボット側) の成分
-# LOWERED_NATURAL_MAX_OUTWARD を超える、上下の成分が
-# LOWERED_NATURAL_MAX_VERTICAL を超えるとき (掌が下や上を向きすぎる) は
-# 使わない (下向きは少しなら許す)。
+# 掌の向き 'natural': 前腕をひねらず、腕を下ろす回転だけで動かした向き。
+# 終点の掌の法線の外向き成分が LOWERED_NATURAL_MAX_OUTWARD、上下の成分が
+# LOWERED_NATURAL_MAX_VERTICAL を超えるときは使わない。
 LOWERED_NATURAL_MAX_OUTWARD = 0.3
 LOWERED_NATURAL_MAX_VERTICAL = 0.5
 
-# 掌の向きは LOWERED_FACING_ORDER の順に試し、その向きで移動先・経路が
-# 通らなければ次の向きを試す (``plan_transition`` の ``facing_variants``)。
-# 掌は外向き (ロボット側) にはしない。前腕のひねりがこの角度 [度] を超える
-# 向きは試さない。押し込みで掌を上に向けて (回外して) 差し出した人が、腕を
-# 下ろして掌を後ろに向ける (回内する) と 150 度前後ひねる。
-# 握手の姿勢から前腕をひねれる範囲はおおよそ ±80〜90 度なので 80 度
-# (実機 2026-10-19 は 127・90 度の姿勢で人の手首がねじれた)。
+# 掌の向きは LOWERED_FACING_ORDER の順に試す (``plan_transition`` の
+# ``facing_variants``)。前腕のひねりがこの角度 [度] を超える向きは試さない
+# (握手の姿勢から前腕をひねれる範囲は約 ±80〜90 度)。
 LOWERED_TWIST_MAX_DEG = 80.0
 
-# 腕を下ろしきったときに、押し込み時の手首の曲げをどれだけ戻すか (0: 戻さず
-# 手を前腕に剛体で付ける、1: 指先が前腕の向き)。腕を下ろす間に線形に戻す。
-# 戻さないと押し込み時の曲げ (約 20 度) が残り、前腕のひねりで曲げの向きが
-# 上 (親指側) へ回って、前腕は下を向いても指先は前に残る。
+# 腕を下ろしきったときに押し込み時の手首の曲げを戻す割合 (0: 戻さず
+# 剛体、1: 指先が前腕の向き)。下ろす間に線形に戻す。
 LOWERED_WRIST_STRAIGHTEN = 1.0
 
-# 前腕のひねりを始める、腕を下ろす動きの割合 (0 なら下ろしながら同時に
-# ひねる)。同時にひねると、前に出した前腕のまわりで手が回って親指が上へ
-# 向く。先に腕を下ろして指先を下へ向け、下がった前腕のまわりで掌を回す。
+# 前腕のひねりを始める、腕を下ろす動きの割合 (先に下ろして指先を下へ
+# 向け、下がった前腕まわりで掌を回す)。
 LOWERED_TWIST_START = 0.5
 
-# 掌の向きの候補を試す順。腕を下ろしきって掌が後ろ向きなら、ロボットは
-# 人の手の後ろから肘を伸ばして手を合わせられ、肘を曲げずに済み干渉しにくい。
-# 'natural' は前腕をひねらない向き。
+# 掌の向きの候補を試す順 ('natural' は前腕をひねらない向き)。
 LOWERED_FACING_ORDER = ('natural', 'backward', 'inward', 'forward')
 
-# 押し込み時に人の掌が上向き (掌の法線の上向き成分がこの値以上) のときは、
-# 最後に掌が前向きになる向きを先に試す。上向きの掌を後ろ向きへ回すと前腕を
-# 大きくひねる (回内する) ので、前向きへ回して(回外の向きのまま)手を下ろす。
+# 押し込み時の掌の法線の上向き成分がこの値以上なら、下の順で試す
+# (上向きの掌を後ろへ回すと前腕を大きくひねるため)。
 PALM_UP_NORMAL_Z = 0.0
 LOWERED_FACING_ORDER_PALM_UP = ('forward', 'backward', 'natural', 'inward')
 
-# 移動先の台車の前後位置を、人の立ち位置からどれだけずらしてよいか [m]。
-# 狭い方から試し、解けなければ広げる。合成データでは横並びまで進めた人は
-# 全員 ±0.05 m で解けており、広げて解けるのは移動先の検証・経路に通らない
-# 解だけだった (広げると解けない人で 1 組あたりバッチ IK が 4 回になる) ので、
-# ±0.05 m だけにしている。
+# 移動先の台車の前後位置を、人の立ち位置からずらしてよい量 [m]
+# (狭い方から試す)。
 DEFAULT_GOAL_X_MARGINS = (0.05,)
 
-# 移動先のバッチ IK の目標 1 つあたりの初期値の数。合成データで 512 と
-# 256 は成功数が同じで、1 回あたり約 0.32 -> 0.23 秒。2026-10-20 に 256 ->
-# 128 にした: 横並び移動の verified は seed 0 (53 人) で 50・50 (256 は 5 回で
-# 49〜52)、seed 1 (34 人) は 34/34 のまま、計算時間の平均は seed 0 で
-# 0.83〜0.93 -> 0.65〜0.70 秒/人。
-# 移動先の押し込み IK から視線を外す案 (直後に _aim_head で向け直すため) は、
-# 128 と併用しても速くならず verified が 49・48 に下がったので不採用。
+# 移動先のバッチ IK の目標 1 つあたりの初期値の数。
 GOAL_ATTEMPTS_PER_POSE = 128
 
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
-# 上体の前後ずれ |ankle + knee| [rad] (脚は平行リンクで、胴体は台車の
-# 中心から約 0.25 m x (sin(-knee) - sin(ankle)) 前に出る)。
+# 上体の前後ずれ |ankle + knee| [rad]。
 GOAL_FRONT_OFFSET_WEIGHT = 100.0
 GOAL_FACING_YAW_WEIGHT = spik.DEFAULT_FACING_YAW_WEIGHT
 GOAL_LEG_OFFSET_WEIGHT = 10.0
 
-# 移動先のコストで、しゃがみ量 ankle + |knee| [rad] (どちらも 0 で脚を
-# 伸ばしきった一番高い姿勢) に掛ける重み。以前は横並びでしゃがまない解を
-# 優先して 30 だったが、腰を上げずに (GOAL_LEG_RISE) 前に倒すよりしゃがむ
-# 方を選ぶので 0 (沈み込みは罰しない)。
+# 移動先のコストで、しゃがみ量 ankle + |knee| [rad] に掛ける重み。
 GOAL_CROUCH_WEIGHT = 30.0
-# 移動先のコストで、腰の前傾 (waist_p が正、お辞儀) [rad] の二乗に掛ける重み
-# (hover の BOW_WEIGHT と同じ形)。合成 400 人 (seed 0) で 0・200・1000 を比べ、
-# 横並び終了時の前傾 平均 6.4° -> 4.3° -> 3.7° (p90 14.2° -> 9.9° -> 8.5°)、
-# 解ける人数は同じなので 1000。
+# 移動先のコストで、腰の前傾 (waist_p が正) [rad] の二乗に掛ける重み。
 GOAL_BOW_WEIGHT = 0.0
-# 横並び移動で腰 (脚) を押し込み終了時より上げないか: 'strict' なら移動先の
-# 候補を腰の高さが押し込み終了時以下 (許容 GOAL_LEG_RISE_TOLERANCE) のものに
-# 絞り、経路で脚も IK で動かすときは足首の下限・膝の上限をその waypoint の
-# 脚の角度にする (腰が高くなる側へ動かさない)。'fallback' は移動先の候補が
-# 絞った結果なくなるときだけ絞らない。'off' は制限しない。
+# 腰 (脚) を押し込み終了時より上げないか: 'strict' は移動先の候補を
+# 腰が押し込み終了時以下 (許容 GOAL_LEG_RISE_TOLERANCE) に絞り、経路の脚の IK
+# も腰が高くなる側へ動かさない。'fallback' は候補が全滅するときだけ絞らない。
+# 'off' は制限しない。
 GOAL_LEG_RISE = 'strict'
 GOAL_LEG_RISE_MODES = ('off', 'strict', 'fallback')
 GOAL_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW  # [m]
-# 移動先の候補の腰が押し込み終了時より高い量がこの範囲 (許容を超えて、この
-# 値以下) なら、候補を捨てずに脚を押し込み終了時の角度に直す [m]。腰を上げ
-# ない候補が 1 つも出ない人が、最小で 1〜3 cm 高いだけで外れていたため。
+# 移動先の候補の腰の超過がこの量 [m] 以下なら、捨てずに脚を押し込み
+# 終了時の角度に直す。
 GOAL_LEG_RISE_REPAIR_MAX = 0.10
-# 経路の各 waypoint で、腰が直前の waypoint より高くならないよう脚を補正
-# するときの許容 [m]。
+# 経路の各 waypoint で、腰が直前より高くなってよい許容 [m]。
 PATH_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW
 
 # 移動先のコストで、差し出す腕の手首ヨー・ロールが可動域の端に近いほど
-# 増やす項。手首が端にあると、経路で手首をそれ以上曲げられず掌を回せない
-# (関節の可動域に対する角度の割合が ``GOAL_WRIST_MARGIN_START`` を超えた
-# 分を、``GOAL_WRIST_RATIO_RANGE`` を 1 として 2 乗する)。手首ピッチは
-# 可動域が狭く (約 4 度) 使わないので見ない。
+# 増やす項 (可動域に対する割合が GOAL_WRIST_MARGIN_START を超えた分を、
+# GOAL_WRIST_RATIO_RANGE を 1 として 2 乗)。手首ピッチは見ない。
 GOAL_WRIST_WEIGHT = 30.0
 GOAL_WRIST_MARGIN_START = 0.7
 GOAL_WRIST_RATIO_RANGE = 0.3
 GOAL_WRIST_AXES = ('y', 'r')
 
 # 移動先のコストで、ロボットの指先 (手先の +Z、``finger_direction``) が
-# 下を向いていない分 (1 - 下向きの成分、0〜2) に掛ける重み。握りの向きを
-# 自由にすると、手首を曲げたまま握りの向きだけが回り、指先が上を向いた
-# まま横並びになる。
+# 下を向いていない分 (1 - 下向きの成分、0〜2) に掛ける重み。
 GOAL_ROBOT_FINGER_DOWN_WEIGHT = 30.0
 
-# 移動先の候補のうち、ロボットの指先 (手先の +Z) の鉛直成分 (-1 が真下) が
-# この値以下の「指先が下を向く」候補があれば、そうでない候補は捨てる
-# (下向きのコストだけでは、腕を低く下ろせる上向きの解が先に選ばれ、
-# 指先が上を向いたまま横並びになる)。下向きの候補が窓に 1 つもなければ
-# 全候補をコストで選ぶ。
+# 指先の鉛直成分 (-1 が真下) がこの値以下の候補があれば、そうでない
+# 候補は捨てる。
 GOAL_FINGER_DOWN_MAX_Z = -0.5
 
 # 移動先のコストで、差し出す腕の手首の曲げ (ロール・ヨーの |角度| [rad]
-# の和) に掛ける重み。手首を曲げたままだと、横並びで手首が窮屈に見える。
+# の和) に掛ける重み。
 GOAL_WRIST_BEND_WEIGHT = 10.0
 
-# 経路で握りの向きを、押し込み時の値から移動先の解の値へ補間して固定するか
-# (False なら経路でも握りの向きを拘束せず、直前の解から解き進める)。自由に
-# すると直前の解の近くに留まり、移動先で選んだ指先の向きへ回っていかない。
+# 経路で握りの向きを押し込み時から移動先の値へ補間して固定するか
+# (False なら拘束せず直前の解から解き進める)。
 PATH_INTERPOLATE_TURN = True
 
-# 経路の首を、押し込み時の角度から移動先 (前を見る姿勢) の角度へ関節角で
-# 線形に補間するか (False なら waypoint ごとに視線の IK で解く)。視線の IK
-# で解くと、台車の向きの変化に合わせて首が細かく往復し、ロールが可動域の
-# 端 (±5 度) で反対側へ跳ぶ。
+# 経路の首を関節角で線形に補間するか (False なら waypoint ごとに視線の
+# IK で解く。首が細かく往復し、ロールが可動域の端で跳ぶ)。
 PATH_INTERPOLATE_NECK = True
 
-# 移動先で試す握りの向き (人の掌の法線まわりに、ロボットの指先を人の指先
-# から回す角度 [度]、solve_palm_ik.palm_target_rot の turn_deg)。押し込み
-# 時の向きから変わってよい (経路の途中で少しずつ回す)。向きごとに 1 回の
-# バッチ IK (約 0.3 秒、窓を広げるとその回数分) なので、前の組で移動先の
-# IK が 1 つも解けなかったときだけ次の組を試す (合成データでは ±90 度は
-# 選ばれなかった)。
+# 移動先で試す握りの向き [度] (solve_palm_ik.palm_target_rot の
+# turn_deg)。前の組で移動先の IK が 1 つも解けなかったときだけ次の組を試す。
 GOAL_TURN_DEG_GROUPS = ((0.0,), (90.0, -90.0))
 GOAL_TURN_DEGS = tuple(t for group in GOAL_TURN_DEG_GROUPS for t in group)
 
 # 移動先のバッチ IK の解のうち、差し出す腕の肩ヨー・手首ヨーが押し込み
-# 姿勢の角度からこの範囲 [度] を超えるものは捨てる (バッチ IK はソルバーを
-# 作ったときの関節の可動域をキャッシュするので、呼び出しごとに可動域を
-# 絞っても効かない)。腕を前に出した押し込み姿勢と、腕を体の横に
-# 垂らして肩・手首を大きくひねった姿勢は別の解の枝で、手を合わせたまま
-# 一方から他方へは移れない (途中で手が大きく回り、人の手首がねじれる)。
-# 垂らす姿勢を移動先に選ぶと、経路は前に出した腕のまま膝を曲げて手を
-# 下げ、最後に肩・手首が 120 度以上飛んで止まるため、押し込みと同じ枝の
-# 解だけを探す。
+# 姿勢からこの範囲 [度] を超えるものは捨てる (腕を前に出した枝と体の横に
+# 垂らした枝は、手を合わせたまま移れない)。
 GOAL_BRANCH_JOINT_RANGE_DEG = 60.0
 GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 
 # --- 上半身・台車の向き・台車と脚の距離・寄せ (段階 2) ----------------------
-#
-# 横並び (と寄せ) の間、ロボットの上半身 (body_link の +x) を人の正面から
-# ±UPPER_BODY_LIMIT_DEG に収める。掌を人側へ回さず後ろ向きのまま合わせる
-# 解は、上半身を人の方へ 50〜100 度ねじって手を合わせていた (腰ヨーが
-# コストにもなかった)。移動先は範囲外の候補を捨て、ずれの二乗に
+# 横並び (と寄せ) の間、上半身 (body_link の +x) を人の正面から
+# ±UPPER_BODY_LIMIT_DEG に収める。移動先は範囲外の候補を捨て、ずれの二乗に
 # UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は、始点の
 # 上半身が範囲内 (UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす)
 # なら全体を、範囲外なら移動先だけを範囲に絞る (押し込み姿勢から出る途中の
-# 腰ヨーを絞ると、腕が掌に届かず経路が序盤で止まる。実機 10/13 の 7 試行で
-# 移動先まで進めたのが 4 -> 6)。
+# 腰ヨーを絞ると、腕が掌に届かず経路が序盤で止まる)。
 UPPER_BODY_LIMIT_DEG = 20.0
 UPPER_BODY_WEIGHT = 100.0
 UPPER_BODY_START_SLACK_DEG = 3.0
@@ -258,20 +168,16 @@ UPPER_BODY_START_SLACK_DEG = 3.0
 # それまでの一番良い解 (無ければ横並びしない) で終える。
 TRANSITION_TIME_LIMIT = 10.0
 
-# 移動先の台車の向きを、人の正面から ±GOAL_YAW_MARGIN_DEG に絞る。この範囲で
-# 寄れない人 (寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人) だけ
-# GOAL_YAW_FALLBACK_DEG まで探索を広げて解き直す (終点の台車の向きは
-# GOAL_YAW_MARGIN_DEG に収まるものだけ採る)。±20 度だけだと、掌を大きく
-# 回す解が通らず寄れない人がいる (合成 57 人で 6 人、寄せ後 0.9〜1.0 m ->
-# 0.6〜0.8 m)。None なら広げない。
+# 移動先の台車の向きを人の正面から ±GOAL_YAW_MARGIN_DEG に絞る。
+# 寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人だけ
+# GOAL_YAW_FALLBACK_DEG まで広げて解き直す (終点は GOAL_YAW_MARGIN_DEG
+# に収まるものだけ採る)。None なら広げない。
 GOAL_YAW_MARGIN_DEG = 20.0
 GOAL_YAW_FALLBACK_DEG = 30.0
 APPROACH_FALLBACK_LATERAL = 0.85
 
-# 台車 (車輪の箱) と人の脚などの距離 [m]。ほかの組は
-# TRANSITION_HUMAN_CLEARANCE のまま。人の脚は円柱で、足先は入っていないので
-# 余裕を見る。人の向きに対して台車が斜め (+30 度) だと台車の角がすねに
-# 2 cm まで近づいていた。
+# 台車 (車輪の箱) と人の脚などの距離 [m] (ほかの組は
+# TRANSITION_HUMAN_CLEARANCE)。人の脚は円柱で足先が入っていないので余裕を見る。
 TRANSITION_BASE_CLEARANCE = 0.10
 
 # 人の掌の向きの候補 (``HumanArm.lowering`` の facing): 腕を下ろしきった
@@ -285,47 +191,40 @@ PALM_FACING_ORDER = ('phi40', 'phi60', 'phi20', 'phi80', 'phi90', 'phi0',
                      'natural', 'forward')
 APPROACH_STOP_LATERAL = 0.75
 
-# 寄せ (段階 2): 横並びの終わりの姿勢から、人の腕・掌を動かさず台車だけを
-# 横へ人の方へ寄せる。寄せ後の横 (台車の中心から人の立ち位置までの、人の
-# 左右方向の距離) の目標 [m] の窓 (目標 - 0.1 〜 目標) を近い方から
-# APPROACH_WINDOW_COUNT 個、0.1 m ずつ遠くして試す。台車の向きは変えない。
+# 寄せ (段階 2): 横並びの終わりから、人の腕・掌を動かさず台車だけを人の
+# 方へ寄せる。寄せ後の横の距離 (台車の中心から人の立ち位置までの人の左右方向)
+# の目標 [m] の窓 (目標 - 0.1 〜 目標) を近い方から APPROACH_WINDOW_COUNT 個、
+# 0.1 m ずつ遠くして試す。
 APPROACH_TARGET_LATERAL = 0.6
 APPROACH_WINDOW_COUNT = 5
 APPROACH_STEP = 0.04  # 台車の 1 waypoint あたりの移動 [m] (直線寄せ)
 APPROACH_MIN_GAIN = 0.03  # これ未満しか寄れないなら寄せない [m]
 APPROACH_MAX_GOAL_TRIES = 6
 
-# 移動先の候補 (腕の低い目標から、同じ目標ではコストの安い順) のうち、
-# 経路まで試す数と、押し込み IK・検証まで試す数 (どちらも目標 1 つ
-# あたり)。手を低く下ろす目標は人の胴体に近く、検証に落ちる候補が数百
-# 続くことがある (1 つ数十 ms)。
+# 移動先の候補のうち、経路まで試す数と、押し込み IK・検証まで試す数
+# (どちらも目標 1 つあたり)。
 MAX_GOAL_CANDIDATES = 2
 MAX_GOAL_CHECKS = 8
 
-# 1 人の横並び移動で経路 (plan_path) を計画する回数の上限。None は無制限。
-# 上限に達したらそこまでで一番進んだ経路を使う。
+# 1 人の横並び移動で経路 (plan_path) を計画する回数の上限 (None は無制限)。
 MAX_PATH_TRIES = None
 
 # 1 waypoint あたりの台車・掌の移動量の上限 (位置 [m]・向き [rad])。
 MAX_STEP = 0.10
 MAX_ANGLE_STEP = math.radians(10.0)
 
-# 隣り合う waypoint の間で、関節角がこれより大きく変わったら IK が別の解へ
-# 飛んだとみなして、そこで止める [rad]。首は視線の IK で別の解へ飛ぶことは
-# なく、視線を掌から前へ移す最初の区間で大きく回るので見ない。
+# 隣り合う waypoint で関節角 [rad] がこれより大きく変わったら IK が別の
+# 解へ飛んだとみなして止める (首は見ない)。
 MAX_JOINT_STEP = math.radians(20.0)
 
-# waypoint の数は、押し込み姿勢と移動先の姿勢の関節角の差がこの角度
-# [rad] ごとに 1 区間以上になるようにも決める (台車・掌の移動量だけで
-# 決めると、関節の動きの大きい人で 1 区間の変化が MAX_JOINT_STEP を
-# 超える)。
+# waypoint の数は、押し込み姿勢と移動先の関節角の差がこの角度 [rad]
+# ごとに 1 区間以上にもなるようにする。
 PLANNED_JOINT_STEP = math.radians(20.0)
 
 # 移動先までのうち進めた割合がこれに満たなければ、横並び移動はしない。
 MIN_FRACTION = 0.3
 
-# 人の腕の目安 (表示・ログ用、超えても止めない。届くか (reach <= 1) だけ
-# は止める)。
+# 人の腕の目安 (表示・ログ用、超えても止めない。reach <= 1 だけ止める)。
 HUMAN_ELBOW_FLEX_MAX_DEG = 145.0
 HUMAN_WRIST_BEND_MAX_DEG = 70.0
 HUMAN_TWIST_CHANGE_MAX_DEG = 90.0
@@ -400,9 +299,8 @@ def _outward(joint_positions, hand):
 class HumanArm(object):
     """人の差し出した腕 (肩は固定) を、掌の位置姿勢に追従させる。
 
-    手 (手首から先) は押し込み時の掌に対して剛体のまま動かし、手首の位置
-    を決める。肘は上腕・前腕の長さ (押し込み時の骨格) を保つ 2 リンクの
-    IK で、下・少し外を向く側に置く。
+    手 (手首から先) は押し込み時の掌に対して剛体。肘は上腕・前腕の長さを保つ
+    2 リンクの IK で、下・少し外を向く側に置く。
     """
 
     def __init__(self, joint_positions, hand, palm):
@@ -482,11 +380,9 @@ class HumanArm(object):
         return moved
 
     # --- 肩から腕を下ろす (押し込み時の腕 -> 下ろした腕) ---------------
-    #
-    # 腕は「上腕の向き ua と肘の蝶番軸 n の組 (回転行列 [ua, n, ua x n])」・
-    # 肘の曲げ・前腕まわりのひねりで表す。前腕の向きは
-    # cos(曲げ) ua + sin(曲げ) (n x ua)。上腕の組は slerp、曲げとひねりは
-    # 線形に補間するので、手は肩を中心に回って下りる。
+    # 腕は上腕の向き ua と肘の蝶番軸 n の組・肘の曲げ・前腕まわりのひねりで
+    # 表す。前腕の向きは cos(曲げ) ua + sin(曲げ) (n x ua)。組は slerp、曲げと
+    # ひねりは線形に補間する。
 
     def _press_arm_frame(self):
         """押し込み時の腕の (上腕の組, 肘の曲げ [rad])。"""
@@ -533,13 +429,11 @@ class HumanArm(object):
     def lowering(self, arm_deg, abduction_deg=None, facing=None):
         """上腕を真下から前へ ``arm_deg`` 度上げ、外へ ``abduction_deg``
         (既定 ``LOWERED_ARM_ABDUCTION_DEG``) 開き、肘を
-        ``LOWERED_ELBOW_FLEX_DEG`` 曲げた腕へ下ろす動き。掌は
-        ``LOWERED_PALM_FACINGS`` のうち ``facing`` (既定は前腕のひねりが
-        一番少ない向き、'phi<角度>' なら後ろ向きから人側へその角度回した
-        向き) にする。
+        ``LOWERED_ELBOW_FLEX_DEG`` 曲げた腕へ下ろす動き。掌は ``facing``
+        (既定は前腕のひねりが一番少ない向き、'phi<角度>' なら後ろ向きから
+        人側へその角度回した向き) にする。
         ``lowering_pose`` に渡す dict (``palm``: 下ろしきった掌の ``(位置,
-        回転行列)``、``arm_deg``、``abduction_deg``、``palm_facing``) を
-        返す。"""
+        回転行列)`` を含む) を返す。使えない向きなら None。"""
         if abduction_deg is None:
             abduction_deg = LOWERED_ARM_ABDUCTION_DEG
         start_frame, start_flex = self._press_arm_frame()
@@ -652,10 +546,8 @@ def _rotation_between(a, b):
 
 # --- ロボット ------------------------------------------------------------
 
-# 台車の経路を、人の立ち位置を中心に距離と方位を補間する回り込みにするか
-# (False なら押し込み位置から移動先へ直線)。人の正面から横へ移るとき、直線
-# (弦) は人の足元に近いところを通り、車輪が人のすねに近づく (90 度回り込む
-# と弦の中点は人から端点の約 0.71 倍の距離)。
+# 台車の経路を、人の立ち位置まわりの距離・方位の補間 (回り込み) にするか
+# (False なら直線。直線は人の足元に近づく)。
 BASE_PATH_ORBIT = True
 
 
@@ -701,8 +593,7 @@ class BasePath(object):
 
 
 def _sync_leg_mimics(robot):
-    """脚の平行リンクのミミック関節を、主関節 (足首・膝) に合わせ直す。
-    実機に送る関節角は主関節だけで、ミミックは主関節から決まる。"""
+    """脚の平行リンクのミミック関節を、主関節 (足首・膝) に合わせ直す。"""
     spik.sync_leg_mimics(robot)
 
 
@@ -758,18 +649,13 @@ LEG_JOINT_NAMES = ('ankle_joint', 'ankle_joint_mimic', 'knee_joint',
                    'knee_joint_mimic')
 
 
-# 握りの向きを自由にするときの手先の回転の拘束 (手先座標系の +Y = 掌の
-# 法線まわりだけ自由、掌は合わせたまま指先の向きが回る)。
+# 握りの向きを自由にするときの手先の回転の拘束 (手先の +Y = 掌の法線
+# まわりだけ自由)。
 FREE_TURN_ROTATION_MASK = (1, 0, 1)
 
-# 横並び移動の IK で握りの向きを自由にするか (True なら移動先・経路とも
-# 掌の法線まわりの回転を拘束しない。False なら GOAL_TURN_DEG_GROUPS の
-# 角度に固定して解く)。押し込みまでは握りの向きを決めて合わせ、そこから
-# 手を下ろしやすい向きへ少しずつ回す (合成データ 42 人で waypoint ごとに
-# 最大 8 度、移動先で ±45 度以内)。固定と比べて成功数は同じ (36/42) で、
-# 移動先の knee が中央値 -46 -> -19 度とほとんどしゃがまなくなり、時間も
-# 平均 0.84 -> 0.53 秒。バッチ IK の回転の拘束が違うので、別にコンパイル
-# される (warmup_batch_ik)。
+# 横並び移動の IK で握りの向きを自由にするか (False なら
+# GOAL_TURN_DEG_GROUPS の角度に固定)。バッチ IK の回転の拘束が違うので別に
+# コンパイルされる (warmup_batch_ik)。
 GOAL_FREE_TURN = True
 
 
@@ -813,8 +699,8 @@ def down_turn_deg(palm, robot_arm):
 
 
 class _UpperBody(threading.local):
-    """横並び移動の IK が使う上半身の向きの制約の状態。``human_yaw`` が
-    None なら制約なし。``path`` は経路の IK 中 (``plan_path``) だけ
+    """横並び移動の IK の上半身の向きの制約の状態 (スレッドごと)。
+    ``human_yaw`` が None なら制約なし。``path`` は経路の IK 中だけ
     ``(始点の腰ヨー, 移動先の腰ヨー, 始点の上半身が範囲内か)``、``s`` は
     経路の割合。``_upper_body_limit`` で設定する。"""
     human_yaw = None
@@ -916,15 +802,13 @@ def _press_ik_core(robot, robot_arm, target, gaze_point, free_legs=False,
                    free_turn=False, leg_floor=None):
     """台車をいまの位置に固定し、腕・腰を押し込み目標 ``target`` に、カメラ
     の光軸を ``gaze_point`` に向ける (``solve_palm_ik.solve_post_process``
-    と同じ IK)。脚 (``LEG_JOINT_NAMES``) は ``free_legs`` でなければいまの
-    角度に固定する (呼び出し側が補間して与える)。``free_turn`` なら掌の
-    法線まわりの回転 (握りの向き) は拘束しない。視線が解けなければ首は
-    そのままで腕だけを解く (``gaze_point`` が None なら視線は解かない)。
-    腕が解けなければ ``False`` (ロボットは呼び出し前の姿勢に戻る)。
+    と同じ IK)。脚 (``LEG_JOINT_NAMES``) は ``free_legs`` でなければ固定する。
+    ``free_turn`` なら握りの向きは拘束しない。視線が解けなければ首はそのまま
+    で腕だけを解く (``gaze_point`` が None なら視線は解かない)。腕が解けなけ
+    れば ``False`` (呼び出し前の姿勢に戻る)。
 
-    ``free_legs`` のときは、IK が脚のミミック関節を主関節と食い違った角度で
-    終える (実機の姿勢では掌が最大 10 cm 離れる) ので、ミミックを主関節に
-    合わせてから、脚を固定して腕だけ解き直す。解き直せなければ ``False``。
+    ``free_legs`` のときは IK が脚のミミック関節を食い違わせるので、ミミックを
+    主関節に合わせてから、脚を固定して腕だけ解き直す。
 
     ``leg_floor`` (足首, 膝の角度 [rad]) を与えると、``free_legs`` の IK 中は
     足首の下限・膝の上限をその角度にして、腰が高くなる側へ脚を動かさない。"""
@@ -996,10 +880,8 @@ AIM_HEAD_ROUNDS = 10
 
 
 def _aim_head(robot, gaze_point):
-    """首だけで、カメラの光軸を ``gaze_point`` へ向ける。今の首の角度と
-    首 0 度の両方から解き、視線のずれの小さい方にする (押し込み時の首から
-    前を向くまで大きく回すと、今の角度からでは解けないことがある)。視線の
-    ずれ [rad] を返す。"""
+    """首だけで、カメラの光軸を ``gaze_point`` へ向ける。今の首の角度と首 0 度
+    の両方から解き、視線のずれの小さい方にする。視線のずれ [rad] を返す。"""
     gaze_coords = spik.camera_optical_coords(robot)
     joints = [link.joint for link in spik.gaze_link_list(robot)]
     best = None
@@ -1030,13 +912,7 @@ def _below_elbow(link, robot_arm):
     return False
 
 
-# 横並び移動の検証で人体 (車輪と脚を含む) から空ける距離 [m]。hover の IK
-# (6 cm、DEFAULT_HOVER_HUMAN_CLEARANCE) より 1 cm 緩め、接近の検証
-# (plan_handshake_motion.DEFAULT_HUMAN_CLEARANCE) と同じ値。実機 2026-10-13 の
-# 13 人を解き直すと、押し込み直後に胴体の円柱へ 6 cm を割る人が多く、移動先まで
-# 100% は 6 cm で 5/13、5 cm で 7/13 (3〜4 cm でも 7/13、1 cm で 9/13)。合成
-# データは 6 cm で全員通り、差が出ない。移動先のバッチ IK のマージン
-# (DEFAULT_COLLISION_MARGIN) も緩めても成功数は増えないので 6 cm のまま。
+# 横並び移動の検証で人体 (車輪と脚を含む) から空ける距離 [m]。
 TRANSITION_HUMAN_CLEARANCE = 0.05
 
 
@@ -1064,8 +940,7 @@ class TransitionChecker(object):
             self.clearance_pairs = (
                 source.with_pairs(pairs)
                 if isinstance(source, spik.VerificationPairs) else pairs)
-        # 台車の車輪と人の脚などの組 (人の腕は動くので除く)。腕・腰・脚の
-        # 姿勢によらず台車の位置だけで距離が決まる。
+        # 台車の車輪と人の脚などの組 (人の腕は動くので除く)。
         self.base_pairs = None
         if source is not None:
             arm = offered | set(_lowered_arm_slots(hand))
@@ -1119,7 +994,6 @@ class TransitionChecker(object):
                 return '人体 ({}) まで {:.3f} m'.format(
                     spik.human_obstacle_names()[index], clearances[index])
         if self.base_pairs and self.base_clearance > self.clearance:
-            # 台車は人の脚などから ``base_clearance`` 空ける。
             clearances = spik.human_obstacle_clearances(
                 robot, self.base_pairs,
                 spik.human_body_obstacles(joint_positions),
@@ -1140,13 +1014,9 @@ def _branch_joint_indices(robot, robot_arm):
             if name.format(robot_arm) in names]
 
 
-# 移動先のバッチ IK に、押し込みの干渉ペア (collision_pairs.json) へ足す組
-# (_transition_pairs)。移動先の検証で落ちる候補はほぼ、ロボットの差し出す
-# 腕の前腕・肘が人の下ろした上腕・胴体の横に 6 cm 以内まで近づくもの
-# (下ろした上腕は押し込みの IK には無い) と、差し出さない腕の前腕・手が腰に
-# めり込む自己干渉 (押し込みの干渉ペアには自己干渉の組が無い) だった。
-# IK に避けさせると、移動先の検証に落ちる候補が約半分になり、合成データで
-# 移動先まで 100% の人が 33 -> 35/41 人に増えた。
+# 移動先のバッチ IK に、押し込みの干渉ペアへ足す組 (_transition_pairs):
+# ロボットの差し出す腕の前腕・肘と人の下ろした上腕・胴体、差し出さない腕の
+# 前腕・手と腰の自己干渉。
 TRANSITION_EXTRA_PAIRS = True
 TRANSITION_ARM_LINKS = ('{}_forearm_link', '{}_elbow_link')
 TRANSITION_SELF_PAIRS = (
@@ -1169,10 +1039,8 @@ def _lowered_arm_slots(hand):
 
 
 def _transition_pairs(robot, robot_arm, hand):
-    """横並び移動の移動先のバッチ IK に、押し込みの干渉ペアへ足す組。
-    移動先の検証で落ちるのはほぼ、ロボットの差し出す腕の前腕・肘と人の
-    下ろした上腕・胴体の横、差し出さない腕の前腕・手と腰の自己干渉
-    (押し込みの干渉ペアには無い組)。"""
+    """横並び移動の移動先のバッチ IK に、押し込みの干渉ペアへ足す組
+    (``TRANSITION_EXTRA_PAIRS``)。"""
     other = 'l' if robot_arm == 'r' else 'r'
     links_by_name = {link.name: link for link in
                      list(robot.link_list)
@@ -1280,12 +1148,9 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
 def warmup_batch_ik(robot, robot_arm, hand, seed_av, collision_pairs,
                     base_limits,
                     attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
-    """横並び移動の移動先のバッチ IK (``_batch_ik``) を、実際の呼び出しと
-    同じ形 (目標 3 つ・障害物・干渉ペア・回転の拘束) で 1 回解いて、JAX の
-    トレース・コンパイルを前倒しで済ませる。握りの向きを自由にしない
-    (``GOAL_FREE_TURN`` が False) ときは ``solve_person_ik`` と同じ形なので
-    何もしない。``seed_av`` は押し込み姿勢など、解ける目標を作るための
-    姿勢。"""
+    """移動先のバッチ IK (``_batch_ik``) を、実際の呼び出しと同じ形で 1 回
+    解いて、JAX のトレース・コンパイルを前倒しで済ませる。``GOAL_FREE_TURN``
+    が False なら何もしない。``seed_av`` は解ける目標を作るための姿勢。"""
     if not GOAL_FREE_TURN:
         return
     _place(robot, seed_av, (0.0, 0.0, 0.0))
@@ -1355,22 +1220,19 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
     """下ろした手の候補 ``goal_palms`` (腕の低い順の 3 つの ``(位置,
     回転行列)``) への押し込み目標を、握りの向き ``turn_degs`` ごとに 1 回の
     バッチ IK で解き、移動先の台車・姿勢の候補を前後の窓の狭い方から
-    (候補が出るまで) 集めて、腕の低い目標から、同じ目標ではコスト (曲げ量
-    + 前方ずれ + 向きのずれ + 上体の前後ずれ + しゃがみ量 + 腰の前傾) の
-    安い順に返す。
+    (候補が出るまで) 集めて、腕の低い目標から、同じ目標ではコストの安い順に
+    返す。
 
-    ``max_waist_z`` (腰の高さ [m]、押し込み終了時の値) を与え、
-    ``GOAL_LEG_RISE`` が 'off' でなければ、腰がそれより
-    ``GOAL_LEG_RISE_TOLERANCE`` を超えて高い候補は外す ('fallback' は全部
-    外れるときだけ外さない)。
+    ``max_waist_z`` (押し込み終了時の腰の高さ [m]) を与え、``GOAL_LEG_RISE``
+    が 'off' でなければ、腰がそれより ``GOAL_LEG_RISE_TOLERANCE`` を超えて
+    高い候補は外す ('fallback' は全部外れるときだけ外さない)。
 
-    台車の可動域 (ワールドの x/y に沿った箱) で人の前後を絞れるよう、人の
-    立ち位置まわりに回して人の正面方向が +x の座標系で解き、解いた台車の
-    位置姿勢は元の座標系に戻す。左右は差し出した手の側 (``y_window``
-    ``(下限, 上限)`` [m] を与えれば、手の側の人からの横の距離をその窓に絞る)、
-    向きは人の正面方向 ±``yaw_margin_deg`` (既定 ``GOAL_YAW_MARGIN_DEG``)
-    度に絞る。上半身の向きが人の正面から ``UPPER_BODY_LIMIT_DEG`` を超える
-    候補は捨て、残りはずれの二乗のコスト (``UPPER_BODY_WEIGHT``) を足す。
+    人の立ち位置まわりに回して人の正面方向が +x の座標系で解き、台車の位置
+    姿勢は元の座標系に戻す。左右は差し出した手の側 (``y_window``
+    ``(下限, 上限)`` [m] で手の側の横の距離を絞る)、向きは人の正面方向
+    ±``yaw_margin_deg`` (既定 ``GOAL_YAW_MARGIN_DEG``) 度に絞る。上半身が人の
+    正面から ``UPPER_BODY_LIMIT_DEG`` を超える候補は捨て、残りはずれの二乗の
+    コスト (``UPPER_BODY_WEIGHT``) を足す。
 
     Returns
     -------
@@ -1404,9 +1266,8 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
         return targets
 
     limits = list(base_limits)
-    # 下ろした手は人の体の左右どちらか (人の正面が +x なので左は +y) に
-    # 来るので、差し出した手首の位置 (体の中心線をまたぐことがある) では
-    # なく、手の左右で台車の側を決める。
+    # 下ろした手は人の体の左右どちらかに来るので、手の左右で台車の側を
+    # 決める (人の正面が +x なので左は +y)。
     if y_window is None:
         limits[1] = spik.restrict_base_y_range_to_hand_side(
             limits[1], 1.0 if hand == 'L' else -1.0)
@@ -1444,8 +1305,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                 # 指先の上下は台車の yaw に依らないので、解いた座標系のまま。
                 _place(robot, av, base)
                 if max_waist_z is not None and GOAL_LEG_RISE != 'off':
-                    # 腰が少しだけ高い候補は、脚を押し込み終了時の角度に直す
-                    # (腕は、このあと脚を固定した押し込み IK で解き直す)。
+                    # 腰が少しだけ高い候補は、脚を押し込み終了時の角度に直す。
                     rise = waist_height(robot) - max_waist_z
                     if (GOAL_LEG_RISE_TOLERANCE < rise
                             <= GOAL_LEG_RISE_REPAIR_MAX):
@@ -1505,9 +1365,8 @@ def _lowering_path_steps(human_arm, lowering, samples=20):
 def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
               lowering, start_av, base_path, goal_av,
               checker, gaze_forward, free_turn=False):
-    """``_plan_path_impl`` を、上半身の向きの制約 (``_upper_body_limit`` の
-    間だけ) の経路の情報 (腰ヨーの始点・移動先、始点の上半身が範囲内か) を
-    設定して解く。"""
+    """``_plan_path_impl`` を、上半身の向きの制約の経路情報 (腰ヨーの始点・
+    移動先、始点の上半身が範囲内か) を設定して解く。"""
     if _UPPER.human_yaw is None:
         return _plan_path_impl(
             robot, robot_arm, hand, start_turn, goal_turn, human_arm,
@@ -1530,16 +1389,13 @@ def plan_path(robot, robot_arm, hand, start_turn, goal_turn, human_arm,
 def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
                     human_arm, lowering, start_av, base_path, goal_av,
                     checker, gaze_forward, free_turn=False):
-    """押し込み姿勢から移動先まで、台車 (``base_path``: ``BasePath``)・
-    人の腕 (``lowering``:
-    ``HumanArm.lowering`` の肩から腕を下ろす動き)・握りの向き
-    (``start_turn`` -> ``goal_turn`` [度]、近い回り方。``free_turn`` なら
-    拘束せず IK に任せる) を補間しながら、
-    ロボットの腕・脚・首を直前の解から解き進めた waypoint を返す。視線は
-    掌から、横並びで前を見る点 ``gaze_forward`` へ移していく。
-    解けない waypoint は、直前の解に移動先の姿勢 ``goal_av`` への補間を
-    1 区間分足した初期値でも試す。人の腕が届かない・関節角が飛ぶ・干渉
-    する waypoint があれば、その手前までで止める。
+    """押し込み姿勢から移動先まで、台車 (``base_path``)・人の腕 (``lowering``)・
+    握りの向き (``start_turn`` -> ``goal_turn`` [度]、``free_turn`` なら拘束せず
+    IK に任せる) を補間しながら、ロボットの腕・脚・首を直前の解から解き進めた
+    waypoint を返す。視線は掌から ``gaze_forward`` へ移していく。
+    解けない waypoint は、直前の解を ``goal_av`` へ 1 区間寄せた初期値でも試す。
+    人の腕が届かない・関節角が飛ぶ・干渉する waypoint があれば、その手前で
+    止める。
 
     Returns
     -------
@@ -1563,8 +1419,8 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
     legs = [names.index(name) for name in ('ankle_joint', 'knee_joint')]
     head = {link.joint.name for link in robot.head.link_list}
     neck = [names.index(name) for name in sorted(head)]
-    # 差し出さない腕 (肩ピッチ・肘) は台車の箱をよけるために姿勢の候補へ
-    # 差し替えるので、関節角の飛びの判定から外す。
+    # 差し出さない腕 (肩ピッチ・肘) は台車の箱をよけるため差し替えるので、
+    # 関節角の飛びの判定から外す。
     other = 'l' if robot_arm == 'r' else 'r'
     other_names = ['{}_shoulder_p_joint'.format(other),
                    '{}_elbow_joint'.format(other)]
@@ -1590,18 +1446,16 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
         target = press_target(palm_from_frame(palm_pos, palm_rot), turn_deg,
                               robot_arm)
         gaze_point = palm_pos + (gaze_forward - palm_pos) * s
-        # 脚は直前の waypoint から移動先の脚へ、残りの区間で均等に近づけた
-        # 角度に固定して解く。解けなければ脚も IK で動かす (以後はそこから
-        # 移動先へ近づける)。
+        # 脚は直前から移動先へ残りの区間で均等に近づけた角度に固定して解く。
+        # 解けなければ脚も IK で動かす。
         leg_angles = prev[legs] + (goal_av[legs] - prev[legs]) / (n - k + 1)
         if GOAL_LEG_RISE != 'off':
-            # 補間の途中で腰が膨らんで高くならないよう、直前・押し込み終了時
-            # より高くなるときは膝をより曲げる。
+            # 補間の途中で腰が高くならないよう、高くなるときは膝をより曲げる。
             leg_angles = np.array(cap_leg_rise(
                 robot, leg_angles[0], leg_angles[1],
                 min(z_prev, z_start) + PATH_LEG_RISE_TOLERANCE))
-        # 初期値は、直前の解を移動先の姿勢へ 1 区間分寄せたものを先に試す
-        # (直前の解からだと手首などが直前の曲げに留まり、移動先へ向かわない)。
+        # 直前の解を移動先へ 1 区間寄せた初期値を先に試す (直前の解からだと
+        # 手首などが直前の曲げに留まる)。
         for seed, free_legs in ((prev + step_av, False), (prev, False),
                                 (prev, True)):
             seed = seed.copy()
@@ -1621,9 +1475,8 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
             neck_av = robot.angle_vector().copy()
             neck_av[neck] = start_av[neck] + (goal_av[neck] - start_av[neck]) * s
             robot.angle_vector(neck_av)
-        # 上体を傾けると差し出さない手が台車の前の箱に入るので、入らない
-        # 姿勢に差し替える (押し込みの計画と同じ候補。直前の姿勢より曲げの
-        # 小さい候補には戻さない)。
+        # 上体を傾けると差し出さない手が台車の前の箱に入るので、入らない姿勢に
+        # 差し替える (直前より曲げの小さい候補には戻さない)。
         if spik.other_hand_base_clearance(robot, robot_arm) \
                 < spik.OTHER_ARM_BASE_CLEARANCE:
             current = robot.angle_vector().copy()
@@ -1660,18 +1513,17 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
     return waypoints, len(waypoints) / float(n), reason
 
 
-# 横並びで前を見るときの、人の立ち位置から人の正面方向への距離 [m] と、
-# 骨格から目の高さが求まらないときの高さ [m]。
+# 横並びで前を見る点までの、人の正面方向への距離 [m] と、目の高さが
+# 求まらないときの高さ [m]。
 FORWARD_GAZE_DISTANCE = 10.0
 FORWARD_GAZE_DEFAULT_HEIGHT = 1.4
 
 
 def forward_gaze_point(joint_positions):
     """横並びで見る点: 人の立ち位置から人の正面方向へ
-    ``FORWARD_GAZE_DISTANCE`` 先の、人の目 (鼻、なければ両耳の中点、
-    なければ ``FORWARD_GAZE_DEFAULT_HEIGHT``) の高さの点。人の顔を見ると
-    首・上半身を人の方へ向けてしまうので、人と同じ前方を見る (遠いので
-    首ヨーはほぼ上半身の向きになる)。"""
+    ``FORWARD_GAZE_DISTANCE`` 先の、人の目 (鼻、なければ両耳の中点、なければ
+    ``FORWARD_GAZE_DEFAULT_HEIGHT``) の高さの点。人の顔を見ると首・上半身が
+    人の方へ向くので、人と同じ前方を見る。"""
     standing = spik.human_standing_xy(joint_positions)
     facing = spik.human_facing_direction(joint_positions)
     nose = joint_positions.get('Nose')
@@ -2371,7 +2223,6 @@ _PALM_FACING_NAMES = dict(inward='人側', forward='前向き', backward='後ろ
 def lowered_arm_text(transition):
     """移動先の人の腕 (上腕の真下からの角度と掌の向き) の説明。"""
     if 'arm_deg' not in transition:
-        # 肩から下ろす形にする前の結果 (前腕の真下からの角度)
         return '前腕 {:.0f} 度'.format(transition.get('forearm_deg',
                                                      float('nan')))
     return '上腕 {:.0f} 度・掌は{}'.format(
