@@ -232,6 +232,10 @@ GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 MAX_GOAL_CANDIDATES = 2
 MAX_GOAL_CHECKS = 8
 
+# 1 人の横並び移動で経路 (plan_path) を計画する回数の上限。None は無制限。
+# 上限に達したらそこまでで一番進んだ経路を使う。
+MAX_PATH_TRIES = None
+
 # 1 waypoint あたりの台車・掌の移動量の上限 (位置 [m]・向き [rad])。
 MAX_STEP = 0.10
 MAX_ANGLE_STEP = math.radians(10.0)
@@ -1521,6 +1525,11 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     checker = TransitionChecker(robot_arm, hand, verification_pairs)
     reasons = []
     best = [None]
+    # plan_path を呼んだ回数と、100% に届いた (最初の) 回数 (結果の n_paths・
+    # n_paths_full)。MAX_PATH_TRIES を超えたら探索を打ち切る。
+    n_paths = [0]
+    n_paths_full = [None]
+    path_fractions = []
     free_turn = GOAL_FREE_TURN
     # 握りの向きを自由にするなら、目標の向きは 0 度の 1 組だけでよい
     # (法線まわりは拘束しないので、どの角度から解いても同じ)。
@@ -1606,11 +1615,18 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                     reasons.append('移動先で{}'.format(problem.split(' ')[0]))
                     continue
                 tried[palm_index] = tried.get(palm_index, 0) + 1
+                if (MAX_PATH_TRIES is not None
+                        and n_paths[0] >= MAX_PATH_TRIES):
+                    reasons.append('経路の試行回数が上限 ({}) に達した'.format(
+                        MAX_PATH_TRIES))
+                    return True
+                n_paths[0] += 1
                 waypoints, fraction, why = plan_path(
                     robot, robot_arm, hand, turn_deg, goal_turn, human_arm,
                     lowering, start_av, base_path,
                     robot.angle_vector().copy(), checker,
                     gaze_forward, free_turn=free_turn)
+                path_fractions.append(round(float(fraction), 3))
                 if why is not None:
                     reasons.append('経路の{}'.format(why))
                 if best[0] is None or fraction > best[0][1]:
@@ -1620,6 +1636,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                                   palm_facing=lowering['palm_facing'],
                                   x_margin=x_margin)
                 if fraction >= 1.0:
+                    n_paths_full[0] = n_paths[0]
                     return True
             # 次の組 (握りの向き ±90 度) は、この組で移動先の IK が 1 つも
             # 解けなかったときだけ試す (経路が途中で止まっても、別の向きで
@@ -1669,6 +1686,8 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
         if any(try_lowerings(lowerings) for _, lowerings in ordered):
             break
     best = best[0]
+    result.update(n_paths=n_paths[0], n_paths_full=n_paths_full[0],
+                  path_fractions=path_fractions)
     if best is None or best[1] < MIN_FRACTION:
         result.update(reason=', '.join(sorted(set(reasons))) or None,
                       compute_time=time.time() - t0)

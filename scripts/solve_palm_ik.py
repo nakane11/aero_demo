@@ -714,6 +714,35 @@ def restrict_base_x_range_to_human_standing(base_x_range, standing_x,
     return (restricted_lo, restricted_hi)
 
 
+# 台車の x・y を掌の水平位置 ± この距離 [m] に絞る (None は絞らない)。
+# バッチ IK の初期値は可動域全体から一様に引くので、腕が届かない遠くの
+# 初期値を減らす狙いだったが、効果がなく既定では無効 (2026-10-20 評価):
+# 過去の成功解 36 件で台車と掌の水平距離は最大 0.91 m だが、1.1 m に絞って
+# も IK 1 段階目の時間は 0.371 → 0.369 秒/人で変わらず (バッチの時間は
+# レーン数で決まる)。試行数を 512 → 256 に半減すると seed 0 の 67 人では
+# 時間 -30%・verified 53 → 54 だったが、seed 1 の 400 人では 34 → 28 に悪化
+# した (絞りなしの 512 は 34、絞り 512 は 32、1.5 m 512 は 30 で、乱数の揺れ
+# が ±3 人ほどある)。
+DEFAULT_BASE_PALM_REACH = None
+
+
+def restrict_base_range_to_palm_reach(base_limits, palm_position,
+                                      reach=DEFAULT_BASE_PALM_REACH):
+    """台車の x・y の範囲を ``palm_position`` (x, y) ± ``reach`` との積集合に
+    絞った ``base_limits`` を返す。``reach`` が None か、どちらかが空集合に
+    なるならそのまま返す。"""
+    if reach is None or palm_position is None:
+        return list(base_limits)
+    restricted = []
+    for limits, center in zip(base_limits[:2], palm_position[:2]):
+        lo = max(limits[0], float(center) - reach)
+        hi = min(limits[1], float(center) + reach)
+        if lo > hi:
+            return list(base_limits)
+        restricted.append((lo, hi))
+    return restricted + [base_limits[2]]
+
+
 # 台車の yaw を人の正面方向 ± この角度 [deg] に絞る。
 DEFAULT_BASE_YAW_FACING_MARGIN_DEG = 30.0
 
@@ -3165,6 +3194,7 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  collision_obstacles, base_limits,
                                  standing_x,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
+                                 palm_reach=DEFAULT_BASE_PALM_REACH,
                                  **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に絞って
     狭い順に ``solve_person_ik`` を解き、後処理まで解けた最初の結果を返す.
@@ -3183,10 +3213,11 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
     for x_margin in x_margins:
         if twisted is not None and x_margin < 0.0:
             break
-        person_base_limits = [
-            restrict_base_x_range_to_human_standing(
+        person_base_limits = restrict_base_range_to_palm_reach(
+            [restrict_base_x_range_to_human_standing(
                 base_limits[0], standing_x, margin=x_margin),
-            base_limits[1], base_limits[2]]
+             base_limits[1], base_limits[2]],
+            palm['position'], palm_reach)
         picked, ik_time, selection_time = solve_person_ik(
             robot, palm, hand, robot_arm, collision_obstacles,
             base_limits=person_base_limits, **kwargs)
@@ -3389,6 +3420,11 @@ def main():
         help='台車の x を人の立ち位置 ±この幅 [m] に絞る。先頭から順に試す。'
             '負は絞らない (既定 {})。'
             .format(' '.join(str(m) for m in DEFAULT_BASE_X_STANDING_MARGINS)))
+    parser.add_argument(
+        '--base-palm-reach', type=float, default=0.0,
+        help='台車の x・y を掌の水平位置 ±この距離 [m] に絞る (0 以下は絞ら'
+            'ない、既定)。効果がなかったので既定は無効 (DEFAULT_BASE_PALM_REACH '
+            'のコメント参照)。')
     parser.add_argument(
         '--front-offset-weight', type=float,
         default=DEFAULT_FRONT_OFFSET_WEIGHT,
@@ -3667,6 +3703,8 @@ def main():
             robot, palm, human_hand, robot_arm, collision_obstacles,
             person_base_limits, standing_x,
             x_margins=args.base_x_standing_margins,
+            palm_reach=(args.base_palm_reach
+                        if args.base_palm_reach > 0.0 else None),
             front_offset_weight=args.front_offset_weight,
             facing_yaw_weight=args.facing_yaw_weight,
             joint_positions=collision_joints,

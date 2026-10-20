@@ -932,13 +932,15 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         verified = motion_passes(distances, clearances)
         return lead_in, distances, clearances, verified
 
+    pretouch_cache = {}
     zero,others = candidates[0], candidates[1:]
     zero_lead_in = check_lead_in(zero[1])
     zero_motion = None
     if zero_lead_in[-1]:
         zero_motion = _plan_from_start(
             robot, robot_arm, handshake, joint_positions, zero[1], args,
-            verification_pairs, solver, obstacle_cache, orbit=orbit)
+            verification_pairs, solver, obstacle_cache, orbit=orbit,
+            pretouch_cache=pretouch_cache)
     best = None
     n_tried = 1
     if zero_motion is not None and zero_motion['verified']:
@@ -956,7 +958,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
             motion = _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
                 args, verification_pairs, solver, obstacle_cache,
-                optimize=False, orbit=orbit)
+                optimize=False, orbit=orbit, pretouch_cache=pretouch_cache)
             if motion['verified']:
                 best = (candidate, lead_in_check, motion)
                 break
@@ -966,13 +968,17 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
             candidate, lead_in_check = first_lead_in_ok
             best = (candidate, lead_in_check, _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
-                args, verification_pairs, solver, obstacle_cache, orbit=orbit))
+                args, verification_pairs, solver, obstacle_cache, orbit=orbit,
+                pretouch_cache=pretouch_cache))
         if best is None:
-            # どの候補も通らなければ角度 0 の結果を返す。
+            # どの候補も通らなければ角度 0 の結果を返す。lead-in が全滅なら
+            # 呼び出し側は採用しない (motion_verified) ので最適化はしない。
             if zero_motion is None:
                 zero_motion = _plan_from_start(
                     robot, robot_arm, handshake, joint_positions, zero[1],
-                    args, verification_pairs, solver, obstacle_cache, orbit=orbit)
+                    args, verification_pairs, solver, obstacle_cache,
+                    optimize=False, orbit=orbit,
+                    pretouch_cache=pretouch_cache)
             best = (zero, zero_lead_in, zero_motion)
 
     ((angle, _), (lead_in, lead_in_distances, lead_in_clearances,
@@ -1026,13 +1032,14 @@ def blend_head_to_post_process(robot, motion, handshake):
 
 def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
                      args, verification_pairs, solver, obstacle_cache, orbit,
-                     optimize=True):
+                     optimize=True, pretouch_cache=None):
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する。
 
     pre-touch 経由 → 線形補間の順に検証し、通ればそれを返す。通らなければ
     jaxls で最適化し、warm start を揺らして ``args.motion_attempts`` 回まで
     解き直す (全滅なら最も余裕の大きい候補を ``verified: false`` で返す)。
-    ``optimize`` が偽なら最適化しない。
+    ``optimize`` が偽なら最適化しない。``pretouch_cache`` (dict) を渡すと、
+    始点に依存しない pre-touch 姿勢の IK を同じ ``handshake`` の間で使い回す。
     """
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         build_start_and_goal(robot, robot_arm, handshake, base_start,
@@ -1091,9 +1098,14 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     direction = pretouch_direction(handshake, base_goal)
     pretouch_status = 'no_direction'
     if direction is not None:
-        q_pre = solve_pretouch_pose(
-            robot, robot_arm, link_list, joint_list, handshake, q_goal,
-            base_goal, direction, DEFAULT_PRETOUCH_STANDOFF)
+        if pretouch_cache is not None and 'q_pre' in pretouch_cache:
+            q_pre = pretouch_cache['q_pre']
+        else:
+            q_pre = solve_pretouch_pose(
+                robot, robot_arm, link_list, joint_list, handshake, q_goal,
+                base_goal, direction, DEFAULT_PRETOUCH_STANDOFF)
+            if pretouch_cache is not None:
+                pretouch_cache['q_pre'] = q_pre
         pretouch_status = 'ik_failed'
         if q_pre is not None:
             pretouch_status = 'built'
@@ -1231,8 +1243,9 @@ def main():
         help='jaxls の最大反復回数 (既定 {})。'.format(
             DEFAULT_MAX_ITERATIONS))
     parser.add_argument(
-        '--motion-attempts', type=int, default=3,
-        help='warm start を揺らして最適化を解き直す最大回数 (既定 3)。')
+        '--motion-attempts', type=int, default=1,
+        help='warm start を揺らして最適化を解き直す最大回数 (既定 1)。2 回目'
+             '以降で救われた人は 67 人・400 人 (seed 0・1) で 0 人だった。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='最適化なしの軌道が通っても必ず jaxls で最適化する (計測用)。')

@@ -670,6 +670,8 @@ class HandshakePlanner(object):
                 self.robot, translated_palm, offered_hand, robot_arm,
                 collision_obstacles, person_base_limits, standing_x,
                 x_margins=args.base_x_standing_margins,
+                palm_reach=(args.base_palm_reach
+                            if args.base_palm_reach > 0.0 else None),
                 front_offset_weight=args.front_offset_weight,
                 facing_yaw_weight=args.facing_yaw_weight,
                 attempts_per_pose=args.attempts_per_pose,
@@ -3834,6 +3836,10 @@ def build_arg_parser():
         help='台車の x 可動範囲を人の立ち位置 ±この幅 [m] に絞る (順に試す、'
             '負は絞らない)。')
     parser.add_argument(
+        '--base-palm-reach', type=float, default=0.0,
+        help='台車の x・y を掌の水平位置 ±この距離 [m] に絞る (0 以下は絞ら'
+             'ない、既定)。効果がなかったので既定は無効。')
+    parser.add_argument(
         '--front-offset-weight', type=float,
         default=spik.DEFAULT_FRONT_OFFSET_WEIGHT,
         help='IK 候補のコストに足す、台車の人の正面方向へのずれ [m] の重み。')
@@ -3861,8 +3867,9 @@ def build_arg_parser():
         '--collision-activation-distance', type=float,
         default=phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE)
     parser.add_argument(
-        '--motion-attempts', type=int, default=3,
-        help='軌道の干渉が残ったとき warm start を変えて解き直す最大回数。')
+        '--motion-attempts', type=int, default=1,
+        help='軌道の干渉が残ったとき warm start を変えて解き直す最大回数 '
+             '(2 回目以降で救われた人は合成 67 人・400 人で 0 人だった)。')
     parser.add_argument(
         '--motion-collision-verify-tolerance', type=float,
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
