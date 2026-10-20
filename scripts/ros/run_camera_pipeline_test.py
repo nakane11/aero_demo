@@ -40,6 +40,7 @@ import message_filters
 import tf2_ros
 import trajectory_msgs.msg
 from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from std_srvs.srv import SetBool
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_DIR = os.path.dirname(_THIS_DIR)
@@ -2318,9 +2319,13 @@ class HandshakePipelineNode(object):
         if self.args.base_correction == 'scan':
             ref_scan = self._capture_scan()
             with self._lock:
+        self._hand_grasped = False
                 frozen = self._frozen_joint_positions
             if frozen:
                 exclude_centers = np.array(
+            # 握った場合は、試行が終わる (途中で失敗した場合も) ときに開く。
+            if self._hand_grasped:
+                self._set_hand_grasp(False)
                     [p[:2] for p in frozen.values()], dtype=np.float64)
 
         # 接近の直線 (lead-in) は首で人の顔を追い、螺旋に入ったら差し出し手の
@@ -2547,6 +2552,8 @@ class HandshakePipelineNode(object):
                 frame_candidates.append(dict(
                     side=hand['side'], score=hand['score'],
                     n_points=len(hand['positions']),
+        if reach_boundary < len(display_waypoints):
+            self._set_hand_grasp(True)
                     palm_position=(None if palm is None
                                    else [float(v) for v in palm['position']]),
                     distance=dist, normal_angle_deg=normal_angle,
@@ -3295,6 +3302,26 @@ class HandshakePipelineNode(object):
         skip_head = (self._head_face_tracking.is_set()
                      or self._head_hand_following.is_set())
         waited = []
+    def _set_hand_grasp(self, grasp):
+        """ハンドの握る (True) / 開く (False) 姿勢を
+        ``/aero_hand_grasp_service/grasp`` (std_srvs/SetBool) で切り替える。
+        サービスが無い・失敗しても実機動作は止めない。"""
+        name = '/aero_hand_grasp_service/grasp'
+        try:
+            rospy.wait_for_service(name, timeout=2.0)
+            response = rospy.ServiceProxy(name, SetBool)(bool(grasp))
+            if grasp:
+                self._hand_grasped = True
+            print('[execute] ハンドを{} (success={}, {})'.format(
+                '握ります' if grasp else '開きます',
+                response.success, response.message))
+        except Exception as e:  # noqa: BLE001
+            print('[execute] ハンドの切り替えに失敗しました ({}): {}'.format(
+                grasp, e))
+            if grasp:
+                # 送信できたか不明なので、終了時に開く指令も試す。
+                self._hand_grasped = True
+
         for action in self.ri.controller_table[self.ri.controller_type]:
             name = self._action_name(action)
             if skip_head and name.startswith('head_controller'):
