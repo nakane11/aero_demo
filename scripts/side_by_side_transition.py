@@ -23,8 +23,8 @@
   ひねり)・握りの向き・台車を補間し、ロボットの腕・脚・首を解き直す。
 - 横並びの間、ロボットの上半身 (body_link) は人の正面から
   ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と同じ前方を見る
-  (``forward_gaze_point``)。人の掌は後ろ向きから人側へ ``PALM_PHI_ORDER``
-  の角度だけ回した向き (親指が前に来る側) を試す。
+  (``forward_gaze_point``)。人の掌は ``PALM_FACING_ORDER`` の向き (後ろ向き
+  から人側へ回した向き、前腕をひねらない向き、前向き) を試す。
 - 横並びまで進んだら、人の腕・掌を動かさず台車だけを人の方へ寄せる
   (``plan_approach``、段階 2)。台車の向きは変えず、台車は人の脚などから
   ``TRANSITION_BASE_CLEARANCE`` 空ける。
@@ -42,6 +42,7 @@
 import contextlib
 import copy
 import math
+import threading
 import time
 import zlib
 
@@ -244,14 +245,18 @@ GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 # ±UPPER_BODY_LIMIT_DEG に収める。掌を人側へ回さず後ろ向きのまま合わせる
 # 解は、上半身を人の方へ 50〜100 度ねじって手を合わせていた (腰ヨーが
 # コストにもなかった)。移動先は範囲外の候補を捨て、ずれの二乗に
-# UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は腰ヨーの可動域を
-# 絞る (上半身が範囲内の人は範囲内に、押し込み姿勢から戻る人は腰ヨーを始点から
-# 移動先へ線形に補間した値の ±UPPER_BODY_WAIST_BAND_DEG)。始点のずれが
-# 範囲を UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす。
+# UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は、始点の
+# 上半身が範囲内 (UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす)
+# なら全体を、範囲外なら移動先だけを範囲に絞る (押し込み姿勢から出る途中の
+# 腰ヨーを絞ると、腕が掌に届かず経路が序盤で止まる。実機 10/13 の 7 試行で
+# 移動先まで進めたのが 4 -> 6)。
 UPPER_BODY_LIMIT_DEG = 20.0
 UPPER_BODY_WEIGHT = 100.0
-UPPER_BODY_WAIST_BAND_DEG = 15.0
 UPPER_BODY_START_SLACK_DEG = 3.0
+
+# 横並び移動の計画 (``plan_transition``) の探索の時間の上限 [秒]。超えたら
+# それまでの一番良い解 (無ければ横並びしない) で終える。
+TRANSITION_TIME_LIMIT = 10.0
 
 # 移動先の台車の向きを、人の正面から ±GOAL_YAW_MARGIN_DEG に絞る。この範囲で
 # 寄れない人 (寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人) だけ
@@ -269,14 +274,15 @@ APPROACH_FALLBACK_LATERAL = 0.85
 # 2 cm まで近づいていた。
 TRANSITION_BASE_CLEARANCE = 0.10
 
-# 人の掌の向き: 腕を下ろしきったときの掌の法線を、後ろ向き (0 度) から人側
-# (90 度) へ回した角度 [度] の候補 (``HumanArm.lowering`` の facing 'phi<角度>')。
-# 親指が前に来る側へ回すほどロボットは人のすぐ横に寄れる (0 度は 1.0 m 前後、
-# 40〜90 度は 0.6〜0.9 m)。LOWERED_TWIST_MAX_DEG を超える角度は試さない。
-# この順に、段階 2 (寄せ) まで解き、寄せ後の横の距離が
-# APPROACH_STOP_LATERAL 以下になったところで打ち切る。打ち切れなければ全部
-# 解いて一番近いものを選ぶ。
-PALM_PHI_ORDER = (40, 60, 80, 90, 20, 0)
+# 人の掌の向きの候補 (``HumanArm.lowering`` の facing): 腕を下ろしきった
+# ときの掌の法線を後ろ向き (0 度) から人側 (90 度) へ回した角度 [度] の
+# 'phi<角度>'、続けて 'natural' と 'forward'。
+# 寄せまで解くとき (``plan_transition`` の approach=True) は向きごとに段階 2
+# まで解き、寄せ後の横の距離が APPROACH_STOP_LATERAL [m] 以下で打ち切る。
+# 寄せないとき (approach=False) は上腕の角度の組を外側・この順の向きを内側に
+# 試し、横並びまで進んだ最初の解で止める。
+PALM_FACING_ORDER = ('phi40', 'phi60', 'phi20', 'phi80', 'phi90', 'phi0',
+                     'natural', 'forward')
 APPROACH_STOP_LATERAL = 0.75
 
 # 寄せ (段階 2): 横並びの終わりの姿勢から、人の腕・掌を動かさず台車だけを
@@ -806,7 +812,7 @@ def down_turn_deg(palm, robot_arm):
     return float(turns[int(np.argmin(zs))])
 
 
-class _UpperBody(object):
+class _UpperBody(threading.local):
     """横並び移動の IK が使う上半身の向きの制約の状態。``human_yaw`` が
     None なら制約なし。``path`` は経路の IK 中 (``plan_path``) だけ
     ``(始点の腰ヨー, 移動先の腰ヨー, 始点の上半身が範囲内か)``、``s`` は
@@ -855,12 +861,9 @@ def _waist_sign(robot):
 
 def _restrict_waist_for_upper_body(robot):
     """上半身の向きを範囲内にするよう腰ヨーの可動域を絞り、元に戻す関数を
-    返す (``_UPPER.human_yaw`` が None なら何もしない)。台車の向きは変わらない
-    ので、上半身のずれは腰ヨーの変化に比例して変わる。経路 (``_UPPER.path``)
-    では、腰ヨーを始点から移動先へ線形に補間した値の
-    ``UPPER_BODY_WAIST_BAND_DEG`` 以内にして、始点の上半身が範囲内の人、
-    移動先 (割合 1) では上半身の範囲とも重ねる。範囲外から戻る途中の
-    (押し込み姿勢から出る) waypoint は、直前の腰ヨーを超えて外へ回さない。"""
+    返す (``_UPPER.human_yaw`` が None なら何もしない)。経路 (``_UPPER.path``)
+    では、始点の上半身が範囲内なら全体を、範囲外なら移動先 (割合 1) だけを
+    絞る。"""
     if _UPPER.human_yaw is None:
         return lambda: None
     joint = robot.waist_y_joint
@@ -876,12 +879,10 @@ def _restrict_waist_for_upper_body(robot):
         # 経路の外: 範囲内にするか、直前のずれより悪くしない
         lo, hi = min(torso_lo, w), max(torso_hi, w)
     else:
-        start_w, goal_w, start_ok = _UPPER.path
-        w_lin = start_w + (goal_w - start_w) * _UPPER.s
-        band = math.radians(UPPER_BODY_WAIST_BAND_DEG)
-        lo, hi = w_lin - band, w_lin + band
+        start_ok = _UPPER.path[2]
+        lo, hi = lo0, hi0
         if start_ok or _UPPER.s >= 1.0 - 1e-9:
-            lo, hi = max(lo, torso_lo), min(hi, torso_hi)
+            lo, hi = torso_lo, torso_hi
     joint.min_angle = max(lo0, lo - 1e-3)
     joint.max_angle = min(hi0, hi + 1e-3)
     if _UPPER.path is not None:
@@ -1687,16 +1688,93 @@ def forward_gaze_point(joint_positions):
 
 def plan_transition(*args, **kwargs):
     """``_plan_transition`` を、乱数 (バッチ IK の初期値) を押し込み姿勢から
-    決めたシードで解く。結果が呼び出し前の乱数の状態 (ウォームアップや
-    前の人の計算) に依らないようにし、呼び出し元の乱数の状態は戻す。"""
+    決めたシードにして解く。呼び出し元の乱数の状態は戻す。"""
     post = args[3] if len(args) > 3 else kwargs['post']
+    return _with_press_seed(post, _plan_transition, *args, **kwargs)
+
+
+def _with_press_seed(post, function, *args, **kwargs):
+    """``function`` を、乱数を押し込み姿勢 ``post`` から決めたシードにして
+    呼び、呼び出し元の乱数の状態は戻す。"""
     state = np.random.get_state()
     np.random.seed(zlib.crc32(np.round(np.asarray(
         post['joint_angle_vector'], dtype=np.float64), 6).tobytes()))
     try:
-        return _plan_transition(*args, **kwargs)
+        return function(*args, **kwargs)
     finally:
         np.random.set_state(state)
+
+
+def refine_transition(robot, robot_arm, hand, post, turn_deg,
+                      translated_joints, collision_joints, verification_pairs,
+                      collision_pairs, base_limits, secured,
+                      attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
+    """動かす前に確保した横並び移動 ``secured`` (``plan_transition`` の
+    approach=False の結果) を、寄せ (段階 2) と残りの掌の向きで良くした計画を
+    返す (実機ノードは動いている間に裏のスレッドで解く)。
+
+    まず ``secured`` の終わりから寄せを解き、寄せ後の横の距離が
+    ``APPROACH_STOP_LATERAL`` 以下ならそれを返す。そうでなければ残りの向きも
+    解き (``_plan_transition``)、寄せ後の一番近いものを返す。``robot`` は、
+    ほかで使っていないロボットモデルにすること (IK で姿勢を書き換える)。"""
+    return _with_press_seed(
+        post, _refine_transition, robot, robot_arm, hand, post, turn_deg,
+        translated_joints, collision_joints, verification_pairs,
+        collision_pairs, base_limits, secured, attempts_per_pose)
+
+
+def _refine_transition(robot, robot_arm, hand, post, turn_deg,
+                       translated_joints, collision_joints,
+                       verification_pairs, collision_pairs, base_limits,
+                       secured, attempts_per_pose):
+    t0 = time.time()
+    facing = spik.human_facing_direction(translated_joints)
+    common = (robot, robot_arm, hand, post, turn_deg, translated_joints,
+              collision_joints, verification_pairs, collision_pairs,
+              base_limits)
+    results = []
+    found = secured.get('palm_facing') if secured else None
+    if (secured and secured.get('verified') and secured['fraction'] >= 1.0
+            and facing is not None):
+        first = copy.deepcopy(secured)
+        with _upper_body_limit(math.atan2(facing[1], facing[0])):
+            _add_approach(
+                robot, robot_arm, hand, post, turn_deg, first,
+                translated_joints, collision_joints, verification_pairs,
+                collision_pairs, base_limits,
+                first.get('yaw_margin', GOAL_YAW_MARGIN_DEG))
+        results.append(first)
+        approach = first['approach']
+        if (approach['n_waypoints']
+                and approach['lateral_after'] <= APPROACH_STOP_LATERAL):
+            first['compute_time'] = time.time() - t0
+            return first
+    rest = [name for name in PALM_FACING_ORDER if name != found]
+    if rest:
+        results.append(_plan_transition(
+            *common, attempts_per_pose=attempts_per_pose, facings=rest))
+    best = min(results, key=lambda r: _result_key(r, translated_joints, hand))
+    best['compute_time'] = time.time() - t0
+    return best
+
+
+def _result_key(result, translated_joints, hand):
+    """横並び移動の計画結果の良さの並べ替えの鍵 (小さいほど良い): 寄せまで
+    進んだもの (寄せ後の横の距離、2 cm 刻み) > 横並びまで進んだもの (横の
+    距離) > 途中まで (進めた割合) > 失敗。同じなら ``PALM_FACING_ORDER`` の
+    先の向き。"""
+    facing = result.get('palm_facing')
+    phi = (PALM_FACING_ORDER.index(facing) if facing in PALM_FACING_ORDER
+           else len(PALM_FACING_ORDER))
+    approach = result.get('approach')
+    if approach and approach['n_waypoints']:
+        return (0, round(approach['lateral_after'] / 0.02), phi)
+    if result['verified'] and result['fraction'] >= 1.0:
+        end = result['waypoints'][-1]['base_position']
+        return (1, human_lateral(translated_joints, end, hand), phi)
+    if result['verified']:
+        return (2, -result['fraction'], phi)
+    return (3, 0.0, phi)
 
 
 def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
@@ -1704,7 +1782,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                  collision_pairs, base_limits,
                  attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
                  use_facing_variants=True, facings=None,
-                 yaw_margin_deg=None):
+                 yaw_margin_deg=None, deadline=None):
     """押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict、向き
     ``turn_deg``) から、つないだ手を人の体の横へ下ろしながら、ロボットも
     人と横並びになる位置・姿勢へ移る waypoint を計画する (段階 1)。
@@ -1712,9 +1790,10 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     ``translated_joints`` は立ち位置・向き・人の腕の判定用、
     ``collision_joints`` は干渉判定用 (体幹をずらした) の骨格 (どちらも
     IK と同じ座標系)。``base_limits`` は台車の可動域全体。``facings`` は
-    試す掌の向きの名前 (``HumanArm.lowering`` の facing) を試す順に並べた
-    もの (None なら ``LOWERED_FACING_ORDER``)、``yaw_margin_deg`` は移動先の
-    台車の向きの範囲 (``solve_goal_candidates``)。
+    試す掌の向き (``HumanArm.lowering`` の facing) の順 (None なら
+    ``LOWERED_FACING_ORDER``)、``yaw_margin_deg`` は移動先の台車の向きの範囲。
+    ``deadline`` (``time.time()`` の値) を過ぎたら探索をやめ、それまでの一番
+    良い経路を返す (``timed_out`` が True)。
 
     Returns
     -------
@@ -1731,7 +1810,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     result = dict(verified=False, waypoints=[], hand=hand,
                   joint_names=list(post['joint_names']), fraction=0.0,
                   x_margin=None, reason=None,
-                  placement_before=None, placement_after=None)
+                  placement_before=None, placement_after=None,
+                  timed_out=False)
     needed = ['{}{}'.format(hand, name) for name in
               ('Shoulder', 'Elbow', 'Wrist')] + [
         '{}Shoulder'.format('L' if hand == 'R' else 'R')]
@@ -1758,24 +1838,32 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     checker = TransitionChecker(robot_arm, hand, verification_pairs)
     reasons = []
     best = [None]
-    # plan_path を呼んだ回数と、100% に届いた (最初の) 回数 (結果の n_paths・
-    # n_paths_full)。MAX_PATH_TRIES を超えたら探索を打ち切る。
+    # plan_path を呼んだ回数と、100% に届いた (最初の) 回数。
     n_paths = [0]
     n_paths_full = [None]
     path_fractions = []
     free_turn = GOAL_FREE_TURN
-    # 握りの向きを自由にするなら、目標の向きは 0 度の 1 組だけでよい
-    # (法線まわりは拘束しないので、どの角度から解いても同じ)。
+    # 握りの向きを自由にするなら、目標の向きは 0 度の 1 組だけでよい。
     turn_groups = ((0.0,),) if free_turn else GOAL_TURN_DEG_GROUPS
+
+    def out_of_time():
+        if deadline is None or time.time() < deadline:
+            return False
+        if not result['timed_out']:
+            result['timed_out'] = True
+            reasons.append('探索の時間の上限に達した')
+        return True
 
     def try_lowerings(lowerings):
         """腕の下ろし方 ``lowerings`` (3 つ) を移動先にして経路を作る。
-        横並びまで (100%) 進めたら True。"""
+        横並びまで (100%) 進めたか、時間の上限を過ぎたら True。"""
         goal_palms = [lowering['palm'] for lowering in lowerings]
         lowered_arms = [(human_arm.shoulder,
                          human_arm.lowering_pose(lowering, 1.0)[0])
                         for lowering in lowerings]
         for turn_degs in turn_groups:
+            if out_of_time():
+                return True
             candidates, x_margin = solve_goal_candidates(
                 robot, robot_arm, hand, goal_palms, start_av,
                 translated_joints, collision_joints, collision_pairs,
@@ -1797,6 +1885,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 if (tried.get(palm_index, 0) >= MAX_GOAL_CANDIDATES
                         or checked.get(palm_index, 0) >= MAX_GOAL_CHECKS):
                     continue
+                if out_of_time():
+                    return True
                 lowering = lowerings[palm_index]
                 goal_palm = lowering['palm']
                 goal_skeleton = human_arm.skeleton(human_arm.pose(
@@ -1824,8 +1914,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                                  free_turn=free_turn):
                     reasons.append('移動先で押し込み IK が解けない')
                     continue
-                # 指先が上を向いた解は、握りの向きを指先が一番下を向く角度に
-                # 固定して解き直す (解けなければそのまま)。
+                # 指先が上を向いた解は、握りの向きを指先が一番下を向く角度に固定して
+                # 解き直す (解けなければそのまま)。
                 if finger_z(robot, robot_arm) > GOAL_FINGER_DOWN_MAX_Z:
                     before = robot.angle_vector().copy()
                     before_z = finger_z(robot, robot_arm)
@@ -1837,9 +1927,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                                       gaze_forward)
                             or finger_z(robot, robot_arm) >= before_z):
                         robot.angle_vector(before)
-                # 腕と同時の視線 IK は押し込み時の首から大きく回せず解けない
-                # ことがあるので、首だけで前へ向け直す (経路の首はここへ補間
-                # する、PATH_INTERPOLATE_NECK)。
+                # 腕と同時の視線 IK は首が大きく回せず解けないことがあるので、首だけで
+                # 前へ向け直す (経路の首はここへ補間する)。
                 _aim_head(robot, gaze_forward)
                 if free_turn:
                     goal_turn = grip_turn_deg(robot, robot_arm,
@@ -1872,10 +1961,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 if fraction >= 1.0:
                     n_paths_full[0] = n_paths[0]
                     return True
-            # 次の組 (握りの向き ±90 度) は、この組で移動先の IK が 1 つも
-            # 解けなかったときだけ試す (経路が途中で止まっても、別の向きで
-            # 進めたことは合成データでは無く、1 組あたり窓を広げて 1〜3 秒
-            # かかる)。
+            # 次の組 (握りの向き ±90 度) は、この組で移動先の IK が 1 つも解けなかった
+            # ときだけ試す。
             return False
         return False
 
@@ -1904,9 +1991,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             variants.append((rank, lowerings))
         return variants
 
-    # 人が腕を低く下ろせる組から試し、横並びまで進めた組で止める。同じ上腕の
-    # 角度の組の中では、脇の開きより掌の向きを優先する (掌の向きを
-    # LOWERED_FACING_ORDER の順に、それぞれ脇の開きの狭い順に試す)。
+    # 人が腕を低く下ろせる組から試し、横並びまで進めた組で止める。同じ
+    # 上腕の角度の組の中では、脇の開きより掌の向きを優先する。
     groups = []
     for arm_degs, abduction_deg in LOWERED_ARM_GROUPS:
         if not groups or groups[-1][0] != arm_degs:
@@ -1987,15 +2073,16 @@ def human_lateral(joint_positions, xy, hand):
 def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
                   translated_joints, collision_joints, verification_pairs,
                   collision_pairs, base_limits, yaw_margin_deg=None,
-                  target_lateral=APPROACH_TARGET_LATERAL):
+                  target_lateral=APPROACH_TARGET_LATERAL, windows=None,
+                  attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
+                  direct_below=None):
     """横並びの終わり ``last`` (``plan_path`` の最後の waypoint) の姿勢から、
     人の腕・掌を動かさず、台車を横へ人の方へ寄せる waypoint (寄せ、段階 2)
     を計画する。台車の向きは変えない。
 
     寄せ後の横の距離が目標 ``target_lateral`` の窓 (``APPROACH_WINDOW_COUNT``
-    個、近い方から) の移動先を、台車も動かすバッチ IK で解き、``plan_path``
-    で経路を作る。台車を窓の端へ直線で寄せながら直前の解から解き進める
-    経路も作り、より近ければそちらを採る。
+    個、近い方から) の移動先をバッチ IK で解き、``plan_path`` で経路を作る。
+    台車を窓の端へ直線で寄せる経路も作り、より近ければそちらを採る。
 
     Returns
     -------
@@ -2023,9 +2110,10 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     gaze_forward = forward_gaze_point(translated_joints)
     _place(robot, start_av, start)
     start_waist_z = waist_height(robot)
-    windows = [(round(target_lateral - 0.1 + 0.1 * i, 3),
-                round(target_lateral + 0.1 * i, 3))
-               for i in range(APPROACH_WINDOW_COUNT)]
+    if windows is None:
+        windows = [(round(target_lateral - 0.1 + 0.1 * i, 3),
+                    round(target_lateral + 0.1 * i, 3))
+                   for i in range(APPROACH_WINDOW_COUNT)]
     reasons = []
     best = None
     window = None
@@ -2038,10 +2126,14 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             base_limits, turn_degs=(0.0,), free_turn=GOAL_FREE_TURN,
             lowered_arms=[(real.shoulder, static.elbow)] * 3,
             max_waist_z=start_waist_z, branch_range_deg=100.0,
-            y_window=(lo, hi), yaw_margin_deg=yaw_margin_deg)
+            y_window=(lo, hi), yaw_margin_deg=yaw_margin_deg,
+            attempts_per_pose=attempts_per_pose)
         if not candidates:
             reasons.append('窓 {}-{} m の移動先の IK が解けない'.format(lo, hi))
             continue
+        # 横が近いものから (5 cm の幅の中ではコストの安い順)
+        candidates = sorted(candidates, key=lambda c: round(
+            human_lateral(translated_joints, c[2], hand) / 0.05))
         tried = 0
         for _, goal_av, goal_base, goal_turn, _ in candidates:
             if tried >= APPROACH_MAX_GOAL_TRIES:
@@ -2084,12 +2176,14 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
         if best is not None:
             break
     mode = 'batch' if best is not None else None
-    # 台車を目標の横の距離へ直線で寄せながら、直前の解から腕・脚を解き
-    # 進める (移動先は決めない)。止まったらそこまでを使う (各 waypoint は
-    # 検証済み)。バッチ IK の結果より近ければ採る。
+    # 台車を目標の横の距離へ直線で寄せながら直前の解から腕・脚を解き進める
+    # (移動先は決めない)。バッチ IK の結果より近ければ採る。
     goal = start.copy()
     goal[:2] = start[:2] - left * side * (lat0 - target_lateral)
-    if lat0 - target_lateral >= APPROACH_MIN_GAIN:
+    batch_lat = (human_lateral(translated_joints, best[-1]['base_position'],
+                               hand) if best is not None else lat0)
+    if (lat0 - target_lateral >= APPROACH_MIN_GAIN
+            and (direct_below is None or batch_lat > direct_below)):
         waypoints, fraction, why = plan_path(
             robot, robot_arm, hand, last['turn_deg'], last['turn_deg'],
             static, None, start_av, BasePath(start, goal), start_av, checker,
@@ -2121,13 +2215,15 @@ def _approach_ok(result):
 
 def _add_approach(robot, robot_arm, hand, post, turn_deg, result,
                   translated_joints, collision_joints, verification_pairs,
-                  collision_pairs, base_limits, yaw_margin_deg):
+                  collision_pairs, base_limits, yaw_margin_deg,
+                  approach_kwargs=None):
     """段階 1 が横並びまで進んだ ``result`` に、寄せの waypoint を足す。
     寄せられなければ足さず、``result['approach']`` に理由だけ残す。"""
     approach = plan_approach(
         robot, robot_arm, hand, post, turn_deg, result['waypoints'][-1],
         translated_joints, collision_joints, verification_pairs,
-        collision_pairs, base_limits, yaw_margin_deg=yaw_margin_deg)
+        collision_pairs, base_limits, yaw_margin_deg=yaw_margin_deg,
+        **(approach_kwargs or {}))
     waypoints = approach.pop('waypoints')
     approach['n_waypoints'] = len(waypoints)
     result['approach'] = approach
@@ -2147,68 +2243,82 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                      translated_joints, collision_joints, verification_pairs,
                      collision_pairs, base_limits,
                      attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
-                     use_facing_variants=True, approach=True, phis=None,
-                     stop_lateral=APPROACH_STOP_LATERAL):
+                     use_facing_variants=True, approach=True, facings=None,
+                     stop_lateral=APPROACH_STOP_LATERAL,
+                     approach_kwargs=None,
+                     time_limit=TRANSITION_TIME_LIMIT):
     """押し込み姿勢 ``post`` から、つないだ手を人の体の横へ下ろしながら
     ロボットも人と横並びになる位置・姿勢へ移り (段階 1、``_plan_stage1``)、
-    さらに台車を人の方へ寄せる (段階 2、``plan_approach``) waypoint を
-    計画する。
+    さらに台車を人の方へ寄せる (段階 2、``plan_approach``) waypoint を計画する。
 
-    人の掌の向き (``PALM_PHI_ORDER`` の角度、``HumanArm.lowering`` の
-    'phi<角度>') ごとに段階 1 を解き、横並びまで進んだ向きだけ段階 2 へ進める。
-    寄せ後の横の距離が ``stop_lateral`` 以下になった向きで打ち切り、
-    打ち切れなければ全部解いて寄せ後の一番近い向き (差が 2 cm 以内なら回す
-    量の小さい向き) を選ぶ。``GOAL_YAW_FALLBACK_DEG`` が設定されていて、
-    台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG`` で ``APPROACH_FALLBACK_LATERAL``
-    以内に寄れなければ、探索の範囲を広げて解き直す (終点の台車の向きは
-    ``GOAL_YAW_MARGIN_DEG`` に収まる解だけ)。ロボットの上半身は人の正面から
-    ``UPPER_BODY_LIMIT_DEG`` に収める (経路の途中、押し込み姿勢から戻る
-    waypoint を除く)。
+    人の掌の向き (``PALM_FACING_ORDER``) ごとに段階 1 を解き、横並びまで進んだ
+    向きだけ段階 2 へ進める。寄せ後の横の距離が ``stop_lateral`` 以下の向きで
+    打ち切り、打ち切れなければ全部解いて寄せ後の一番近い向き (差が 2 cm 以内
+    なら回す量の小さい向き) を選ぶ。台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG``
+    で ``APPROACH_FALLBACK_LATERAL`` 以内に寄れなければ、
+    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は人の正面から
+    ``UPPER_BODY_LIMIT_DEG`` に収める。
 
     ``translated_joints``・``collision_joints``・``base_limits`` と戻り値は
     ``_plan_stage1`` と同じ。加えて ``approach`` (寄せ: ``lateral_before``/
     ``lateral_after`` [m]、``window``、``mode``、``n_waypoints``、``reason``)、
-    ``palm_phi``、``yaw_margin`` を持ち、``waypoints`` は寄せまでを含む。
-    ``approach`` が False なら段階 2 は解かない。
+    ``yaw_margin`` を持ち、``waypoints`` は寄せまでを含む。``approach`` が
+    False なら段階 2 は解かず、横並びまで進んだ最初の解で止める。
+    ``time_limit`` [秒] (None なら無制限) を過ぎたら探索をやめ、それまでの
+    一番良い解を返す (``timed_out`` が True)。
     """
     t0 = time.time()
+    deadline = None if time_limit is None else t0 + time_limit
     standing = spik.human_standing_xy(translated_joints)
     facing = spik.human_facing_direction(translated_joints)
     if standing is None or facing is None or not use_facing_variants:
-        # 人の向きが求まらなければ段階 1 の理由を返す。掌の向きを自分で
-        # 決める呼び出し (use_facing_variants=False) は段階 1 だけ。
+        # 人の向きが求まらなければ段階 1 の理由を返す。掌の向きを自分で決める
+        # 呼び出し (use_facing_variants=False) は段階 1 だけ。
         return _plan_stage1(
             robot, robot_arm, hand, post, turn_deg, translated_joints,
             collision_joints, verification_pairs, collision_pairs,
             base_limits, attempts_per_pose=attempts_per_pose,
-            use_facing_variants=use_facing_variants)
+            use_facing_variants=use_facing_variants, deadline=deadline)
     human_yaw = math.atan2(facing[1], facing[0])
-    phis = PALM_PHI_ORDER if phis is None else tuple(phis)
+    facings = PALM_FACING_ORDER if facings is None else tuple(facings)
+    # 寄せまで解くなら向きごとに段階 1・2 を解いて比べる。寄せないなら段階 1 を
+    # 1 回で解き、最初に横並びまで進んだところで止める。
+    groups = ([(name,) for name in facings] if approach
+              else [tuple(facings)])
     margins = [GOAL_YAW_MARGIN_DEG]
     if GOAL_YAW_FALLBACK_DEG and GOAL_YAW_FALLBACK_DEG > GOAL_YAW_MARGIN_DEG:
         margins.append(GOAL_YAW_FALLBACK_DEG)
     results = []
     done = False
+
+    def out_of_time():
+        return deadline is not None and time.time() >= deadline
     with _upper_body_limit(human_yaw):
         for margin in margins:
+            # 探索を広げるのは、寄せるなら近くへ寄れなかったとき、寄せないなら
+            # 横並びまで進めた向きが無かったときだけ。
             if margin != margins[0] and (
-                    not approach or any(_approach_ok(r) for r in results)):
+                    any(_approach_ok(r) for r in results) if approach
+                    else done):
                 break
-            for phi in phis:
+            for group in groups:
+                if results and out_of_time():
+                    done = True
+                    break
                 result = _plan_stage1(
                     robot, robot_arm, hand, post, turn_deg,
                     translated_joints, collision_joints, verification_pairs,
                     collision_pairs, base_limits,
                     attempts_per_pose=attempts_per_pose,
-                    facings=('phi{:g}'.format(phi),), yaw_margin_deg=margin)
-                result.update(palm_phi=phi, yaw_margin=margin, approach=None)
+                    facings=group, yaw_margin_deg=margin, deadline=deadline)
+                result.update(yaw_margin=margin, approach=None)
                 if approach and result['verified'] \
                         and result['fraction'] >= 1.0:
                     _add_approach(
                         robot, robot_arm, hand, post, turn_deg, result,
                         translated_joints, collision_joints,
                         verification_pairs, collision_pairs, base_limits,
-                        margin)
+                        margin, approach_kwargs=approach_kwargs)
                 if margin != margins[0] and result['verified']:
                     # 探索を広げた解も、終点の台車の向きは元の範囲内
                     limit = math.radians(GOAL_YAW_MARGIN_DEG) + 0.01
@@ -2222,23 +2332,18 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                         and ap['lateral_after'] <= stop_lateral):
                     done = True
                     break
+                if (not approach and result['verified']
+                        and result['fraction'] >= 1.0):
+                    # 寄せを解かないなら、横並びまで進んだ最初の向きで終える
+                    done = True
+                    break
             if done:
                 break
 
-    def key(r):
-        ap = r['approach']
-        if ap and ap['n_waypoints']:
-            return (0, round(ap['lateral_after'] / 0.02), r['palm_phi'])
-        if r['verified'] and r['fraction'] >= 1.0:
-            end = r['waypoints'][-1]['base_position']
-            return (1, human_lateral(translated_joints, end, hand),
-                    r['palm_phi'])
-        if r['verified']:
-            return (2, -r['fraction'], r['palm_phi'])
-        return (3, 0.0, r['palm_phi'])
-
-    best = min(results, key=key)
+    best = min(results,
+               key=lambda r: _result_key(r, translated_joints, hand))
     best['tries'] = len(results)
+    best['timed_out'] = out_of_time()
     best['compute_time'] = time.time() - t0
     return best
 
@@ -2302,9 +2407,9 @@ def transition_summary(transition):
     approach = transition.get('approach')
     if approach is not None:
         if approach['n_waypoints']:
-            text += ' / 寄せ: 横 {:.2f} -> {:.2f} m ({}、掌 {:g} 度回し)'.format(
+            text += ' / 寄せ: 横 {:.2f} -> {:.2f} m ({})'.format(
                 approach['lateral_before'], approach['lateral_after'],
-                approach['mode'], transition.get('palm_phi', float('nan')))
+                approach['mode'])
         else:
             text += ' / 寄せない ({})'.format(approach['reason'])
     if transition['reason']:
