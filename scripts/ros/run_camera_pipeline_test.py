@@ -24,6 +24,7 @@ import copy
 import json
 import math
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -467,6 +468,41 @@ def untranslate_motion(motion, offset):
                 arm[key][1] -= dy
 
 
+class _DeferredSolver(object):
+    """軌道最適化のソルバーを包み、裏の準備 (``HandshakePlanner.warmup`` の
+    ``background_optimizer``) が終わるまで ``solve`` だけを待たせる。
+
+    準備中に最適化を要する計画 (線形補間・pre-touch が全部検証に落ちたとき
+    だけ ``solve`` が呼ばれる) が来ても、失敗にせず準備の完了を待つ。
+    準備していなければ (既定) 待たずにそのまま ``solve`` する。"""
+
+    def __init__(self, solver):
+        self._solver = solver
+        self._ready = threading.Event()
+        self._ready.set()
+
+    def set_pending(self):
+        self._ready.clear()
+
+    def set_ready(self):
+        self._ready.set()
+
+    def wait_ready(self, timeout=None):
+        return self._ready.wait(timeout)
+
+    def solve(self, *args, **kwargs):
+        if not self._ready.is_set():
+            t0 = time.time()
+            print('[motion] 軌道最適化の準備が終わるのを待っています...')
+            self._ready.wait()
+            print('[motion] 軌道最適化の準備を {:.1f} 秒待ちました。'.format(
+                time.time() - t0))
+        return self._solver.solve(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._solver, name)
+
+
 class HandshakePlanner(object):
     """差し出された掌に対する IK -> 軌道計画 -> 横並び移動の計画。
 
@@ -488,23 +524,14 @@ class HandshakePlanner(object):
     def __init__(self, args):
         self.args = args
         # IK は指なしで解く。
-        self.robot = Aero(use_hand=False)
-        spik.restrict_elbow_range(self.robot)
-        spik.restrict_leg_range(self.robot)
-        spik.restrict_waist_range(self.robot)
-        spik.restrict_neck_range(self.robot)
-        spik.lock_fixed_joints(self.robot)
-        spik.apply_collision_model(self.robot)
-        spik.apply_hand_box(self.robot)
-        # 指の点群のキャッシュを先に作る (約 1 秒)。
-        spik.other_hand_points('r')
-        # 事後検証用の総当たりペア (--collision-pairs の有無によらず必要)。
-        self.verification_pairs = spik.build_verification_pairs_for_model(
-            self.robot, args.collision_verify_model)
+        self.robot, self.verification_pairs = self._build_robot_and_pairs()
         self.motion_verification_pairs = self.verification_pairs
-        # JIT キャッシュを効かせるためノードの寿命で使い回す。
-        self.solver = create_solver(
+        # JIT キャッシュを効かせるためノードの寿命で使い回す。軌道最適化の
+        # 準備を裏で行うとき (warmup の background_optimizer) は、準備が終わる
+        # まで solve を待たせる。
+        self._real_solver = create_solver(
             'jaxls', max_iterations=args.max_iterations, verbose=False)
+        self.solver = _DeferredSolver(self._real_solver)
         self.collision_pairs = None
         if os.path.exists(args.collision_pairs):
             self.collision_pairs = spik.load_collision_pairs(
@@ -518,19 +545,48 @@ class HandshakePlanner(object):
                             tuple(args.base_y_range),
                             tuple(args.base_yaw_range)]
 
-    def warmup(self):
+    def _build_robot_and_pairs(self):
+        """IK・軌道計画用の指なしロボットと、事後検証用の総当たりペア
+        (``--collision-pairs`` の有無によらず必要) を作る。"""
+        robot = Aero(use_hand=False)
+        spik.restrict_elbow_range(robot)
+        spik.restrict_leg_range(robot)
+        spik.restrict_waist_range(robot)
+        spik.restrict_neck_range(robot)
+        spik.lock_fixed_joints(robot)
+        spik.apply_collision_model(robot)
+        spik.apply_hand_box(robot)
+        # 指の点群のキャッシュを先に作る (約 1 秒)。
+        spik.other_hand_points('r')
+        pairs = spik.build_verification_pairs_for_model(
+            robot, self.args.collision_verify_model)
+        return robot, pairs
+
+    def warmup(self, background_optimizer=False):
         """左右の腕で IK と軌道最適化をダミー目標で 1 回ずつ解き、JAX の
         トレース・コンパイルを起動時に済ませる。
 
         ``plan`` の呼び出しと引数を完全に一致させること
         (1 つでも違うと別関数としてトレースし直され、キャッシュミスする)。
+
+        ``background_optimizer`` なら、軌道最適化の準備 (起動時間の大半、
+        実機で片腕 10〜45 秒) は別のロボットで裏のスレッドが行い、この関数は
+        IK と横並び移動の準備だけで返る。最適化が要る人 (線形補間・pre-touch
+        が全部検証に落ちた人、実機で約 4%) の計画だけが、準備の完了を待つ。
         """
         random_state = np.random.get_state()
         np.random.seed(self._WARMUP_SEED)
         try:
-            self._warmup_body()
+            self._warmup_body(background_optimizer)
         finally:
             np.random.set_state(random_state)
+            # 裏のスレッドへ「これで全部」を伝える (例外のときも)。
+            if getattr(self, '_optimizer_jobs', None) is not None:
+                self._optimizer_jobs.put(None)
+
+    def wait_optimizer_ready(self, timeout=None):
+        """軌道最適化の準備が終わるまで待つ (終わっていれば True)。"""
+        return self.solver.wait_ready(timeout)
 
     def _pin_warmup_fixed_joints(self, robot_arm, handshake):
         """軌道最適化に渡す ``handshake`` の、軌道で動かさない関節 (差し出さ
@@ -557,12 +613,48 @@ class HandshakePlanner(object):
             angles[i] = float(np.clip(angle, joint.min_angle, joint.max_angle))
         handshake['joint_angle_vector'] = angles
 
-    def _warmup_body(self):
+    def _optimizer_warmup_job(self, robot, pairs, robot_arm, label, handshake,
+                              human_xy, motion_args, solver):
+        """軌道最適化の準備 1 件 (``plan`` と同じ引数で
+        ``plan_person_motion`` を force_optimize で 1 回解く)。"""
+        t0 = time.time()
+        phm.plan_person_motion(
+            robot, robot_arm, handshake, {}, human_xy, motion_args, pairs,
+            solver)
+        log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
+            label, time.time() - t0))
+
+    def _optimizer_warmup_thread(self, jobs, human_xy, motion_args):
+        """裏のスレッド: 別のロボット (IK のロボットは主スレッドが使う) で
+        ``jobs`` (腕・ラベル・握手姿勢の queue、None で終わり) の軌道最適化の
+        準備を順に行い、終わったら ``self.solver`` の待ちを解く。"""
+        t0 = time.time()
+        try:
+            robot, pairs = self._build_robot_and_pairs()
+            while True:
+                job = jobs.get()
+                if job is None:
+                    break
+                robot_arm, label, handshake = job
+                self._optimizer_warmup_job(
+                    robot, pairs, robot_arm, label, handshake, human_xy,
+                    motion_args, self._real_solver)
+            print('[warmup] 軌道最適化の準備が裏で完了しました ({:.1f} 秒)。'
+                  .format(time.time() - t0))
+        except BaseException as exc:  # 失敗しても待ちは解く (遅いだけで動く)
+            print('[warmup] 軌道最適化の裏の準備に失敗しました: {!r}。最適化が'
+                  '要る人の最初の計画でコンパイルします。'.format(exc))
+        finally:
+            self.solver.set_ready()
+
+    def _warmup_body(self, background_optimizer=False):
         """``warmup`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
         warmup_t0 = time.time()
+        jobs = None
+        self._optimizer_jobs = None
         collision_obstacles = (
             [] if self.collision_pairs is None
             else spik.human_body_obstacles({}))
@@ -599,12 +691,20 @@ class HandshakePlanner(object):
                 turn_index, angle_vector, base_pose, self.base_limits,
                 post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
             self._pin_warmup_fixed_joints(robot_arm, handshake)
-            t0 = time.time()
-            phm.plan_person_motion(
-                self.robot, robot_arm, handshake, {}, warmup_human_xy,
-                motion_args, self.motion_verification_pairs, self.solver)
-            log_debug('[warmup] {}腕: 軌道最適化 {:.1f} 秒'.format(
-                label, time.time() - t0))
+            if background_optimizer:
+                if jobs is None:
+                    jobs = self._optimizer_jobs = queue.Queue()
+                    self.solver.set_pending()
+                    threading.Thread(
+                        target=self._optimizer_warmup_thread,
+                        args=(jobs, warmup_human_xy, motion_args),
+                        name='optimizer-warmup', daemon=True).start()
+                jobs.put((robot_arm, label, handshake))
+            else:
+                self._optimizer_warmup_job(
+                    self.robot, self.motion_verification_pairs, robot_arm,
+                    label, handshake, warmup_human_xy, motion_args,
+                    self.solver)
             if args.side_by_side_transition:
                 # 横並び移動のバッチ IK (回転の拘束が違い別にコンパイルされる)。
                 t0 = time.time()
@@ -613,8 +713,10 @@ class HandshakePlanner(object):
                     self.collision_pairs, self.base_limits)
                 log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
                           .format(label, time.time() - t0))
-        print('[warmup] 完了しました ({:.1f} 秒)。'.format(
-            time.time() - warmup_t0))
+        print('[warmup] 完了しました ({:.1f} 秒)。{}'.format(
+            time.time() - warmup_t0,
+            '軌道最適化の準備は裏で続けています。'
+            if self._optimizer_jobs is not None else ''))
 
     def plan(self, joint_positions, palms, offered_hand, attempt):
         """差し出された掌 ``palms[offered_hand]`` に対して IK -> 軌道計画 ->
@@ -937,7 +1039,8 @@ class HandshakePipelineNode(object):
         self._last_skeleton_redraw_time = 0.0
         self._attempt_count = 0  # 試行番号 (ログ用)
 
-        self.planner.warmup()
+        self.planner.warmup(
+            background_optimizer=args.background_optimizer_warmup)
 
         # 実機接続は --auto-execute によらず試みる (ARM 時の初期姿勢復帰・
         # うなずきに使う)。失敗しても viewer として動作を続ける。表示スレッド
@@ -3874,6 +3977,12 @@ def build_arg_parser():
         '--motion-collision-verify-tolerance', type=float,
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
         help='軌道の事後検証で許容する最大貫通量 [m]。')
+    parser.add_argument(
+        '--no-background-optimizer-warmup', dest='background_optimizer_warmup',
+        action='store_false',
+        help='軌道最適化 (jaxls) の起動時の準備を裏のスレッドで行わず、IK の'
+             '準備と順に行う (既定は裏で行い、最適化が要る人の計画だけが準備の'
+             '完了を待つ)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='候補が検証に通っても必ず jaxls の軌道最適化まで実行する。')
