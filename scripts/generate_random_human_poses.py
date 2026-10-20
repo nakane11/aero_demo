@@ -5,7 +5,7 @@
 (手のランドマーク含む) を作って、両方を JSON に保存する。
 
 座標はロボット座標系 (x=前, y=左, z=上)、床 z=0 に接地。SMPL モデル
-ファイルはライセンス上同梱しないのでローカルパスを渡す。
+ファイルはローカルパスを渡す。
 
 Usage
 -----
@@ -81,13 +81,11 @@ class RandomSmplHumanGenerator(object):
     _SPINE_SWAY_MAX_DEG = 6.0           # 脊柱のごく僅かな傾き
     _NECK_SWAY_MAX_DEG = 8.0            # 首のごく僅かな傾き
 
-    # 鉛直軸まわりのひねり (正で左を向く)。sway は最小回転でヨーを持たない
-    # ので別に与える。
+    # 鉛直軸まわりのひねり (正で左を向く)。
     _SPINE_TWIST_MAX_DEG = 25.0         # 腰 (体幹) のひねり
     _NECK_TWIST_MAX_DEG = 45.0          # 首のひねり
 
-    # 肩: T-pose 基準の仰角 (-90=真下, +90=真上) と方位角 (正=前)。
-    # 仰角は腕を下ろした状態を最頻値とする三角分布。
+    # 肩: T-pose 基準の仰角 (-90=真下, +90=真上, 最頻値は真下) と方位角 (正=前)。
     _SHOULDER_ELEVATION_DOWN_DEG = -90.0
     _SHOULDER_ELEVATION_UP_DEG = 90.0
     _SHOULDER_AZIMUTH_DEG_RANGE = (-40.0, 110.0)
@@ -99,7 +97,7 @@ class RandomSmplHumanGenerator(object):
     _BETAS_STD = 1.5
     _BETAS_CLIP = 3.0
 
-    # 身長の上限 [m]。超えたら betas を引き直す。
+    # 身長の上限 [m] (超えたら betas を引き直す)。
     _MAX_HEIGHT_M = 1.7
     _MAX_HEIGHT_RESAMPLE_ATTEMPTS = 100
 
@@ -156,7 +154,6 @@ class RandomSmplHumanGenerator(object):
         zb = np.array([0.0, 0.0, 1.0])  # up
 
         pose = np.zeros((24, 3))
-        # root (pelvis) の向きは単位行列に固定。
         cumulative = {0: np.eye(3)}
 
         def swing(pose_idx, child_idx, obs_dir_world):
@@ -196,8 +193,7 @@ class RandomSmplHumanGenerator(object):
         cumulative[smpl_body.NECK] = cumulative[9].dot(neck_rot)
 
         # --- 腕 (左右独立): 肩の仰角・方位角 + 肘 + 手首のひねり ---
-        # 手首のひねりは pose[wrist_idx] に書く (メッシュとランドマークの
-        # 掌の向きを一致させるため)。
+        # 手首のひねりは pose[wrist_idx] に書く (メッシュと掌の向きを一致させる)。
         wrist_rots = {}
         for shoulder_idx, elbow_idx, wrist_idx, side, sign in (
                 (smpl_body.L_SHOULDER, smpl_body.L_ELBOW, smpl_body.L_WRIST,
@@ -218,7 +214,6 @@ class RandomSmplHumanGenerator(object):
             forearm_dir = _rotate(upper_dir, xb, flex * sign)
             swing(elbow_idx, wrist_idx, forearm_dir)
 
-            # 前腕の T-pose 方向 (局所軸) まわりにひねる。
             forearm_rest_dir = _unit(
                 smpl_body.PERM.dot(model.J[wrist_idx] - model.J[elbow_idx]))
             twist = math.radians(
@@ -232,7 +227,7 @@ class RandomSmplHumanGenerator(object):
         vertices, joints = smpl_body.forward_world(
             model, pose, betas, root_pos=np.zeros(3))
 
-        # 身長上限を超えたら betas だけ引き直す (pose はそのまま)。
+        # 身長上限超えは betas だけ引き直す。
         for _ in range(self._MAX_HEIGHT_RESAMPLE_ATTEMPTS):
             height = float(vertices[:, 2].max() - vertices[:, 2].min())
             if height <= self._MAX_HEIGHT_M:
@@ -241,7 +236,6 @@ class RandomSmplHumanGenerator(object):
             vertices, joints = smpl_body.forward_world(
                 model, pose, betas, root_pos=np.zeros(3))
 
-        # 最下点を床 (z=0) に接地させる。
         min_z = float(vertices[:, 2].min())
         root_pos = np.array([0.0, 0.0, -min_z])
         vertices = vertices + root_pos
@@ -272,11 +266,7 @@ class RandomSkeletonGenerator(object):
 
     @staticmethod
     def _hand_frame(wrist_rot, rest_dir_robot, side):
-        """手首の局所座標系 (u=指方向, v=親指側, n=掌の向き) を返す.
-
-        T-pose の基準フレーム (u0=前腕方向, n0=``smpl_body._REST_PALM_NORMAL``,
-        v0=親指側 +X) に ``wrist_rot`` (ロボット座標系) を掛けて作る。
-        """
+        """手首の局所座標系 (u=指方向, v=親指側, n=掌の向き) を返す."""
         wrist_rot = np.asarray(wrist_rot, dtype=np.float64)
         u0 = np.asarray(rest_dir_robot, dtype=np.float64)
         n0 = smpl_body._REST_PALM_NORMAL
@@ -312,7 +302,7 @@ class RandomSkeletonGenerator(object):
         neck = joints['Neck']
         head = smpl_joints[smpl_body.HEAD]
         head_dir = _unit(head - neck, fallback=zb)
-        # 顔の正面: head_rot で回した +x の、首->頭の軸に直交する成分。
+        # 顔の正面: head_rot で回した +x の首->頭軸に直交する成分。
         head_rot = smpl_person.get('head_rot')
         if head_rot is None:
             head_fwd_raw = np.cross(yb, head_dir)

@@ -2,13 +2,12 @@
 # -*- coding:utf-8 -*-
 
 """``solve_palm_ik.py`` の IK 結果 JSON と対応する SMPL モデルを
-ファイル名で突き合わせ、viser で並べて表示する。
+ファイル名で突き合わせ、viser で表示する。
 
-人体・ロボットの干渉用近似ジオメトリと台車の可動範囲を半透明で重ね、
-IK 失敗時は目標 (長い Axis) と手先 (短い Axis) を描く。人間の顔は
-ロボットの手先を向くよう首/頭だけ回して描く。IK 対象外 (``target``
-が false) の人物は読み飛ばす。Back/Next/Good/Bad ボタンで切り替え・
-判定 (``human_label`` を handshake JSON に書き込む)。
+干渉用ジオメトリと台車の可動範囲を半透明で重ね、IK 失敗時は目標 (長い
+Axis) と手先 (短い Axis) を描く。人の顔は手先を向ける。``target`` が false
+の人物は読み飛ばす。Back/Next/Good/Bad で切り替え・判定 (``human_label``
+を handshake JSON に書く)。
 
 Usage
 -----
@@ -65,18 +64,18 @@ from skrobot.viewers import ViserViewer  # noqa: E402
 
 SKIN_COLOR = [180, 130, 110, 255]
 
-# 台車の可動範囲 (薄い赤の半透明平面)。z は z-fighting 回避のため少し浮かす。
+# 台車の可動範囲 (半透明平面)。z は z-fighting 回避。
 BASE_MOVABLE_REGION_COLOR = [220, 40, 40, 60]
 BASE_MOVABLE_REGION_HEIGHT = 0.005
 BASE_MOVABLE_REGION_Z = 0.005
 
-# IK 失敗時の Axis [m]。色では区別できないので長さで区別 (長い方が目標)。
+# IK 失敗時の Axis [m]。長さで区別 (長い方が目標)。
 TARGET_AXIS_LENGTH = 0.12
 TARGET_AXIS_RADIUS = 0.005
 HAND_AXIS_LENGTH = 0.06
 HAND_AXIS_RADIUS = 0.005
 
-# 視線の回転のうち首 (NECK) に持たせる割合 (残りは頭)。
+# 視線の回転のうち首に持たせる割合 (残りは頭)。
 GAZE_NECK_RATIO = 0.5
 
 # 胸の正面から顔の正面を離せる最大角度 [deg]。
@@ -85,7 +84,7 @@ GAZE_MAX_ANGLE_DEG = 80.0
 # 首を回すと頭も動くので解き直す回数。
 GAZE_ITERATIONS = 2
 
-# 静止姿勢での顔の正面 (ロボット座標系の +x)。
+# 静止姿勢での顔の正面 (+x)。
 GAZE_FORWARD_AXIS = np.array([1.0, 0.0, 0.0])
 
 
@@ -108,10 +107,7 @@ def load_handshake_json(path):
 
 
 def smpl_world_rots(model, pose):
-    """SMPL の各関節のワールド (ロボット座標系) 回転行列 ``(24, 3, 3)``.
-
-    root は回転しない (``forward_world`` と同じ)。
-    """
+    """SMPL の各関節のワールド回転行列 ``(24, 3, 3)`` (root は回転しない)."""
     pose = np.asarray(pose, dtype=np.float64).reshape(24, 3)
     world_rots = np.zeros((24, 3, 3))
     for i in range(24):
@@ -124,10 +120,7 @@ def smpl_world_rots(model, pose):
 
 
 def limit_direction(base, direction, max_angle):
-    """``direction`` を ``base`` から ``max_angle`` [rad] 以内に丸める.
-
-    回転量でなく方向を丸めるので ``look_at_pose`` の反復が収束する。
-    """
+    """``direction`` を ``base`` から ``max_angle`` [rad] 以内に丸める."""
     angle = np.arccos(np.clip(float(np.dot(base, direction)), -1.0, 1.0))
     if angle <= max_angle:
         return direction
@@ -153,7 +146,7 @@ def look_at_pose(model, person, target_position):
             model, pose, person['betas'], person['root_pos'])
         world_rots = smpl_world_rots(model, pose)
         forward = world_rots[smpl_body.HEAD].dot(GAZE_FORWARD_AXIS)
-        # 首をひねれる限界は胸 (首の親) の正面から測る。
+        # 限界は胸 (首の親) の正面から測る。
         chest_forward = world_rots[model.parent[smpl_body.NECK]].dot(
             GAZE_FORWARD_AXIS)
 
@@ -168,8 +161,7 @@ def look_at_pose(model, person, target_position):
         if np.linalg.norm(axis_angle) < 1e-9:
             break
 
-        # 首 -> 頭の順に、ワールド回転を親の座標系に移して入れる
-        # (頭の親は回した後の首)。
+        # 首 -> 頭の順にワールド回転を親座標系へ移して入れる。
         parent_world = world_rots[model.parent[smpl_body.NECK]]
         accumulated = np.eye(3)
         for joint_index, ratio in ((smpl_body.NECK, GAZE_NECK_RATIO),
@@ -185,7 +177,7 @@ def look_at_pose(model, person, target_position):
 
 
 def build_smpl_mesh(model, person, pose=None):
-    """SMPL のメッシュを作る (``pose`` を渡すと ``person['pose']`` の代わりに使う)."""
+    """SMPL のメッシュを作る (``pose`` 指定時は ``person['pose']`` の代わり)."""
     if pose is None:
         pose = person['pose']
     vertices, _joints = smpl_body.forward_world(
@@ -196,7 +188,7 @@ def build_smpl_mesh(model, person, pose=None):
 
 
 def is_target(handshake):
-    """IK の対象にした人物か (``target`` キーが無い古い JSON は対象扱い)."""
+    """IK の対象にした人物か (``target`` が無ければ対象)."""
     return bool(handshake.get('target', True))
 
 
@@ -305,7 +297,7 @@ def main():
     robot = load_aero(use_hand=True)
 
     viewer = ViserViewer(draw_grid=True)
-    # ボタンはロボットを add する前に作る (関節スライダーの下に埋もれるため)。
+    # ボタンはロボットの add 前に作る (スライダーの下に埋もれるため)。
     nav = viewer_nav.ManualNav(viewer)
     label_text = viewer._server.gui.add_markdown('')
 
@@ -318,14 +310,14 @@ def main():
     show_post_process_checkbox = viewer._server.gui.add_checkbox(
         '後処理後の姿勢を表示 (掌に押し付け/自分の手を注視)',
         initial_value=False)
-    # 表示中の handshake (クロージャから更新するため 1 要素リスト)。
+    # 表示中の handshake (クロージャ更新用)。
     current_handshake = [None]
 
     def set_link_visible(link, visible):
         common_set_link_visible(viewer, link, visible)
 
     def refresh_robot_pose():
-        """表示中の handshake をチェックボックスに応じた姿勢で反映する."""
+        """表示中の handshake を反映する."""
         handshake = current_handshake[0]
         if handshake is None:
             return
@@ -354,17 +346,17 @@ def main():
     viewer.add(robot)
     robot_collision_overlay = build_robot_collision_overlay(robot)
     viewer.add(robot_collision_overlay)
-    # 事後検証と同じ干渉ペア (人物に依存しない。'r' はプレースホルダ)。
+    # 事後検証と同じ干渉ペア ('r' はプレースホルダ)。
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
-    # 関節スライダーは robot と overlay の姿勢を食い違わせるので消す。
+    # スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
     remove_obstacles_gui(viewer)
     viewer.show(open_browser=not args.no_open_browser)
     viewer_nav.wait_for_client(viewer, args.client_wait_timeout)
     viewer_nav.set_front_view(viewer)
 
-    # IK 失敗時だけ表示する Axis (1 組を使い回す)。
+    # IK 失敗時だけ表示する Axis。
     target_axis = Axis(axis_length=TARGET_AXIS_LENGTH,
                        axis_radius=TARGET_AXIS_RADIUS)
     hand_axis = Axis(axis_length=HAND_AXIS_LENGTH,
@@ -424,12 +416,12 @@ def main():
             set_link_visible(current_base_region_link,
                              show_base_region_checkbox.value)
 
-        # 人物を切り替えたら後処理前の姿勢から表示する。
+        # 人物切り替え時は後処理前から表示。
         current_handshake[0] = handshake
         show_post_process_checkbox.value = False
         refresh_robot_pose()
 
-        # 表示中の姿勢で貫通している組 (事後検証と同じ形状・許容誤差)。
+        # 貫通している組 (事後検証と同じ基準)。
         colliding_pairs = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
             current_obstacle_links,

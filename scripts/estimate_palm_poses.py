@@ -4,9 +4,8 @@
 """骨格 (MediaPipe 形式の関節位置 dict) から左右の掌の位置姿勢と、
 人が差し出している手 (``offered_hand``) を推定して JSON に保存する。
 
-合成骨格と実カメラで同じ ``PalmPoseEstimator.estimate`` を使う。手の
-ランドマークが 3 点未満の側は ``None`` (前腕からのフォールバックはしない)。
-掌のローカル座標系: +x=指先方向, +y=手の甲->掌 (法線), +z=x cross y。
+手のランドマークが 3 点未満の側は ``None``。
+掌座標系: +x=指先方向, +y=手の甲->掌 (法線), +z=x cross y。
 
 Usage
 -----
@@ -43,11 +42,11 @@ iter_skeleton_files = json_io.iter_json_files
 
 
 # --- 差し出している手の判定に使う定数 -------------------------------------
-# 既定のロボット手先位置: 人物から +x に 3.0 m、高さ 1.2 m (ワールド座標)。
+# 既定のロボット手先位置: 人物から +x に 3.0 m、高さ 1.2 m。
 ROBOT_FORWARD_DISTANCE = 3.0
 ROBOT_HAND_HEIGHT = 1.2
 
-# 特徴量 (0..1) の重み。合計 1.0。合成骨格と実カメラで共通。
+# 特徴量 (0..1) の重み。合計 1.0。
 OFFER_FEATURE_WEIGHTS = {
     'approach': 0.25,
     'separation': 0.05,
@@ -55,39 +54,35 @@ OFFER_FEATURE_WEIGHTS = {
     'thumb_roll': 0.15,
 }
 
-# face_to_robot は重み付き和でなく減点:
-#     score -= FACE_AWAY_PENALTY * (1 - face_to_robot)
+# face_to_robot は減点: score -= FACE_AWAY_PENALTY * (1 - face_to_robot)
 FACE_AWAY_PENALTY = 0.15
 
 # 各特徴量のランプ (下限, 上限)。下限以下で 0、上限以上で 1。距離は [m]。
 APPROACH_RAMP = (0.0, 0.45)
 SEPARATION_RAMP = (0.35, 0.55)
 FINGER_TO_ROBOT_RAMP = (0.0, 0.90)
-# 手を体の横に下げて差し出す (手繋ぎ) と指先が下を向き、ロボットへの cos が
-# 小さくなる。指先の下向き (-finger・up) と、脱力した掌からロボット側へ
-# 出た距離 [m] の両方のランプの積も finger_to_robot の候補にする
-# (腕を垂らしただけでは後者が 0 なので点が入らない)。
+# 手を横に下げた差し出し用: 指先の下向き cos と、脱力した掌からロボット側へ
+# 出た距離 [m] のランプの積も finger_to_robot の候補にする。
 DOWN_FINGER_RAMP = (0.40, 0.70)
 DOWN_FINGER_APPROACH_RAMP = (0.08, 0.20)
-# 親指が明らかに下向きの不自然な差し出しを弾く。
 THUMB_ROLL_RAMP = (-0.20, 0.30)
 FACE_TO_ROBOT_RAMP = (-0.20, 0.50)
 
-# thumb_roll の基準 (人体軸ではなく世界の鉛直)。
+# thumb_roll の基準 (世界の鉛直)。
 WORLD_UP = np.array([0.0, 0.0, 1.0])
 
-# これ未満のスコアしか無ければ offered_hand=None (誤って掴みに行かない側に倒す)。
+# これ未満なら offered_hand=None。
 OFFER_SCORE_MIN = 0.86
 # 左右のスコア差がこれ未満なら ambiguous。
 AMBIGUOUS_MARGIN = 0.08
 
-# 掌の静止判定 (select に t を渡したときだけ効く)。
+# 掌の静止判定 (select に t を渡したときだけ有効)。
 STILLNESS_WINDOW = 0.5  # [s]
 STILLNESS_MAX_DISPLACEMENT = 0.05  # [m]
 # 履歴のサンプル間隔がこれを超えたら履歴を捨てる [s]。
 STILLNESS_MAX_GAP = 0.4
 
-# 欠測した関節の補完に使う人体比。
+# 欠測関節の補完に使う人体比。
 _TORSO_PER_SHOULDER_WIDTH = 1.25
 _ARM_PER_TORSO = 1.15
 _DEFAULT_SHOULDER_WIDTH = 0.40
@@ -120,11 +115,7 @@ def _distance_to_segment(point, end_a, end_b):
 
 
 def _body_frame(joints):
-    """関節位置から :class:`_BodyFrame` を作る.
-
-    片肩欠けは ``Neck`` で、両腰欠けは +z 軸と肩幅からの胴長で補う。
-    両肩とも無い・縮退時は ``None``。
-    """
+    """関節位置から :class:`_BodyFrame` を作る (両肩無し・縮退は ``None``)."""
     r_sho = joints.get('RShoulder')
     l_sho = joints.get('LShoulder')
     if r_sho is not None and l_sho is not None:
@@ -169,15 +160,15 @@ def _midpoint(joints, name_a, name_b):
 
 
 def _face_frame(joints, body):
-    """顔の前方向 (単位ベクトル) と顔の位置の組を返す。作れなければ ``None``.
+    """顔の前方向と顔の位置の組を返す (作れなければ ``None``).
 
-    「両耳の中点 -> 鼻」を優先し、無ければ左右軸 x 体軸 (pitch は取れない)。
+    「両耳の中点 -> 鼻」を優先し、無ければ左右軸 x 体軸。
     """
     nose = joints.get('Nose')
     ear_center = _midpoint(joints, 'REar', 'LEar')
     eye_center = _midpoint(joints, 'REye', 'LEye')
 
-    # 顔の位置: 耳の中点 > 目の中点 > 鼻 > 首 > 肩の中点。
+    # 顔の位置の優先順: 耳 > 目 > 鼻 > 首 > 肩の中点。
     position = ear_center
     for candidate in (eye_center, nose, joints.get('Neck'),
                       body.shoulder_center):
@@ -190,7 +181,6 @@ def _face_frame(joints, body):
     if nose is not None and base is not None:
         forward = _unit(nose - base)
     if forward is None:
-        # 左右軸 (人物の左方向)。
         lateral = None
         if 'REar' in joints and 'LEar' in joints:
             lateral = joints['LEar'] - joints['REar']
@@ -232,20 +222,20 @@ def _arm_length(joints, side, torso):
 class OfferedHandSelector(object):
     """左右の掌のうち、人が手繋ぎのために差し出している方を選ぶ.
 
-    左右それぞれ 4 特徴量の重み付き和から顔の向きの減点を引いたスコアを
-    付け、``score_min`` 以上の側の argmax を採る (無ければ ``None``)。
+    左右それぞれ 4 特徴量の重み付き和から顔向きの減点を引いたスコアを付け、
+    ``score_min`` 以上の側の argmax を採る (無ければ ``None``)。
 
-    特徴量 (距離は身長で正規化しない [m]):
-      ``approach``: 脱力して垂らした掌に比べてロボットへどれだけ近づいたか。
+    特徴量 (距離は [m]):
+      ``approach``: 脱力した掌に比べてロボットへどれだけ近づいたか。
       ``separation``: 掌と胴体 (腰-肩の線分) の距離。
-      ``finger_to_robot``: 指先方向と掌->ロボット方向の cos。指先が下向きで
-      掌がロボット側へ出ていれば、その度合い (``DOWN_FINGER_*``) も認める。
+      ``finger_to_robot``: 指先方向と掌->ロボット方向の cos (下向き指先は
+      ``DOWN_FINGER_*`` でも認める)。
       ``thumb_roll``: 指先軸まわりのロール (親指が上=1, 水平=0, 下=-1)。
       ``face_to_robot``: 顔の前方向と顔->ロボット方向の cos (減点のみ。
-      顔が取れなければ 1.0 扱い)。
+      顔が取れなければ 1.0)。
 
-    ``select`` に時刻 ``t`` を渡すと掌の静止判定も加わる。掌位置の履歴を
-    持つので人物ごとに別インスタンスを使うこと。
+    ``select`` に時刻 ``t`` を渡すと静止判定も加わる。掌位置の履歴を持つので
+    人物ごとに別インスタンスを使うこと。
     """
 
     def __init__(self, robot_position=None, weights=None,
@@ -264,17 +254,15 @@ class OfferedHandSelector(object):
         Parameters
         ----------
         robot_position : (3,) array_like or None
-            ロボット手先のワールド座標。``None`` なら人物ごとに
-            :meth:`_robot_position` の既定位置。
+            ロボット手先のワールド座標。``None`` なら人物ごとの既定位置。
         max_distance : float or None
             人物 (腰) からロボットまでがこれを超えたら両手 ``veto='too_far'``。
         finger_to_robot_axis_blend : float
             ``finger_to_robot`` の軸を指先 (0.0) から掌の法線 (1.0) へ寄せる率。
         approach_height_scale : float
-            ``approach`` の距離計算で z 差分に掛ける倍率 (0 で水平のみ)。
+            ``approach`` の距離で z 差分に掛ける倍率 (0 で水平のみ)。
         down_finger_ramp, down_finger_approach_ramp : tuple or None
-            下向きの指先を認めるランプ (下向きの cos と、ロボット側へ出た
-            距離 [m])。``None`` なら認めない (cos だけ)。
+            下向き指先のランプ (cos、ロボット側へ出た距離 [m])。``None`` なら無効。
         stillness_window : float
             0.0 以下なら静止判定をしない。
         """
@@ -297,7 +285,7 @@ class OfferedHandSelector(object):
         self.stillness_window = float(stillness_window)
         self.stillness_max_displacement = float(stillness_max_displacement)
         self.stillness_max_gap = float(stillness_max_gap)
-        # 左右の掌位置の履歴 [(t, position), ...] (t 昇順)。
+        # 掌位置の履歴 [(t, position), ...] (t 昇順)。
         self._palm_history = {'R': [], 'L': []}
 
     def reset_stillness(self):
@@ -305,7 +293,7 @@ class OfferedHandSelector(object):
         self._palm_history = {'R': [], 'L': []}
 
     def select(self, joint_positions, palms, t=None):
-        """どちらの手を繋ぐべきかを判定する.
+        """差し出している手を判定する.
 
         Parameters
         ----------
@@ -314,8 +302,7 @@ class OfferedHandSelector(object):
         palms : dict
             ``PalmPoseEstimator.estimate`` の ``{'R': palm, 'L': palm}``。
         t : float or None
-            フレーム時刻 [s]。渡すと静止判定を行う (同じ ``t`` の再呼び出しは
-            履歴を増やさない)。
+            フレーム時刻 [s]。渡すと静止判定を行う。
 
         Returns
         -------
@@ -364,7 +351,7 @@ class OfferedHandSelector(object):
         side = None
         if candidates:
             best = max(candidates, key=lambda s: candidates[s])
-            # 静止していなければ見送る (反対の手には切り替えない)。
+            # 静止していなければ見送る。
             if (candidates[best] >= self.score_min
                     and still[best] is not False):
                 side = best
@@ -386,13 +373,13 @@ class OfferedHandSelector(object):
             history = self._palm_history[side]
             palm = palms.get(side)
             if palm is None:
-                # 一時的なロストでは履歴を残す (max_gap を超えたら捨てる)。
+                # 一時的なロストでは履歴を残す。
                 if history and t - history[-1][0] > self.stillness_max_gap:
                     del history[:]
                 continue
             position = np.asarray(palm['position'], dtype=np.float64)
             if history and t < history[-1][0]:
-                # 時刻が巻き戻った (rosbag のループ再生等)。
+                # 時刻の巻き戻り (ループ再生等)。
                 del history[:]
             if history and t - history[-1][0] > self.stillness_max_gap:
                 del history[:]
@@ -400,12 +387,12 @@ class OfferedHandSelector(object):
                 history[-1] = (t, position)
             else:
                 history.append((t, position))
-            # 窓の始点以前のサンプルは 1 つだけ残す。
+            # 窓の始点以前は 1 つだけ残す。
             window_start = t - self.stillness_window
             while len(history) >= 2 and history[1][0] <= window_start:
                 del history[0]
 
-            # 現在位置からのずれが閾値以内に収まり続けている時間。
+            # 現在位置からのずれが閾値以内の継続時間。
             since = t
             for sample_t, sample_position in reversed(history):
                 if (np.linalg.norm(sample_position - position)
@@ -413,7 +400,7 @@ class OfferedHandSelector(object):
                     break
                 since = sample_t
             still_duration[side] = t - since
-            # 1e-6 はタイムスタンプの浮動小数点誤差ぶん。
+            # 1e-6 は浮動小数点誤差ぶん。
             still[side] = (still_duration[side]
                            >= self.stillness_window - 1e-6)
         return still, still_duration
@@ -453,7 +440,6 @@ class OfferedHandSelector(object):
         arm = _arm_length(joints, side, body.torso)
         robot = self._robot_position(body)
 
-        # 脱力して真下に垂れた掌の位置。
         rest = shoulder - arm * body.up
         approach_distance = (self._robot_distance(robot, rest)
                              - self._robot_distance(robot, center))
@@ -532,16 +518,14 @@ def format_offer_scores(selection, score_min):
     return ', '.join(parts)
 
 
-# --- 掌を真横から見たときの推定 (PalmPoseEstimator._estimate_edge_on) -------
-# 掌の 5 点の視線方向の広がりの比 (2 番目/1 番目) がこれ以下なら真横。
-# 10/16 試行3 (付け根 4 点が同じ画素に重なった) で 0.01〜0.03、正面なら 0.5 前後。
+# --- 掌を真横から見たときの推定 (_estimate_edge_on) ---
+# 掌 5 点の視線方向の広がりの比 (2 番目/1 番目) がこれ以下なら真横。
 EDGE_ON_MAX_SPAN_RATIO = 0.15
-# 指先方向が視線に近い (指をカメラへ向けている) と平面が決まらない。
+# 指先方向が視線にこれ以上近いと平面が決まらない。
 EDGE_ON_MAX_FINGER_RAY_COS = math.cos(math.radians(30.0))
-# 深度で見えるのは手の手前の縁。掌の中心はおよそ掌の幅の半分だけ奥。
+# 深度で見えるのは手前の縁なので、中心を視線の奥へずらす量。
 EDGE_ON_DEPTH_OFFSET = 0.03  # [m]
-# 親指と付け根の視線方向の差がこれ以上なら表裏を親指で決める。10/16 試行3
-# (計画時の掌が裏返っていた) では親指が 17〜23mm 手前だった。
+# 親指と付け根の視線方向の差がこれ以上なら表裏を親指で決める。
 EDGE_ON_MIN_THUMB_DEPTH = 0.005  # [m]
 
 
@@ -556,13 +540,12 @@ def flip_palm(palm):
 
 
 def hand_joint_positions(hand, side):
-    """``PeoplePoseEstimator.estimate_hands_3d`` の手 1 つを、``side`` の手
-    として ``estimate_palm`` に渡せる関節名 -> 位置にする (Hands の左右判定は
-    誤りうるので、呼び出し側が決めた ``side`` の名前に付け替える)。"""
+    """``estimate_hands_3d`` の手 1 つを ``side`` の関節名 -> 位置にする
+    (Hands の左右は誤りうるので呼び出し側の ``side`` に付け替える)。"""
     joints = {}
     for key in ('positions', 'model_positions'):
         for name, p in hand.get(key, {}).items():
-            # '{side}Hand{i}' / '{side}PalmModel{i}' の先頭 1 文字が左右。
+            # 先頭 1 文字が左右。
             joints[side + name[1:]] = p
     return joints
 
@@ -575,7 +558,7 @@ class PalmPoseEstimator(object):
             offered_hand_selector or OfferedHandSelector()
 
     def estimate(self, joint_positions, t=None):
-        """左右の掌の位置姿勢と、手繋ぎに使うべき手を推定する.
+        """左右の掌の位置姿勢と差し出している手を推定する.
 
         Parameters
         ----------
@@ -604,8 +587,7 @@ class PalmPoseEstimator(object):
         """``side`` ('R'/'L') の掌 1 つだけを推定する (差し出し判定なし).
 
         ``camera_position`` と ``reference_normal`` (関節と同じ座標系) を
-        渡すと、掌を真横から見て平面が作れないときも
-        ``_estimate_edge_on`` で推定する。
+        渡すと、平面が作れないとき ``_estimate_edge_on`` で推定する。
         """
         joints = {name: np.asarray(p, dtype=np.float64)
                  for name, p in joint_positions.items()}
@@ -621,20 +603,16 @@ class PalmPoseEstimator(object):
     def _estimate_edge_on(joints, side, camera_position, reference_normal):
         """掌を真横から見ている (掌の点が画像上でほぼ一直線) ときの掌.
 
-        真横から見ると掌の平面は視線を含むので、法線は指先方向 (手首 ->
-        指の付け根、深度で測れる) と視線の両方に垂直になる。表裏は親指が
-        付け根より手前か奥か (MediaPipe の推定深度) で決め、差が
-        ``EDGE_ON_MIN_THUMB_DEPTH`` 未満なら ``reference_normal`` に近い側を
-        採る (計画時の掌が裏返っていると一緒に裏返るので最後の手段)。
-        見えているのは手の手前の縁なので、中心は視線の奥へ
-        ``EDGE_ON_DEPTH_OFFSET`` ずらす。
+        平面は視線を含むので、法線は指先方向 (手首 -> 付け根) と視線の両方に
+        垂直。表裏は親指が付け根より手前か奥か (推定深度) で決め、差が
+        ``EDGE_ON_MIN_THUMB_DEPTH`` 未満なら ``reference_normal`` に近い側。
+        中心は視線の奥へ ``EDGE_ON_DEPTH_OFFSET`` ずらす。
         """
         wrist = joints.get('{}Hand{}'.format(side, palm_plane.WRIST_INDEX))
         mcps = [joints[name] for name in (
             '{}Hand{}'.format(side, i) for i in palm_plane.MCP_INDICES)
             if name in joints]
-        # 画像上の並びは推定深度の掌の点 (各ランドマークの画素の視線上に
-        # ある) から見る。
+        # 画像上の並びは推定深度の掌の点で見る。
         model = [joints[name] for name in (
             '{}PalmModel{}'.format(side, i)
             for i in palm_plane.PLANE_LANDMARKS) if name in joints]
@@ -657,8 +635,7 @@ class PalmPoseEstimator(object):
                 or abs(float(np.dot(x_axis, ray))) > EDGE_ON_MAX_FINGER_RAY_COS:
             return None
         y_axis = _unit(np.cross(x_axis, ray))
-        # 親指は人差し指側にあるので、親指が付け根より手前なら人差し指側が
-        # カメラを向いている (fit_palm_plane と同じ左右の決まりで法線へ)。
+        # 親指が付け根より手前なら人差し指側がカメラを向いている。
         thumb = [joints[name] for name in (
             '{}PalmModel{}'.format(side, i)
             for i in palm_plane.THUMB_LANDMARKS) if name in joints]
@@ -691,9 +668,7 @@ class PalmPoseEstimator(object):
 
     def _estimate_one(self, joints, side):
         plane = self._fit_plane(joints, '{}Hand{{}}'.format(side), side)
-        # 実カメラでは PeoplePoseEstimator が MediaPipe の推定深度で作った
-        # 掌の点も渡す。カメラの深度で平面が作れない (掌の点がほぼ一直線)
-        # か、向きが裏返っている (90 度超の食い違い) ときはそちらを使う。
+        # 深度で平面が作れない・向きが 90 度超食い違うときは推定深度の掌の点を使う。
         model_plane = self._fit_plane(
             joints, '{}PalmModel{{}}'.format(side), side)
         if model_plane is not None and (
@@ -703,8 +678,7 @@ class PalmPoseEstimator(object):
         if plane is None:
             return None
 
-        # plane.rot はロボット手先向け (+Y = -normal) なので、人の掌フレーム
-        # (+y = normal) はここで組み直す。
+        # plane.rot はロボット手先向け (+Y = -normal) なので組み直す。
         x_axis = plane.finger_dir
         y_axis = plane.normal
         z_axis = np.cross(x_axis, y_axis)

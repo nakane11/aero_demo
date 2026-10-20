@@ -4,9 +4,8 @@
 """``plan_handshake_motion.py`` の軌道 JSON を、対応する骨格・握手姿勢
 JSON と合わせて viser で再生する (waypoint スライダー/Play)。
 
-各 waypoint の干渉余裕と貫通しているリンクの組を表示する。``planned``
-が false の人物は読み飛ばす。経路末尾の押し込み (``post_process``) と
-横並び移動は表示専用で、経路の検証対象ではない。
+各 waypoint の干渉余裕と貫通リンク組を表示する。``planned`` が false の人物
+は読み飛ばす。押し込み・横並び移動は表示専用 (経路の検証対象外)。
 
 Usage
 -----
@@ -69,10 +68,10 @@ from view_handshake_poses import load_skeleton_json as load_smpl_params  # noqa:
 from aero_demo.aero_urdf_setup import load_aero  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
-# waypoint 自動再生の既定の速さ [waypoint/秒]。
+# 自動再生の既定の速さ [waypoint/秒]。
 DEFAULT_PLAYBACK_FPS = 40.0
 
-# plan_handshake_motion.KIND_LABELS の複製 (向こうは import が重い)。
+# plan_handshake_motion.KIND_LABELS の複製 (import が重いため)。
 KIND_LABELS = {
     'pretouch': 'pre-touch 経由 (最適化なし)',
     'linear': '線形補間のみ (最適化なし)',
@@ -108,7 +107,6 @@ class PlaybackControls(object):
     """waypoint スライダー・Play・Back/Next の GUI.
 
     切り替えのたびに ``on_person_change``/``on_waypoint_change`` を呼ぶ。
-    Play は ``fps`` 周期で進め、最後の waypoint で止まる。
     """
 
     def __init__(self, viewer, fps):
@@ -121,10 +119,9 @@ class PlaybackControls(object):
         self.on_person_change = None
         self.on_waypoint_change = None
         self._closed = False
-        # viser のコールバックは並行に走り、シーングラフ操作は非スレッド
-        # セーフなので、描画は必ずこのロックを握って行う。
+        # シーングラフ操作は非スレッドセーフなので描画はこのロックで行う。
         self._render_lock = threading.RLock()
-        # 古い描画リクエストを捨てるための世代カウンタ。
+        # 古い描画リクエストを捨てる世代カウンタ。
         self._generation = 0
 
         self.back_button = viewer._server.gui.add_button('Back (人物)')
@@ -151,8 +148,7 @@ class PlaybackControls(object):
         threading.Thread(target=self._play_loop, daemon=True).start()
 
     def _render(self, callback):
-        """``callback`` を排他制御して呼ぶ。新しいリクエストに追い越されたら
-        スキップする (index は呼ぶ前に更新しておくこと)。"""
+        """``callback`` を排他で呼ぶ (新しい要求に追い越されたらスキップ)。"""
         if callback is None:
             return
         with self._lock:
@@ -197,16 +193,13 @@ class PlaybackControls(object):
                     continue
                 self.waypoint_index += 1
                 idx = self.waypoint_index
-            # 代入で on_update が同期的に呼ばれ描画される (_render を直接
-            # 呼ぶと二重描画になる)。
+            # 代入で on_update が同期的に呼ばれる (_render 直呼びは二重描画)。
             self.waypoint_slider.value = idx
 
 
 def follow_arm_pose(model, person, pose, human_arm, arm):
-    """SMPL の差し出した腕を計画した人の腕 ``arm`` に合わせた pose を返す.
-
-    手首から先は剛体で掌に合わせ、肩・肘は 2 リンク IK で決める。
-    """
+    """SMPL の差し出した腕を計画した腕 ``arm`` に合わせた pose を返す
+    (手首から先は剛体、肩・肘は 2 リンク IK)."""
     if human_arm.hand == 'R':
         joints_ix = (smpl_body.R_SHOULDER, smpl_body.R_ELBOW,
                      smpl_body.R_WRIST)
@@ -255,7 +248,6 @@ def status_text(name, person_i, n_people, motion, display_waypoints,
     header = '**{}** ({}/{})  waypoint {}/{}\n\n経路: {}  検証: {}\n\n'.format(
         name, person_i + 1, n_people, waypoint_index,
         n_display_waypoints - 1, kind, verified_text)
-    # 検証 OK は接近経路の干渉だけ。押し込みの可否は別。
     if not has_post_process:
         header += ('**押し込み: なし** (solve_palm_ik.py の後処理判定が解けず、'
                    '経路は hover で終わる -- 掌は合わない。実機では動かさない)'
@@ -356,7 +348,7 @@ def main():
     viewer.add(robot_collision_overlay)
     verification_pairs = build_collision_verification_pairs(
         robot_collision_overlay, 'r')
-    # 関節スライダーは robot と overlay の姿勢を食い違わせるので消す。
+    # スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
     remove_obstacles_gui(viewer)
     viewer.show(open_browser=not args.no_open_browser)
@@ -392,7 +384,7 @@ def main():
     press_in_line = [None]
 
     def set_press_in_line(handshake):
-        # hover 目標から最終目標までの押し込みの手先目標の曲線を赤線で描く。
+        # 押し込みの手先目標の曲線を赤線で描く。
         if press_in_line[0] is not None:
             press_in_line[0].remove()
             press_in_line[0] = None
@@ -436,7 +428,7 @@ def main():
 
         display_waypoints, n_approach = build_display_waypoints(
             motion, handshake)
-        # 横並び移動では人の腕をロボットの手に追従させる (sbs.HumanArm)。
+        # 横並び移動では人の腕をロボットの手に追従させる。
         transition = motion.get('transition') or {}
         human_arm = None
         if transition.get('verified'):
@@ -455,8 +447,7 @@ def main():
         set_obstacles(joint_positions)
         set_press_in_line(handshake)
 
-        # set_waypoint_count は同期的に refresh_waypoint を呼び得るので、
-        # current/障害物を更新し終えてから呼ぶ。
+        # refresh_waypoint が同期的に呼ばれ得るので更新後に呼ぶ。
         controls.set_waypoint_count(len(display_waypoints))
         refresh_waypoint()
 
@@ -469,13 +460,12 @@ def main():
             robot, motion['joint_names'], current['display_waypoints'], idx)
         sync_robot_collision_overlay(robot_collision_overlay, robot)
 
-        # 人間にロボットの手先を見させる。
         hand_move_target = getattr(
             robot, '{}arm_end_coords'.format(current['handshake']
                                              ['robot_arm']))
         gaze_target = hand_move_target.worldpos()
         pose = look_at_pose(current['model'], current['person'], gaze_target)
-        # 横並び移動では人の腕 (SMPL と干渉円柱) を計画した腕に合わせる。
+        # 横並び移動では人の腕を計画した腕に合わせる。
         arm = current['display_waypoints'][idx].get('human_arm')
         if arm is not None and current['human_arm'] is not None:
             pose = follow_arm_pose(
@@ -486,8 +476,7 @@ def main():
                           else current['human_arm'].skeleton(arm))
             current['obstacle_arm'] = arm
         mesh = build_smpl_mesh(current['model'], current['person'], pose)
-        # 作り直すと Play 中に点滅するので、メッシュは 1 つだけ作り頂点を
-        # 書き換える (SMPL は男女とも同じ面構成)。
+        # Play 中の点滅回避のため頂点だけ書き換える。
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.uint32)
         handle = human_mesh_handle[0]

@@ -86,8 +86,7 @@ class BackgroundStep(object):
         return elapsed, output
 
     def stop(self):
-        """別の段階が失敗したときの後始末。SIGKILL は jax の永続キャッシュを
-        壊すので SIGINT で終わらせる。"""
+        """後始末。SIGKILL は jax の永続キャッシュを壊すので SIGINT で止める。"""
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGINT)
             try:
@@ -98,7 +97,7 @@ class BackgroundStep(object):
 
 
 def extract_warmup_lines(stdout):
-    """標準出力の ``[warmup]`` 行と合計秒数 ``(lines, total)`` を返す。"""
+    """``[warmup]`` 行と合計秒数 ``(lines, total)`` を返す。"""
     lines = [line for line in stdout.splitlines()
             if line.startswith('[warmup]')]
     total = 0.0
@@ -126,9 +125,7 @@ def summarize_palms(palm_dir):
 
 
 def summarize_handshakes(handshake_dir):
-    """``solve_palm_ik.py`` の出力 JSON を集計する (IK 2 段階目の時間は
-    ``candidate_selection_time``。``post_process.compute_time`` は棄却候補を
-    含まないので使わない)。"""
+    """``solve_palm_ik.py`` の出力 JSON を集計する。"""
     n_total = n_target = n_solved = n_post_process = 0
     collision_ik_times = []
     candidate_selection_times = []
@@ -161,8 +158,7 @@ def summarize_handshakes(handshake_dir):
 
 
 def summarize_final_corrections(handshake_dir):
-    """``final_correction`` (押し込み直前の最終補正の試行) を集計する
-    (比較用に計画時の押し込み IK の平均時間も返す)。無ければ ``None``。"""
+    """``final_correction`` を集計する (無ければ ``None``)。"""
     times = []
     reasons = {}
     position_changes = []
@@ -191,7 +187,7 @@ def summarize_final_corrections(handshake_dir):
 
 
 def summarize_motions(motion_dir):
-    """``plan_handshake_motion.py`` の出力 JSON を集計する (``planned`` の人のみ)。"""
+    """``plan_handshake_motion.py`` の出力 JSON (``planned`` のみ) を集計する。"""
     n_planned = n_verified = n_lead_in_verified = n_both_verified = 0
     n_head_blended = 0
     kinds = {}
@@ -215,7 +211,6 @@ def summarize_motions(motion_dir):
         if data.get('compute_time') is not None:
             compute_times.append(data['compute_time'])
 
-    # 最適化を要した人だけの平均は母集団が実行ごとに変わるので、全員の平均。
     avg_compute_time = (sum(compute_times) / len(compute_times)
                         if compute_times else None)
     return dict(n_planned=n_planned, n_verified=n_verified,
@@ -302,8 +297,7 @@ def main():
     print('作業ディレクトリ: {}'.format(base_dir))
 
     if args.input_set is not None:
-        # 保存済みの入力 (読み取り専用で使う)。ファイル名が IK の乱数シードに
-        # なるので、名前を変えずにそのまま渡す。
+        # ファイル名が IK の乱数シードになるので名前を変えない。
         skeleton_dir = os.path.join(args.input_set, 'skeletons')
         palm_dir = os.path.join(args.input_set, 'palms')
         n_generated = len(json_io.iter_json_files(skeleton_dir))
@@ -357,9 +351,8 @@ def main():
                        args.collision_verify_model]
     solve_args += args.solve_args.split()
 
-    # plan_handshake_motion.py の warmup は入力 (握手姿勢 JSON) に依存しない
-    # ので、solve_palm_ik.py の実行中に先に起動して warmup を重ねる。入力が
-    # 揃った (solve_done_path ができた) ら本処理に入る。
+    # warmup は入力に依存しないので solve_palm_ik.py と並行して先に起動し、
+    # solve_done_path ができたら本処理に入る。
     motion_args = None
     motion_step = None
     solve_done_path = os.path.join(base_dir, 'solve_done')

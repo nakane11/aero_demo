@@ -15,8 +15,7 @@ IK が解けるかを出し、実機ノードの上限で採用されるか (``*
   wide  flip + 距離 350mm 以内
 
 ``--warmup approach`` (既定) は実機ノードと同じく接近の開始から Hands を
-走らせて追跡を温める。``--warmup 0`` は補正のときだけ Hands を呼ぶ
-(2026-10-16 までの実機ノード)。
+走らせて追跡を温める。``--warmup 0`` は補正のときだけ Hands を呼ぶ。
 
 入力は試行ごとの bag と、その試行の ``person_NN.log`` (同じディレクトリに
 ``palms/``・``handshakes/``・``motions/`` がある)。roscore は不要。

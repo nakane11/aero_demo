@@ -79,7 +79,7 @@ def test_anchored_shift_follows_palm_and_cancels_slip():
 
 
 def test_anchored_shift_ignores_rotation_about_the_palm():
-    # 掌のまわりに 12° 回ったスリップ (10/19 person_03) は odom 上でずらさ
+    # 掌のまわりに 12° 回ったスリップは odom 上でずらさ
     # なくてよい。
     palm = _planned_palm()
     yaw = np.radians(12.0)
@@ -88,8 +88,7 @@ def test_anchored_shift_ignores_rotation_about_the_palm():
     slip = np.r_[palm - rot @ palm, yaw]
     shift = _anchored_shift(palm, slip)
     assert np.allclose(shift, 0.0)
-    # 実際に動かす量も 0 (スリップの梃子の分を含めない。以前は計画の位置から
-    # の差を返し、p03 で要る 2.5cm が 15cm に見えて上限で縮められた)。
+    # 実際に動かす量も 0 (スリップの梃子の分を含めない)。
     displacement, _ = imc.anchored_displacement(palm, PALM_IN_BASE, FINAL, slip)
     assert np.allclose(displacement, 0.0)
     assert np.linalg.norm(slip[:2]) > 0.05

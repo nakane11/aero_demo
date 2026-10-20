@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""握手の viser ビューア (``view_handshake_poses.py``/``view_handshake_
-motion.py``/``scripts/ros/run_camera_pipeline_test.py``) の共通処理。
-
-干渉ジオメトリの overlay 表示、貫通しているリンクの組の列挙、IK 結果・
-waypoint の反映、押し込み区間の表示用 waypoint の生成など。
-``solve_palm_ik`` に依存するので ``scripts/`` を ``sys.path`` に含めて
-import すること。
+"""握手 viser ビューア群の共通処理 (干渉 overlay、貫通リンク組の列挙、
+IK 結果・waypoint の反映、押し込み区間の表示用 waypoint)。
+``scripts/`` を ``sys.path`` に含めて import すること。
 """
 
 import os
@@ -29,29 +25,25 @@ from aero_demo.collision_model import build_collision_model_urdf  # noqa: E402
 from aero_demo.palm_plane_view import set_color as set_translucent_color  # noqa: E402,E501
 
 
-# 干渉ジオメトリの表示色 (RGBA, 0-255): ロボットは橙、人体は青。
+# 干渉ジオメトリの表示色 (RGBA)。
 ROBOT_COLLISION_LINK_COLOR = [220, 140, 80, 90]
 HUMAN_COLLISION_OBSTACLE_COLOR = [80, 140, 220, 90]
 
-# hover から押し込み姿勢までの補間フレーム数。
+# hover から押し込みまでの補間フレーム数。
 PRESS_IN_DISPLAY_WAYPOINTS = 5
 
 
 def set_link_visible(viewer, link, visible):
-    """``link`` の表示/非表示を切り替える (GUI スレッドとの競合で既に
-    削除されたリンクなら何もしない)。"""
+    """``link`` の表示/非表示を切り替える (削除済みなら何もしない)。"""
     handle = viewer._linkid_to_handle.get(str(id(link)))
     if handle is not None:
         handle.visible = visible
 
 
 def remove_joint_angle_gui(viewer):
-    """``ViserViewer`` の関節スライダー GUI を取り除く。
-
-    スライダーは関節名で管理され、ロボットと overlay の片方だけを動かして
-    しまうため。全てのロボットを ``viewer.add`` した後に呼ぶこと。
-    """
-    # 親フォルダごと消す (_joint_sliders は 2 体目のものしか持たない)。
+    """``ViserViewer`` の関節スライダー GUI を取り除く (ロボットと overlay の
+    片方だけが動くため)。全ロボットを ``viewer.add`` した後に呼ぶこと。"""
+    # 親フォルダごと消す。
     for attr in ('_joint_angles_folder', '_export_folder'):
         folder = getattr(viewer, attr, None)
         if folder is not None:
@@ -61,8 +53,7 @@ def remove_joint_angle_gui(viewer):
 
 
 def remove_obstacles_gui(viewer):
-    """``ViserViewer`` の "Obstacles" GUI を取り除く (全てのロボットを
-    ``viewer.add`` した後に呼ぶこと)。"""
+    """``ViserViewer`` の "Obstacles" GUI を取り除く (``viewer.add`` 後に呼ぶ)。"""
     folder = getattr(viewer, '_obstacles_folder', None)
     if folder is not None:
         folder.remove()
@@ -71,9 +62,8 @@ def remove_obstacles_gui(viewer):
 
 
 def build_robot_collision_overlay(robot):
-    """``robot`` のプリミティブ近似ジオメトリを半透明の別 ``RobotModel``
-    (overlay) として読み込む。姿勢は ``sync_robot_collision_overlay`` で
-    追従させる。"""
+    """``robot`` のプリミティブ近似ジオメトリを半透明の ``RobotModel``
+    (overlay) として読み込む。"""
     collision_urdf_path = build_collision_model_urdf(robot.urdf_path)
     collision_robot = RobotModel()
     collision_robot.load_urdf_file(
@@ -95,18 +85,16 @@ def sync_robot_collision_overlay(collision_robot, robot):
 
 def colliding_link_pairs(robot, pairs, obstacle_links,
                          tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
-    """``pairs`` のうち ``tolerance`` を超えて貫通している組をすべて列挙する。
+    """``pairs`` のうち ``tolerance`` を超えて貫通している組を列挙する。
 
-    人体は表示中の円柱 ``obstacle_links`` で、頂点の入り込みと円柱表面
-    からの入り込みの両方向を見る (片方向だと面の途中の貫通を見逃す)。
-    自己干渉は ``solve_palm_ik.self_collision_depth`` で判定する。
-    ``obstacle_links`` が空なら人体との組は読み飛ばす。
+    人体は円柱 ``obstacle_links`` に対し頂点と円柱表面の両方向で見る
+    (片方向だと面の途中の貫通を見逃す)。``obstacle_links`` が空なら人体は
+    読み飛ばす。
 
     Returns
     -------
     list of (kind, link_a_name, name_b, dist)
-        ``kind`` は ``'self'``/``'human'``、``dist`` [m] は負なほど深い。
-        深い順。
+        ``kind`` は ``'self'``/``'human'``、``dist`` [m] は負なほど深い。深い順。
     """
     if not pairs:
         return []
@@ -140,7 +128,7 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             if not obstacle_links:
                 continue
             obstacle = obstacle_links[other]
-            # 円柱のローカル座標 (Z が軸、原点中心) で入り込んだ深さ (内側で正)。
+            # 円柱ローカル座標での入り込み深さ (内側で正)。
             local_pts = ((verts_a - obstacle.worldpos())
                         @ obstacle.worldrot())
             radial = np.linalg.norm(local_pts[:, :2], axis=1)
@@ -148,7 +136,7 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
             depth = float(np.minimum(
                 obstacle.radius - radial,
                 obstacle.height / 2.0 - axial).max())
-            # 逆向き (円柱がリンクの面の途中を貫通) も見る。
+            # 逆向き (円柱表面からリンクへ) も見る。
             depth = max(depth, spik.obstacle_into_link_depth(
                 _samples(other), link_a, _shape(link_a)))
             dist = -depth
@@ -168,8 +156,7 @@ def colliding_link_pairs(robot, pairs, obstacle_links,
 
 
 def collision_pairs_text(colliding, label='干渉'):
-    """``colliding_link_pairs`` の結果をテキストパネル用の文字列にする
-    (``label`` は見出し)。"""
+    """``colliding_link_pairs`` の結果をパネル用の文字列にする。"""
     self_pairs = [c for c in colliding if c[0] == 'self']
     human_pairs = [c for c in colliding if c[0] == 'human']
     if not colliding:
@@ -187,12 +174,8 @@ def collision_pairs_text(colliding, label='干渉'):
 
 
 def apply_robot_pose(robot, result, use_post_process=False):
-    """IK 結果の関節角 (関節名で対応、指は初期姿勢のまま) と台車姿勢を
-    ``robot`` に反映する。
-
-    ``use_post_process`` なら押し込み姿勢 (``post_process``、無ければ
-    hover 姿勢) を反映する。
-    """
+    """IK 結果の関節角と台車姿勢を ``robot`` に反映する (指は初期姿勢)。
+    ``use_post_process`` なら押し込み姿勢 (無ければ hover 姿勢)。"""
     source = result
     if use_post_process and result.get('post_process') is not None:
         source = result['post_process']
@@ -220,13 +203,12 @@ def apply_waypoint_pose(robot, joint_names, waypoints, index):
 
 
 def build_display_waypoints(motion, result):
-    """接近経路の後ろに押し込み区間と横並び移動の waypoint を足す。
+    """接近経路の後ろに押し込み・横並び移動の waypoint を足す。
 
     Returns
     -------
     (waypoints, n_approach)
-        ``n_approach`` は ``motion['waypoints']`` の個数 (以降は未検証の
-        押し込み・横並び区間)。
+        ``n_approach`` は ``motion['waypoints']`` の個数。
     """
     waypoints = list(motion['waypoints'])
     n_approach = len(waypoints)
@@ -240,9 +222,8 @@ def build_display_waypoints(motion, result):
 
 
 def transition_waypoints(motion):
-    """横並び移動 (``motion['transition']``) の waypoint を
-    ``motion['joint_names']`` の並びに直して返す (``transition: True`` 付き。
-    無い・未検証なら空)。"""
+    """``motion['transition']`` の waypoint を ``motion['joint_names']`` 順に
+    直して返す (``transition: True`` 付き。無い・未検証なら空)。"""
     transition = motion.get('transition')
     if not transition or not transition.get('verified'):
         return []
@@ -259,13 +240,11 @@ def transition_waypoints(motion):
 
 
 def build_press_in_waypoints(last_wp, joint_names, post):
-    """hover の waypoint ``last_wp`` から押し込み姿勢 ``post`` までの waypoint
-    のリスト (``last_wp`` は含まない)。
+    """hover の ``last_wp`` から押し込み姿勢 ``post`` までの waypoint 列
+    (``last_wp`` を含まない)。
 
-    ``post['press_in_path']`` (押し込みの曲線上で IK を解いた途中の姿勢、
-    台車は ``press_in_base_path``) があればそれと最終姿勢を、無ければ (古い
-    結果) 関節空間で
-    ``PRESS_IN_DISPLAY_WAYPOINTS`` 等分した姿勢を返す。"""
+    ``post['press_in_path']`` (台車は ``press_in_base_path``) があればそれと
+    最終姿勢、無ければ関節空間の ``PRESS_IN_DISPLAY_WAYPOINTS`` 等分。"""
     waypoints = []
     start_vec = np.asarray(last_wp['joint_angle_vector'], dtype=np.float64)
 
@@ -281,7 +260,7 @@ def build_press_in_waypoints(last_wp, joint_names, post):
                          post['base_yaw']])
 
     if post.get('press_in_path') is not None:
-        # 押し込みと同時に台車も動く (無ければ台車は固定)。
+        # 台車経路が無ければ固定。
         bases = post.get('press_in_base_path') or (
             [base_end] * len(post['press_in_path']))
         for angle_vector, base in zip(

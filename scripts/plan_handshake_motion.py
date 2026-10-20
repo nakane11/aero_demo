@@ -4,11 +4,10 @@
 """``solve_palm_ik.py`` の握手姿勢 (hover 目標) へ至る接近軌道を干渉回避
 付きで計画し、JSON に保存する。
 
-台車は人間の手を中心に公転+自転して最終位置へ寄り、最後は pre-touch 姿勢
-から掌の法線方向にまっすぐ近づく。まず最適化なしの軌道を厳密形状で検証し、
-通らないときだけ jaxls で最適化する (jaxls は ``pip install
-"git+https://github.com/brentyi/jaxls.git"`` が別途必要)。押し込み
-(``post_process``) の区間は計画・検証しない。
+台車は人の手を中心に公転+自転して最終位置へ寄り、最後は pre-touch 姿勢
+から直進する。まず最適化なしの軌道を厳密形状で検証し、通らないときだけ
+jaxls (別途 pip install が必要) で最適化する。押し込み (``post_process``)
+は計画・検証しない。
 
 Usage
 -----
@@ -60,7 +59,7 @@ import solve_palm_ik as spik  # noqa: E402  (パス追加後に import)
 
 DEFAULT_N_WAYPOINTS = 20
 
-# waypoint 間の時間刻み [秒] (コストの正規化用で、実機の再生速度ではない)。
+# waypoint 間の時間刻み [秒] (コスト正規化用。実機の速度ではない)。
 DEFAULT_DT = 0.2
 
 DEFAULT_MAX_ITERATIONS = 60
@@ -73,10 +72,10 @@ DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE = (
 DEFAULT_SMOOTHNESS_WEIGHT = 1.0
 DEFAULT_ACCELERATION_WEIGHT = 1.0
 
-# ロボットの初期台車姿勢 [x, y, yaw] (IK と同じ座標系)。
+# 初期台車姿勢 [x, y, yaw] (IK と同じ座標系)。
 INITIAL_BASE_POSE = (0.0, 0.0, 0.0)
 
-# 接近開始位置を置く円の半径 (手から最終台車位置までの距離) への上乗せ [m]。
+# 接近開始位置の円の半径 (手から最終台車位置まで) への上乗せ [m]。
 DEFAULT_APPROACH_DISTANCE = 0.3  # [m]
 
 # 初期位置がこの距離以内なら接近開始位置を置かず初期位置から計画する [m]。
@@ -90,7 +89,7 @@ APPROACH_CANDIDATE_MAX_ANGLE = math.radians(120.0)  # [rad]
 ORBIT_TANGENT_SEARCH_STEP = math.radians(0.5)  # [rad]
 ORBIT_TANGENT_MAX_MISMATCH = math.radians(3.0)  # [rad]
 
-# lead-in は人の立ち位置からこの距離以内の waypoint だけ検証する [m]。
+# lead-in は人からこの距離以内の waypoint だけ検証する [m]。
 LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 
 # lead-in の waypoint 間隔 (並進 / 回頭)。
@@ -112,12 +111,8 @@ DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
     spik.DEFAULT_COLLISION_VERIFY_TOLERANCE)  # [m]
 
-# 押し込み前 (lead-in・接近軌道) の検証でロボットと人体の間に空ける距離 [m]。
-# hover の IK (DEFAULT_HOVER_HUMAN_CLEARANCE、6 cm) と軌道最適化の効き始め
-# (6 cm) より 1 cm 緩め、横並び移動 (TRANSITION_HUMAN_CLEARANCE) と揃える。
-# hover が 6 cm ちょうどに来るため、6 cm だと経路が差し出した掌・前腕へ数 mm
-# 入るだけで落ちていた。実機 2026-10-13 の 13 試行を解き直すと 6 cm で 8/13、
-# 5 cm で 11/13。合成 400 人 (seed 0) はどちらも 49/49。
+# 押し込み前 (lead-in・接近軌道) の検証での人体との距離 [m]。
+# 横並び移動 (TRANSITION_HUMAN_CLEARANCE) と揃える。
 DEFAULT_HUMAN_CLEARANCE = 0.05  # [m]
 
 # 接近区間のこの割合以降で首を押し込み姿勢の角度へ補間する。
@@ -130,13 +125,11 @@ def human_body_cylinder_obstacles(
     """``solve_palm_ik.human_body_obstacles`` の円柱を ``add_collision_cost``
     の ``world_obstacles`` 形式 (``type='cylinder'``) に変換する。
 
-    ``hand`` (差し出した手) を渡すと、hover が人の掌から約 2 cm なので、
-    その掌・指は遠くのダミーに置き換え (経路の検証で
-    ``OFFERED_HAND_CLEARANCE`` を見る)、前腕は ``activation_distance`` で
-    ``OFFERED_HAND_CLEARANCE`` の距離になるよう細らせる。
+    ``hand`` (差し出した手) を渡すと、その掌・指は遠くのダミーに置き換え、
+    前腕は ``activation_distance`` で ``OFFERED_HAND_CLEARANCE`` の距離に
+    なるよう細らせる。
 
-    個数は人物によらず ``len(human_obstacle_names())`` で一定 (jit キャッシュ
-    のため)。
+    個数は人物によらず一定 (jit キャッシュのため)。
     """
     cylinders = spik.human_body_obstacles(joint_positions)
     if hand is not None:
@@ -160,8 +153,8 @@ def human_body_cylinder_obstacles(
 
 
 def arms_down_angles(robot, joint_list):
-    """腕を体の横に下ろした姿勢 (``reset_pose`` の肘を 0 度に伸ばしたもの) を
-    ``joint_list`` の順で返す。"""
+    """腕を下ろした姿勢 (``reset_pose`` の肘を 0 度にしたもの) を
+    ``joint_list`` 順で返す。"""
     robot.reset_pose()
     for side in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(side)).joint_angle(0.0)
@@ -191,14 +184,13 @@ def approach_direction(human_xy, base_goal):
 
 
 def orbit_center_xy(handshake):
-    """公転の中心 (掌の水平位置、古い結果では IK の目標位置)。"""
+    """公転の中心 (掌の水平位置)。"""
     center = handshake.get('palm_position', handshake['target_position'])
     return np.asarray(center[:2], dtype=np.float64)
 
 
 def orbit_direction(center_xy, initial_base_pose, human_xy, base_goal):
-    """中心 ``center_xy`` から初期位置へ向かう水平単位ベクトル (重なる場合は
-    ``approach_direction``)。"""
+    """中心から初期位置へ向かう水平単位ベクトル (重なれば ``approach_direction``)。"""
     direction = (np.asarray(initial_base_pose[:2], dtype=np.float64)
                  - center_xy)
     norm = float(np.linalg.norm(direction))
@@ -209,8 +201,8 @@ def orbit_direction(center_xy, initial_base_pose, human_xy, base_goal):
 
 def orbit_base_start(base_goal, center_xy, direction, distance,
                      initial_base_pose=None):
-    """中心から ``direction`` へ半径 (最終台車位置までの距離 + ``distance``)
-    離れ、中心を向く接近開始位置 ``[x, y, yaw]``。
+    """中心から ``direction`` へ (最終台車位置までの距離 + ``distance``) 離れ、
+    中心を向く接近開始位置 ``[x, y, yaw]``。
 
     初期位置が既にこの半径以内なら (後退しないよう) 初期位置を返す。
     """
@@ -229,9 +221,8 @@ def orbit_base_start(base_goal, center_xy, direction, distance,
 def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
                         initial_base_pose):
     """lead-in の直進が公転経路 (``orbit_base_path``) の出だしの接線になる
-    接近開始位置 ``[x, y, yaw]`` (yaw は進行方向)。
-
-    初期位置が既に円の内側か、向きが揃う位置が無ければ ``None``。
+    接近開始位置 ``[x, y, yaw]``。初期位置が円の内側か、揃う位置が無ければ
+    ``None``。
     """
     center = np.asarray(center_xy, dtype=np.float64)
     initial = np.asarray(initial_base_pose, dtype=np.float64)
@@ -253,13 +244,13 @@ def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
         if sweep is None or travel_len < 1e-6:
             continue
         dtheta = sweep[1]
-        # 経路の出だしの向き (半径方向 r1 - r0 と接線方向 r0 * dtheta の比)。
+        # 経路の出だしの向き。
         v =(r1 - r0) * e_r + r0 * dtheta * e_t
         cos_mismatch = float(np.dot(v, travel)) / (
             float(np.linalg.norm(v)) * travel_len)
         if cos_mismatch < min_cos:
             continue
-        # 公転の向きごとに最もよく揃うものを残し、最後に経路長が短い方を選ぶ。
+        # 公転の向きごとに最も揃うものを残し、経路長が短い方を選ぶ。
         side = 1 if dtheta >= 0.0 else -1
         length = travel_len + 0.5 * (r0 + r1) * abs(dtheta)
         if side not in best_per_side \
@@ -280,8 +271,7 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
         始点の方位角 [rad]、公転角 [rad] (正で反時計回り)、始点・終点の
         半径 [m]、yaw の変化量 [rad]。半径がほぼ 0 なら ``None``。
 
-    公転は ``avoid_xy`` (人の立ち位置) の方位を通らない向きに回る
-    (中心と重なるなら近い方)。
+    公転は ``avoid_xy`` (人の位置) の方位を通らない向きに回る。
     """
     center_xy = np.asarray(center_xy, dtype=np.float64)
     rel0 = np.asarray(base_start[:2], dtype=np.float64) - center_xy
@@ -304,7 +294,7 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
 
 
 def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy):
-    """``unwrap_start_yaw`` の公転版 (``orbit_sweep`` の自転量に合わせる)。"""
+    """``unwrap_start_yaw`` の公転版。"""
     sweep = orbit_sweep(base_start, base_goal, center_xy, avoid_xy)
     if sweep is None:
         return unwrap_start_yaw(base_start, base_goal)
@@ -316,9 +306,8 @@ def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy):
 def orbit_base_path(base_start, base_goal, center_xy, avoid_xy, n):
     """中心 ``center_xy`` の周りを公転+自転する台車の経路 ``(n, 3)``。
 
-    方位角・半径・yaw を ``1 - (1 - s)^2`` で補間するアルキメデス螺旋
-    (終点で減速)。始点の yaw は ``orbit_unwrap_start`` 済みである前提。
-    公転が決まらなければ直線補間。
+    方位角・半径・yaw を ``1 - (1 - s)^2`` で補間する螺旋 (終点で減速)。
+    始点 yaw は ``orbit_unwrap_start`` 済み前提。公転が決まらなければ直線。
     """
     s = np.linspace(0.0, 1.0, n)
     sweep = orbit_sweep(base_start, base_goal, center_xy, avoid_xy)
@@ -342,8 +331,7 @@ def approach_start_candidates(base_goal, human_xy, distance,
     """接近開始位置の候補 ``[(角度 [rad], [x, y, yaw]), ...]``。
 
     先頭は角度 0 (``orbit_tangent_start``、無ければ ``orbit_base_start``)。
-    残りはそれを手の周りに回した位置 (yaw は初期位置からの進行方向) で、
-    台車の経路長が短い順。人の背後・横からの回り込み用。
+    残りはそれを手の周りに回した位置で、台車の経路長が短い順 (回り込み用)。
     """
     human_xy = np.asarray(human_xy[:2], dtype=np.float64)
     center = np.asarray(orbit_center[:2], dtype=np.float64)
@@ -370,7 +358,7 @@ def approach_start_candidates(base_goal, human_xy, distance,
             rotated = np.array([c * direction[0] - s * direction[1],
                                 s * direction[0] + c * direction[1]])
             xy = center + rotated * radius
-            # 進行方向を向く (初期位置とほぼ重なるときは手の方)。
+            # 進行方向を向く (重なるときは手の方)。
             travel = xy - np.asarray(initial_base_pose[:2], dtype=np.float64)
             if float(np.linalg.norm(travel)) > MIN_APPROACH_DISTANCE:
                 yaw = math.atan2(travel[1], travel[0])
@@ -392,9 +380,8 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
     """初期台車姿勢から ``first_waypoint`` までの lead-in の waypoint 列
     (``first_waypoint`` 自身は含まない)。
 
-    その場回転で終点の向きになってから直進する。関節角は
-    ``start_joint_angles`` (``{関節名: 角度}``、省略時は終点のまま) から
-    線形補間する。
+    その場回転してから直進する。関節角は ``start_joint_angles``
+    (``{関節名: 角度}``、省略時は終点のまま) から線形補間する。
     """
     end_base = np.array([first_waypoint['base_position'][0],
                          first_waypoint['base_position'][1],
@@ -459,8 +446,8 @@ def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
 
 
 def unwrap_start_yaw(base_start, base_goal):
-    """``base_start`` の yaw を ``base_goal`` から ±π 以内の等価な角度にした
-    コピー (線形補間で遠回りしないため。終点側は変えない)。"""
+    """``base_start`` の yaw を ``base_goal`` から ±π 以内にしたコピー
+    (遠回り防止)。"""
     base_start = np.array(base_start, dtype=np.float64)
     base_start[2] = base_goal[2] + wrap_angle(base_start[2] - base_goal[2])
     return base_start
@@ -470,14 +457,12 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit):
     """始点 (腕を下ろした姿勢 + ``base_start``) と終点 (``handshake``) の
     関節角・台車姿勢を ``{robot_arm}arm_whole_body`` の関節順で求める。
 
-    始点の yaw は ``orbit`` (``(公転の中心, 避ける位置)``) で
-    ``orbit_unwrap_start`` により調整する。
+    始点の yaw は ``orbit`` (``(公転の中心, 避ける位置)``) で調整する。
 
     Returns
     -------
     (link_list, joint_list, q_start, base_start, q_goal, base_goal)
-        呼び出し後、``robot`` の台車はワールド原点 (``TrajectoryProblem``
-        は構築時の台車姿勢からの差分を扱うため、軌道の台車列をそのまま
+        呼び出し後、``robot`` の台車はワールド原点 (軌道の台車列をそのまま
         ワールド座標として読める)、腕は始点の姿勢になる。
     """
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -499,8 +484,7 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit):
     robot.base_link.newcoords(Coordinates())
     for joint, angle in zip(joint_list, q_start):
         joint.joint_angle(float(angle))
-    # 差し出さない腕は軌道全体で IK 結果の姿勢 (指先が台車にかからない
-    # よう曲げたもの) に固定する。
+    # 差し出さない腕は軌道全体で IK 結果の姿勢に固定する。
     other = 'l' if robot_arm == 'r' else 'r'
     for joint in robot.joint_list:
         if joint.name.startswith(other + '_') and joint.name in name_to_angle:
@@ -514,10 +498,9 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
                   self_collision_activation_distance,
                   smoothness_weight, acceleration_weight,
                   collision_weight=100.0, self_collision_weight=100.0):
-    """``TrajectoryProblem`` を組み立てる (始点・終点の値は呼び出し側が渡す)。
+    """``TrajectoryProblem`` を組み立てる。
 
-    干渉コストは近似なので、収束しても干渉が無い保証はない。経路は必ず
-    ``verify_waypoints`` で検証すること。"""
+    干渉コストは近似なので、経路は必ず ``verify_waypoints`` で検証すること。"""
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     problem = TrajectoryProblem(
         robot_model=robot, link_list=link_list, n_waypoints=n_waypoints,
@@ -525,8 +508,7 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
     problem.add_smoothness_cost(weight=smoothness_weight)
     problem.add_acceleration_cost(weight=acceleration_weight)
     problem.add_joint_limit_constraint()
-    # add_self_collision_cost は add_collision_cost が作る primitives を使う
-    # ので、この順で呼ぶ。
+    # add_self_collision_cost は add_collision_cost の primitives を使うのでこの順。
     problem.add_collision_cost(
         collision_link_list, world_obstacles,
         weight=collision_weight,
@@ -572,9 +554,8 @@ KIND_LABELS = {
 
 
 def pretouch_direction(handshake, base_goal):
-    """pre-touch 姿勢へ手先を引き戻す向き: hover 目標から終点の台車へ向かう
-    水平の単位ベクトル (高さを変えない。掌の法線方向に引き戻すと、掌が下を
-    向いた人ではしゃがみ込む)。求まらなければ ``None``。"""
+    """pre-touch 姿勢へ引き戻す向き: hover 目標から終点の台車へ向かう水平の
+    単位ベクトル (求まらなければ ``None``)。"""
     direction = np.zeros(3)
     direction[:2] = (np.asarray(base_goal[:2], dtype=np.float64)
                      - np.asarray(handshake['target_position'][:2]))
@@ -584,12 +565,11 @@ def pretouch_direction(handshake, base_goal):
 
 def solve_pretouch_pose(robot, robot_arm, link_list, joint_list, handshake,
                         q_goal, base_goal, direction, standoff):
-    """終点の手先を ``direction`` (``pretouch_direction``) へ ``standoff``
-    [m] 引き戻した pre-touch 姿勢を台車固定・干渉回避なしの IK で解き、
-    ``joint_list`` 順の関節角を返す (失敗時 ``None``)。
+    """終点の手先を ``direction`` へ ``standoff`` [m] 引き戻した pre-touch
+    姿勢を台車固定・干渉回避なしの IK で解き、``joint_list`` 順の関節角を返す
+    (失敗時 ``None``)。
 
-    脚 (足首・膝) は終点の角度のまま腕と腰だけで解く (脚も動かすと手先を
-    手前に引くのにしゃがみ込む解になる)。"""
+    脚 (足首・膝) は終点の角度のまま腕と腰だけで解く (しゃがみ込み防止)。"""
     target_position = (np.asarray(handshake['target_position'])
                        + direction * standoff)
     robot.newcoords(Coordinates(
@@ -652,8 +632,7 @@ def trajectory_waypoints(robot, joint_list, trajectory):
 
 
 def build_obstacle_cache(joint_positions):
-    """人体の障害物と表面サンプルを 1 人分まとめて作る
-    (``verify_waypoints`` の ``obstacle_cache``)。"""
+    """人体の障害物と表面サンプルを 1 人分作る (``obstacle_cache``)。"""
     obstacle_links = spik.human_body_obstacles(joint_positions) \
         if joint_positions else None
     obstacle_samples = (
@@ -666,7 +645,7 @@ _SELF_PAIRS_CACHE = {}
 
 
 def _self_pairs_cached(verification_pairs):
-    # 自己干渉の組は verification_pairs ごとに 1 回だけ作る (計算計画を持つため)。
+    # 自己干渉の組は verification_pairs ごとに 1 回だけ作る。
     if verification_pairs is None:
         return None
     key = id(verification_pairs)
@@ -683,8 +662,7 @@ def verify_waypoints(robot, joint_names, waypoints, verification_pairs,
     """各 waypoint の自己干渉の組の最小距離 [m] (負なら貫通) のリスト。
 
     人体との距離は ``verify_human_clearance`` で別に見る。``robot_arm`` を
-    渡すと、差し出さない手の指先と台車の箱の距離も含める (検証モデルは
-    指なしのため)。
+    渡すと、差し出さない手の指先と台車の箱の距離も含める。
     """
     if obstacle_cache is not None:
         obstacle_links, obstacle_samples = obstacle_cache
@@ -724,7 +702,7 @@ def verify_human_clearance(robot, joint_names, waypoints, verification_pairs,
                            obstacle_cache, hand=None):
     """各 waypoint の人体との最短距離から ``DEFAULT_HUMAN_CLEARANCE`` (差し
     出した手 ``hand`` の手まわりは ``OFFERED_HAND_CLEARANCE``) を引いた余裕
-    [m] の最小のリスト (0 以上なら通過、障害物が無ければ ``inf``)。"""
+    [m] のリスト (0 以上で通過、障害物が無ければ ``inf``)。"""
     obstacle_links = obstacle_cache[0]
     if not obstacle_links or not waypoints:
         return [float('inf')] * len(waypoints)
@@ -762,8 +740,7 @@ def not_planned_result(reason):
 
 
 def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
-    """中間 waypoint の関節角にガウスノイズを足した warm start (台車は揺らさ
-    ない)。局所解を抜けるリトライ用。"""
+    """中間 waypoint の関節角にガウスノイズを足した warm start (台車は不変)。"""
     traj = initial_traj.copy()
     noise = rng.normal(scale=scale, size=(traj.shape[0] - 2, n_joints))
     traj[1:-1, :n_joints] += noise
@@ -819,7 +796,7 @@ def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
             return None
     post = new.get('post_process')
     if post is not None:
-        # 押し込み区間の途中の姿勢も差し替える (検証は自己干渉のみ)。
+        # 押し込み途中の姿勢も差し替える (検証は自己干渉のみ)。
         path = []
         for angle_vector in post.get('press_in_path', []):
             step = dict(post, joint_angle_vector=angle_vector)
@@ -858,7 +835,7 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
     差し出さない手の指先が台車に入って通らない場合は、その腕を 1 段ずつ
-    曲げて計画し直す。通れば ``handshake`` も破壊的に書き換え、
+    曲げて計画し直す。通れば ``handshake`` を破壊的に書き換え、
     ``other_arm_posture_replanned`` に姿勢 [deg] を入れる。
     """
     start_time = time.time()
@@ -896,12 +873,10 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
                              initial_base_pose=INITIAL_BASE_POSE):
     """1 人分の軌道を計画する (差し出さない腕の差し替えなし)。
 
-    まず角度 0 の接近開始位置で最適化込みで計画し、lead-in かその先が
-    通らなければ ``approach_start_candidates`` の残りを経路長順に最適化
-    なしで試す。結果には lead-in の検証結果 (``lead_in_*``)、採用した
-    候補の角度 ``approach_angle`` [rad] などを入れる。
-
-    ``solver`` は jit キャッシュを効かせるため人物間で使い回すこと。
+    まず角度 0 の接近開始位置で最適化込みで計画し、通らなければ
+    ``approach_start_candidates`` の残りを経路長順に最適化なしで試す。
+    結果に lead-in の検証結果 (``lead_in_*``) と採用角度 ``approach_angle``
+    [rad] を入れる。``solver`` は jit キャッシュのため人物間で使い回すこと。
     """
     start_time = time.time()
     obstacle_cache = build_obstacle_cache(joint_positions)
@@ -917,7 +892,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         orbit_center=orbit[0])
 
     def check_lead_in(base_start):
-        # lead-in は始点だけで決まるので、軌道計画の前に安く検証する。
+        # lead-in は始点だけで決まるので計画前に検証する。
         _,joint_list, q_start, base_start, _, _ = build_start_and_goal(
             robot, robot_arm, handshake, base_start, orbit=orbit)
         first_waypoint = trajectory_waypoints(
@@ -946,7 +921,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     if zero_motion is not None and zero_motion['verified']:
         best = (zero, zero_lead_in, zero_motion)
     else:
-        # 残りの候補は (遅いので) 最適化なしで試す。
+        # 残りの候補は最適化なしで試す。
         first_lead_in_ok = None
         for candidate in others:
             n_tried += 1
@@ -971,8 +946,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
                 args, verification_pairs, solver, obstacle_cache, orbit=orbit,
                 pretouch_cache=pretouch_cache))
         if best is None:
-            # どの候補も通らなければ角度 0 の結果を返す。lead-in が全滅なら
-            # 呼び出し側は採用しない (motion_verified) ので最適化はしない。
+            # どれも通らなければ角度 0 の結果を返す (最適化なし)。
             if zero_motion is None:
                 zero_motion = _plan_from_start(
                     robot, robot_arm, handshake, joint_positions, zero[1],
@@ -998,9 +972,9 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
 
 def blend_head_to_post_process(robot, motion, handshake):
     """接近区間の ``HEAD_GAZE_BLEND_START`` 以降で首の角度を押し込み姿勢の
-    値へ線形補間する (破壊的。hover 時点で掌が画角に入るように)。
+    値へ線形補間する (破壊的。hover 時に掌が画角に入るように)。
 
-    書き換えた waypoint は検証し直さない。書き換えたら True を返す。
+    書き換えた waypoint は検証し直さない。書き換えたら True。
     """
     post = handshake.get('post_process')
     waypoints = motion.get('waypoints')
@@ -1036,10 +1010,10 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する。
 
     pre-touch 経由 → 線形補間の順に検証し、通ればそれを返す。通らなければ
-    jaxls で最適化し、warm start を揺らして ``args.motion_attempts`` 回まで
-    解き直す (全滅なら最も余裕の大きい候補を ``verified: false`` で返す)。
-    ``optimize`` が偽なら最適化しない。``pretouch_cache`` (dict) を渡すと、
-    始点に依存しない pre-touch 姿勢の IK を同じ ``handshake`` の間で使い回す。
+    jaxls で最適化し、``args.motion_attempts`` 回まで解き直す (全滅なら最も
+    余裕の大きい候補を ``verified: false`` で返す)。``optimize`` が偽なら
+    最適化しない。``pretouch_cache`` (dict) は pre-touch 姿勢の IK を同じ
+    ``handshake`` 内で使い回す。
     """
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         build_start_and_goal(robot, robot_arm, handshake, base_start,
@@ -1074,7 +1048,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             solve_time=solve_time,
         )
 
-    # 試した候補ごとの合否 (結果の candidates_tried、デバッグ用)。
+    # 試した候補ごとの合否 (candidates_tried)。
     tried = []
 
     def record(candidate):
@@ -1129,8 +1103,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     if not optimize:
         return best
 
-    # 問題を組む前に台車を原点・腕を始点に戻す (solve_pretouch_pose が
-    # 台車を動かしているため。build_start_and_goal 参照)。
+    # solve_pretouch_pose が台車を動かすので、台車を原点・腕を始点に戻す。
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
     for joint, angle in zip(joint_list, q_start):
@@ -1152,7 +1125,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         self_collision_weight=100.0)
     rng = np.random.RandomState(0)
 
-    # 既に verified な warm start (force_optimize 時のみ) は 1 回だけ解く。
+    # verified な warm start (force_optimize 時) は 1 回だけ解く。
     max_attempts = args.motion_attempts if not best['verified'] else 1
 
     for attempt in range(max_attempts):
@@ -1174,8 +1147,8 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
 
 
 def _warmup_solver(robot, solver, args):
-    """左右両腕の軌道最適化を 1 回ずつ解き、jaxls の jit コンパイルを
-    済ませる。cache key は障害物の個数しか見ないので空の骨格で足りる。"""
+    """左右両腕の軌道最適化を 1 回ずつ解き jit コンパイルを済ませる
+    (cache key は障害物の個数のみなので空の骨格で足りる)。"""
     world_obstacles = human_body_cylinder_obstacles({})
     for robot_arm in ('l', 'r'):
         warmup_start = time.time()
@@ -1223,9 +1196,7 @@ def main():
         help='軌道 JSON の保存先ディレクトリ。')
     parser.add_argument(
         '--wait-file', type=str, default=None,
-        help='warmup を済ませたあと、このファイルができるまで待ってから '
-            '--input-dir を読む (run_pipeline_test.py が solve_palm_ik.py と '
-            '並行して起動し、warmup を重ねるため)。')
+        help='warmup 後、このファイルができるまで待ってから --input-dir を読む。')
     parser.add_argument(
         '--approach-distance', type=float,
         default=DEFAULT_APPROACH_DISTANCE,
@@ -1244,8 +1215,7 @@ def main():
             DEFAULT_MAX_ITERATIONS))
     parser.add_argument(
         '--motion-attempts', type=int, default=1,
-        help='warm start を揺らして最適化を解き直す最大回数 (既定 1)。2 回目'
-             '以降で救われた人は 67 人・400 人 (seed 0・1) で 0 人だった。')
+        help='warm start を揺らして最適化を解き直す最大回数 (既定 1)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='最適化なしの軌道が通っても必ず jaxls で最適化する (計測用)。')
@@ -1285,8 +1255,7 @@ def main():
             sbs.GOAL_BOW_WEIGHT))
     parser.add_argument(
         '--leg-rise-allow', type=float, default=None,
-        help='strict のとき、横並びで腰が上がってよい量 [m] (移動先・経路の'
-            '許容と、脚を固定するときの余裕)。既定は上げない。')
+        help='strict のとき横並びで腰が上がってよい量 [m] (既定は上げない)。')
     parser.add_argument(
         '--leg-low-margin', type=float, default=None,
         help='足首の上限・膝の下限を全域幅のこの割合だけ狭める '
@@ -1317,18 +1286,17 @@ def main():
     spik.lock_fixed_joints(robot)
     spik.apply_collision_model(robot)
     spik.apply_hand_box(robot)
-    # 指の点群を先に作っておく (指ありモデルの読み込みに約 1 秒)。
+    # 指の点群を先に作る。
     spik.other_hand_points('r')
     verification_pairs = spik.build_verification_pairs_for_model(
         robot, args.collision_verify_model)
     print('[collision-verify] 軌道の事後検証は {} モデルの {} 組で行います。'
           .format(args.collision_verify_model, len(verification_pairs)))
-    # jit キャッシュを効かせるためソルバーは人物間で使い回す。
+    # jit キャッシュのためソルバーは人物間で使い回す。
     solver = create_solver('jaxls', max_iterations=args.max_iterations,
                            verbose=False)
-    # skrobot の JaxBackend は最初に作られた時に x64 を有効にする (バッチ IK
-    # が作る)。warmup をその前に走らせると float32 でコンパイルされ、本番の
-    # float64 の solve で各腕の初回に約 9 秒の再コンパイルが起きる。
+    # JaxBackend は作成時に x64 を有効にする。warmup が先だと float32 で
+    # コンパイルされ、本番で再コンパイルが起きる。
     import jax
     jax.config.update('jax_enable_x64', True)
     _warmup_solver(robot, solver, args)
@@ -1341,8 +1309,7 @@ def main():
         if os.path.exists(args.collision_pairs):
             transition_pairs = spik.load_collision_pairs(
                 args.collision_pairs, robot)
-        # 最初のバッチ IK は台車の全可動域で解く (狭い可動域で最初に呼ぶと
-        # 以後の結果が壊れる)。横並び移動用のソルバーも同様。
+        # 最初のバッチ IK は台車の全可動域で解く (狭いと以後の結果が壊れる)。
         for robot_arm, hand in (('l', 'R'), ('r', 'L')):
             picked, _, _ = spik.solve_person_ik(
                 robot, spik._WARMUP_PALM, hand, robot_arm,
@@ -1355,7 +1322,7 @@ def main():
                 transition_pairs, base_limits)
 
     if args.wait_file is not None:
-        # warmup は入力に依存しないので先に済ませた。入力の完成を待つ。
+        # 入力の完成を待つ。
         wait_t0 = time.time()
         while not os.path.exists(args.wait_file):
             time.sleep(0.1)
@@ -1372,7 +1339,6 @@ def main():
     for i, path in enumerate(files):
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))
-        # 押し込み姿勢が解けなかった人は計画しない。
         if (not handshake.get('target') or not handshake.get('solved')
                 or handshake.get('post_process') is None):
             reason = ('not_target' if not handshake.get('target')
@@ -1391,12 +1357,12 @@ def main():
             joint_positions, front_distance=spik.HUMAN_FRONT_DISTANCE)
         joint_positions = spik.translate_joint_positions(
             joint_positions, offset)
-        # 立ち位置が求まらなければ公称位置 (Aero の前方) を使う。
+        # 立ち位置が求まらなければ公称位置。
         human_xy = spik.human_standing_xy(joint_positions)
         if human_xy is None:
             human_xy = np.array([spik.HUMAN_FRONT_DISTANCE, 0.0])
 
-        # 干渉判定用に体幹を体の奥へずらした骨格。
+        # 干渉判定用に体幹をずらした骨格。
         collision_joints = spik.shift_torso_joints_from_surface(
             joint_positions, offset, args.torso_surface_offset)
         result = plan_person_motion(
@@ -1420,7 +1386,7 @@ def main():
                 sbs.transition_summary(transition)))
         json_io.save_json(out_path, result)
         if result.get('other_arm_posture_replanned') is not None:
-            # 差し替えた腕の姿勢を IK 結果の JSON にも反映する。
+            # 差し替えた姿勢を IK 結果の JSON にも反映する。
             json_io.save_json(path, handshake)
             print('  [other-arm] 差し出さない腕を {} deg に曲げて計画し直し、'
                   '{} も更新しました。'.format(

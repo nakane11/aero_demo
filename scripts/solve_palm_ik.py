@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""掌の位置姿勢 JSON (``estimate_palm_poses.py`` の出力) から、Aero が手を
-繋ぐ全身 IK (台車移動を含む) を人物ごとにバッチで解き、結果を JSON に保存する
+"""掌の位置姿勢 JSON (``estimate_palm_poses.py`` の出力) から、Aero が手を繋ぐ
+全身 IK (台車移動を含む) を人物ごとにバッチで解き、結果を JSON に保存する
 オフライン処理。``offered_hand`` が null の人物は ``target: false`` の JSON
 だけを書く。
 
-人物は立ち位置が Aero の前方 ``HUMAN_FRONT_DISTANCE`` に来るよう平行移動
-してから解く。人体 (骨格を円柱で近似) と自己干渉を回避し、収束した候補は
-厳密形状での事後検証と後処理判定 (``solve_post_process``) を通ったものだけ
-を採用する (``pick_verified_candidate``)。
+人物は Aero の前方 ``HUMAN_FRONT_DISTANCE`` に平行移動してから解く。収束した
+候補のうち、厳密形状での事後検証と後処理判定を通ったものを採用する
+(``pick_verified_candidate``)。
 
 Usage
 -----
@@ -71,9 +70,8 @@ PALM_VERTICAL_THRESHOLD = math.sin(math.radians(30.0))
 
 
 def turn_candidates_deg(hand, palm):
-    """差し出す手 ``hand`` ('R'/'L') と掌 ``palm`` から、試す向き [deg] を
-    優先順に返す。掌が上向きなら親指側、下向き (甲が上) なら小指側、横向き
-    なら 0 度を最優先にする。"""
+    """差し出す手 ``hand`` ('R'/'L') と掌 ``palm`` から、試す向き [deg] を優先順に
+    返す (上向き: 親指側、下向き: 小指側、横向き: 0 度が先頭)。"""
     thumb_deg = THUMB_SIDE_DEG_BY_HAND[hand]
     pinky_deg = PINKY_SIDE_DEG_BY_HAND[hand]
     normal_z = float(np.asarray(palm['y_axis'], dtype=np.float64)[2])
@@ -122,60 +120,41 @@ DEFAULT_SELF_COLLISION_MARGIN = 0.02
 # 同じ箱・円柱・球) または 'spheres' (skrobot 既定の球近似)。
 DEFAULT_IK_COLLISION_GEOMETRY = 'primitive'
 
-# hover 目標 (IK の目標) は、押し込みの最終目標を掌の法線方向に
-# PRESS_IN_LIFT 浮かせ (人の掌と約 3 cm 離れる)、ロボットの指先と逆向きに
-# PRESS_IN_SLIDE ずらした位置 (手先の向きは最終目標と同じ)。押し込みは
-# 指先を PRESS_IN_SLIDE 押し出しながら PRESS_IN_LIFT 詰める曲線
-# (press_in_target_position)。3 -> 4 cm: 2026-10-19 実機の試行2で、検出し直した
-# 掌が計画から 3 cm 下・向き 20° ずれていて、hover の掌からの余裕 2 cm では
-# 押し出しの始点がもう掌の面の反対側 (甲側) にあった。
+# hover 目標は、押し込みの最終目標を掌の法線方向に PRESS_IN_LIFT 浮かせ、
+# ロボットの指先と逆向きに PRESS_IN_SLIDE ずらした位置。押し込みは指先方向へ
+# 押し出しながら詰める曲線 (press_in_target_position)。
 PRESS_IN_LIFT = 0.04  # [m]
 PRESS_IN_SLIDE = 0.15  # [m]
 # 指先方向の進み u (0 -> 1) に対し、法線方向は 1 - u**指数 で詰める
 # (大きいほど押し出しの終盤で詰める、1 で直線)。
 PRESS_IN_CURVE_EXPONENT = 3.0
-# 押し込み中に台車が受け持つ割合: 指先方向の押し出し (PRESS_IN_SLIDE) の
-# 水平成分のこの割合だけ、押し出すのと同時に台車も平行移動する (向きは
-# 変えない、0 で台車固定)。法線方向の詰め (PRESS_IN_LIFT) は腕で行う。
+# 押し込み中に台車が受け持つ、指先方向の押し出しの水平成分の割合 (0 で台車固定)。
 PRESS_IN_BASE_RATIO = 1.0
-# 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。各点で IK を
-# 解いた waypoint 列にする (関節空間の補間では曲線にならないため)。
+# 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。
 PRESS_IN_PATH_POINTS = 8
-# 押し込み区間で腰を上げないか: 'strict' なら各点の IK で足首の下限・膝の上限を
-# 直前の姿勢の角度にして (腰が高くなる側へ脚を動かさない)、hover で沈んだ
-# 腰を押し込みで浮かせない。解けなければ押し込みの失敗。'fallback' は解けない
-# ときだけ制限なしで解き直す。'off' は制限しない。
+# 押し込み区間で腰を上げないか: 'strict' は脚を腰が高くなる側へ動かさない
+# (解けなければ失敗)、'fallback' は解けないときだけ制限なし、'off' は制限なし。
 PRESS_IN_LEG_RISE = 'strict'
 PRESS_IN_LEG_RISE_MODES = ('off', 'strict', 'fallback')
-# 脚の下限・上限を直前の角度に合わせるときの許容 [rad]。
-# 腰が上がってよい量 LEG_RISE_ALLOW [m] の目安を足首・膝の余裕 [rad] にしたもの
-# (2 倍)。厳密に上げないと hover で沈んだまま終わり、10/19 の実機で沈みすぎ。
-# 合成 400 人 (seed 0) で 0・2・5・8・12・16 cm と制限なしを比べた (脚の低い側の
-# 制限 0.1 のとき 12 cm が、上がり最大 12 cm・終了時の沈みが制限なしと同程度)。
-# 脚の低い側を 0.3 に狭めたので、hover で沈めない分、上がりは 20 cm まで許す
-# (0.3 + 20 cm: 上がり 平均 4.1 / 最大 13.5 cm、終了時の沈み 平均 4.1 cm)。
+# 押し込みで腰が上がってよい量 [m]。LEG_RISE_PIN_TOLERANCE は脚の関節を直前の
+# 角度に合わせるときの許容 [rad] (その 2 倍)。
 LEG_RISE_ALLOW = 0.20  # [m]
 LEG_RISE_PIN_TOLERANCE = 2.0 * LEG_RISE_ALLOW
 
 # hover 姿勢でロボットと人体 (全身) の間に空ける距離 [m]。
 DEFAULT_HOVER_HUMAN_CLEARANCE = DEFAULT_COLLISION_MARGIN  # [m]
 
-# 差し出した手 (掌・指) と同じ側の前腕 (offered_hand_obstacle_indices) だけ
-# に空ける距離 [m] (hover・接近)。hover が人の掌から約 2 cm なので全身と
-# 同じ距離は取れない。
+# 差し出した手 (掌・指) と同じ側の前腕だけに空ける距離 [m] (hover・接近)。
 OFFERED_HAND_CLEARANCE = 0.02  # [m]
 
-# 押し込み区間 (最終姿勢を含む) で、差し出した手まわり以外の人体に空ける
-# 距離 [m] (接近の検証と同じ 5 cm)。手まわりには触れるので見ない。
+# 押し込み区間で、差し出した手まわり以外の人体に空ける距離 [m]。
 PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 
 # 後処理判定の目標の掌からのオフセット [m] (負 = 掌にわずかにめり込む)。
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
-# 後処理 IK・押し込み区間の IK (どちらも脚を含めて解く) の直後に、脚のミミック
-# 関節を主関節に合わせて、脚を固定して腕・腰だけ解き直すか (settle_legs)。しない
-# と、実機に送る関節角 (主関節だけ) では手先が目標から IK の許容 (10 mm) を超えて
-# 離れる (保存した押し込み姿勢で中央値 14〜22 mm、最大 59 mm)。
+# 後処理 IK・押し込み IK の直後に、脚のミミック関節を主関節に合わせて脚を固定し
+# 腕・腰だけ解き直すか (settle_legs)。
 POST_PROCESS_SETTLE_LEGS = True
 
 # 後処理判定の腕 IK (ヤコビアン法、干渉回避・台車なし) の反復回数・収束閾値。
@@ -184,16 +163,9 @@ DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 押し込み直前の最終補正で、目標の変化がこれを超えたら補正しない (誤検出対策)。
-# 実機の bag (10/13〜10/16 の 10 試行、tools/ros/replay_press_in_refine.py)
-# で必要だった補正は位置 133〜220mm・回転 7〜28 度。10/16 夜の実機では
-# 手が本当に 46 度回っていた試行が 2 回あった (hover と押し込み後の画像で
-# 確認、bag の再現で IK は 48 度まで解けた) ので回転は 60 度まで許す。
 REFINE_MAX_POSITION_CHANGE = 0.25  # [m]
 REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
-# 押し込み直前の最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる
-# 角度 [rad] or None)。hover で決めた腰の高さを保つため、まず脚を動かさず、
-# 解けなければ hover の角度から少しだけ動かす。それでも解けなければ補正しない
-# (以前は脚を自由にして足首が hover から 18 度沈んだ: 10/19 実機 person_03)。
+# 最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる角度 [rad] or None)。
 REFINE_LEG_STAGES = (('fixed', True, None),
                      ('limited', False, math.radians(8.0)))
 
@@ -203,16 +175,12 @@ DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
 # 後処理判定の視線 IK (首 3 関節、rotation_mask='xy') の反復回数・収束閾値。
 DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
-# 腕と視線の同時 IK が解けないときは腕だけで押し込みを解き、首だけで掌へ
-# 向け直す。視線のずれがこれ未満なら採用する (カメラの縦の画角の半分 約 21
-# 度より内側で、掌が画面に入る)。
+# 腕と視線の同時 IK が解けないときは腕だけで押し込み、首だけで掌へ向け直す。
+# 視線のずれがこれ未満なら採用する。
 POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE = math.radians(15.0)  # [rad]
 
 # head_link -> camera_link (launch/decompress.launch の head_to_camera_link と
-# 同じ値、四元数は (x, y, z, w))。head_end_coords の +Z は実機カメラの光軸と
-# 12.8 度ずれているため、視線 IK はこちらの光軸を使う。値は
-# tools/ros/calibrate_head_camera.py で 10/15 の較正用 bag 2 本から推定した
-# もの (深度を床と /scan に合わせる。旧値は /scan に対し約 4 度ヨーがずれていた)。
+# 同じ値、四元数は (x, y, z, w))。視線 IK は head_end_coords ではこの光軸を使う。
 HEAD_TO_CAMERA_LINK_POS = (0.02918, 0.00703, 0.19434)  # [m]
 HEAD_TO_CAMERA_LINK_QUAT_XYZW = (-0.004963, -0.024023, 0.012764, 0.999618)
 # camera_link -> optical frame の回転 (REP 103、列が optical の各軸)。
@@ -224,13 +192,6 @@ CAMERA_LINK_TO_OPTICAL_ROT = np.array([[0.0, 0.0, 1.0],
 ELBOW_MIN_ANGLE_DEG = -120.0
 
 # 脚 (ankle: 0〜90 度、knee: -90〜0 度) の腰が低くなる側を削る比率。
-# 実機の押し込みで足首が指令に追従できないことがあるため。
-# 2026-10-19 実機で沈みすぎ (hover で ankle/knee 73/-76°) と指摘があり 0.1 から
-# 0.3 (足首の上限 63°・膝の下限 -63°) に。合成 400 人 (seed 0) で 0.1/0.2/0.3/0.4
-# の押し込み終了時の沈み (平均 13.9/10.6/8.8/6.5 cm、最大 32.9/21.3/20.6/14.3 cm)
-# と後処理まで成功 61/55/54/47 人。沈み込みの重みは 3000 でも変わらない
-# (沈まない候補は人体距離の検証・押し込み IK を通らない)。0.3 は LEG_RISE_ALLOW
-# 20 cm と組み合わせて、hover の沈み 平均 9.3 / 最大 22.5 cm、横並びまで 53/54。
 LEG_LOW_SIDE_MARGIN_RATIO = 0.3
 
 # 腰ピッチの上限 [deg]。URDF は 34.95 度だが実機は 32.96 度で止まる (ハード上限)。
@@ -239,19 +200,12 @@ WAIST_P_MAX_ANGLE_DEG = 32.5
 # 首ピッチの上限 [deg]。URDF は 55 度だが実機は 45.44 度で止まる。
 NECK_P_MAX_ANGLE_DEG = 44.5
 
-# 首ロール (neck_r_joint) は視線 IK で使わず 0 度に固定する。実機の首の
-# ピッチ・ロールは左右 2 本のアクチュエータの差動で、ロールを付けると片側の
-# ストロークが端に当たってピッチ・ロールとも指令に届かない (neck_r 5 度で
-# ピッチは 33.6 度まで)。また実機の /joint_states の neck_r は符号が逆
-# (物理的には指令どおりに傾く) なので、0 以外では TF もずれる。
+# 首ロールを視線 IK で使わず固定する角度 [deg] (実機の首は差動アクチュエータで、
+# ロールを付けると頭打ちになり /joint_states の符号も逆のため)。
 NECK_ROLL_FIXED_ANGLE = 0.0
 
-# 干渉回避付きバッチ IK だけに適用する関節可動域の上下マージン比率。
-# 端に張り付いた解では押し込みの IK が解けにくいので入れた (当初 5%、後に
-# 10%)。2026-10-20 に 10% -> 5% にした: 横並びまで 100% の人数が seed 0
-# (67 人) で 50 -> 58、seed 1 (46 人) で 34 -> 36、押し込みの失敗は増えない。
-# 0% は IK は更に解けるが横並びまでは 57・35 で 5% と同等以下、横並び移動の
-# 時間が伸びる。hover の解はこの余裕の境界に張り付きやすい。
+# 干渉回避付きバッチ IK だけに適用する関節可動域の上下マージン比率
+# (端に張り付いた解では押し込みの IK が解けにくいため)。
 DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.05
 
 # 候補選択の「関節の曲げ量コスト」(関節角 [rad] の重み付き二乗和) の対象
@@ -266,27 +220,17 @@ JOINT_BEND_COST_JOINTS = {
 
 
 # 候補のコストに足す hover の腰の沈み込み (CROUCH_REFERENCE_WAIST_Z からの
-# 下がり量 [m]) の重み (0 で無効)。hover が低い姿勢だと、しゃがんでから掌に
-# 近づく不自然な動きになるため。以前は沈み込みを避けて 300 にしていたが、
-# 押し込み・横並びで腰を上げない (PRESS_IN_LEG_RISE・GOAL_LEG_RISE) ように
-# してから、沈んだ腰を浮かせ直す無駄な動きは無くなったので、腰を前に倒す
-# より沈む方を選ぶ向きに寄せて 100 にした。合成 400 人 (seed 0) の掃引は
-# docs/ik_and_motion_constraints.md の「腰を上げない」の節。
-# 10/19 の実機で深くしゃがむ (ankle/knee 69/-76°) と指摘があり 300 に上げた
-# (合成 hover で 10cm 超沈む人 29 -> 22、横並び 100% は 57 のまま、前傾も増えない)。
+# 下がり量 [m]) の重み (0 で無効)。
 CROUCH_WEIGHT = 300.0
-# 候補のコストに足す hover の腰の前傾 (waist_p が正、お辞儀) [rad] の二乗の
-# 重み (0 で無効)。CROUCH_WEIGHT と合わせて、沈み込みよりお辞儀を嫌う。
-# 200 から 1000 に上げた (横並び終了時の前傾 平均 5.5° -> 4.3°、p90 10.6° ->
-# 9.9°、横並びまで解ける人数は同じ)。
-BOW_WEIGHT = 200.0  # 1000 は 10/19 実機で沈みすぎ (f0d7fc0 以前の値に戻した)
+# 候補のコストに足す hover の腰の前傾 (waist_p が正) [rad] の二乗の重み
+# (0 で無効)。
+BOW_WEIGHT = 200.0
 # 沈み込みの基準にする腰の高さ [m] (接近の始点の姿勢: 足首 30°・膝 -30°)。
 CROUCH_REFERENCE_WAIST_Z = 0.853
 
 
 def _joint_bend_cost_indices(robot, robot_arm):
-    """曲げ量コストの各関節の ``robot.angle_vector()`` 中のインデックスと
-    重みのリストを返す。"""
+    """曲げ量コストの各関節の ``angle_vector`` 中の添字と重みのリストを返す。"""
     index_by_name = {joint.name: i for i, joint in enumerate(robot.joint_list)}
     return [(index_by_name['{}_{}_joint'.format(robot_arm, suffix)], weight)
            for suffix, weight in JOINT_BEND_COST_JOINTS.items()]
@@ -317,8 +261,7 @@ HUMAN_COLLISION_SEGMENTS = (
     ('LHip', 'LKnee', 0.09),
     ('LKnee', 'LAnkle', 0.06),
 )
-# 胴体の 3 本の円柱の半径を決める幅の関節 (事後検証が円柱前提なので Box は
-# 使わない)。半径は前後の厚みで、実測の肩幅・腰幅から概算する。
+# 胴体の 3 本の円柱の半径を決める幅の関節。半径は前後の厚みで、肩幅・腰幅から概算する。
 _TORSO_SEGMENT_WIDTH_JOINTS = {
     ('RShoulder', 'RHip'): ('RShoulder', 'LShoulder'),
     ('LShoulder', 'LHip'): ('RShoulder', 'LShoulder'),
@@ -326,10 +269,8 @@ _TORSO_SEGMENT_WIDTH_JOINTS = {
 }
 # 体幹の前後の厚み / 左右の幅 (経験則)。
 TORSO_DEPTH_TO_WIDTH_RATIO = 0.55
-# 衣服等の安全マージン [m]。実カメラの骨格 (``SURFACE_SHIFTED_MARKER``
-# あり) は深度と比べると 0.03 では胴体が正面・横へ数 cm はみ出していたため
-# 0 にする。合成データは 0 にすると IK の終点が胴体に寄り接近経路の検証で
-# 落ちる人が増えたので 0.03 のまま。
+# 衣服等の安全マージン [m]。実カメラの骨格 (``SURFACE_SHIFTED_MARKER`` あり)
+# では 0 にする。
 TORSO_RADIUS_MARGIN = 0.03
 SURFACE_TORSO_RADIUS_MARGIN = 0.0
 # 誤検出対策の半径のクリップ範囲 [m]。
@@ -338,8 +279,7 @@ MAX_TORSO_RADIUS = 0.20
 
 
 def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
-    """胴体の辺なら実測の肩幅/腰幅から概算した半径を、それ以外や幅を
-    測れないときは ``default_radius`` を返す。"""
+    """胴体の辺なら肩幅/腰幅から概算した半径を、それ以外は ``default_radius`` を返す。"""
     width_joints = _TORSO_SEGMENT_WIDTH_JOINTS.get((name_a, name_b))
     if width_joints is None:
         return default_radius
@@ -356,13 +296,10 @@ def _torso_segment_radius(name_a, name_b, default_radius, joint_positions):
     return float(np.clip(radius, MIN_TORSO_RADIUS, MAX_TORSO_RADIUS))
 
 
-# 実カメラの骨格の関節は体の表面の点なので、干渉判定では体幹の関節を
-# カメラから離れる水平方向へずらす (合成データの関節は体内にあるので不要)。
+# 実カメラの骨格の関節は表面の点なので、体幹の関節をカメラから離れる水平方向へずらす。
 TORSO_SURFACE_JOINTS = ('Neck', 'RShoulder', 'LShoulder', 'RHip', 'LHip')
 DEFAULT_TORSO_SURFACE_OFFSET = 0.07  # [m]
-# 頭・腕・脚の関節も表面の点なので、体幹をずらすときは部位の太さ程度
-# 奥へずらす [m] (Nose は鼻先なので頭の中心まで。頭の円柱に Nose を使うのは
-# 耳が欠けたときだけ)。
+# 頭・腕・脚の関節も表面の点なので、部位の太さ程度奥へずらす [m]。
 LIMB_SURFACE_OFFSETS = {
     'Nose': 0.08,
     'REar': 0.05, 'LEar': 0.05,
@@ -371,19 +308,16 @@ LIMB_SURFACE_OFFSETS = {
     'RKnee': 0.05, 'LKnee': 0.05,
     'RAnkle': 0.05, 'LAnkle': 0.05,
 }
-# ``shift_torso_joints_from_surface`` でずらした (実カメラの) 骨格の目印。
-# 骨格は座標変換されながら引き回されるので、値は点 (首と同じ位置) にする。
+# ``shift_torso_joints_from_surface`` でずらした骨格の目印 (値は点)。
 SURFACE_SHIFTED_MARKER = 'SurfaceShifted'
 
 
 def shift_torso_joints_from_surface(joint_positions, viewpoint_xy,
                                     offset=DEFAULT_TORSO_SURFACE_OFFSET,
                                     limb_offsets=None):
-    """体幹の関節を ``viewpoint_xy`` (カメラの x/y、骨格と同じ座標系) から
-    離れる水平方向へ ``offset`` [m]、頭・腕・脚の関節を ``limb_offsets``
-    (既定 ``LIMB_SURFACE_OFFSETS``) ずつずらし、目印
-    ``SURFACE_SHIFTED_MARKER`` を加えたコピーを返す (干渉判定用)。
-    ``offset`` が 0 以下 (合成データ) なら何もしない。"""
+    """体幹の関節を ``viewpoint_xy`` (カメラの x/y) から離れる水平方向へ ``offset`` [m]、
+    頭・腕・脚の関節を ``limb_offsets`` ずつずらし、目印を加えたコピーを返す。
+    ``offset`` が 0 以下なら何もしない。"""
     if offset <= 0.0 or not joint_positions:
         return joint_positions
     if limb_offsets is None:
@@ -424,9 +358,8 @@ _CHAIN_FALLBACK_OFFSETS = (
 
 
 def _fill_missing_joints_straight_down(joint_positions):
-    """欠けた関節を ``_CHAIN_FALLBACK_OFFSETS`` で親関節から補い、頭の
-    中心 ``HeadCenter`` を加え、前腕の手首端を掌の円柱の表面まで延ばした
-    コピーを返す。"""
+    """欠けた関節を ``_CHAIN_FALLBACK_OFFSETS`` で親関節から補い、頭の中心
+    ``HeadCenter`` を加え、前腕の手首端を掌の円柱の表面まで延ばしたコピーを返す。"""
     filled = dict(joint_positions)
     for parent_name, child_name, z_offset in _CHAIN_FALLBACK_OFFSETS:
         if parent_name in filled and child_name not in filled:
@@ -467,8 +400,7 @@ def _fill_missing_joints_straight_down(joint_positions):
             filled[wrist_name] = filled['{}Hand0'.format(side)]
     return filled
 
-# 手の干渉回避用ジオメトリ (MediaPipe 形式の {R,L}Hand0..20)。掌は平たい
-# 円柱、各指は付け根から指先までの細い円柱で近似する。
+# 手の干渉回避用ジオメトリ (MediaPipe 形式の {R,L}Hand0..20): 掌は平たい円柱、各指は細い円柱。
 HAND_PALM_LANDMARKS = (0, 5, 9, 13, 17)  # 手首 + 4 指の付け根 (MCP)
 HAND_FINGER_LANDMARKS = (
     (1, 4),    # 親指: CMC -> 指先
@@ -501,20 +433,16 @@ def _turn_about_y(rot, turn_deg):
 
 
 def _correct_grasp_frame(rot, arm):
-    """左腕用に +Y/+Z を反転する (局所 +X まわり 180 度).
-
-    URDF の都合で ``l_eef_grasp_link`` の +Y は右と逆に掌->甲を向くため、
-    右腕用 (+Y=甲->掌) の ``rot`` を左腕で使うにはこの補正が必須。
-    """
+    """左腕用に +Y/+Z を反転する (局所 +X まわり 180 度)。URDF で左の
+    ``l_eef_grasp_link`` の +Y が掌->甲を向くため。"""
     if arm != 'l':
         return rot
     return np.column_stack([rot[:, 0], -rot[:, 1], -rot[:, 2]])
 
 
 def palm_to_target_rots(palm, hand, robot_arm):
-    """掌 (1 手分) から手先 (``{arm}_eef_grasp_link``, +X=指方向,
-    +Y=甲->掌) の目標姿勢の候補を ``turn_candidates_deg`` の順に返す。
-    指方向は鏡写しにせず、+Y は掌の法線の逆向き。"""
+    """掌から手先 (``{arm}_eef_grasp_link``, +X=指方向, +Y=甲->掌) の目標姿勢の候補を
+    ``turn_candidates_deg`` の順に返す。+Y は掌の法線の逆向き。"""
     return [palm_target_rot(palm, deg, robot_arm)
            for deg in turn_candidates_deg(hand, palm)]
 
@@ -540,8 +468,7 @@ def press_in_slide_direction(palm, target_rot):
 
 
 def press_in_target_position(palm, target_rot, u):
-    """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover 目標、
-    1 = 最終目標)。"""
+    """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover、1 = 最終目標)。"""
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
     final = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
@@ -577,8 +504,7 @@ def human_standing_xy(joint_positions):
 
 
 def human_translation_offset(joint_positions, front_distance=HUMAN_FRONT_DISTANCE):
-    """立ち位置を ``(front_distance, 0)`` に移す平行移動量 (dx, dy) を返す
-    (求まらなければ (0, 0))."""
+    """立ち位置を ``(front_distance, 0)`` に移す平行移動量 (dx, dy) (求まらなければ (0, 0))。"""
     person_xy = human_standing_xy(joint_positions)
     if person_xy is None:
         return (0.0, 0.0)
@@ -632,8 +558,7 @@ def transform_palm(palm, rot, pos):
 
 
 def human_facing_direction(joint_positions):
-    """人物の正面方向 (xy 単位ベクトル) を右肩->左肩 (無ければ腰) と鉛直上
-    向きの外積で返す。求まらなければ None。"""
+    """人物の正面方向 (xy 単位ベクトル) を右肩->左肩 (無ければ腰) と鉛直上向きの外積で返す。"""
     def get(name):
         v = joint_positions.get(name)
         return None if v is None else np.asarray(v, dtype=np.float64)
@@ -652,8 +577,7 @@ def human_facing_direction(joint_positions):
 
 
 def human_facing_yaw(joint_positions):
-    """``human_facing_direction`` を world yaw [rad] (atan2) に変換する。
-    求まらなければ None。"""
+    """``human_facing_direction`` を world yaw [rad] に変換する。求まらなければ None。"""
     direction = human_facing_direction(joint_positions)
     if direction is None:
         return None
@@ -661,8 +585,7 @@ def human_facing_yaw(joint_positions):
 
 
 def offered_hand_side_sign(human_hand, joint_positions, palm):
-    """差し出した手 (手首、無ければ掌) が立ち位置から見て y のどちら側に
-    あるかを +1.0/-1.0 で返す (求まらない・ほぼ正面なら None)。"""
+    """差し出した手が立ち位置から見て y のどちら側かを +1.0/-1.0 で返す (不明なら None)。"""
     if joint_positions is None:
         return None
     center_xy = human_standing_xy(joint_positions)
@@ -683,8 +606,7 @@ def offered_hand_side_sign(human_hand, joint_positions, palm):
 
 
 def restrict_base_y_range_to_hand_side(base_y_range, side_sign):
-    """台車の y 範囲を ``side_sign`` の側 (人物は y=0) に制限して返す。
-    ``side_sign`` が None か、制限すると空になる場合はそのまま返す。"""
+    """台車の y 範囲を ``side_sign`` の側 (人物は y=0) に制限する。None・空になる場合はそのまま。"""
     if side_sign is None:
         return base_y_range
     lo, hi = base_y_range
@@ -707,8 +629,7 @@ DEFAULT_FACING_YAW_WEIGHT = 30.0
 
 def restrict_base_x_range_to_human_standing(base_x_range, standing_x,
                                             margin):
-    """台車の x 範囲を ``standing_x ± margin`` との積集合に絞って返す (人が
-    ほぼ ±x を向いている前提)。None・負の margin・空集合ならそのまま返す。"""
+    """台車の x 範囲を ``standing_x ± margin`` との積集合に絞る。None・負の margin・空集合ならそのまま。"""
     if standing_x is None or margin is None or margin < 0.0:
         return base_x_range
     lo, hi = base_x_range
@@ -720,22 +641,13 @@ def restrict_base_x_range_to_human_standing(base_x_range, standing_x,
 
 
 # 台車の x・y を掌の水平位置 ± この距離 [m] に絞る (None は絞らない)。
-# バッチ IK の初期値は可動域全体から一様に引くので、腕が届かない遠くの
-# 初期値を減らす狙いだったが、効果がなく既定では無効 (2026-10-20 評価):
-# 過去の成功解 36 件で台車と掌の水平距離は最大 0.91 m だが、1.1 m に絞って
-# も IK 1 段階目の時間は 0.371 → 0.369 秒/人で変わらず (バッチの時間は
-# レーン数で決まる)。試行数を 512 → 256 に半減すると seed 0 の 67 人では
-# 時間 -30%・verified 53 → 54 だったが、seed 1 の 400 人では 34 → 28 に悪化
-# した (絞りなしの 512 は 34、絞り 512 は 32、1.5 m 512 は 30 で、乱数の揺れ
-# が ±3 人ほどある)。
 DEFAULT_BASE_PALM_REACH = None
 
 
 def restrict_base_range_to_palm_reach(base_limits, palm_position,
                                       reach=DEFAULT_BASE_PALM_REACH):
-    """台車の x・y の範囲を ``palm_position`` (x, y) ± ``reach`` との積集合に
-    絞った ``base_limits`` を返す。``reach`` が None か、どちらかが空集合に
-    なるならそのまま返す。"""
+    """台車の x・y の範囲を ``palm_position`` (x, y) ± ``reach`` との積集合に絞る。
+    ``reach`` が None か空集合になるならそのまま。"""
     if reach is None or palm_position is None:
         return list(base_limits)
     restricted = []
@@ -755,19 +667,15 @@ DEFAULT_BASE_YAW_FACING_MARGIN_DEG = 30.0
 def restrict_base_yaw_range_to_human_facing(base_yaw_range, human_yaw,
                                             margin=math.radians(
                                                 DEFAULT_BASE_YAW_FACING_MARGIN_DEG)):
-    """台車の yaw 範囲を ``human_yaw ± margin`` [rad] で置き換えて返す
-    (積集合ではない。``human_yaw`` が None ならそのまま)。"""
+    """台車の yaw 範囲を ``human_yaw ± margin`` [rad] で置き換える (``human_yaw`` が None ならそのまま)。"""
     if human_yaw is None:
         return base_yaw_range
     return (human_yaw - margin, human_yaw + margin)
 
 
 def seed_arm_pose(robot, robot_arm):
-    """バッチ IK の attempt 0 に使う種の姿勢をロボットに作る (台車は原点).
-
-    ``reset_pose()`` は台車を戻さないので ``robot``/``base_link`` の両方を
-    単位姿勢に戻す。使わない腕は肘を伸ばして体の横に下ろす。
-    """
+    """バッチ IK の attempt 0 の種の姿勢をロボットに作る (台車は原点、使わない腕は
+    肘を伸ばして体の横に下ろす)。"""
     robot.reset_pose()
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
@@ -801,9 +709,7 @@ _OTHER_HAND_POINTS_CACHE = {}
 
 def other_hand_points(side):
     """指ありモデルの ``side`` 側の手と指の表面サンプルを
-    ``{side}_hand_yaw_link`` 座標系で返す (指なしモデルに載せて指先を求める
-    ため。左手の取り付け位置が URDF 間で違うので hand_link 基準にしない)。
-    """
+    ``{side}_hand_yaw_link`` 座標系で返す。"""
     cached = _OTHER_HAND_POINTS_CACHE.get(side)
     if cached is not None:
         return cached
@@ -829,8 +735,7 @@ def other_hand_points(side):
 
 
 def other_hand_base_clearance(robot, robot_arm):
-    """差し出さない手 (指先を含む) と台車の箱の最短距離 [m] を返す (入り
-    込んでいれば負)。"""
+    """差し出さない手 (指先を含む) と台車の箱の最短距離 [m] を返す (入り込めば負)。"""
     side = 'l' if robot_arm == 'r' else 'r'
     hand_yaw = getattr(robot, '{}_hand_yaw_link'.format(side))
     world = (other_hand_points(side) @ hand_yaw.worldrot().T
@@ -863,9 +768,8 @@ def apply_other_arm_posture(robot, robot_arm, posture_index):
 
 
 def select_other_arm_posture(robot, robot_arm):
-    """現在の姿勢で差し出さない手が台車の箱から ``OTHER_ARM_BASE_CLEARANCE``
-    以上離れる最初の ``OTHER_ARM_POSTURES_DEG`` の添字を返す (無ければ
-    None)。腕は最後に試した姿勢のままになる。"""
+    """現在の姿勢で差し出さない手が台車の箱から ``OTHER_ARM_BASE_CLEARANCE`` 以上離れる
+    最初の ``OTHER_ARM_POSTURES_DEG`` の添字を返す (無ければ None)。"""
     for index in range(len(OTHER_ARM_POSTURES_DEG)):
         apply_other_arm_posture(robot, robot_arm, index)
         if other_hand_base_clearance(robot, robot_arm) \
@@ -875,25 +779,22 @@ def select_other_arm_posture(robot, robot_arm):
 
 
 def with_other_arm_posture(robot, angle_vector, robot_arm, posture_index):
-    """``angle_vector`` の差し出さない腕だけを ``posture_index`` の姿勢に
-    差し替えた関節角ベクトルを返す (``robot`` はその姿勢になる)。"""
+    """``angle_vector`` の差し出さない腕だけを ``posture_index`` の姿勢にした関節角ベクトルを返す。"""
     robot.angle_vector(angle_vector)
     apply_other_arm_posture(robot, robot_arm, posture_index)
     return robot.angle_vector().copy()
 
 
 def restrict_elbow_range(robot):
-    """両肘の下限を ``ELBOW_MIN_ANGLE_DEG`` にする (``*_whole_body`` にも
-    効く)。"""
+    """両肘の下限を ``ELBOW_MIN_ANGLE_DEG`` にする。"""
     min_angle = math.radians(ELBOW_MIN_ANGLE_DEG)
     for arm in ('r', 'l'):
         getattr(robot, '{}_elbow_joint'.format(arm)).min_angle = min_angle
 
 
 def restrict_leg_range(robot):
-    """ankle の上限と knee の下限 (腰が低くなる側) を全域幅の
-    ``LEG_LOW_SIDE_MARGIN_RATIO`` だけ狭める。URDF の可動域を
-    ``_urdf_range`` に覚えるので 2 回呼んでも重ならない。"""
+    """ankle の上限と knee の下限 (腰が低くなる側) を全域幅の ``LEG_LOW_SIDE_MARGIN_RATIO``
+    だけ狭める (``_urdf_range`` に元の可動域を覚えるので 2 回呼んでも重ならない)。"""
     for joint, low_side_is_max in ((robot.ankle_joint, True),
                                    (robot.knee_joint, False)):
         if not hasattr(joint, '_urdf_range'):
@@ -909,14 +810,12 @@ def restrict_leg_range(robot):
 
 
 def restrict_waist_range(robot):
-    """``waist_p_joint`` の上限 (前傾側) を ``WAIST_P_MAX_ANGLE_DEG`` まで
-    狭める。"""
+    """``waist_p_joint`` の上限を ``WAIST_P_MAX_ANGLE_DEG`` まで狭める。"""
     _restrict_max_angle(robot.waist_p_joint, WAIST_P_MAX_ANGLE_DEG)
 
 
 def restrict_neck_range(robot):
-    """``neck_p_joint`` の上限 (下向き側) を ``NECK_P_MAX_ANGLE_DEG`` まで
-    狭める。"""
+    """``neck_p_joint`` の上限を ``NECK_P_MAX_ANGLE_DEG`` まで狭める。"""
     _restrict_max_angle(robot.neck_p_joint, NECK_P_MAX_ANGLE_DEG)
 
 
@@ -930,11 +829,8 @@ def _restrict_max_angle(joint, max_angle_deg):
 
 
 def lock_fixed_joints(robot):
-    """実機にモータが無い関節 (``{r,l}_hand_y_joint``) の可動域を 0 に潰す.
-
-    バッチ IK・軌道計画は ``link_list`` の関節を全部動かすため必須。あわせて
-    手の取り付け位置を指ありモデルに合わせ、IK の手先を指先側へずらす。
-    """
+    """実機にモータが無い関節 (``{r,l}_hand_y_joint``) の可動域を 0 に潰す。
+    手の取り付け位置も指ありモデルに合わせ、IK の手先を指先側へずらす。"""
     for name in robot._FIXED_JOINT_NAMES:
         joint = getattr(robot, name)
         joint.min_angle = 0.0
@@ -949,8 +845,7 @@ GRASP_POINT_OFFSET_X = 0.04
 
 
 def shift_grasp_point(robot):
-    """``{r,l}arm_end_coords`` を親から局所 +X に ``GRASP_POINT_OFFSET_X``
-    [m] の位置に置き直す (何度呼んでも重ならない)。"""
+    """``{r,l}arm_end_coords`` を親から局所 +X に ``GRASP_POINT_OFFSET_X`` [m] の位置に置き直す。"""
     for side in ('r', 'l'):
         end_coords = getattr(robot, '{}arm_end_coords'.format(side), None)
         if end_coords is None:
@@ -960,14 +855,12 @@ def shift_grasp_point(robot):
         end_coords.newcoords(local)
 
 
-# {r,l}_hand_y_joint の origin [m] (指ありの URDF の値)。指なしの URDF は
-# 左だけ z=0 で、手先が 4 cm ずれるため合わせる。
+# {r,l}_hand_y_joint の origin [m] (指ありの URDF の値)。
 HAND_Y_JOINT_ORIGIN = (0.0, 0.0, -0.04)
 
 
 def align_hand_mount_with_hand_model(robot):
-    """``{r,l}_hand_y_joint`` の取り付け位置を ``HAND_Y_JOINT_ORIGIN`` に
-    合わせる (既に同じなら何もしない)。"""
+    """``{r,l}_hand_y_joint`` の取り付け位置を ``HAND_Y_JOINT_ORIGIN`` に合わせる。"""
     for side in ('r', 'l'):
         joint = getattr(robot, '{}_hand_y_joint'.format(side), None)
         if joint is None:
@@ -975,8 +868,7 @@ def align_hand_mount_with_hand_model(robot):
         origin = np.asarray(HAND_Y_JOINT_ORIGIN, dtype=np.float64)
         if np.allclose(joint.default_coords.translation, origin):
             continue
-        # default_coords を変えても子リンクは動かないので両方書き換える。
-        # 子リンクは newcoords で (translation 直接代入はキャッシュが古いまま)。
+        # default_coords を変えても子リンクは動かないので両方書き換える (子リンクは newcoords で)。
         joint.default_coords.translation = origin
         local = joint.child_link.copy_coords()
         local.translation = origin.copy()
@@ -984,8 +876,7 @@ def align_hand_mount_with_hand_model(robot):
 
 
 def restrict_joint_range_margin(link_list, margin_ratio):
-    """``link_list`` の各関節の可動域を上下とも全域幅の ``margin_ratio``
-    だけ一時的に狭め、元に戻す関数を返す (可動域が無限の関節は対象外)。"""
+    """``link_list`` の各関節の可動域を上下とも全域幅の ``margin_ratio`` だけ一時的に狭め、元に戻す関数を返す。"""
     joints = []
     seen_ids = set()
     for link in link_list:
@@ -1036,8 +927,7 @@ def _cylinder_between(p0, p1, radius):
 
 
 def _palm_obstacle(points):
-    """掌 (``HAND_PALM_LANDMARKS`` の 5 点) を近似する平たい ``Cylinder``
-    を作る (軸は掌面の法線)。"""
+    """掌 (``HAND_PALM_LANDMARKS`` の 5 点) を近似する平たい ``Cylinder`` (軸は掌面の法線) を作る。"""
     points = np.asarray(points, dtype=np.float64)
     center = points.mean(axis=0)
     wrist, index_mcp, pinky_mcp = points[0], points[1], points[-1]
@@ -1055,8 +945,7 @@ def _palm_obstacle(points):
 
 
 def _palm_obstacle_partial(points):
-    """検出できた一部の掌 landmark から SVD 平面フィットで大まかな掌の
-    ``Cylinder`` を作る。点が足りない・ほぼ一直線なら None。"""
+    """一部の掌 landmark から SVD 平面フィットで掌の ``Cylinder`` を作る。点不足・ほぼ一直線なら None。"""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < PALM_OBSTACLE_MIN_POINTS:
         return None
@@ -1083,9 +972,8 @@ def _dummy_cylinder(radius):
 
 
 def human_body_obstacles(joint_positions):
-    """骨格の関節位置から全身 (差し出した手を含む) の障害物 ``Cylinder``
-    のリストを作る。個数は常に一定 (``human_obstacle_names`` と同じ順) で、
-    欠けた部位はダミーで埋める。"""
+    """骨格の関節位置から全身 (差し出した手を含む) の障害物 ``Cylinder`` のリストを作る。
+    個数・順序は常に一定 (``human_obstacle_names``) で、欠けた部位はダミーで埋める。"""
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     obstacles = []
     for name_a, name_b, default_radius in HUMAN_COLLISION_SEGMENTS:
@@ -1134,9 +1022,8 @@ OFFERED_HAND_PENALTY_LINKS = ('{}_hand_link', '{}_thumb_box_link',
 
 def human_clearance_thresholds(hand, clearance,
                                hand_clearance=OFFERED_HAND_CLEARANCE):
-    """人体の障害物ごとに空ける距離 [m] の配列 (``human_obstacle_names`` の
-    順)。差し出した手 ``hand`` の手まわりだけ ``hand_clearance`` (None なら
-    見ない = -inf) にする。"""
+    """人体の障害物ごとに空ける距離 [m] の配列 (``human_obstacle_names`` の順)。
+    差し出した手 ``hand`` の手まわりだけ ``hand_clearance`` (None なら見ない = -inf)。"""
     thresholds = np.full(len(human_obstacle_names()), float(clearance))
     if hand is not None:
         indices = sorted(offered_hand_obstacle_indices(hand))
@@ -1146,9 +1033,8 @@ def human_clearance_thresholds(hand, clearance,
 
 
 def clearance_shortfall(clearances, thresholds):
-    """``human_obstacle_clearances`` の結果 ``{添字: 距離}`` で、距離から
-    ``thresholds`` を引いた余裕が最小の ``(添字, 余裕)`` (無ければ
-    ``(None, inf)``)。"""
+    """``human_obstacle_clearances`` の結果 ``{添字: 距離}`` で、距離から ``thresholds`` を
+    引いた余裕が最小の ``(添字, 余裕)`` (無ければ ``(None, inf)``)。"""
     best = (None, float('inf'))
     for index, distance in clearances.items():
         margin = distance - thresholds[index]
@@ -1159,9 +1045,8 @@ def clearance_shortfall(clearances, thresholds):
 
 def offered_hand_penalty_obstacle(obstacle, margin,
                                   hand_clearance=OFFERED_HAND_CLEARANCE):
-    """バッチ IK の干渉ペナルティ (全体で 1 つのマージン ``margin``) で、
-    前腕の円柱との距離を ``hand_clearance`` にするために半径と長さを
-    ``margin - hand_clearance`` だけ細らせた円柱を返す。"""
+    """バッチ IK の干渉ペナルティ (マージン ``margin`` は共通) で前腕との距離を
+    ``hand_clearance`` にするため、半径と長さを ``margin - hand_clearance`` 細らせた円柱を返す。"""
     shrink = max(margin - hand_clearance, 0.0)
     return Cylinder(radius=max(obstacle.radius - shrink, 1e-3),
                     height=max(obstacle.height - 2.0 * shrink, 1e-3),
@@ -1170,8 +1055,7 @@ def offered_hand_penalty_obstacle(obstacle, margin,
 
 
 def human_obstacle_names():
-    """``human_body_obstacles`` と同じ順序の名前のリスト (--collision-pairs
-    の人体側の名前)。"""
+    """``human_body_obstacles`` と同じ順序の名前のリスト。"""
     names = ['{}-{}'.format(name_a, name_b)
             for name_a, name_b, _ in HUMAN_COLLISION_SEGMENTS]
     for side in ('R', 'L'):
@@ -1196,8 +1080,7 @@ def segment_points_distance(p0, p1, points):
 
 
 def human_capsules(joint_positions):
-    """``human_body_obstacles`` と同じ順序のカプセル (p0, p1, 半径) の
-    リストと名前のリストを返す。"""
+    """``human_body_obstacles`` と同じ順序のカプセル (p0, p1, 半径) のリストと名前のリストを返す。"""
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     caps = []
     names = []
@@ -1247,8 +1130,7 @@ CYLINDER_SAMPLES_N_HEIGHT = 5
 
 
 def cylinder_surface_samples(obstacle):
-    """円柱の表面をワールド座標でサンプルし、``(points, center, radius)``
-    (``center``/``radius`` は足切り用の包含球) を返す。"""
+    """円柱の表面をワールド座標でサンプルし、``(points, center, radius)`` (包含球は足切り用) を返す。"""
     n_theta = CYLINDER_SAMPLES_N_THETA
     n_height = CYLINDER_SAMPLES_N_HEIGHT
     thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
@@ -1274,12 +1156,9 @@ _LINK_COLLISION_SHAPE_CACHE = {}
 
 
 def link_collision_shape(link):
-    """``link.collision_mesh`` (凸プリミティブ) をローカル座標の
-    ``(bounds, normals, offsets, radius)`` で返す (キャッシュする)。
-
-    ``normals @ p - offsets`` が全て 0 以下なら ``p`` は内部。``bounds``
-    (AABB) と ``radius`` (原点中心の包含球) は足切り用。
-    """
+    """``link.collision_mesh`` (凸プリミティブ) をローカル座標の ``(bounds, normals, offsets, radius)``
+    で返す (キャッシュ)。``normals @ p - offsets`` が全て 0 以下なら ``p`` は内部。
+    ``bounds`` (AABB) と ``radius`` は足切り用。"""
     cached = _LINK_COLLISION_SHAPE_CACHE.get(id(link))
     if cached is not None:
         return cached
@@ -1300,9 +1179,8 @@ def link_collision_shape(link):
 
 
 def obstacle_into_link_depth(samples, link, shape):
-    """円柱の表面サンプルがリンクの形状に入り込んだ深さ [m] (正 = 貫通) を
-    返す。リンクの頂点だけの判定では面の途中の貫通を見逃すため、円柱側から
-    も見る。"""
+    """円柱の表面サンプルがリンクの形状に入り込んだ深さ [m] (正 = 貫通) を返す。
+    リンクの頂点だけでは面の途中の貫通を見逃すため円柱側からも見る。"""
     points, obstacle_center, obstacle_radius = samples
     (lo, hi), normals, offsets, link_radius = shape
     # ホットパスなので np.linalg.norm ではなく math.sqrt で足切りする。
@@ -1330,8 +1208,7 @@ SELF_COLLISION_MAX_SAMPLES = 2000
 
 
 def link_surface_samples(link):
-    """``link.collision_mesh`` の表面をほぼ等間隔にサンプルした点 (ローカル
-    座標、決定的) を返す。"""
+    """``link.collision_mesh`` の表面をほぼ等間隔にサンプルした点 (ローカル座標、決定的) を返す。"""
     cached = _LINK_SURFACE_SAMPLES_CACHE.get(id(link))
     if cached is not None:
         return cached
@@ -1394,8 +1271,7 @@ SELF_COLLISION_CHUNK_SIZE = 128
 
 
 def _link_sample_chunks(link):
-    """表面サンプルを ``SELF_COLLISION_CHUNK_SIZE`` 点以下の塊に分け、
-    ``(塊の点のリスト, 中心 (C, 3), 包む球の半径 (C,))`` を返す。"""
+    """表面サンプルを ``SELF_COLLISION_CHUNK_SIZE`` 点以下の塊に分け、``(塊の点のリスト, 中心 (C, 3), 半径 (C,))`` を返す。"""
     cached = _LINK_SAMPLE_CHUNKS_CACHE.get(id(link))
     if cached is not None:
         return cached
@@ -1420,8 +1296,7 @@ def _link_sample_chunks(link):
 
 
 def _link_samples_into_link_depth(src, dst):
-    """``src`` の表面サンプルが ``dst`` の凸形状に入り込んだ最大の深さ [m]
-    (無ければ 0)。"""
+    """``src`` の表面サンプルが ``dst`` の凸形状に入り込んだ最大の深さ [m] (無ければ 0)。"""
     (lo, hi), normals, offsets, _ = link_collision_shape(dst)
     chunks, centers, radii = _link_sample_chunks(src)
     # src のローカル座標 -> dst のローカル座標
@@ -1450,9 +1325,7 @@ def _penetration_depth(link_a, link_b):
 
 
 def self_collision_depth(link_a, link_b):
-    """ロボットの 2 リンクの貫通深さ [m] (無ければ 0) を、表面サンプルが
-    相手の内部に入り込んだ深さの両方向の大きい方で返す (サンプル間隔の
-    半分程度まで過小評価しうる)。"""
+    """ロボットの 2 リンクの貫通深さ [m] (無ければ 0)。両方向の表面サンプルの大きい方 (過小評価しうる)。"""
     if _obb_separated(link_a, link_b):
         return 0.0
     return _penetration_depth(link_a, link_b)
@@ -1469,8 +1342,7 @@ def collision_pair_name(pair):
 def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
                                  obstacle_links=None, obstacle_samples=None,
                                  return_pair=False):
-    """``collision_pair_distances`` の最小値 [m] (負なら貫通、組が無ければ
-    inf) を返す。``return_pair`` なら ``(距離, 組)`` を返す。"""
+    """``collision_pair_distances`` の最小値 [m] を返す (組が無ければ inf)。``return_pair`` なら ``(距離, 組)``。"""
     if not collision_pairs:
         return (float('inf'), None) if return_pair else float('inf')
     dists = collision_pair_distances(
@@ -1484,14 +1356,12 @@ def collision_pairs_min_distance(robot, collision_pairs, joint_positions,
 
 def collision_pair_distances(robot, collision_pairs, joint_positions,
                              obstacle_links=None, obstacle_samples=None):
-    """現在の姿勢での ``collision_pairs`` (``(Link, Link)``/``(Link, int)``)
-    の組ごとの距離 [m] のリストを返す (負は貫通、人体が無ければ人体との組
-    は inf)。正の値は貫通判定用の粗い近似。
+    """現在の姿勢での ``collision_pairs`` の組ごとの距離 [m] のリストを返す
+    (負は貫通、人体が無ければ人体との組は inf)。正の値は粗い近似。
 
-    人体側は表示と同じ ``human_body_obstacles`` の円柱を使い、リンクの頂点
-    が円柱に入る深さと円柱の表面がリンクに入る深さ (頂点だけでは面の途中
-    の貫通を見逃す) の大きい方を採る。``obstacle_links``/
-    ``obstacle_samples`` は人体が同じままループで呼ぶときの事前計算。
+    人体側は円柱に対し、リンクの頂点が入る深さと円柱の表面がリンクに入る深さの
+    大きい方を採る。``obstacle_links``/``obstacle_samples`` は人体が同じままループで
+    呼ぶときの事前計算。
     """
     if not collision_pairs:
         return []
@@ -1622,8 +1492,7 @@ _RIGID_PAIR_DISTANCE_CACHE = {}
 
 
 def _pair_plan(collision_pairs):
-    """距離計算をまとめて行うための添字の配列とリンクの包含球の半径の dict
-    (``VerificationPairs`` ならキャッシュする)。"""
+    """距離計算をまとめて行うための添字の配列とリンクの包含球の半径の dict (``VerificationPairs`` ならキャッシュ)。"""
     plan = getattr(collision_pairs, '_plan', None)
     if plan is not None and plan['n'] == len(collision_pairs):
         return plan
@@ -1660,17 +1529,15 @@ def _pair_plan(collision_pairs):
 
 
 def _ragged_arange(starts, counts):
-    """``np.concatenate([np.arange(s, s + c) for s, c in zip(starts,
-    counts)])`` をループなしで作る。"""
+    """``np.concatenate([np.arange(s, s + c) for s, c in zip(starts, counts)])`` をループなしで作る。"""
     offsets = np.r_[0, np.cumsum(counts)[:-1]]
     return (np.repeat(starts - offsets, counts)
             + np.arange(int(np.sum(counts))))
 
 
 def _human_pair_plan(plan):
-    """``human_obstacle_clearances`` 用に ``plan`` へキャッシュする値 (人体と
-    組むリンクの通し番号、詰め直した ``local_a``、表面サンプルの塊を並べた
-    配列とその範囲。座標はリンクのローカル)。"""
+    """``human_obstacle_clearances`` 用に ``plan`` へキャッシュする値 (人体と組むリンクの
+    通し番号、詰め直した ``local_a``、表面サンプルの塊の配列と範囲。座標はリンクのローカル)。"""
     human_plan = plan.get('human_plan')
     if human_plan is not None:
         return human_plan
@@ -1702,8 +1569,7 @@ def _human_pair_plan(plan):
 
 def _min_vertex_distances(verts_a, verts_b, rots, positions, index_a,
                           index_b):
-    """組ごとの頂点同士の最短距離 (J,) を返す。``verts_a``/``verts_b`` は
-    リンクごとのローカルの頂点 (L, V, 3) で、NaN は無視する。"""
+    """組ごとの頂点同士の最短距離 (J,) を返す。``verts_a``/``verts_b``: リンクごとのローカル頂点 (L, V, 3)、NaN は無視。"""
     rot_a, rot_b = rots[index_a], rots[index_b]
     world_a = (np.einsum('jvn,jmn->jvm', verts_a[index_a], rot_a)
                + positions[index_a][:, np.newaxis, :])
@@ -1741,8 +1607,7 @@ def _pair_plan_boxes(plan):
 
 
 def _rigid_self_pairs(collision_pairs, plan):
-    """自己干渉の組ごとに、相対姿勢が常に同じか (bool の配列)。別モデルで
-    ``sync_from`` されない関節 (指) だけでつながる組が True。"""
+    """自己干渉の組ごとに相対姿勢が常に同じか (bool の配列)。別モデルで ``sync_from`` されない関節 (指) だけでつながる組が True。"""
     rigid = plan.get('rigid')
     if rigid is not None:
         return rigid
@@ -1786,11 +1651,10 @@ def points_cylinder_distance(points, obstacle):
 
 def human_obstacle_clearances(robot, collision_pairs, obstacle_links,
                               cull_distance):
-    """人体の障害物ごとのロボットとの最短距離 [m] を ``{添字: 距離}`` で返す.
+    """人体の障害物ごとのロボットとの最短距離 [m] を ``{添字: 距離}`` で返す。
 
-    リンク表面のサンプルから円柱までの距離をサンプル間隔分だけ安全側に
-    見積もる。``cull_distance`` 以上離れた組は下界で済ませる。深い貫通は
-    正しく測れないので、貫通判定は ``collision_pair_distances`` で行うこと。
+    サンプル間隔分だけ安全側に見積もる。``cull_distance`` 以上離れた組は下界で
+    済ませる。深い貫通は測れないので貫通判定は ``collision_pair_distances`` で行う。
     """
     sync_from = getattr(collision_pairs, 'sync_from', None)
     if sync_from is not None:
@@ -1873,18 +1737,14 @@ _HAND_BOX_CACHE = {}
 # apply_hand_box が足す親指の箱のリンク名 ({} は腕)。
 HAND_THUMB_BOX_LINK = '{}_thumb_box_link'
 
-# 手のリンク自身の箱とは別の箱にする部位 (リンク名に含まれる文字列, 箱の
-# リンク名)。残り (掌・4 本の指) は手のリンク自身の箱。
+# 手のリンク自身の箱とは別の箱にする部位 (リンク名に含まれる文字列, 箱のリンク名)。
 HAND_SPLIT_BOXES = ((('thumb',), HAND_THUMB_BOX_LINK),)
 
 
 def hand_box_primitives(robot):
-    """指なしの ``robot`` の手のリンクの代わりに使う、指ありモデルの手と指
-    を包む箱の一覧 ``[(手のリンク, 名前, primitive dict), ...]`` を返す.
-
-    名前が None の箱 (掌+4 本の指) は手のリンク自身の形状を置き換え、名前
-    付きの箱 (親指) は干渉専用のリンクにする。``robot`` ごとにキャッシュ。
-    """
+    """指なしの ``robot`` の手のリンクの代わりに使う、指ありモデルの手と指を包む箱の一覧
+    ``[(手のリンク, 名前, primitive dict), ...]`` を返す (``robot`` ごとにキャッシュ)。
+    名前が None の箱は手のリンク自身の形状を置き換え、名前付き (親指) は干渉専用のリンクにする。"""
     cached = _HAND_BOX_CACHE.get(id(robot))
     if cached is not None:
         return cached
@@ -1947,9 +1807,8 @@ def hand_box_primitives(robot):
 
 
 def apply_hand_box(robot):
-    """指なしの ``robot`` の手を ``hand_box_primitives`` の箱で表す (親指は
-    ``extra_collision_links`` に追加)。skrobot が干渉形状をキャッシュする
-    ので、IK を解く前に 1 回だけ呼ぶこと。"""
+    """指なしの ``robot`` の手を ``hand_box_primitives`` の箱で表す (親指は ``extra_collision_links`` に追加)。
+    skrobot が干渉形状をキャッシュするので、IK を解く前に 1 回だけ呼ぶこと。"""
     import trimesh
     extra_links = list(getattr(robot, 'extra_collision_links', []))
     for parent, name, prim in hand_box_primitives(robot):
@@ -1972,9 +1831,8 @@ def apply_hand_box(robot):
 
 
 def apply_collision_model(robot):
-    """``robot`` の各リンクの ``collision_mesh`` をプリミティブ近似形状
-    (``build_collision_model_urdf`` が生成・キャッシュ) に差し替え、干渉
-    モデルにだけあるリンクを ``robot.extra_collision_links`` に足す."""
+    """``robot`` の各リンクの ``collision_mesh`` をプリミティブ近似形状に差し替え、
+    干渉モデルにだけあるリンクを ``robot.extra_collision_links`` に足す。"""
     collision_urdf_path = build_collision_model_urdf(robot.urdf_path)
 
     collision_robot = RobotModel()
@@ -1995,8 +1853,7 @@ def apply_collision_model(robot):
                 collision_link, 'collision_primitive', None)
             n_replaced += 1
 
-    # 干渉モデルにだけあるリンク (台車前方の箱など) は、link_list に入れず
-    # 親リンクに assoc した干渉専用のリンクにする (parent_link も設定する)。
+    # 干渉モデルにだけあるリンクは、親リンクに assoc した干渉専用のリンクにする (parent_link も設定)。
     robot_links_by_name = {link.name: link for link in robot.link_list}
     extra_links = [link for link in getattr(robot, 'extra_collision_links',
                                             [])]
@@ -2035,11 +1892,8 @@ def apply_collision_model(robot):
 
 
 def collision_link_list_for_arm(robot):
-    """干渉ジオメトリを持つ全身のリンクの一覧を返す.
-
-    干渉専用のリンクは親リンクの直後に並べる (``ignore_adjacent`` で常に
-    重なる親子の組が除かれるようにするため)。
-    """
+    """干渉ジオメトリを持つ全身のリンクの一覧を返す。干渉専用のリンクは親リンクの
+    直後に並べる (``ignore_adjacent`` で親子の組を除くため)。"""
     extras_by_parent = {}
     for link in getattr(robot, 'extra_collision_links', []):
         extras_by_parent.setdefault(link.parent_link, []).append(link)
@@ -2052,9 +1906,8 @@ def collision_link_list_for_arm(robot):
 
 
 def load_collision_pairs(path, robot):
-    """``--collision-pairs`` の JSON (``[[名前A, 名前B], ...]``) を
-    ``(Link, Link)``/``(Link, 人体の障害物の添字)`` のリストにする。
-    名前 A は常にロボットのリンク名。"""
+    """``--collision-pairs`` の JSON (``[[名前A, 名前B], ...]``) を ``(Link, Link)``/
+    ``(Link, 人体の障害物の添字)`` のリストにする。名前 A は常にロボットのリンク名。"""
     with open(path) as f:
         pair_names = json.load(f)
     links_by_name = {link.name: link for link in
@@ -2081,8 +1934,7 @@ def load_collision_pairs(path, robot):
     return pairs
 
 
-# 自己干渉の事後検証から除く、関節のつながりが近い組の段数 (干渉ジオメトリを
-# 持つリンクで数える。近似形状が関節付近で重なるだけで実機では当たらない)。
+# 自己干渉の事後検証から除く、関節のつながりが近い組の段数。
 SELF_COLLISION_IGNORE_LINK_DISTANCE = 3
 
 # 段数では除けないが、実機では当たらないので除く組 ({} は腕)。
@@ -2099,10 +1951,8 @@ def _collision_parent(link, collision_links):
 
 
 def self_collision_ignored(robot, collision_link_list):
-    """自己干渉の事後検証から除く組 (``frozenset`` の集合) を返す: つながり
-    が ``SELF_COLLISION_IGNORE_LINK_DISTANCE`` 段以内の組、既定の姿勢で既に
-    貫通している組、``SELF_COLLISION_IGNORE_PAIRS``。``robot`` の姿勢は
-    戻す。"""
+    """自己干渉の事後検証から除く組 (``frozenset`` の集合): つながりが ``SELF_COLLISION_IGNORE_LINK_DISTANCE`` 段以内、
+    既定の姿勢で既に貫通、``SELF_COLLISION_IGNORE_PAIRS``。``robot`` の姿勢は戻す。"""
     collision_links = set(collision_link_list)
     ignore_names = {frozenset((a.format(side), b.format(side)))
                     for a, b in SELF_COLLISION_IGNORE_PAIRS
@@ -2146,9 +1996,8 @@ def self_collision_ignored(robot, collision_link_list):
 
 
 def build_collision_verification_pairs(robot, robot_arm):
-    """事後検証用の総当たりのペア (``load_collision_pairs`` と同じ形式) を
-    作る: ``self_collision_ignored`` を除いた自己干渉の全組と、全リンク x
-    全人体セグメント。ロボットの構造だけで決まる。"""
+    """事後検証用の総当たりのペア (``load_collision_pairs`` と同じ形式): ``self_collision_ignored`` を除いた
+    自己干渉の全組と、全リンク x 全人体セグメント。"""
     collision_link_list = collision_link_list_for_arm(robot)
     ignored = self_collision_ignored(robot, collision_link_list)
     pairs = [(link_a, link_b) for link_a, link_b in
@@ -2161,9 +2010,8 @@ def build_collision_verification_pairs(robot, robot_arm):
 
 
 class VerificationPairs(list):
-    """事後検証のペアのリストに判定用のモデルを添えたもの。``model`` が
-    None でなければペアのリンクは ``model`` のもので、判定前に
-    ``sync_from`` で姿勢を IK のロボットに合わせる。"""
+    """事後検証のペアのリストに判定用のモデルを添えたもの。``model`` が None でなければペアのリンクは
+    ``model`` のもので、判定前に ``sync_from`` で姿勢を IK のロボットに合わせる。"""
 
     def __init__(self, pairs, model=None):
         super().__init__(pairs)
@@ -2188,14 +2036,12 @@ class VerificationPairs(list):
                                if joint.name in by_name]
         for model_joint, robot_joint in self._joint_map:
             model_joint.joint_angle(robot_joint.joint_angle())
-        # 台車は robot と base_link のどちらで与えられることもあるので、
-        # base_link のワールド座標に合わせる。
+        # 台車は robot と base_link のどちらでも与えられるので、base_link のワールド座標に合わせる。
         self.model.newcoords(robot.base_link.copy_worldcoords())
 
 
 def self_collision_pairs(verification_pairs):
-    """``verification_pairs`` のうち自己干渉の組だけ (None ならそのまま)。
-    人体との貫通は ``human_obstacle_clearances`` の距離で捕まえる。"""
+    """``verification_pairs`` のうち自己干渉の組だけ (None ならそのまま)。"""
     if verification_pairs is None:
         return None
     pairs = [pair for pair in verification_pairs
@@ -2217,9 +2063,8 @@ DEFAULT_COLLISION_VERIFY_MODEL = 'mixed'
 
 def build_verification_pairs_for_model(
         robot, verify_model=DEFAULT_COLLISION_VERIFY_MODEL):
-    """``verify_model`` で事後検証する ``VerificationPairs`` を作る:
-    'nohand' は ``robot`` (指なし+手の箱)、'hand' は指ありモデル、'mixed'
-    は自己干渉を ``robot`` で、人体との距離を指ありモデルで測る。"""
+    """``verify_model`` で事後検証する ``VerificationPairs`` を作る: 'nohand' は ``robot``、
+    'hand' は指ありモデル、'mixed' は自己干渉を ``robot`` で、人体との距離を指ありモデルで測る。"""
     if verify_model in ('nohand', 'mixed'):
         pairs = VerificationPairs(
             build_collision_verification_pairs(robot, 'r'))
@@ -2239,11 +2084,8 @@ def build_verification_pairs_for_model(
 
 
 def attach_camera_optical_coords(robot, pos=None, rot=None):
-    """``robot.head_link`` に実機カメラの光軸を +Z とする座標
-    ``robot.camera_optical_coords`` を取り付けて返す.
-
-    ``pos``/``rot`` は head_link から見た位置 [m]・回転行列 (省略時は
-    ``HEAD_TO_CAMERA_LINK_*`` と ``CAMERA_LINK_TO_OPTICAL_ROT`` から作る)。
+    """``robot.head_link`` に実機カメラの光軸を +Z とする座標 ``robot.camera_optical_coords`` を取り付けて返す。
+    ``pos``/``rot`` は head_link から見た位置 [m]・回転行列 (省略時は ``HEAD_TO_CAMERA_LINK_*``)。
     """
     if pos is None:
         pos = HEAD_TO_CAMERA_LINK_POS
@@ -2269,8 +2111,7 @@ def camera_optical_coords(robot):
 
 
 def gaze_link_list(robot):
-    """視線 IK で動かす首のリンク (``robot.head.link_list`` から首ロールを
-    除いたもの)。首ロールを ``NECK_ROLL_FIXED_ANGLE`` にしてから返す。"""
+    """視線 IK で動かす首のリンク (首ロールを除く)。首ロールを ``NECK_ROLL_FIXED_ANGLE`` にしてから返す。"""
     robot.neck_r_joint.joint_angle(NECK_ROLL_FIXED_ANGLE)
     return [link for link in robot.head.link_list
             if link.joint is not robot.neck_r_joint]
@@ -2278,8 +2119,7 @@ def gaze_link_list(robot):
 
 def _gaze_target(gaze_coords, position):
     """``gaze_coords`` の +Z を ``position`` へ向ける視線 IK の目標座標。
-    rotation_mask='xy' はひねりが大きいと収束しないので、現在の向きから
-    最小回転で向けた姿勢にする。"""
+    rotation_mask='xy' はひねりが大きいと収束しないので現在の向きからの最小回転にする。"""
     return Coordinates(
         pos=list(position), rot=gaze_coords.worldrot()).align_axis_to_direction(
             np.asarray(position) - gaze_coords.worldpos())
@@ -2298,10 +2138,8 @@ LEG_JOINT_NAMES = ('ankle_joint', 'ankle_joint_mimic', 'knee_joint',
 
 
 def sync_leg_mimics(robot):
-    """脚の平行リンクのミミック関節 (``joint_list`` に無く、主関節のフックで
-    だけ更新される) を、主関節 (足首・膝) に合わせ直す。脚を含む IK はミミック
-    を主関節と食い違った角度で終えることがあり (最大 0.25 rad)、実機に送る
-    関節角は主関節だけなので、その姿勢の手先は IK の結果から最大 10 cm 動く。"""
+    """脚の平行リンクのミミック関節を主関節 (足首・膝) に合わせ直す。脚を含む IK は
+    ミミックを食い違わせることがあり、主関節だけを送る実機では手先がずれるため。"""
     for name in ('ankle_joint', 'knee_joint'):
         joint = getattr(robot, name, None)
         if joint is not None:
@@ -2310,9 +2148,8 @@ def sync_leg_mimics(robot):
 
 def settle_legs(robot, target_coords, move_target, whole_body, stop, thre,
                 rthre):
-    """脚を含む IK の直後に、ミミックを主関節に合わせ、脚を固定して腕・腰だけ
-    で ``target_coords`` へ解き直す。解けなければ False (ロボットは合わせた
-    直後の姿勢、手先は目標から離れている)。"""
+    """脚を含む IK の直後に、ミミックを主関節に合わせ、脚を固定して腕・腰だけで
+    ``target_coords`` へ解き直す。解けなければ False。"""
     sync_leg_mimics(robot)
     upper = [link for link in whole_body.link_list
              if link.joint.name not in LEG_JOINT_NAMES]
@@ -2327,10 +2164,8 @@ POST_PROCESS_GAZE_REAIM_ROUNDS = 3
 
 def _reaim_gaze(robot, gaze_coords, position, stop, rthre,
                 rounds=POST_PROCESS_GAZE_REAIM_ROUNDS):
-    """腕・首の同時 IK の後、首だけで視線を ``position`` へ向け直す.
-
-    同時 IK の視線目標は解く前の頭の位置で固定され、解く間に頭が動く分
-    ずれるため。目標を作り直して最大 ``rounds`` 回繰り返し、悪化したら戻す。
+    """腕・首の同時 IK の後、首だけで視線を ``position`` へ向け直す (同時 IK の視線目標は
+    解く前の頭の位置で固定されるため)。最大 ``rounds`` 回繰り返し、悪化したら戻す。
     """
     link_list = gaze_link_list(robot)
     head_joints = [link.joint for link in link_list]
@@ -2365,18 +2200,14 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
                        gaze_ik_stop=DEFAULT_POST_PROCESS_GAZE_IK_STOP,
                        gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
                        gaze=True, arm_only_fallback=True, fix_legs=False):
-    """後処理判定: 台車を動かさずに、腕で掌から
-    ``POST_PROCESS_TARGET_HOVER_OFFSET`` の位置 (わずかにめり込む) へ
-    ``target_rot`` で押し付けるのと、カメラの光軸を掌へ向ける
-    (``gaze=False`` なら省く) のを同時に解く.
+    """後処理判定: 台車を動かさずに、腕で掌から ``POST_PROCESS_TARGET_HOVER_OFFSET`` の位置へ
+    ``target_rot`` で押し付けるのと、カメラの光軸を掌へ向ける (``gaze=False`` なら省く) のを同時に解く。
 
-    同時に解けなければ (首の可動域で視線が届かないことが多い)、
-    ``arm_only_fallback`` なら腕だけで押し込みを解いてから首だけで掌へ
-    向け直し、視線のずれが ``POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE`` 未満
-    なら採用する (結果の ``arm_only`` が True)。
+    同時に解けなければ ``arm_only_fallback`` で腕だけ押し込み、首だけで掌へ向け直して視線のずれが
+    ``POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE`` 未満なら採用する (``arm_only`` が True)。
 
-    ``robot`` の現在の姿勢を初期値に書き換える (失敗時は元に戻る)。両方
-    収束したら結果 dict、そうでなければ None を返す。
+    ``robot`` の現在の姿勢を初期値に書き換える (失敗時は元に戻る)。両方収束したら結果 dict、
+    そうでなければ None を返す。
     """
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
@@ -2452,8 +2283,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
 
 
 def _pin_leg_floor(robot, limits):
-    """脚の可動域を、いまの足首・膝の角度から腰が高くなる側へ動けないよう
-    に狭める (``limits`` は ``_leg_limits`` の元の可動域)。"""
+    """脚の可動域を、いまの角度から腰が高くなる側へ動けないよう狭める (``limits`` は ``_leg_limits`` の元の可動域)。"""
     (ankle_min, _), (_, knee_max) = limits
     robot.ankle_joint.min_angle = max(
         ankle_min, float(robot.ankle_joint.joint_angle())
@@ -2474,8 +2304,7 @@ def _restore_leg_limits(robot, limits):
 
 
 def _narrow_leg_limits(robot, limits, leg_range):
-    """脚の可動域を、いまの足首・膝の角度から両側に ``leg_range`` [rad] まで
-    に狭める (``limits`` は ``_leg_limits`` の元の可動域)。"""
+    """脚の可動域を、いまの角度から両側に ``leg_range`` [rad] までに狭める (``limits`` は ``_leg_limits`` の元の可動域)。"""
     (ankle_min, ankle_max), (knee_min, knee_max) = limits
     ankle = float(robot.ankle_joint.joint_angle())
     knee = float(robot.knee_joint.joint_angle())
@@ -2487,10 +2316,8 @@ def _narrow_leg_limits(robot, limits, leg_range):
 
 def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
                    **kwargs):
-    """``_solve_press_in`` を ``leg_rise`` (None なら ``PRESS_IN_LEG_RISE``)
-    の方針で解く。'strict' は押し込みで腰を上げない (脚を hover より腰が
-    高くなる側へ動かさない) 解だけ、'fallback' はそれが解けないときだけ
-    制限なしで解き直す、'off' は制限しない。"""
+    """``_solve_press_in`` を ``leg_rise`` (None なら ``PRESS_IN_LEG_RISE``) の
+    方針で解く。"""
     if leg_rise is None:
         leg_rise = PRESS_IN_LEG_RISE
     if leg_rise == 'off':
@@ -2518,26 +2345,17 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
                     gaze=True, arm_only_fallback=True,
                     n_points=PRESS_IN_PATH_POINTS, limit_legs=False,
                     fix_legs=False, leg_range=None, skip_unreachable=False):
-    """hover 姿勢の ``robot`` から押し込みの曲線
-    (``press_in_target_position``) を ``n_points`` 等分した手先目標を、途中は
-    腕だけの IK、最終目標は ``solve_post_process`` で順に解く.
+    """hover 姿勢の ``robot`` から押し込みの曲線 (``press_in_target_position``) を ``n_points`` 等分した
+    手先目標を、途中は腕だけの IK、最終目標は ``solve_post_process`` で順に解く。
 
-    台車は各点で ``press_in_base_shift`` だけ hover の位置から平行移動して
-    おく (押し出すのと同時に近づく)。途中の点の首は最終姿勢の角度にする
-    (接近区間の終盤で首は最終姿勢の角度へ補間済み)。``solve_post_process``
-    の結果に、途中の点の関節角 (``robot.joint_list`` 順、最終姿勢は含まない)
-    のリスト ``press_in_path`` と台車 ``[x, y, yaw]`` のリスト
-    ``press_in_base_path`` を足して返す。どこかで解けなければ ``robot`` を
-    元に戻して None。
+    台車は各点で ``press_in_base_shift`` だけ平行移動し、途中の点の首は最終姿勢の角度にする。
+    ``solve_post_process`` の結果に、途中の点の関節角のリスト ``press_in_path`` (``robot.joint_list`` 順、
+    最終姿勢を含まない) と台車 ``[x, y, yaw]`` のリスト ``press_in_base_path`` を足して返す。
+    解けなければ ``robot`` を元に戻して None。
 
-    ``limit_legs`` なら、各点の IK の前に脚の可動域を直前の姿勢の角度から
-    腰が高くなる側へ動けないように狭める (終わったら元に戻す)。
-    ``fix_legs`` なら脚を IK で動かさない。``leg_range`` [rad] を渡すと、
-    脚の足首・膝を今の角度から両側にこの幅までしか動かさない。
-    ``skip_unreachable`` なら、先頭の点 (hover に近い点) が関節の可動域で
-    届かないとき、届く点から始める (最終目標より手前の点だけ。検出し直した
-    掌の向きが計画から回ると、手前 PRESS_IN_SLIDE の点が大きく動いて手首が
-    限界に当たる)。
+    ``limit_legs``: 各点の IK の前に脚を直前の姿勢から腰が高くなる側へ動けないよう狭める。
+    ``fix_legs``: 脚を IK で動かさない。``leg_range`` [rad]: 足首・膝を今の角度から両側にこの幅まで。
+    ``skip_unreachable``: 先頭の点が可動域で届かないとき、届く点から始める (最終目標より手前のみ)。
     """
     leg_limits = _leg_limits(robot)
     # 狭める順は、幅 → 腰を上げない側 (後者が下限・上限の片側を上書きする)。
@@ -2636,16 +2454,12 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
 
 def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
                         leg_stages=REFINE_LEG_STAGES):
-    """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終
-    補正.
+    """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終補正。
 
-    ``robot`` は hover 目標の姿勢にしておき、``palm`` はそのワールド系で
-    表す。``planned_post`` は計画時の ``result['post_process']``。
-    脚は ``leg_stages`` の順に動かす範囲を広げて解く (``(('free', False,
-    None),)`` なら従来どおり脚を自由に)。
-    ``post_process``/``position_change`` [m]/``rotation_change`` [rad]/
-    ``reason`` ('ok'/'ok_arm_only'/'too_large'/'ik_failed')/``legs`` (採用
-    した段階の名前)/``compute_time`` の dict を返す。
+    ``robot`` は hover 目標の姿勢、``palm`` はそのワールド系、``planned_post`` は計画時の
+    ``result['post_process']``。脚は ``leg_stages`` の順に動かす範囲を広げて解く。
+    ``post_process``/``position_change`` [m]/``rotation_change`` [rad]/``reason``
+    ('ok'/'ok_arm_only'/'too_large'/'ik_failed')/``legs`` (採用した段階)/``compute_time`` の dict を返す。
     """
     start_time = time.time()
     target_rot = palm_target_rot(palm, turn_deg, robot_arm)
@@ -2676,8 +2490,7 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
         if post is not None:
             reason = 'ok'
             break
-        # 首が可動域の端で視線 IK が収束しないことが多いので、首は計画時の
-        # 角度にして腕だけで解き直す。
+        # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
         for link in robot.head.link_list:
             if link.joint.name in planned_angles:
                 link.joint.joint_angle(planned_angles[link.joint.name])
@@ -2694,10 +2507,8 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
 
 def simulate_final_correction(robot, robot_arm, result, palm, angle_vector,
                               base_pose, trials, slip_xy, slip_yaw, rng):
-    """hover 目標で台車が一様乱数 (x/y ±``slip_xy`` [m]、yaw ±``slip_yaw``
-    [rad]) だけスリップしたと仮定して ``refine_post_process`` を ``trials``
-    回解き、各回の結果 (``post_process`` を除き ``slip`` を付けたもの) の
-    リストを返す。"""
+    """hover 目標で台車が一様乱数 (x/y ±``slip_xy`` [m]、yaw ±``slip_yaw`` [rad]) だけスリップしたと
+    仮定して ``refine_post_process`` を ``trials`` 回解き、各回の結果 (``slip`` 付き) のリストを返す。"""
     robot.angle_vector(angle_vector)
     robot.newcoords(base_pose)
     base_rot = robot.base_link.worldrot().copy()
@@ -2725,8 +2536,7 @@ def simulate_final_correction(robot, robot_arm, result, palm, angle_vector,
 
 
 def _base_front_offset(base_pose, standing_xy, facing):
-    """台車が人の立ち位置から人の正面方向 ``facing`` にどれだけ前 [m] に
-    あるか (後ろなら負)。"""
+    """台車が人の立ち位置から人の正面方向 ``facing`` にどれだけ前 [m] にあるか (後ろなら負)。"""
     base_xy = np.asarray(base_pose.worldpos(), dtype=np.float64)[:2]
     return float(np.dot(base_xy - standing_xy, facing))
 
@@ -2778,21 +2588,17 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
                             placement_joint_positions=None):
-    """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、
-    収束・事後検証 (自己干渉の貫通なし、人体から ``hover_human_clearance``
-    以上、差し出した手まわりだけ ``OFFERED_HAND_CLEARANCE`` 以上) ・後処理
-    判定 (``solve_press_in`` の押し込み区間が解け、自己干渉と手まわり以外の
-    人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) をすべて通る候補を
-    コストの低い順に探す.
+    """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
+    (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、差し出した手まわりだけ
+    ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が解け、自己干渉と手まわり以外の
+    人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) をすべて通る候補をコストの低い順に探す。
 
-    コストは関節の曲げ量に、台車の人の正面方向へのずれ x
-    ``front_offset_weight`` と向きのずれ x ``facing_yaw_weight`` を足した
-    もの (立ち位置・向きは ``placement_joint_positions`` から求める)。
-    後処理だけ失敗した場合は、事後検証を通った最小コストの候補を
+    コストは関節の曲げ量に、台車の正面方向のずれ x ``front_offset_weight`` と向きのずれ x
+    ``facing_yaw_weight`` を足したもの。後処理だけ失敗した場合は、事後検証を通った最小コストの候補を
     ``post_process_result=None`` で採用する。
 
-    ``(turn_index, angle_vector, base_pose, post_process_result)`` または
-    None を返す。``robot`` は最後に調べた候補の姿勢のままになる。
+    ``(turn_index, angle_vector, base_pose, post_process_result)`` または None を返す。
+    ``robot`` は最後に調べた候補の姿勢のままになる。
     """
     turn_degs = turn_candidates_deg(hand, palm)
     bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
@@ -2857,8 +2663,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         [cylinder_surface_samples(o) for o in obstacle_links]
         if obstacle_links else None)
 
-    # 差し出さない腕 (後で姿勢を差し替える) に関わる組とそれ以外に分け、
-    # それ以外は後処理の前に検証して安く落とす。
+    # 差し出さない腕 (後で姿勢を差し替える) に関わる組とそれ以外に分け、それ以外は後処理の前に検証する。
     other_prefix = ('l' if robot_arm == 'r' else 'r') + '_'
 
     def _subset(keep, source=verification_pairs):
@@ -2916,9 +2721,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         return True
 
     def _press_in_path_rejected(path, bases, posture, label):
-        # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの、台車は
-        # bases の [x, y, yaw]) を自己干渉と手まわり以外の人体距離で検証し、
-        # 差し替えた関節角のリストを返す (通らなければ None)。
+        # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの、台車は bases の [x, y, yaw]) を
+        # 自己干渉と手まわり以外の人体距離で検証し、差し替えた関節角のリストを返す (通らなければ None)。
         replaced = []
         for k, (angle_vector, base) in enumerate(zip(path, bases)):
             robot.newcoords(Coordinates(
@@ -2969,8 +2773,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             continue
         if _too_close_to_human(early_clearance_pairs, label):
             continue
-        # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決めて
-        # hover・押し込みの両方に差し替える。
+        # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決め、hover・押し込みの両方に差し替える。
         post_result = solve_press_in(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop,
@@ -3004,8 +2807,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             fallback = (turn_index, hover_av, base_poses[candidate_index],
                         cost)
         if post_result is not None:
-            # 押し込み区間 (最終姿勢を含む) は差し出した手まわりに触れるので、
-            # 自己干渉と手まわり以外の人体距離だけを検証する。
+            # 押し込み区間は差し出した手まわりに触れるので、自己干渉と手まわり以外の人体距離だけを検証する。
             replaced = _press_in_path_rejected(
                 post_result['press_in_path']
                 + [post_result['joint_angle_vector']],
@@ -3067,18 +2869,14 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
                     placement_joint_positions=None):
-    """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉
-    を回避するバッチ IK (jax) でまとめて解き、``pick_verified_candidate``
-    で 1 つ選ぶ.
+    """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉を回避する
+    バッチ IK (jax) で解き、``pick_verified_candidate`` で 1 つ選ぶ。
 
-    ``palm``/``joint_positions`` は人物を前方に平行移動済みのもの。収束判定
-    は干渉を見ないので、``verification_pairs`` (総当たり) で事後検証する。
+    ``palm``/``joint_positions`` は前方に平行移動済み。``verification_pairs`` (総当たり) で事後検証する。
     ``collision_pairs`` が None/空なら干渉回避なし (None は事後検証もなし)。
-    ``collision_joint_limit_margin_ratio`` はバッチ IK の間だけ適用する。
-    ``n_turn_candidates`` は向きの候補を先頭から何個解くか。
+    ``collision_joint_limit_margin_ratio`` はバッチ IK の間だけ適用。``n_turn_candidates`` は解く向きの数。
 
-    ``(picked, collision_ik_time, candidate_selection_time)`` を返す (時間
-    は秒)。
+    ``(picked, collision_ik_time, candidate_selection_time)`` を返す (時間は秒)。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -3107,9 +2905,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
             # 空リストだと ValueError になるので自己干渉を無効にする。
             effective_self_collision = False
     else:
-        # 差し出された前腕とロボットの手先側のリンクの組を足す。hover は
-        # 人の掌から約 2 cm なので、掌・指は組に入れず (事後検証で
-        # OFFERED_HAND_CLEARANCE を見る)、前腕は細らせて同じ距離にする。
+        # 差し出された前腕とロボットの手先側のリンクの組を足す。掌・指は組に入れず (事後検証で見る)、前腕は細らせて同じ距離にする。
         forearm = human_obstacle_names().index(
             '{0}Elbow-{0}Wrist'.format(hand))
         effective_collision_obstacles = list(collision_obstacles)
@@ -3180,15 +2976,13 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     return picked, collision_ik_time, candidate_selection_time
 
 
-# 押し込み姿勢の肩ヨーの大きさ [deg] がこれを超える解は、肘を外へ大きく
-# 回して手首もひねった枝 (接近で肘と掌が大きく回る)。狭い窓の解がこの枝
-# なら、次の (有限の) 窓も解き、収まる解があればそちらを採る。
+# 押し込み姿勢の肩ヨーの大きさ [deg] がこれを超える解は、肘を外へ大きく回した枝。
+# 狭い窓の解がこの枝なら次の窓も解く。
 TWISTED_SHOULDER_YAW_DEG = 60.0
 
 
 def _twisted_shoulder_yaw_deg(robot, robot_arm, angle_vector):
-    """``angle_vector`` の肩ヨー [deg] が ``TWISTED_SHOULDER_YAW_DEG`` を
-    超えればその値、収まれば None。"""
+    """``angle_vector`` の肩ヨー [deg] が ``TWISTED_SHOULDER_YAW_DEG`` を超えればその値、収まれば None。"""
     names = [joint.name for joint in robot.joint_list]
     yaw = math.degrees(float(angle_vector[names.index(
         '{}_shoulder_y_joint'.format(robot_arm))]))
@@ -3201,13 +2995,11 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
                                  palm_reach=DEFAULT_BASE_PALM_REACH,
                                  **kwargs):
-    """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に絞って
-    狭い順に ``solve_person_ik`` を解き、後処理まで解けた最初の結果を返す.
-    ただし肩ヨーがねじれた解 (``TWISTED_SHOULDER_YAW_DEG``) なら、次の有限の
-    窓でねじれずに後処理まで解ければそちらを返す。
+    """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に狭い順に絞って ``solve_person_ik`` を解き、
+    後処理まで解けた最初の結果を返す。肩ヨーがねじれた解なら、次の有限の窓でねじれずに解ければそちらを返す。
 
-    ``(picked, collision_ik_time, candidate_selection_time, base_limits,
-    x_margin)`` を返す (時間は合計、窓は採った解のもの)。
+    ``(picked, collision_ik_time, candidate_selection_time, base_limits, x_margin)`` を返す
+    (時間は合計、窓は採った解のもの)。
     """
     if standing_x is None or not x_margins:
         x_margins = (-1.0,)
@@ -3262,8 +3054,7 @@ def base_movable_region(base_limits):
 
 
 def _palm_fields(palm):
-    """結果 dict に入れる掌の位置・法線 (hover 目標は掌から指先方向にも
-    ずれるので、掌の向きはこちらを使う)。"""
+    """結果 dict に入れる掌の位置・法線 (hover 目標は指先方向にもずれるため掌の向きはこちらを使う)。"""
     return dict(
         palm_position=[float(v) for v in palm['position']],
         palm_normal=[float(v) for v in palm['y_axis']])
@@ -3272,8 +3063,7 @@ def _palm_fields(palm):
 def solved_result(robot, robot_arm, target_rot, turn_index,
                   angle_vector, base_pose, base_limits, post_process_result,
                   collision_ik_time, candidate_selection_time, hand, palm):
-    """採用した解をロボットに反映して結果 dict を組む (後処理の結果は
-    ``post_process`` キーに入れる)。"""
+    """採用した解をロボットに反映して結果 dict を組む (後処理の結果は ``post_process`` キー)。"""
     robot.angle_vector(angle_vector)
     robot.newcoords(base_pose)
     hand_coords = getattr(robot, '{}arm_end_coords'.format(robot_arm))
@@ -3355,10 +3145,8 @@ _WARMUP_PALM = dict(
 
 
 def _warmup_batch_ik(robot, base_limits, ik_kwargs):
-    """人物ループの前にダミー目標で ``solve_person_ik`` を解き、jax の
-    トレース/コンパイルを済ませる (左右の腕ごと、結果は捨てる)。
-    ``ik_kwargs`` は人物ループと同じものを渡すこと (違うと別のコンパイル)。
-    """
+    """人物ループの前にダミー目標で ``solve_person_ik`` を解き、jax のコンパイルを済ませる (結果は捨てる)。
+    ``ik_kwargs`` は人物ループと同じものを渡すこと (違うと別のコンパイル)。"""
     collision_obstacles = human_body_obstacles({})
     for robot_arm, hand in (('l', 'R'), ('r', 'L')):
         t0 = time.time()
@@ -3428,8 +3216,7 @@ def main():
     parser.add_argument(
         '--base-palm-reach', type=float, default=0.0,
         help='台車の x・y を掌の水平位置 ±この距離 [m] に絞る (0 以下は絞ら'
-            'ない、既定)。効果がなかったので既定は無効 (DEFAULT_BASE_PALM_REACH '
-            'のコメント参照)。')
+            'ない、既定)。')
     parser.add_argument(
         '--front-offset-weight', type=float,
         default=DEFAULT_FRONT_OFFSET_WEIGHT,
