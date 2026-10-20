@@ -75,7 +75,7 @@
 | `neck_r_joint` | 視線 IK では動かさず 0° に固定 (`NECK_ROLL_FIXED_ANGLE`, `gaze_link_list`) | 実機の首のピッチ・ロールは左右 2 本のアクチュエータの差動で、ロールを付けると片側のストロークが端に当たりピッチ・ロールとも指令に届かない。実機の `/joint_states` の neck_r は符号が逆なので 0 以外では TF もずれる |
 | `{r,l}_hand_y_joint` | 0 に固定 (`lock_fixed_joints`) | 実機にモータが無い。動かすと左手の向きが 180° 前後ずれる |
 
-第1段のバッチ IK だけは、この上からさらに各関節の上下を全域幅の 10% ずつ
+第1段のバッチ IK だけは、この上からさらに各関節の上下を全域幅の 5% ずつ (2026-10-20 に 10% から変更)
 狭める (`restrict_joint_range_margin`, `DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO`)。
 バッチ IK の呼び出し前後だけ適用して戻すので、後処理 IK・軌道計画は本来の
 (上表適用後の) 可動域で解く。

@@ -247,7 +247,12 @@ NECK_P_MAX_ANGLE_DEG = 44.5
 NECK_ROLL_FIXED_ANGLE = 0.0
 
 # 干渉回避付きバッチ IK だけに適用する関節可動域の上下マージン比率。
-DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.1
+# 端に張り付いた解では押し込みの IK が解けにくいので入れた (当初 5%、後に
+# 10%)。2026-10-20 に 10% -> 5% にした: 横並びまで 100% の人数が seed 0
+# (67 人) で 50 -> 58、seed 1 (46 人) で 34 -> 36、押し込みの失敗は増えない。
+# 0% は IK は更に解けるが横並びまでは 57・35 で 5% と同等以下、横並び移動の
+# 時間が伸びる。hover の解はこの余裕の境界に張り付きやすい。
+DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO = 0.05
 
 # 候補選択の「関節の曲げ量コスト」(関節角 [rad] の重み付き二乗和) の対象
 # 関節 ({arm}_{接尾辞}_joint) と重み。ヨー軸・首・台車は含めない。
@@ -3441,6 +3446,12 @@ def main():
         help='干渉回避付きバッチ IK の反復回数 (既定 {})。'.format(
             DEFAULT_COLLISION_IK_STOP))
     parser.add_argument(
+        '--collision-ik-joint-limit-margin-ratio', type=float,
+        default=DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO,
+        help='干渉回避付きバッチ IK だけ関節可動域を上下とも全域幅のこの比率'
+            'だけ狭める (既定 {})。'.format(
+                DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO))
+    parser.add_argument(
         '--collision-weight', type=float, default=DEFAULT_COLLISION_WEIGHT,
         help='バッチ IK の人体との干渉ペナルティの重み (既定 {})。'.format(
             DEFAULT_COLLISION_WEIGHT))
@@ -3608,7 +3619,7 @@ def main():
         collision_ik_thre=DEFAULT_COLLISION_IK_THRE,
         collision_ik_rthre=DEFAULT_COLLISION_IK_RTHRE,
         collision_joint_limit_margin_ratio=(
-            DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
+            args.collision_ik_joint_limit_margin_ratio),
         verification_pairs=verification_pairs,
         collision_verify_tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE,
         post_process_ik_stop=args.post_process_ik_stop,
