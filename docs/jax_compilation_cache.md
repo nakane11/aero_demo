@@ -224,9 +224,8 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 約 2 倍以上になる。
 
 一方、pre-touch も線形補間も検証を通らない人は `--force-optimize` が無くても
-jaxls の最適化ループ(`--motion-attempts`、既定 3 回の warm start リトライ)
-まで進む。そのため「1 人あたりの最大計算時間」はこの検証失敗ケースの
-リトライコストで決まり、`--force-optimize` の有無ではほぼ変わらない。
+jaxls の最適化まで進む。そのため「1 人あたりの最大計算時間」はこの検証失敗
+ケースの最適化コストで決まり、`--force-optimize` の有無ではほぼ変わらない。
 
 ## 12. 干渉ペアが無いときのバッチ IK
 

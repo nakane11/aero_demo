@@ -1320,7 +1320,7 @@ class StageBuilder(object):
                                      np.asarray(press_arm['palm_rot'])))
         final_arm = wps[-1]['human_arm']
         final_joints = human_arm.skeleton(final_arm)
-        x_margin = transition.get('x_margin') or sbs.DEFAULT_GOAL_X_MARGINS[0]
+        x_margin = transition.get('x_margin') or sbs.GOAL_X_MARGIN
         facing = p.facing_yaw
         rot = np.array([[math.cos(facing), -math.sin(facing)],
                         [math.sin(facing), math.cos(facing)]])

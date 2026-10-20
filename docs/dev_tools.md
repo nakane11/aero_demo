@@ -68,7 +68,7 @@ python3 tools/grid_search_collision_ik.py \
 ### `tools/grid_search_handshake_motion.py`
 
 `plan_handshake_motion.py` の軌道最適化のハイパーパラメータ
-(`--motion-attempts`/`--n-waypoints`/`--max-iterations`) の成功率・
+(`--n-waypoints`/`--max-iterations`) の成功率・
 計算時間トレードオフを調べるグリッドサーチ。既定は OFAT (one-factor-at-
 a-time)、`--mode full` で全軸総当たりにできる。結果は
 `tools/grid_search_handshake_motion_results.csv` にも書き出す。

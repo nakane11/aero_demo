@@ -739,14 +739,6 @@ def not_planned_result(reason):
     return dict(planned=False, not_planned_reason=reason)
 
 
-def perturb_initial_trajectory(initial_traj, n_joints, rng, scale):
-    """中間 waypoint の関節角にガウスノイズを足した warm start (台車は不変)。"""
-    traj = initial_traj.copy()
-    noise = rng.normal(scale=scale, size=(traj.shape[0] - 2, n_joints))
-    traj[1:-1, :n_joints] += noise
-    return traj
-
-
 def current_other_arm_posture(robot_arm, handshake):
     """差し出さない腕の姿勢に最も近い ``OTHER_ARM_POSTURES_DEG`` の添字。"""
     other = 'l' if robot_arm == 'r' else 'r'
@@ -1010,15 +1002,14 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する。
 
     pre-touch 経由 → 線形補間の順に検証し、通ればそれを返す。通らなければ
-    jaxls で最適化し、``args.motion_attempts`` 回まで解き直す (全滅なら最も
-    余裕の大きい候補を ``verified: false`` で返す)。``optimize`` が偽なら
+    jaxls で最適化する (検証に通らなければ最も余裕の大きい候補を
+    ``verified: false`` で返す)。``optimize`` が偽なら
     最適化しない。``pretouch_cache`` (dict) は pre-touch 姿勢の IK を同じ
     ``handshake`` 内で使い回す。
     """
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         build_start_and_goal(robot, robot_arm, handshake, base_start,
                              orbit=orbit)
-    n_joints = len(q_start)
 
     def make_candidate(trajectory, kind, attempt=None, cost=None,
                        solve_time=0.0):
@@ -1123,26 +1114,13 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
         collision_weight=100.0,
         self_collision_weight=100.0)
-    rng = np.random.RandomState(0)
-
-    # verified な warm start (force_optimize 時) は 1 回だけ解く。
-    max_attempts = args.motion_attempts if not best['verified'] else 1
-
-    for attempt in range(max_attempts):
-        warm_start = best_trajectory if attempt == 0 \
-            else perturb_initial_trajectory(
-                best_trajectory, n_joints, rng,
-                0.3)
-        solve_start = time.time()
-        result = solver.solve(problem, warm_start)
-        candidate = record(make_candidate(
-            result.trajectory, 'optimized', attempt, float(result.cost),
-            time.time() - solve_start))
-        if candidate['verified']:
-            best = candidate
-            break
-        if motion_margin(candidate) > motion_margin(best):
-            best = candidate
+    solve_start = time.time()
+    result = solver.solve(problem, best_trajectory)
+    candidate = record(make_candidate(
+        result.trajectory, 'optimized', 0, float(result.cost),
+        time.time() - solve_start))
+    if candidate['verified'] or motion_margin(candidate) > motion_margin(best):
+        best = candidate
     return best
 
 
@@ -1213,9 +1191,6 @@ def main():
         '--max-iterations', type=int, default=DEFAULT_MAX_ITERATIONS,
         help='jaxls の最大反復回数 (既定 {})。'.format(
             DEFAULT_MAX_ITERATIONS))
-    parser.add_argument(
-        '--motion-attempts', type=int, default=1,
-        help='warm start を揺らして最適化を解き直す最大回数 (既定 1)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='最適化なしの軌道が通っても必ず jaxls で最適化する (計測用)。')

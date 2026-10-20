@@ -116,8 +116,7 @@ DEFAULT_COLLISION_MARGIN = 0.06
 # 自己干渉ペナルティのマージン [m] (重みの既定は collision_weight と同じ)。
 DEFAULT_SELF_COLLISION_MARGIN = 0.02
 
-# バッチ IK の干渉ペナルティでのロボット側の形状: 'primitive' (事後検証と
-# 同じ箱・円柱・球) または 'spheres' (skrobot 既定の球近似)。
+# バッチ IK の干渉ペナルティでのロボット側の形状 (事後検証と同じ箱・円柱・球)。
 DEFAULT_IK_COLLISION_GEOMETRY = 'primitive'
 
 # hover 目標は、押し込みの最終目標を掌の法線方向に PRESS_IN_LIFT 浮かせ、
@@ -153,10 +152,6 @@ PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 # 後処理判定の目標の掌からのオフセット [m] (負 = 掌にわずかにめり込む)。
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
-# 後処理 IK・押し込み IK の直後に、脚のミミック関節を主関節に合わせて脚を固定し
-# 腕・腰だけ解き直すか (settle_legs)。
-POST_PROCESS_SETTLE_LEGS = True
-
 # 後処理判定の腕 IK (ヤコビアン法、干渉回避・台車なし) の反復回数・収束閾値。
 DEFAULT_POST_PROCESS_IK_STOP = 40
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
@@ -168,6 +163,9 @@ REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
 # 最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる角度 [rad] or None)。
 REFINE_LEG_STAGES = (('fixed', True, None),
                      ('limited', False, math.radians(8.0)))
+# 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
+# 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
+REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
 DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
@@ -638,26 +636,6 @@ def restrict_base_x_range_to_human_standing(base_x_range, standing_x,
     if restricted_lo > restricted_hi:
         return base_x_range
     return (restricted_lo, restricted_hi)
-
-
-# 台車の x・y を掌の水平位置 ± この距離 [m] に絞る (None は絞らない)。
-DEFAULT_BASE_PALM_REACH = None
-
-
-def restrict_base_range_to_palm_reach(base_limits, palm_position,
-                                      reach=DEFAULT_BASE_PALM_REACH):
-    """台車の x・y の範囲を ``palm_position`` (x, y) ± ``reach`` との積集合に絞る。
-    ``reach`` が None か空集合になるならそのまま。"""
-    if reach is None or palm_position is None:
-        return list(base_limits)
-    restricted = []
-    for limits, center in zip(base_limits[:2], palm_position[:2]):
-        lo = max(limits[0], float(center) - reach)
-        hi = min(limits[1], float(center) + reach)
-        if lo > hi:
-            return list(base_limits)
-        restricted.append((lo, hi))
-    return restricted + [base_limits[2]]
 
 
 # 台車の yaw を人の正面方向 ± この角度 [deg] に絞る。
@@ -2254,8 +2232,8 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         return None
     if result is False:
         return None
-    if POST_PROCESS_SETTLE_LEGS and not settle_legs(
-            robot, target_coords, move_target, whole_body, stop, thre, rthre):
+    if not settle_legs(robot, target_coords, move_target, whole_body, stop,
+                       thre, rthre):
         robot.angle_vector(initial_angle_vector)
         sync_leg_mimics(robot)
         return None
@@ -2420,9 +2398,8 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                 continue
             restore()
             return None
-        if POST_PROCESS_SETTLE_LEGS and not settle_legs(
-                robot, target_coords, move_target, whole_body, stop, thre,
-                rthre):
+        if not settle_legs(robot, target_coords, move_target, whole_body, stop,
+                           thre, rthre):
             restore()
             return None
         path.append(robot.angle_vector().copy())
@@ -2452,55 +2429,99 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
     return post
 
 
+def blend_palm_rotation(palm, planned_palm, fraction):
+    """``palm`` の位置はそのままに、掌の向き (x・y 軸) を ``planned_palm`` の向きへ
+    ``fraction`` (0〜1) だけ寄せた掌を返す。"""
+    if fraction <= 0.0:
+        return palm
+    blended = dict(palm)
+    x = ((1.0 - fraction) * np.asarray(palm['x_axis'], dtype=np.float64)
+         + fraction * np.asarray(planned_palm['x_axis'], dtype=np.float64))
+    y = ((1.0 - fraction) * np.asarray(palm['y_axis'], dtype=np.float64)
+         + fraction * np.asarray(planned_palm['y_axis'], dtype=np.float64))
+    x = x / np.linalg.norm(x)
+    y = y - np.dot(y, x) * x
+    y = y / np.linalg.norm(y)
+    blended['x_axis'] = x
+    blended['y_axis'] = y
+    return blended
+
+
+def _rotation_angle_between(rot_a, rot_b):
+    rel = np.asarray(rot_a).T @ np.asarray(rot_b)
+    return float(math.acos(np.clip((np.trace(rel) - 1.0) / 2.0, -1.0, 1.0)))
+
+
 def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
-                        leg_stages=REFINE_LEG_STAGES):
+                        leg_stages=REFINE_LEG_STAGES, planned_palm=None,
+                        rotation_blends=REFINE_ROTATION_BLENDS):
     """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終補正。
 
     ``robot`` は hover 目標の姿勢、``palm`` はそのワールド系、``planned_post`` は計画時の
     ``result['post_process']``。脚は ``leg_stages`` の順に動かす範囲を広げて解く。
+    検出した向きで解けないときは、``planned_palm`` (計画時の掌、``palm`` と同じ系) があれば
+    ``rotation_blends`` の順に掌の向きを計画時の向きへ寄せて解き直す (位置は検出した掌のまま)。
+    向きの変化が大きすぎる (``REFINE_MAX_ROTATION_CHANGE`` 超) 割合は飛ばす。
     ``post_process``/``position_change`` [m]/``rotation_change`` [rad]/``reason``
-    ('ok'/'ok_arm_only'/'too_large'/'ik_failed')/``legs`` (採用した段階)/``compute_time`` の dict を返す。
+    ('ok'/'ok_arm_only'/'too_large'/'ik_failed')/``legs`` (採用した段階)/``blend`` (採用した
+    向きを寄せた割合)/``compute_time`` の dict を返す。``position_change``/``rotation_change`` は
+    検出した掌そのものの計画時からの変化。
     """
     start_time = time.time()
-    target_rot = palm_target_rot(palm, turn_deg, robot_arm)
-    position = np.asarray(palm['position'], dtype=np.float64)
-    normal = np.asarray(palm['y_axis'], dtype=np.float64)
-    target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
-    position_change = float(np.linalg.norm(
-        target_pos - np.asarray(planned_post['target_position'])))
-    rel_rot = np.asarray(planned_post['target_rot']).T @ target_rot
-    rotation_change = float(math.acos(
-        np.clip((np.trace(rel_rot) - 1.0) / 2.0, -1.0, 1.0)))
+
+    def changes(candidate):
+        target_rot = palm_target_rot(candidate, turn_deg, robot_arm)
+        position = np.asarray(candidate['position'], dtype=np.float64)
+        normal = np.asarray(candidate['y_axis'], dtype=np.float64)
+        target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+        return (target_rot,
+                float(np.linalg.norm(
+                    target_pos - np.asarray(planned_post['target_position']))),
+                _rotation_angle_between(planned_post['target_rot'],
+                                        target_rot))
+
+    _, position_change, rotation_change = changes(palm)
     info = dict(post_process=None, position_change=position_change,
-                rotation_change=rotation_change)
-    if (position_change > REFINE_MAX_POSITION_CHANGE
-            or rotation_change > REFINE_MAX_ROTATION_CHANGE):
+                rotation_change=rotation_change, blend=None)
+    if position_change > REFINE_MAX_POSITION_CHANGE:
         info.update(reason='too_large', compute_time=time.time() - start_time)
         return info
     planned_angles = dict(zip(planned_post['joint_names'],
                               planned_post['joint_angle_vector']))
+    blends = rotation_blends if planned_palm is not None else (0.0,)
     post = None
-    reason = 'ik_failed'
+    reason = 'too_large'
     legs = None
-    for legs, fix_legs, leg_range in leg_stages:
-        stage = dict(fix_legs=fix_legs, leg_range=leg_range)
-        post = solve_press_in(robot, robot_arm, palm, target_rot,
-                              arm_only_fallback=False,
-                              skip_unreachable=True, **stage)
+    used = None
+    for blend in blends:
+        candidate = (palm if planned_palm is None
+                     else blend_palm_rotation(palm, planned_palm, blend))
+        target_rot, _, rotation = changes(candidate)
+        if rotation > REFINE_MAX_ROTATION_CHANGE:
+            continue
+        reason = 'ik_failed'
+        for legs, fix_legs, leg_range in leg_stages:
+            stage = dict(fix_legs=fix_legs, leg_range=leg_range)
+            post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                                  arm_only_fallback=False,
+                                  skip_unreachable=True, **stage)
+            if post is not None:
+                reason = 'ok'
+                break
+            # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
+            for link in robot.head.link_list:
+                if link.joint.name in planned_angles:
+                    link.joint.joint_angle(planned_angles[link.joint.name])
+            post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                                  gaze=False, skip_unreachable=True, **stage)
+            if post is not None:
+                reason = 'ok_arm_only'
+                break
         if post is not None:
-            reason = 'ok'
-            break
-        # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
-        for link in robot.head.link_list:
-            if link.joint.name in planned_angles:
-                link.joint.joint_angle(planned_angles[link.joint.name])
-        post = solve_press_in(robot, robot_arm, palm, target_rot, gaze=False,
-                              skip_unreachable=True, **stage)
-        if post is not None:
-            reason = 'ok_arm_only'
+            used = blend
             break
     info.update(post_process=post, reason=reason,
-                legs=legs if post is not None else None,
+                legs=legs if post is not None else None, blend=used,
                 compute_time=time.time() - start_time)
     return info
 
@@ -2993,7 +3014,6 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  collision_obstacles, base_limits,
                                  standing_x,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
-                                 palm_reach=DEFAULT_BASE_PALM_REACH,
                                  **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に狭い順に絞って ``solve_person_ik`` を解き、
     後処理まで解けた最初の結果を返す。肩ヨーがねじれた解なら、次の有限の窓でねじれずに解ければそちらを返す。
@@ -3010,11 +3030,9 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
     for x_margin in x_margins:
         if twisted is not None and x_margin < 0.0:
             break
-        person_base_limits = restrict_base_range_to_palm_reach(
-            [restrict_base_x_range_to_human_standing(
-                base_limits[0], standing_x, margin=x_margin),
-             base_limits[1], base_limits[2]],
-            palm['position'], palm_reach)
+        person_base_limits = [restrict_base_x_range_to_human_standing(
+            base_limits[0], standing_x, margin=x_margin),
+            base_limits[1], base_limits[2]]
         picked, ik_time, selection_time = solve_person_ik(
             robot, palm, hand, robot_arm, collision_obstacles,
             base_limits=person_base_limits, **kwargs)
@@ -3160,8 +3178,7 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 def main():
     global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
         PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT, PRESS_IN_LEG_RISE, \
-        POST_PROCESS_SETTLE_LEGS, LEG_RISE_PIN_TOLERANCE, \
-        LEG_LOW_SIDE_MARGIN_RATIO
+        LEG_RISE_PIN_TOLERANCE, LEG_LOW_SIDE_MARGIN_RATIO
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3213,10 +3230,6 @@ def main():
         help='台車の x を人の立ち位置 ±この幅 [m] に絞る。先頭から順に試す。'
             '負は絞らない (既定 {})。'
             .format(' '.join(str(m) for m in DEFAULT_BASE_X_STANDING_MARGINS)))
-    parser.add_argument(
-        '--base-palm-reach', type=float, default=0.0,
-        help='台車の x・y を掌の水平位置 ±この距離 [m] に絞る (0 以下は絞ら'
-            'ない、既定)。')
     parser.add_argument(
         '--front-offset-weight', type=float,
         default=DEFAULT_FRONT_OFFSET_WEIGHT,
@@ -3335,13 +3348,7 @@ def main():
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '
             '[m]。実カメラの骨格では {} を指定する (既定 0)。'.format(
                 DEFAULT_TORSO_SURFACE_OFFSET))
-    parser.add_argument(
-        '--no-settle-legs', action='store_true',
-        help='後処理 IK・押し込み区間の IK の直後に、脚のミミック関節を主関節に '
-            '合わせて腕だけ解き直す処理 (POST_PROCESS_SETTLE_LEGS) を無効にする '
-            '(比較用)。')
     args = parser.parse_args()
-    POST_PROCESS_SETTLE_LEGS = not args.no_settle_legs
     PRESS_IN_SLIDE = args.press_in_slide
     PRESS_IN_LIFT = args.press_in_lift
     PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
@@ -3501,8 +3508,6 @@ def main():
             robot, palm, human_hand, robot_arm, collision_obstacles,
             person_base_limits, standing_x,
             x_margins=args.base_x_standing_margins,
-            palm_reach=(args.base_palm_reach
-                        if args.base_palm_reach > 0.0 else None),
             front_offset_weight=args.front_offset_weight,
             facing_yaw_weight=args.facing_yaw_weight,
             joint_positions=collision_joints,

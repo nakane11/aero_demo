@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 
 """``plan_handshake_motion.py`` の軌道最適化のハイパーパラメータ
-(``motion_attempts``/``n_waypoints``/``max_iterations``) の成功率・計算時間
+(``n_waypoints``/``max_iterations``) の成功率・計算時間
 トレードオフを調べるグリッドサーチ。
 
 既定は OFAT (ベースラインから 1 軸ずつ振る)、``--mode full`` で総当たり。
@@ -17,7 +17,7 @@ Usage
         --force-optimize
     python3 tools/grid_search_handshake_motion.py --mode full \\
         --force-optimize --n-waypoints-values 12 20 30 \\
-        --motion-attempts-values 1 3 6 --max-iterations-values 60
+        --max-iterations-values 60
 """
 
 import argparse
@@ -120,8 +120,6 @@ def make_baseline_args(seed):
         self_collision_weight=100.0,
         smoothness_weight=phm.DEFAULT_SMOOTHNESS_WEIGHT,
         acceleration_weight=phm.DEFAULT_ACCELERATION_WEIGHT,
-        motion_attempts=3,
-        motion_attempt_perturbation=0.3,
         collision_verify_tolerance=(
             phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE),
         seed=seed,
@@ -129,7 +127,7 @@ def make_baseline_args(seed):
 
 
 # グリッドで振るパラメータ (plan_person_motion の args 属性名)。
-AXES = ['motion_attempts', 'n_waypoints', 'max_iterations']
+AXES = ['n_waypoints', 'max_iterations']
 
 
 def build_combos(baseline, axis_values, mode):
@@ -172,7 +170,6 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
             phm.orbit_base_start(
                 base_goal, orbit_center, orbit_dir, args.approach_distance),
             orbit=(orbit_center, human_xy))
-    n_joints = len(q_start)
 
     def make_candidate(trajectory, attempt, cost, solve_time):
         waypoints = phm.trajectory_waypoints(robot, joint_list, trajectory)
@@ -220,25 +217,11 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
         args.smoothness_weight, args.acceleration_weight,
         collision_weight=args.collision_weight,
         self_collision_weight=args.self_collision_weight)
-    rng = np.random.RandomState(args.seed)
 
-    best = None
-    for attempt in range(args.motion_attempts):
-        warm_start = warm_start_traj if attempt == 0 \
-            else phm.perturb_initial_trajectory(
-                warm_start_traj, n_joints, rng, args.motion_attempt_perturbation)
-        solve_start = time.time()
-        result = solver.solve(problem, warm_start)
-        candidate = make_candidate(
-            result.trajectory, attempt, float(result.cost),
-            time.time() - solve_start)
-        if candidate['verified']:
-            best = candidate
-            break
-        if best is None or (min(candidate['waypoint_min_distances'])
-                            > min(best['waypoint_min_distances'])):
-            best = candidate
-
+    solve_start = time.time()
+    result = solver.solve(problem, warm_start_traj)
+    best = make_candidate(
+        result.trajectory, 0, float(result.cost), time.time() - solve_start)
     best['compute_time'] = time.time() - start_time
     return best
 
@@ -278,8 +261,7 @@ def aggregate(results, combo, wall_elapsed, n_failed=0):
         float(np.mean([bool(r['verified']) for r in optimized]))
         if optimized else float('nan'))
     return dict(
-        label='attempts{motion_attempts}_wp{n_waypoints}'
-             '_iter{max_iterations}'.format(**combo),
+        label='wp{n_waypoints}_iter{max_iterations}'.format(**combo),
         **combo,
         n_target=n,
         n_failed=n_failed,
@@ -326,25 +308,22 @@ def print_ranking(rows):
     print('\n=== ランキング (成功率が高い順 -> 同率なら平均計算時間が短い順) ===')
     for rank, row in enumerate(ranked, start=1):
         print(
-            '{:2d}位: attempts={:<2} n_waypoints={:<3} max_iter={:<4} '
+            '{:2d}位: n_waypoints={:<3} max_iter={:<4} '
             '| 成功率={:.1%} 平均時間={:.3f}s/人 '
             '中央値={:.3f}s 最大={:.3f}s'.format(
-                rank, row['motion_attempts'], row['n_waypoints'],
-                row['max_iterations'],
+                rank, row['n_waypoints'], row['max_iterations'],
                 row['success_rate'], row['compute_time_mean'],
                 row['compute_time_median'], row['compute_time_max']))
 
     best = ranked[0]
-    print('\n[推奨] motion_attempts={} n_waypoints={} max_iterations={}: '
+    print('\n[推奨] n_waypoints={} max_iterations={}: '
          '成功率={:.1%}・平均計算時間={:.3f}秒/人 (全構成中で最良)'.format(
-             best['motion_attempts'], best['n_waypoints'],
-             best['max_iterations'],
+             best['n_waypoints'], best['max_iterations'],
              best['success_rate'], best['compute_time_mean']))
 
 
 CSV_FIELDS = [
-    'label', 'motion_attempts', 'n_waypoints',
-    'max_iterations', 'n_target', 'n_failed', 'success_rate',
+    'label', 'n_waypoints', 'max_iterations', 'n_target', 'n_failed', 'success_rate',
     'compute_time_mean', 'compute_time_median', 'compute_time_max',
     'n_pretouch', 'n_linear', 'n_optimized', 'optimized_verified_rate',
     'wall_elapsed',
@@ -374,8 +353,6 @@ def main():
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='早期採用せず全員で jaxls 最適化を実行する。')
-    parser.add_argument('--motion-attempts-values', type=int, nargs='+',
-                        default=[1, 3, 6])
     parser.add_argument('--n-waypoints-values', type=int, nargs='+',
                         default=[12, phm.DEFAULT_N_WAYPOINTS, 30])
     parser.add_argument('--max-iterations-values', type=int, nargs='+',
@@ -415,10 +392,9 @@ def main():
                  len(targets)))
 
     baseline = dict(
-        motion_attempts=3, n_waypoints=phm.DEFAULT_N_WAYPOINTS,
+        n_waypoints=phm.DEFAULT_N_WAYPOINTS,
         max_iterations=phm.DEFAULT_MAX_ITERATIONS)
     axis_values = dict(
-        motion_attempts=args.motion_attempts_values,
         n_waypoints=args.n_waypoints_values,
         max_iterations=args.max_iterations_values)
     combos = build_combos(baseline, axis_values, args.mode)
@@ -444,8 +420,7 @@ def main():
         grid_args = make_baseline_args(args.seed)
         for axis in AXES:
             setattr(grid_args, axis, combo[axis])
-        label = ('attempts{motion_attempts}_wp{n_waypoints}'
-                '_iter{max_iterations}'.format(**combo))
+        label = 'wp{n_waypoints}_iter{max_iterations}'.format(**combo)
         print('\n=== {} ==='.format(label))
 
         # max_iterations はソルバー構築時に固定されるので組ごとに作る。

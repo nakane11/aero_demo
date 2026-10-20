@@ -730,8 +730,6 @@ class HandshakePlanner(object):
                 self.robot, translated_palm, offered_hand, robot_arm,
                 collision_obstacles, person_base_limits, standing_x,
                 x_margins=args.base_x_standing_margins,
-                palm_reach=(args.base_palm_reach
-                            if args.base_palm_reach > 0.0 else None),
                 front_offset_weight=args.front_offset_weight,
                 facing_yaw_weight=args.facing_yaw_weight,
                 attempts_per_pose=args.attempts_per_pose,
@@ -2742,13 +2740,15 @@ class HandshakePipelineNode(object):
         observed = spik.transform_palm(palm, base_rot, base_pos)
         info = spik.refine_post_process(
             self.robot, result['robot_arm'], observed, result['turn_deg'],
-            planned_post)
+            planned_post,
+            planned_palm=(planned_palm if 'x_axis' in planned_palm else None))
         ik_time = time.time() - t1
         palm_shift = np.asarray(observed['position']) - np.asarray(
             planned_palm['position'])
         self._log_debug(dict(
             event='press_in_refine', reason=info['reason'],
-            legs=info.get('legs'), wait_time=wait_time, ik_time=ik_time,
+            legs=info.get('legs'), blend=info.get('blend'),
+            wait_time=wait_time, ik_time=ik_time,
             n_frames=len(hand_frames), hand_distances=distances,
             expected_position=[float(v) for v in expected_position],
             candidates=candidates, edge_on=palm['edge_on'],
@@ -2762,11 +2762,14 @@ class HandshakePipelineNode(object):
                                  info['position_change'] * 1e3,
                                  math.degrees(info['rotation_change'])))
             return None
+        blend = info.get('blend')
         print('[execute][refine] 検出し直した手{}に合わせて押し込み姿勢を '
-              '補正しました ({}、脚 {}、目標の変化 {:.1f}mm/{:.1f}deg、'
+              '補正しました ({}、脚 {}{}、目標の変化 {:.1f}mm/{:.1f}deg、'
               '待機 {:.2f}s + IK {:.3f}s)。'.format(
                   ' (真横から見た掌)' if palm['edge_on'] else '',
                   info['reason'], info.get('legs'),
+                  '、掌の向きを計画の向きへ {:.0f}% 寄せた'.format(blend * 100)
+                  if blend else '',
                   info['position_change'] * 1e3,
                   math.degrees(info['rotation_change']), wait_time, ik_time))
         return build_press_in_waypoints(
@@ -3871,9 +3874,6 @@ def build_arg_parser():
         help='台車の x 可動範囲を人の立ち位置 ±この幅 [m] に絞る (順に試す、'
             '負は絞らない)。')
     parser.add_argument(
-        '--base-palm-reach', type=float, default=0.0,
-        help='台車の x・y を掌の水平位置 ±この距離 [m] に絞る (0 以下は絞らない)。')
-    parser.add_argument(
         '--front-offset-weight', type=float,
         default=spik.DEFAULT_FRONT_OFFSET_WEIGHT,
         help='IK 候補のコストに足す、台車の人の正面方向へのずれ [m] の重み。')
@@ -3900,9 +3900,6 @@ def build_arg_parser():
         '--collision-activation-distance', type=float,
         default=phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE)
     parser.add_argument(
-        '--motion-attempts', type=int, default=1,
-        help='軌道の干渉が残ったとき warm start を変えて解き直す最大回数。')
-    parser.add_argument(
         '--motion-collision-verify-tolerance', type=float,
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
         help='軌道の事後検証で許容する最大貫通量 [m]。')
@@ -3928,9 +3925,10 @@ def build_arg_parser():
         '--speech-start-text', type=str, default='今から行きますね',
         help='実機が動き出すときの発話 (空で発話しない)。')
     parser.add_argument(
-        '--no-in-motion-correction', dest='in_motion_correction',
-        action='store_false',
-        help='接近終盤に台車の最終位置を掌に合わせてずらさない。')
+        '--in-motion-correction', dest='in_motion_correction',
+        action='store_true',
+        help='接近終盤に台車の最終位置を検出した掌に合わせてずらす '
+             '(既定は無効)。')
     parser.add_argument(
         '--in-motion-lead', type=float, default=IN_MOTION_LEAD,
         help='接近終盤の台車のずらしを、到着の何秒前から行えるか。')
