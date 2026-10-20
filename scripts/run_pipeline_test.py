@@ -230,7 +230,13 @@ def main():
     parser = argparse.ArgumentParser(
         description='合成データのパイプラインを順に実行する回帰テスト。')
     parser.add_argument(
-        'num_people', type=int, help='生成する人数。')
+        'num_people', type=int, nargs='?', default=None,
+        help='生成する人数 (--input-set 指定時は不要)。')
+    parser.add_argument(
+        '--input-set', default=None,
+        help='保存済みの入力セット (skeletons/ と palms/ を持つディレクトリ) '
+            'を使い、骨格生成と掌推定を省く '
+            '(例: data/synthetic/seed0_ik_targets)。')
     parser.add_argument(
         '--viewer', action='store_true',
         help='最後に viser ビューアを起動する (ブラウザ接続を待つ)。')
@@ -295,25 +301,40 @@ def main():
     motion_dir = os.path.join(base_dir, 'motions')
     print('作業ディレクトリ: {}'.format(base_dir))
 
-    # 1. generate_random_human_poses.py
-    gen_args = ['--num-samples', str(args.num_people),
-               '--output-dir', skeleton_dir]
-    if args.seed is not None:
-        gen_args += ['--seed', str(args.seed)]
-    run_step('1/5', 'generate_random_human_poses.py', gen_args)
-    n_generated = len(json_io.iter_json_files(skeleton_dir))
-    print('[1/5] generate_random_human_poses.py: 骨格 JSON を {} 件生成 '
-          '({})'.format(n_generated, skeleton_dir))
+    if args.input_set is not None:
+        # 保存済みの入力 (読み取り専用で使う)。ファイル名が IK の乱数シードに
+        # なるので、名前を変えずにそのまま渡す。
+        skeleton_dir = os.path.join(args.input_set, 'skeletons')
+        palm_dir = os.path.join(args.input_set, 'palms')
+        n_generated = len(json_io.iter_json_files(skeleton_dir))
+        palm_elapsed = 0.0
+        n_palms, offered = summarize_palms(palm_dir)
+        print('[1-2/5] 保存済みの入力セット {} を使用 (骨格 {} 件、'
+              'offered_hand: R={}, L={}, null={})'.format(
+                  args.input_set, n_generated, offered.get('R', 0),
+                  offered.get('L', 0), offered.get(None, 0)))
+    else:
+        if args.num_people is None:
+            parser.error('num_people か --input-set のどちらかが必要です。')
+        # 1. generate_random_human_poses.py
+        gen_args = ['--num-samples', str(args.num_people),
+                   '--output-dir', skeleton_dir]
+        if args.seed is not None:
+            gen_args += ['--seed', str(args.seed)]
+        run_step('1/5', 'generate_random_human_poses.py', gen_args)
+        n_generated = len(json_io.iter_json_files(skeleton_dir))
+        print('[1/5] generate_random_human_poses.py: 骨格 JSON を {} 件生成 '
+              '({})'.format(n_generated, skeleton_dir))
 
-    # 2. estimate_palm_poses.py
-    palm_elapsed, _ = run_step(
-        '2/5', 'estimate_palm_poses.py',
-        ['--input-dir', skeleton_dir, '--output-dir', palm_dir])
-    n_palms, offered = summarize_palms(palm_dir)
-    print('[2/5] estimate_palm_poses.py: 掌の位置姿勢 JSON を {} 件推定 '
-          '(offered_hand: R={}, L={}, null={})'.format(
-              n_palms, offered.get('R', 0), offered.get('L', 0),
-              offered.get(None, 0)))
+        # 2. estimate_palm_poses.py
+        palm_elapsed, _ = run_step(
+            '2/5', 'estimate_palm_poses.py',
+            ['--input-dir', skeleton_dir, '--output-dir', palm_dir])
+        n_palms, offered = summarize_palms(palm_dir)
+        print('[2/5] estimate_palm_poses.py: 掌の位置姿勢 JSON を {} 件推定 '
+              '(offered_hand: R={}, L={}, null={})'.format(
+                  n_palms, offered.get('R', 0), offered.get('L', 0),
+                  offered.get(None, 0)))
 
     # 4. solve_palm_ik.py
     solve_args = ['--input-dir', palm_dir, '--output-dir', handshake_dir,

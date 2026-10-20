@@ -135,6 +135,36 @@ python3 tools/ros/clip_bag.py \
 |---|---|
 | `random_human_poses/` ほか 3 つ | 40 人ぶん。2026-09-08 の生成で、IK 結果は hand_y 固定より前のもので古い。最新のコードで評価するときは `scripts/run_pipeline_test.py` で作り直す (seed を指定すれば再現できる) |
 | `label_backup_20260902/` | 2026-09-02 時点の掌 JSON (100 人) のバックアップ |
+| `seed0_ik_targets/` | **IK・軌道計画・横並び移動のパラメータを変えたときの前後比較用 (日常はこれを使う)**。下記 |
+
+### `seed0_ik_targets/` (固定の比較セット)
+
+`run_pipeline_test.py 400 --seed 0` が作る 400 人のうち、掌を差し出していて IK の
+対象になる 67 人 (R 36 / L 31) の `skeletons/` と `palms/` を保存したもの (2026-10-20 作成)。
+残りの 333 人は掌を差し出していないので IK 以降を素通りし、成功数にも時間にも効かない。
+そのため 400 人で回した結果と同じ数字が約 1/6 の人数で得られる (骨格生成の約 15 秒も省ける)。
+
+```bash
+cd scripts
+python3 run_pipeline_test.py --input-set ../data/synthetic/seed0_ik_targets \
+    --plan-motion --side-by-side-transition [--solve-args "..."] [--motion-args "..."]
+```
+
+- `--input-set` を付けると骨格生成・掌推定を省き、このセットを読み取り専用で使う (`num_people` は不要)。
+  結果は従来どおり `/tmp/aero_demo_pipeline_*` に出る。
+- **ファイル名 (`human_NNN.json`) を変えたり、番号を詰め直したりしない。** `solve_palm_ik.py` は
+  人ごとの乱数シードをファイル名の crc32 で決めるので、名前が変わると IK の結果が変わる。
+- 400 人 (seed 0) と同じ結果になることを確認済み: solved 54/67、軌道 verified 53/67。
+  所要時間は 400 人の 115 秒 → 約 107 秒 (IK 約 38 秒、横並び移動約 39 秒が大半。warmup はキャッシュが温まっていれば 7 秒)。
+  IK だけの変更なら `--plan-motion` を外すと solve のみ (約 50 秒) で済む。
+- **横並び移動の成否は同じ入力でも回ごとに揺れる。** 同じセットを 3 回回して 49・52/53 (400 人では 51/53)。
+  揺れるのは境界の 3 人 (human_150・175・358) で、IK・軌道計画は 3 回とも一致した。横並び移動の
+  1〜2 人の差は変更の効果とみなさず、複数回回して比べるか、揺れる人を除いて見ること (原因は未調査)。
+- seed 0 は調整に何度も使っているため、採用を決める前に別の seed (`run_pipeline_test.py 400 --seed 1` など)
+  でも同じ向きに動くことを確認する。
+- 作り直すとき: `run_pipeline_test.py 400 --seed 0 --plan-motion` を回し、`handshakes/` の JSON で
+  `target` が true の人だけ、`skeletons/` と `palms/` の同名ファイルを新しい `skeletons/`・`palms/` へコピーする
+  (名前はそのまま)。`data/` は git に入らないので、消えたらこの手順で復元する。
 
 `scripts/run_pipeline_test.py` は毎回 `/tmp/aero_demo_pipeline_*` に生成するので
 (消されずに溜まる)、ここのデータは使わない。`--seed 0` の 400 人や 42 人のベンチマークは、
