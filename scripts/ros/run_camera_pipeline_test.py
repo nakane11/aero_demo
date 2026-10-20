@@ -573,6 +573,8 @@ class HandshakePlanner(object):
         実機で片腕 10〜45 秒) は別のロボットで裏のスレッドが行い、この関数は
         IK と横並び移動の準備だけで返る。最適化が要る人 (線形補間・pre-touch
         が全部検証に落ちた人、実機で約 4%) の計画だけが、準備の完了を待つ。
+        ただし準備中は IK が遅くなり解けない回も出るので、ノードの既定は同期
+        (``--background-optimizer-warmup`` のときだけ裏で行う)。
         """
         random_state = np.random.get_state()
         np.random.seed(self._WARMUP_SEED)
@@ -3978,11 +3980,13 @@ def build_arg_parser():
         default=phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE,
         help='軌道の事後検証で許容する最大貫通量 [m]。')
     parser.add_argument(
-        '--no-background-optimizer-warmup', dest='background_optimizer_warmup',
-        action='store_false',
-        help='軌道最適化 (jaxls) の起動時の準備を裏のスレッドで行わず、IK の'
-             '準備と順に行う (既定は裏で行い、最適化が要る人の計画だけが準備の'
-             '完了を待つ)。')
+        '--background-optimizer-warmup', dest='background_optimizer_warmup',
+        action='store_true',
+        help='軌道最適化 (jaxls) の起動時の準備を裏のスレッドで行い、最適化が'
+             '要る人の計画だけが準備の完了を待つ (warmup が約 58 -> 19 秒)。'
+             '既定は無効: 実機 bag の再生で、準備中の IK が 4〜5 倍遅くなり '
+             '(trial22 で 2.5 -> 11〜13 秒)、trial1 では 6 回中 4 回 IK が'
+             '解けなかった (同期なら 3/3)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='候補が検証に通っても必ず jaxls の軌道最適化まで実行する。')
