@@ -1270,7 +1270,21 @@ def main():
         '--goal-bow-weight', type=float, default=sbs.GOAL_BOW_WEIGHT,
         help='横並び移動先の腰の前傾 [rad] の二乗の重み (既定 {})。'.format(
             sbs.GOAL_BOW_WEIGHT))
+    parser.add_argument(
+        '--leg-rise-allow', type=float, default=None,
+        help='strict のとき、横並びで腰が上がってよい量 [m] (移動先・経路の'
+            '許容と、脚を固定するときの余裕)。既定は上げない。')
+    parser.add_argument(
+        '--leg-low-margin', type=float, default=None,
+        help='足首の上限・膝の下限を全域幅のこの割合だけ狭める '
+            '(solve_palm_ik.py と同じにする)。')
     args = parser.parse_args()
+    if args.leg_low_margin is not None:
+        spik.LEG_LOW_SIDE_MARGIN_RATIO = args.leg_low_margin
+    if args.leg_rise_allow is not None:
+        sbs.GOAL_LEG_RISE_TOLERANCE = args.leg_rise_allow
+        sbs.PATH_LEG_RISE_TOLERANCE = args.leg_rise_allow
+        spik.LEG_RISE_PIN_TOLERANCE = 2.0 * args.leg_rise_allow
     sbs.GOAL_LEG_RISE = args.goal_leg_rise
     sbs.GOAL_CROUCH_WEIGHT = args.goal_crouch_weight
     sbs.GOAL_BOW_WEIGHT = args.goal_bow_weight

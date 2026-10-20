@@ -144,12 +144,12 @@ GOAL_LEG_OFFSET_WEIGHT = 10.0
 # 伸ばしきった一番高い姿勢) に掛ける重み。以前は横並びでしゃがまない解を
 # 優先して 30 だったが、腰を上げずに (GOAL_LEG_RISE) 前に倒すよりしゃがむ
 # 方を選ぶので 0 (沈み込みは罰しない)。
-GOAL_CROUCH_WEIGHT = 0.0
+GOAL_CROUCH_WEIGHT = 30.0
 # 移動先のコストで、腰の前傾 (waist_p が正、お辞儀) [rad] の二乗に掛ける重み
 # (hover の BOW_WEIGHT と同じ形)。合成 400 人 (seed 0) で 0・200・1000 を比べ、
 # 横並び終了時の前傾 平均 6.4° -> 4.3° -> 3.7° (p90 14.2° -> 9.9° -> 8.5°)、
 # 解ける人数は同じなので 1000。
-GOAL_BOW_WEIGHT = 1000.0
+GOAL_BOW_WEIGHT = 0.0
 # 横並び移動で腰 (脚) を押し込み終了時より上げないか: 'strict' なら移動先の
 # 候補を腰の高さが押し込み終了時以下 (許容 GOAL_LEG_RISE_TOLERANCE) のものに
 # 絞り、経路で脚も IK で動かすときは足首の下限・膝の上限をその waypoint の
@@ -157,14 +157,14 @@ GOAL_BOW_WEIGHT = 1000.0
 # 絞った結果なくなるときだけ絞らない。'off' は制限しない。
 GOAL_LEG_RISE = 'strict'
 GOAL_LEG_RISE_MODES = ('off', 'strict', 'fallback')
-GOAL_LEG_RISE_TOLERANCE = 0.01  # [m]
+GOAL_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW  # [m]
 # 移動先の候補の腰が押し込み終了時より高い量がこの範囲 (許容を超えて、この
 # 値以下) なら、候補を捨てずに脚を押し込み終了時の角度に直す [m]。腰を上げ
 # ない候補が 1 つも出ない人が、最小で 1〜3 cm 高いだけで外れていたため。
 GOAL_LEG_RISE_REPAIR_MAX = 0.10
 # 経路の各 waypoint で、腰が直前の waypoint より高くならないよう脚を補正
 # するときの許容 [m]。
-PATH_LEG_RISE_TOLERANCE = 0.003
+PATH_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW
 
 # 移動先のコストで、差し出す腕の手首ヨー・ロールが可動域の端に近いほど
 # 増やす項。手首が端にあると、経路で手首をそれ以上曲げられず掌を回せない

@@ -2590,7 +2590,7 @@ class HandshakePipelineNode(object):
             planned_palm['position'])
         self._log_debug(dict(
             event='press_in_refine', reason=info['reason'],
-            wait_time=wait_time, ik_time=ik_time,
+            legs=info.get('legs'), wait_time=wait_time, ik_time=ik_time,
             n_frames=len(hand_frames), hand_distances=distances,
             expected_position=[float(v) for v in expected_position],
             candidates=candidates, edge_on=palm['edge_on'],
