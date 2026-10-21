@@ -32,6 +32,41 @@
        /joint_states, /odom: AeroROSRobotInterface が購読する実機の状態。 -->
   <arg name="robot_topics"
        value="/scan /joint_states /odom" />
+  <!-- 実機を動かした区間の事後解析用 (再生テストには使わない)。
+       各コントローラへ送った軌道 (goal) と実機の応答 (feedback/result)、
+       controller の指令 vs 実測 (state)、台車の速度指令 (/cmd_vel)、AMCL の自己位置、
+       非常停止、ハンドの指令・把持状態。小さいので既定で録る。
+       ハンドの graspサービス (/aero_hand_grasp_service/grasp) はサービスなので録れない。 -->
+  <arg name="exec_topics"
+       value="/base_controller/follow_joint_trajectory/goal
+              /base_controller/follow_joint_trajectory/feedback
+              /base_controller/follow_joint_trajectory/result
+              /larm_controller/follow_joint_trajectory/goal
+              /larm_controller/follow_joint_trajectory/feedback
+              /larm_controller/follow_joint_trajectory/result
+              /larm_controller/state
+              /rarm_controller/follow_joint_trajectory/goal
+              /rarm_controller/follow_joint_trajectory/feedback
+              /rarm_controller/follow_joint_trajectory/result
+              /rarm_controller/state
+              /head_controller/follow_joint_trajectory/goal
+              /head_controller/follow_joint_trajectory/feedback
+              /head_controller/follow_joint_trajectory/result
+              /head_controller/state
+              /waist_controller/follow_joint_trajectory/goal
+              /waist_controller/follow_joint_trajectory/feedback
+              /waist_controller/follow_joint_trajectory/result
+              /waist_controller/state
+              /lifter_controller/follow_joint_trajectory/goal
+              /lifter_controller/follow_joint_trajectory/feedback
+              /lifter_controller/follow_joint_trajectory/result
+              /lifter_controller/state
+              /lhand_controller/follow_joint_trajectory/goal
+              /lhand_controller/follow_joint_trajectory/result
+              /rhand_controller/follow_joint_trajectory/goal
+              /rhand_controller/follow_joint_trajectory/result
+              /aero_hand/command /aero_hand/is_grasped
+              /cmd_vel /amcl_pose /estop" />
   <arg name="compressed_topics"
        value="/camera/color/image_raw/compressed
               /camera/depth/image_raw/compressedDepth"
@@ -40,6 +75,6 @@
 
   <node pkg="rosbag" type="record" name="record_camera_pipeline" output="screen"
         args="-o $(arg prefix) --buffsize=2048
-              $(arg camera_topics) $(arg robot_topics)
+              $(arg camera_topics) $(arg robot_topics) $(arg exec_topics)
               $(arg compressed_topics) $(arg extra_topics)" />
 </launch>

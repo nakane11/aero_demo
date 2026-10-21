@@ -41,6 +41,7 @@ data/
 
 ## 置き方の決まり
 
+- `record_camera_pipeline.launch` は 10/21 以降、再生に使う入力に加えて、実機の動作の事後解析用に各コントローラの goal/feedback/result・state、`/cmd_vel`、`/amcl_pose`、`/estop`、`/aero_hand/command`・`is_grasped` も録る (再生テストでは使わない)。10/21 以前の bag と、10/21 の切り出し 4 本にはこれらは入っていない。
 - 実機の全体 bag は `data/bags/` に録る。テストに使う区間は
   `tools/ros/clip_bag.py` で切り出して `data/real/<日付>/<名前>/` に置き、
   元の全体 bag は消してよい。
@@ -80,6 +81,7 @@ data/
 | `2026-10-13/` | `logs/` (試行 1〜22 の実機ログと JSON。実機 22 人の IK・横並びの再現ベンチに使う)、`grasp_captures/`、`refine_failures/`、`trial22_side_by_side/` |
 | `2026-10-15/` | `logs/` (試行 1・2)、`grasp_captures/`、`refine_failures/`、`trial1_side_by_side/`、`trial2_side_by_side/` |
 | `2026-10-16/` | `trial3_side_by_side/`、`trial6_side_by_side/` (試行 3・6 の person_NN.log・JSON と、その試行の `grasp_captures/`・`refine_failures/` を中に置いた) |
+| `2026-10-21/` | `trial1_side_by_side/`、`trial2_ik_fail/`、`trial3_side_by_side/`、`trial4_side_by_side/` (切り出し bag・person_NN.log・JSON・`replay.sh`、成功した試行には押し込み後の `grasp_captures/`) |
 
 ### 試行の切り出し bag (再生テスト用)
 
@@ -107,6 +109,12 @@ bag の最後まで再生したいときは `EARLY_STOP=0 bash replay.sh`。warm
 **trial1・trial2 の 10/20 以降の結果について**: 10/19 の実機で「沈みすぎ」と指摘があり、足首・膝の低い側の制限 `LEG_LOW_SIDE_MARGIN_RATIO` を 0.1 から 0.3 にした (`80b96f2` で 0.2、`c778487` で 0.3)。この 2 つのクリップは、しゃがまないと届かない掌なので、0.3 では解けない回が増える (沈みを抑える代わりに合成 400 人でも後処理まで 61→54 人)。10/20 に、各再生で検出された掌・骨格 8 通りを 6 通りの名前で解き直した (`resolve_saved_trials.py`、計 48 試行) ところ、`0937b40` までは 7/48、`80b96f2` 以降は 0/48、現在のコードで 0.3 を 0.1 に戻すと 39/48 だった (hover の重みを戻しても 0/48 のまま)。これらのクリップを回帰テストに使うときは、この値による差であることに注意する。
 | `2026-10-16/trial3_side_by_side/` | 20:07:01.1〜20:07:35.8 (34.7 秒、元は 20-06-35.bag) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正は 1 回目だけ採用) | 未確認 |
 | `2026-10-16/trial6_side_by_side/` | 20:11:14.7〜20:11:52.3 (37.6 秒) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正 2 回) | 未確認 |
+| `2026-10-21/trial1_side_by_side/` | 13:55:32.5〜13:56:11.0 (38.5 秒、元は 13-55-12.bag) | R手/l腕、横並びまで成功 (IK 0.5 秒) | 未確認 |
+| `2026-10-21/trial2_ik_fail/` | 14:09:57.5〜14:10:08.0 (10.5 秒、元は 14-09-23.bag) | L手/r腕、**IK 失敗** (2.2 秒)。失敗の再現・手の出し方の発話の確認用 | 未確認 (期待結果が IK 失敗) |
+| `2026-10-21/trial3_side_by_side/` | 14:10:13.0〜14:10:49.0 (36 秒、同上) | L手/r腕、横並びまで成功 (直前の IK 失敗の次の試行) | 未確認 |
+| `2026-10-21/trial4_side_by_side/` | 14:13:47.0〜14:14:23.0 (36 秒、元は 14-13-29.bag) | L手/r腕、横並びまで成功 (後処理で 7 候補が落ちて 8 番目) | 未確認 |
+
+10/21 の 4 本は `/tmp/run_camera_pipeline_test_logs/20261021_135339` (trial1) と `20261021_140832` (trial2〜4) の `person_NN.log`・JSON を各ディレクトリに置いた (person_01/01/02/03)。ディレクトリ名の trialN は切り出しの通し番号で、ログの試行番号とは違う。10/21 の元 bag 3 本 (計 54 GB) は `data/bags/` に残っている。
 
 再生でつまずく点 (詳しくは各 `replay.sh` の冒頭):
 
