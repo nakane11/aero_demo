@@ -86,6 +86,22 @@ def load_saved_stage(data_dir, name):
     return trial_stage(result, motion)
 
 
+def approach_heading_metrics(motion, palm_position):
+    """接近 (lead-in + 軌道) の台車の yaw の変化量 [度] と、台車の正面から見た
+    掌 ``palm_position`` の方位の絶対値の最大 [度]。"""
+    waypoints = (list(motion.get('lead_in_waypoints') or [])
+                 + list(motion['waypoints']))
+    yaws = np.array([wp['base_yaw'] for wp in waypoints])
+    xy = np.array([wp['base_position'][:2] for wp in waypoints])
+    bearing = (np.arctan2(palm_position[1] - xy[:, 1],
+                          palm_position[0] - xy[:, 0]) - yaws)
+    bearing = (bearing + np.pi) % (2 * np.pi) - np.pi
+    return dict(
+        approach_yaw_change_deg=float(np.degrees(yaws[-1] - yaws[0])),
+        approach_max_palm_bearing_deg=float(np.degrees(
+            np.max(np.abs(bearing)))))
+
+
 def resolve_trial(planner, args, data_dir, name, attempt):
     """1 試行を解き直して記録 (dict) を返す。"""
     joint_positions = spik.load_skeleton_json(
@@ -112,6 +128,8 @@ def resolve_trial(planner, args, data_dir, name, attempt):
         record['motion_kind'] = motion['kind']
         record['motion_min_distance'] = float(
             min(motion['waypoint_min_distances']))
+        record.update(approach_heading_metrics(
+            motion, palms[offered_hand]['position']))
         transition = motion.get('transition')
         if transition is not None:
             record['transition_fraction'] = transition['fraction']
