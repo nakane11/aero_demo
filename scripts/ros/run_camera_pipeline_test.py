@@ -141,12 +141,17 @@ MIN_SEGMENT_TIME = 1.0 / 15.0
 FAILURE_NEAR_HAND_FRACTION = 0.7
 
 # ARMED へ戻った後、掌がこれだけ動く/傾く/見えなくなるまで同じ手の差し出しを受け付けない。
+# 失敗の発話の完了から RETRY_COOLDOWN_AFTER_SPEECH 秒後に見始める。
 RETRY_MIN_DISPLACEMENT = 0.05
 RETRY_MIN_ROTATION_DEG = 20.0
 RETRY_LOST_TIME = 0.5
-# 失敗後に次の差し出しを受け付けるまでの待ち [秒] = BASE + PER_CHAR × 発話文字数。
-RETRY_COOLDOWN_BASE = 3.0
-RETRY_COOLDOWN_PER_CHAR = 0.2
+RETRY_COOLDOWN_AFTER_SPEECH = 1.0  # [s]
+# 発話の完了待ち。action サーバが無ければ topic で送り、BASE + PER_CHAR × 文字数 [秒]
+# 待ったことにする。
+SPEECH_SERVER_TIMEOUT = 1.0  # [s]
+SPEECH_RESULT_TIMEOUT = 60.0  # [s]
+SPEECH_FALLBACK_BASE = 3.0
+SPEECH_FALLBACK_PER_CHAR = 0.2
 
 # 台車の速度上限。実機の aero_base_link.yaml の max_velocity と一致させること。
 BASE_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
@@ -953,7 +958,8 @@ class HandshakePipelineNode(object):
         # ARMED に戻った時点の左右の掌 (_offer_changed)。None ならすぐ受け付ける。
         self._retry_reference = None
         self._busy = False                # IK 計算中は次フレームの処理を止める
-        self._last_failure_speech = None
+        # 直前の失敗の発話の完了で set される Event。
+        self._failure_speech_done = None
         self._nod_done = threading.Event()
         self._nod_done.set()
         self._initial_pose_done = threading.Event()
@@ -1324,12 +1330,15 @@ class HandshakePipelineNode(object):
         ``wait_offer_change``: 手を動かすまで次の差し出しを受け付けない。
         """
         self._latest_offer_selection = None
-        self._retry_reference = (
-            dict(palms={}, lost_since={}, until=None,
-                 cooldown=RETRY_COOLDOWN_BASE + RETRY_COOLDOWN_PER_CHAR * len(
-                     self._last_failure_speech or ''))
-            if wait_offer_change else None)
-        self._last_failure_speech = None
+        self._retry_reference = None
+        if wait_offer_change:
+            speech_done = self._failure_speech_done
+            if speech_done is None:
+                speech_done = threading.Event()
+                speech_done.set()
+            self._retry_reference = dict(
+                palms={}, lost_since={}, speech_done=speech_done, until=None)
+        self._failure_speech_done = None
         with self._lock:
             self._handshake_total_time = None
         self.arm_button.visible = False
@@ -1368,12 +1377,14 @@ class HandshakePipelineNode(object):
             self.viewer.redraw()
 
     def _offer_changed(self, palms, stamp):
-        """ARMED に戻ってから最初に見えた掌を基準に、どちらかの手が
-        動いた/傾いた/一定時間見えなくなったら True。"""
+        """失敗の発話の完了から ``RETRY_COOLDOWN_AFTER_SPEECH`` 秒後に最初に見えた
+        掌を基準に、どちらかの手が動いた/傾いた/一定時間見えなくなったら True。"""
         reference = self._retry_reference
+        if not reference['speech_done'].is_set():
+            return False
         if reference['until'] is None:
-            reference['until'] = stamp + reference['cooldown']
-        if stamp < reference['until']:
+            reference['until'] = time.time() + RETRY_COOLDOWN_AFTER_SPEECH
+        if time.time() < reference['until']:
             return False
         for side in ('R', 'L'):
             palm = palms.get(side)
@@ -1583,8 +1594,7 @@ class HandshakePipelineNode(object):
             speech = self._failure_speech(
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
-                self._last_failure_speech = speech
-                self._say(speech)
+                self._failure_speech_done = self._say(speech, wait=True)
                 return 'failed'
         return 'solved'
 
@@ -3138,14 +3148,72 @@ class HandshakePipelineNode(object):
             if grasp:
                 self._hand_grasped = True
 
-    def _say(self, text):
-        """``text`` を発話する (非ブロッキング、発話できなければ何もしない)。"""
+    def _say(self, text, wait=False):
+        """``text`` を発話する (非ブロッキング、発話できなければ何もしない)。
+
+        ``wait=True`` なら別スレッドで発話の完了を待ち、完了で set される
+        ``threading.Event`` を返す (発話しないときは set 済み)。
+        """
+        done = threading.Event()
         if self.sound_client is None or not text:
-            return
+            done.set()
+            return done if wait else None
+        if wait:
+            threading.Thread(target=self._say_and_wait, args=(text, done),
+                             daemon=True).start()
+            return done
         try:
             self.sound_client.say(text, voice=self.args.speech_voice)
         except Exception:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             pass
+        return None
+
+    def _say_and_wait(self, text, done):
+        """action で ``text`` を発話して完了を待ち、``done`` を set する。
+
+        要求から再生開始 (最初の feedback) と完了までの時間をログに出す。action
+        サーバが無ければ topic で送り、文字数から見積もった時間だけ待つ。
+        """
+        from sound_play.msg import SoundRequest, SoundRequestGoal
+        t_request = time.time()
+        first_feedback = []
+        try:
+            client = self.sound_client.actionclient
+            if not client.wait_for_server(
+                    rospy.Duration(SPEECH_SERVER_TIMEOUT)):
+                self.sound_client.say(text, voice=self.args.speech_voice)
+                estimate = (SPEECH_FALLBACK_BASE
+                            + SPEECH_FALLBACK_PER_CHAR * len(text))
+                print('[speech] 発話の action サーバが無いため、完了を待たずに '
+                      '{:.1f} 秒待ちます。'.format(estimate))
+                time.sleep(estimate)
+                return
+            goal = SoundRequestGoal()
+            goal.sound_request.sound = SoundRequest.SAY
+            goal.sound_request.command = SoundRequest.PLAY_ONCE
+            goal.sound_request.arg = text
+            goal.sound_request.arg2 = self.args.speech_voice
+            goal.sound_request.volume = 1.0
+            client.send_goal(
+                goal, feedback_cb=lambda _fb: first_feedback.append(
+                    time.time()) if not first_feedback else None)
+            finished = client.wait_for_result(
+                rospy.Duration(SPEECH_RESULT_TIMEOUT))
+            t_done = time.time()
+            started = ('{:.2f} 秒後に再生開始、'.format(
+                first_feedback[0] - t_request) if first_feedback else '')
+            print('[speech] 発話 ({} 文字) は要求から {}{:.2f} 秒で{}。'.format(
+                len(text), started, t_done - t_request,
+                '完了' if finished else '打ち切り (時間切れ)'))
+            log_debug_event(dict(
+                event='speech', n_chars=len(text), finished=bool(finished),
+                start_delay=(first_feedback[0] - t_request
+                             if first_feedback else None),
+                total=t_done - t_request))
+        except Exception as exc:  # noqa: BLE001  (発話失敗で実機動作を止めない)
+            print('[speech] 発話の完了待ちに失敗しました ({})。'.format(exc))
+        finally:
+            done.set()
 
     def _execute_waypoint_segment(self, waypoints, joint_names,
                                   min_segment_time=MIN_SEGMENT_TIME,
