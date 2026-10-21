@@ -3116,8 +3116,12 @@ class HandshakePipelineNode(object):
         """ハンドの握る (True) / 開く (False) を ``/aero_hand_grasp_service/grasp``
         (SetBool) で切り替える (失敗しても実機動作は止めない)。"""
         name = '/aero_hand_grasp_service/grasp'
+        if not getattr(self, 'grasp_service_available', True):
+            # 起動時に無かった場合は待たずに飛ばす (タイムアウト待ちを避ける)。
+            print('[execute] {} が起動時に無かったためハンドの切り替えを'
+                  '省略します ({})'.format(name, grasp))
+            return
         try:
-            rospy.wait_for_service(name, timeout=2.0)
             response = rospy.ServiceProxy(name, SetBool)(bool(grasp))
             if grasp:
                 self._hand_grasped = True
@@ -4032,6 +4036,18 @@ def main():
 
     rospy.init_node('run_camera_pipeline_test')
     node = HandshakePipelineNode(args)
+
+    # ハンドの握るサービスが起動時にあるか確認 (無ければ以後は待たない)。
+    node.grasp_service_available = False
+    if not args.bag:
+        try:
+            rospy.wait_for_service('/aero_hand_grasp_service/grasp',
+                                   timeout=2.0)
+            node.grasp_service_available = True
+            print('[init] /aero_hand_grasp_service/grasp を確認しました。')
+        except Exception:  # noqa: BLE001
+            print('[init][WARN] /aero_hand_grasp_service/grasp がありません。'
+                  '握る・開くは省略します。')
 
     if args.bag:
         cmd = ['rosbag', 'play', args.bag, '--clock',
