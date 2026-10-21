@@ -315,9 +315,9 @@ def run(args):
             observed = spik.transform_palm(palm, base_rot, base_pos)
             info = spik.refine_post_process(
                 robot, result['robot_arm'], observed, result['turn_deg'],
-                result['post_process'])
+                result['post_process'], planned_palm=planned_palm)
             row[key] = dict(
-                reason=info['reason'], flipped=flipped,
+                reason=info['reason'], flipped=flipped, blend=info.get('blend'),
                 accepted=bool(
                     info['post_process'] is not None
                     and info['position_change'] <= NODE_MAX_POSITION_CHANGE
@@ -332,9 +332,11 @@ def run(args):
         for key in VARIANTS:
             r = row[key]
             cells.append('{:>8}:{:>26}'.format(key, '-' if r is None else
-                         '{}{}{} d{:3.0f} {:3.0f}mm/{:3.0f}deg'.format(
+                         '{}{}{}{} d{:3.0f} {:3.0f}mm/{:3.0f}deg'.format(
                              '*' if r['accepted'] else '', r['reason'],
                              '(F)' if r['flipped'] else '',
+                             '(b{:.1f})'.format(r['blend'])
+                             if r.get('blend') else '',
                              r['hand_distance'] * 1e3,
                              r['position_change'] * 1e3,
                              r['rotation_change_deg'])))
