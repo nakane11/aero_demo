@@ -3905,9 +3905,10 @@ def build_arg_parser():
         help='軌道の事後検証で許容する最大貫通量 [m]。')
     parser.add_argument(
         '--background-optimizer-warmup', dest='background_optimizer_warmup',
-        action='store_true',
+        action=argparse.BooleanOptionalAction, default=True,
         help='軌道最適化 (jaxls) の準備を別プロセスで行い、最適化が要る人の計画だけ'
-             '完了を待つ。')
+             '完了を待つ (既定で有効、--no-background-optimizer-warmup で同一'
+             'プロセスの同期実行)。')
     parser.add_argument(
         '--force-optimize', action='store_true',
         help='候補が検証に通っても必ず jaxls の軌道最適化まで実行する。')
