@@ -132,6 +132,11 @@ HEAD_FACE_TRACK_SPEED_DEG = 80.0  # [deg/s] (実機の首ヨーの上限は約 9
 # 指令の変化がこれ未満なら送り直さない (毎周期の再送で head_controller のゴールが
 # 終わらなくなるため)。
 HEAD_TRACK_RESEND_DEG = 0.5
+# 実行中は人の体が近づき、体の一部を人と誤検出して顔が低く出る (bag 2026-10-21 で
+# 高さ 20〜50cm、正常な検出は高さ 11cm・水平 20cm 以内)。実行開始時の顔・体幹から
+# これ以上離れた検出は追従の目標に使わない。
+HEAD_TRACK_MAX_DZ = 0.15  # [m]
+HEAD_TRACK_MAX_DXY = 0.30  # [m]
 ODOM_FRAME = 'odom'
 
 # 実機再生時の waypoint 間の所要時間の下限 [秒] (腕の制御周期 15Hz の 1 周期)。
@@ -975,6 +980,7 @@ class HandshakePipelineNode(object):
         # 直近に人が見えた (time.time(), 体幹の base_link 座標, 顔の座標 or None,
         #  odom <- base_link の 4x4 or None) or None
         self._head_person_seen = None
+        self._head_person_ref = None  # 実行開始時の顔・体幹 (odom 系)。実行中だけ入る
         # set の間は状態によらず首で人の顔を追う (実機の実行中)。
         self._head_face_tracking = threading.Event()
         # set の間は首で差し出し手の掌を追う (顔の追従より優先)。_head_hand_seen は
@@ -1294,7 +1300,8 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._latest_joint_positions = preview_joint_positions
             self._latest_is_base_frame = is_base_frame
-            if person_seen is not None:
+            if person_seen is not None and self._head_person_plausible(
+                    person_seen):
                 self._head_person_seen = person_seen
             hand_frames_requested = self._hand_frames_requested
             hand_tracking = self._hand_tracking
@@ -1948,6 +1955,28 @@ class HandshakePipelineNode(object):
         point_odom = odom_from_base_then @ np.append(point, 1.0)
         return np.linalg.solve(odom_from_base_now, point_odom)[:3]
 
+    @staticmethod
+    def _seen_target_odom(seen):
+        """``seen`` の顔 (無ければ体幹) の odom 系の位置 (換算できなければ None)。"""
+        _, torso, face, odom_from_base = seen
+        if odom_from_base is None:
+            return None
+        point = torso if face is None else face
+        return (odom_from_base @ np.append(point, 1.0))[:3]
+
+    def _head_person_plausible(self, seen):
+        """実行中 (``self._head_person_ref`` あり) の検出 ``seen`` が実行開始時の顔・体幹から
+        ``HEAD_TRACK_MAX_DZ`` / ``HEAD_TRACK_MAX_DXY`` 以内か (実行中でなければ True)。"""
+        ref = self._head_person_ref
+        if ref is None:
+            return True
+        point = self._seen_target_odom(seen)
+        if point is None:
+            return False
+        delta = point - ref
+        return (abs(delta[2]) <= HEAD_TRACK_MAX_DZ
+                and float(np.hypot(delta[0], delta[1])) <= HEAD_TRACK_MAX_DXY)
+
     def _head_tracking_loop(self):
         """ARMED 中、人が見えていればカメラ光軸を体幹へ向け、見えなくなって
         ``HEAD_SCAN_START_DELAY`` 秒たったら首ヨーを往復させて探す。
@@ -2226,9 +2255,14 @@ class HandshakePipelineNode(object):
         """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
         途中で例外になっても顔追従・手の追跡は止める。"""
         self._hand_grasped = False
+        with self._lock:
+            seen = self._head_person_seen
+            self._head_person_ref = (
+                None if seen is None else self._seen_target_odom(seen))
         try:
             self._execute_on_robot_body()
         finally:
+            self._head_person_ref = None
             # 握った場合は試行終了時 (失敗時も) に開く。
             if self._hand_grasped:
                 self._set_hand_grasp(False)
