@@ -271,19 +271,25 @@ def human_palm_from_press(post, turn_deg, robot_arm):
         rot = np.column_stack([rot[:, 0], -rot[:, 1], -rot[:, 2]])
     rot = spik._turn_about_y(rot, -turn_deg)
     fingers, normal = rot[:, 0], -rot[:, 1]
-    position = (np.asarray(post['target_position'], dtype=np.float64)
-                - normal * spik.POST_PROCESS_TARGET_HOVER_OFFSET)
-    return palm_from_frame(position, np.column_stack(
-        [fingers, normal, np.cross(fingers, normal)]))
+    palm = palm_from_frame(
+        np.asarray(post['target_position'], dtype=np.float64)
+        - normal * spik.POST_PROCESS_TARGET_HOVER_OFFSET,
+        np.column_stack([fingers, normal, np.cross(fingers, normal)]))
+    # 最終目標は指先方向へ PRESS_IN_ADVANCE 進めてあるので、その分を戻す。
+    palm['position'] = [float(v) for v in (
+        np.asarray(palm['position'])
+        - spik.press_in_slide_direction(
+            palm, np.asarray(post['target_rot'], dtype=np.float64))
+        * spik.PRESS_IN_ADVANCE)]
+    return palm
 
 
 def press_target(palm, turn_deg, robot_arm):
     """人の掌 ``palm`` への押し込み目標 (``solve_post_process`` と同じ)。"""
-    position, rot = palm_frame(palm)
+    target_rot = spik.palm_target_rot(palm, turn_deg, robot_arm)
     return Coordinates(
-        pos=(position + rot[:, 1]
-             * spik.POST_PROCESS_TARGET_HOVER_OFFSET).tolist(),
-        rot=spik.palm_target_rot(palm, turn_deg, robot_arm))
+        pos=spik.press_in_final_position(palm, target_rot).tolist(),
+        rot=target_rot)
 
 
 def _outward(joint_positions, hand):

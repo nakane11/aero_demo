@@ -124,6 +124,9 @@ DEFAULT_IK_COLLISION_GEOMETRY = 'primitive'
 # 押し出しながら詰める曲線 (press_in_target_position)。
 PRESS_IN_LIFT = 0.04  # [m]
 PRESS_IN_SLIDE = 0.15  # [m]
+# 最終目標を掌の位置からさらに指先方向へ進める量。hover の位置は変えずに、押し出す
+# 距離が PRESS_IN_SLIDE + PRESS_IN_ADVANCE になる。
+PRESS_IN_ADVANCE = 0.02  # [m]
 # 指先方向の進み u (0 -> 1) に対し、法線方向は 1 - u**指数 で詰める
 # (大きいほど押し出しの終盤で詰める、1 で直線)。
 PRESS_IN_CURVE_EXPONENT = 3.0
@@ -465,20 +468,29 @@ def press_in_slide_direction(palm, target_rot):
     return finger if norm < 1e-6 else along / norm
 
 
-def press_in_target_position(palm, target_rot, u):
-    """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover、1 = 最終目標)。"""
+def press_in_final_position(palm, target_rot):
+    """押し込みの最終目標の手先位置: 掌から法線方向に ``POST_PROCESS_TARGET_HOVER_OFFSET``、
+    指先方向に ``PRESS_IN_ADVANCE``。"""
     position = np.asarray(palm['position'], dtype=np.float64)
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
-    final = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+    return (position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+            + press_in_slide_direction(palm, target_rot) * PRESS_IN_ADVANCE)
+
+
+def press_in_target_position(palm, target_rot, u):
+    """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover、1 = 最終目標)。"""
+    normal = np.asarray(palm['y_axis'], dtype=np.float64)
+    final = press_in_final_position(palm, target_rot)
     slide = press_in_slide_direction(palm, target_rot)
-    return (final - slide * PRESS_IN_SLIDE * (1.0 - u)
+    return (final - slide * (PRESS_IN_SLIDE + PRESS_IN_ADVANCE) * (1.0 - u)
             + normal * PRESS_IN_LIFT * (1.0 - u ** PRESS_IN_CURVE_EXPONENT))
 
 
 def press_in_base_shift(palm, target_rot, u):
     """押し込み区間の進み ``u`` での台車の hover からの平行移動量 (z = 0)。"""
     slide = press_in_slide_direction(palm, target_rot)
-    shift = slide * PRESS_IN_SLIDE * PRESS_IN_BASE_RATIO * u
+    shift = (slide * (PRESS_IN_SLIDE + PRESS_IN_ADVANCE)
+             * PRESS_IN_BASE_RATIO * u)
     shift[2] = 0.0
     return shift
 
@@ -2190,8 +2202,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
     position = np.asarray(palm['position'], dtype=np.float64)
-    normal = np.asarray(palm['y_axis'], dtype=np.float64)
-    target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+    target_pos = press_in_final_position(palm, target_rot)
     target_coords = Coordinates(pos=target_pos.tolist(), rot=target_rot)
 
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -2471,9 +2482,7 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
 
     def changes(candidate):
         target_rot = palm_target_rot(candidate, turn_deg, robot_arm)
-        position = np.asarray(candidate['position'], dtype=np.float64)
-        normal = np.asarray(candidate['y_axis'], dtype=np.float64)
-        target_pos = position + normal * POST_PROCESS_TARGET_HOVER_OFFSET
+        target_pos = press_in_final_position(candidate, target_rot)
         return (target_rot,
                 float(np.linalg.norm(
                     target_pos - np.asarray(planned_post['target_position']))),
@@ -3176,9 +3185,10 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 
 def main():
-    global PRESS_IN_SLIDE, PRESS_IN_LIFT, PRESS_IN_CURVE_EXPONENT, \
-        PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, BOW_WEIGHT, PRESS_IN_LEG_RISE, \
-        LEG_RISE_PIN_TOLERANCE, LEG_LOW_SIDE_MARGIN_RATIO
+    global PRESS_IN_SLIDE, PRESS_IN_ADVANCE, PRESS_IN_LIFT, \
+        PRESS_IN_CURVE_EXPONENT, PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, \
+        BOW_WEIGHT, PRESS_IN_LEG_RISE, LEG_RISE_PIN_TOLERANCE, \
+        LEG_LOW_SIDE_MARGIN_RATIO
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3309,6 +3319,10 @@ def main():
         help='hover 目標を押し込みの最終目標からロボットの指先と逆向きに '
             'ずらす距離 [m] (既定 {})。'.format(PRESS_IN_SLIDE))
     parser.add_argument(
+        '--press-in-advance', type=float, default=PRESS_IN_ADVANCE,
+        help='押し込みの最終目標を掌の位置からさらにロボットの指先方向へ進める '
+            '距離 [m]。hover は変わらない (既定 {})。'.format(PRESS_IN_ADVANCE))
+    parser.add_argument(
         '--press-in-lift', type=float, default=PRESS_IN_LIFT,
         help='hover 目標を押し込みの最終目標から掌の法線方向に浮かせる距離 '
             '[m] (既定 {})。'.format(PRESS_IN_LIFT))
@@ -3350,6 +3364,7 @@ def main():
                 DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
     PRESS_IN_SLIDE = args.press_in_slide
+    PRESS_IN_ADVANCE = args.press_in_advance
     PRESS_IN_LIFT = args.press_in_lift
     PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
     PRESS_IN_BASE_RATIO = args.press_in_base_ratio
