@@ -140,10 +140,12 @@ MIN_SEGMENT_TIME = 1.0 / 15.0
 # 干渉 NG の waypoint が全て接近区間のこの割合より後ろなら手の出し方が原因とみなす。
 FAILURE_NEAR_HAND_FRACTION = 0.7
 
-# ARMED へ戻った後、掌がこれだけ動く/傾く/見えなくなるまで同じ手の差し出しを受け付けない。
-# 失敗の発話の完了から RETRY_COOLDOWN_AFTER_SPEECH 秒後に見始める。
+# 失敗して ARMED へ戻った後、掌が失敗した計画の掌からこれだけ動く/傾く (連続
+# RETRY_MIN_CHANGED_FRAMES フレーム) か見えなくなるまで同じ手の差し出しを受け付けない。
+# 失敗の発話中の変化も覚えておき、発話の完了から RETRY_COOLDOWN_AFTER_SPEECH 秒後に受け付ける。
 RETRY_MIN_DISPLACEMENT = 0.05
 RETRY_MIN_ROTATION_DEG = 20.0
+RETRY_MIN_CHANGED_FRAMES = 3
 RETRY_LOST_TIME = 0.5
 RETRY_COOLDOWN_AFTER_SPEECH = 1.0  # [s]
 # 発話の完了待ち。action サーバが無ければ topic で送り、BASE + PER_CHAR × 文字数 [秒]
@@ -955,11 +957,11 @@ class HandshakePipelineNode(object):
         # 'idle' -> 'armed' -> 'solving' -> 'result' (RESET で 'idle')。
         # --auto-execute で失敗したら 'armed' に戻る。
         self.state = 'idle'
-        # ARMED に戻った時点の左右の掌 (_offer_changed)。None ならすぐ受け付ける。
+        # 失敗後の再試行の基準 (_offer_changed)。None ならすぐ受け付ける。
         self._retry_reference = None
         self._busy = False                # IK 計算中は次フレームの処理を止める
-        # 直前の失敗の発話の完了で set される Event。
-        self._failure_speech_done = None
+        # 直前の失敗の (差し出し手, 計画に使った掌, 発話完了の Event)。
+        self._last_failure = None
         self._nod_done = threading.Event()
         self._nod_done.set()
         self._initial_pose_done = threading.Event()
@@ -1332,13 +1334,16 @@ class HandshakePipelineNode(object):
         self._latest_offer_selection = None
         self._retry_reference = None
         if wait_offer_change:
-            speech_done = self._failure_speech_done
+            side, palm, speech_done = self._last_failure or (None, None, None)
             if speech_done is None:
                 speech_done = threading.Event()
                 speech_done.set()
+            # 差し出し手は失敗した計画の掌を基準にする (反対の手は最初に見えた掌)。
             self._retry_reference = dict(
-                palms={}, lost_since={}, speech_done=speech_done, until=None)
-        self._failure_speech_done = None
+                palms={side: palm} if palm is not None else {},
+                lost_since={}, changed_frames={}, changed=None,
+                speech_done=speech_done, until=None)
+        self._last_failure = None
         with self._lock:
             self._handshake_total_time = None
         self.arm_button.visible = False
@@ -1377,26 +1382,37 @@ class HandshakePipelineNode(object):
             self.viewer.redraw()
 
     def _offer_changed(self, palms, stamp):
-        """失敗の発話の完了から ``RETRY_COOLDOWN_AFTER_SPEECH`` 秒後に最初に見えた
-        掌を基準に、どちらかの手が動いた/傾いた/一定時間見えなくなったら True。"""
+        """失敗した計画の掌 (反対の手は最初に見えた掌) を基準に、どちらかの手が
+        動いた/傾いた/一定時間見えなくなったら、失敗の発話の完了から
+        ``RETRY_COOLDOWN_AFTER_SPEECH`` 秒後に True。発話中の変化も覚えておく。"""
         reference = self._retry_reference
+        if reference['changed'] is None:
+            reference['changed'] = self._detect_offer_change(
+                reference, palms, stamp)
         if not reference['speech_done'].is_set():
             return False
         if reference['until'] is None:
             reference['until'] = time.time() + RETRY_COOLDOWN_AFTER_SPEECH
-        if time.time() < reference['until']:
+        if time.time() < reference['until'] or reference['changed'] is None:
             return False
+        print('[ARM] {}、次の差し出しを受け付けます。'.format(
+            reference['changed']))
+        return True
+
+    @staticmethod
+    def _detect_offer_change(reference, palms, stamp):
+        """``reference`` の掌からの変化を 1 フレーム分調べ、変化と判定したら
+        その説明文、まだなら None を返す。"""
         for side in ('R', 'L'):
             palm = palms.get(side)
             ref = reference['palms'].get(side)
             if palm is None:
+                reference['changed_frames'][side] = 0
                 if ref is None:
                     continue
                 since = reference['lost_since'].setdefault(side, stamp)
                 if stamp - since >= RETRY_LOST_TIME:
-                    print('[ARM] {}手が見えなくなったので、次の差し出しを'
-                          '受け付けます。'.format(side))
-                    return True
+                    return '{}手が見えなくなったので'.format(side)
                 continue
             reference['lost_since'].pop(side, None)
             if ref is None:
@@ -1408,13 +1424,16 @@ class HandshakePipelineNode(object):
                 hand_offer_advice._unit(palm['y_axis']),
                 hand_offer_advice._unit(ref['y_axis'])))
             rotation = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
-            if (displacement >= RETRY_MIN_DISPLACEMENT
-                    or rotation >= RETRY_MIN_ROTATION_DEG):
-                print('[ARM] {}手が動いたので (位置 {:.0f} mm、向き {:.0f} 度)、'
-                      '次の差し出しを受け付けます。'.format(
-                          side, displacement * 1e3, rotation))
-                return True
-        return False
+            if (displacement < RETRY_MIN_DISPLACEMENT
+                    and rotation < RETRY_MIN_ROTATION_DEG):
+                reference['changed_frames'][side] = 0
+                continue
+            n = reference['changed_frames'].get(side, 0) + 1
+            reference['changed_frames'][side] = n
+            if n >= RETRY_MIN_CHANGED_FRAMES:
+                return ('{}手が動いたので (位置 {:.0f} mm、向き {:.0f} 度)'
+                        .format(side, displacement * 1e3, rotation))
+        return None
 
     def _try_handshake(self, joint_positions, stamp):
         handshake_t0 = time.time()
@@ -1594,7 +1613,8 @@ class HandshakePipelineNode(object):
             speech = self._failure_speech(
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
-                self._failure_speech_done = self._say(speech, wait=True)
+                self._last_failure = (
+                    offered_hand, palm, self._say(speech, wait=True))
                 return 'failed'
         return 'solved'
 
