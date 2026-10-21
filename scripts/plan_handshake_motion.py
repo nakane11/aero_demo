@@ -89,6 +89,13 @@ APPROACH_CANDIDATE_MAX_ANGLE = math.radians(120.0)  # [rad]
 ORBIT_TANGENT_SEARCH_STEP = math.radians(0.5)  # [rad]
 ORBIT_TANGENT_MAX_MISMATCH = math.radians(3.0)  # [rad]
 
+# 螺旋の自転を最短の向きで回ると、台車の正面から見た人・掌の方位がこの角度を
+# 超える (首ヨーの可動域 約 ±120 度で追えず、カメラの視界から外れる) なら、
+# 逆向きの方が超え方が小さいときだけ逆向きに回る (``_spin_toward_human``)。
+# 方位は螺旋を ORBIT_SPIN_BEARING_SAMPLES 点で調べる。
+ORBIT_SPIN_MAX_BEARING = math.radians(110.0)  # [rad]
+ORBIT_SPIN_BEARING_SAMPLES = 41
+
 # lead-in は人からこの距離以内の waypoint だけ検証する [m]。
 LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 
@@ -240,7 +247,7 @@ def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
         travel = p0 - initial[:2]
         travel_len = float(np.linalg.norm(travel))
         sweep = orbit_sweep(np.array([p0[0], p0[1], 0.0]), base_goal,
-                            center, avoid_xy)
+                            center, avoid_xy, spin_toward_human=False)
         if sweep is None or travel_len < 1e-6:
             continue
         dtheta = sweep[1]
@@ -262,7 +269,8 @@ def orbit_tangent_start(base_goal, center_xy, avoid_xy, distance,
     return np.array([p0[0], p0[1], math.atan2(travel[1], travel[0])])
 
 
-def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
+def orbit_sweep(base_start, base_goal, center_xy, avoid_xy,
+                spin_toward_human=True):
     """``base_start`` から ``base_goal`` への公転・自転の量を返す。
 
     Returns
@@ -271,7 +279,9 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
         始点の方位角 [rad]、公転角 [rad] (正で反時計回り)、始点・終点の
         半径 [m]、yaw の変化量 [rad]。半径がほぼ 0 なら ``None``。
 
-    公転は ``avoid_xy`` (人の位置) の方位を通らない向きに回る。
+    公転は ``avoid_xy`` (人の位置) の方位を通らない向きに回る。自転は最短の
+    向きだが、``spin_toward_human`` なら人・掌が背中側を通るときだけ逆向きに
+    する (``_spin_toward_human``)。
     """
     center_xy = np.asarray(center_xy, dtype=np.float64)
     rel0 = np.asarray(base_start[:2], dtype=np.float64) - center_xy
@@ -290,7 +300,47 @@ def orbit_sweep(base_start, base_goal, center_xy, avoid_xy):
         sweep = ccw - 2 * math.pi if passes_human else ccw
     dyaw = sweep + wrap_angle(
         float(base_goal[2]) - float(base_start[2]) - sweep)
+    if spin_toward_human and abs(dyaw) > 1e-6:
+        dyaw = _spin_toward_human(theta0, sweep, r0, r1, dyaw, base_goal,
+                                  center_xy, avoid_xy)
     return theta0, sweep, r0, r1, dyaw
+
+
+def _orbit_max_bearing(theta0, sweep, r0, r1, dyaw, base_goal, center_xy,
+                       points):
+    """公転+自転 (``orbit_base_path`` と同じ補間) の間の、台車の正面から見た
+    ``points`` (水平位置の列) の方位の絶対値の最大 [rad]。"""
+    turn = 1.0 - (1.0 - np.linspace(0.0, 1.0, ORBIT_SPIN_BEARING_SAMPLES)) ** 2
+    theta = theta0 + sweep * turn
+    radius = r1 + (r0 - r1) * (1.0 - turn)
+    x = center_xy[0] + radius * np.cos(theta)
+    y = center_xy[1] + radius * np.sin(theta)
+    yaw = float(base_goal[2]) - dyaw * (1.0 - turn)
+    worst = 0.0
+    for p in points:
+        bearing = np.arctan2(p[1] - y, p[0] - x) - yaw
+        bearing = (bearing + math.pi) % (2 * math.pi) - math.pi
+        worst = max(worst, float(np.max(np.abs(bearing))))
+    return worst
+
+
+def _spin_toward_human(theta0, sweep, r0, r1, dyaw, base_goal, center_xy,
+                       avoid_xy):
+    """自転の向き: 最短の向き (``dyaw``) で人 (``avoid_xy``) か掌 (公転の中心)
+    の方位が ``ORBIT_SPIN_MAX_BEARING`` を超える (首で追えず視界から外れる)
+    なら、逆向きに 1 周ずらした向きの方が方位の最大が小さいときだけそちらに
+    する。向かい合って始めると、人の左手なら反時計回り、右手なら時計回り
+    (回る途中で正面が人の方を通る) になる。"""
+    points = [np.asarray(avoid_xy[:2], dtype=np.float64), center_xy]
+    shortest = _orbit_max_bearing(theta0, sweep, r0, r1, dyaw, base_goal,
+                                  center_xy, points)
+    if shortest <= ORBIT_SPIN_MAX_BEARING:
+        return dyaw
+    other = dyaw - math.copysign(2 * math.pi, dyaw)
+    if _orbit_max_bearing(theta0, sweep, r0, r1, other, base_goal,
+                          center_xy, points) < shortest:
+        return other
+    return dyaw
 
 
 def orbit_unwrap_start(base_start, base_goal, center_xy, avoid_xy):
