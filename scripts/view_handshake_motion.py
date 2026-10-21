@@ -408,22 +408,30 @@ def main():
         handshake_path = os.path.join(args.handshake_dir, name)
         motion_path = os.path.join(args.motion_dir, name)
 
-        person = load_smpl_params(skeleton_path)
+        try:
+            person = load_smpl_params(skeleton_path)
+        except KeyError:
+            # 実カメラの骨格 (run_camera_pipeline_test.py の保存) は SMPL を
+            # 持たず、計画もロボット座標のまま (人を正面へ移していない)。人は
+            # 干渉円柱だけで表示する。
+            person = None
         handshake = load_handshake_json(handshake_path)
         motion = load_motion_json(motion_path)
 
         joint_positions = load_joint_positions(skeleton_path)
-        offset = human_translation_offset(
-            joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
-        joint_positions = translate_joint_positions(joint_positions, offset)
-        if offset != (0.0, 0.0):
-            person = dict(person)
-            root_pos = np.array(person['root_pos'], dtype=np.float64)
-            root_pos[0] += offset[0]
-            root_pos[1] += offset[1]
-            person['root_pos'] = root_pos
+        if person is not None:
+            offset = human_translation_offset(
+                joint_positions, front_distance=HUMAN_FRONT_DISTANCE)
+            joint_positions = translate_joint_positions(
+                joint_positions, offset)
+            if offset != (0.0, 0.0):
+                person = dict(person)
+                root_pos = np.array(person['root_pos'], dtype=np.float64)
+                root_pos[0] += offset[0]
+                root_pos[1] += offset[1]
+                person['root_pos'] = root_pos
 
-        model = models_by_gender.get(
+        model = None if person is None else models_by_gender.get(
             person['gender'], models_by_gender['male'])
 
         display_waypoints, n_approach = build_display_waypoints(
@@ -464,30 +472,38 @@ def main():
             robot, '{}arm_end_coords'.format(current['handshake']
                                              ['robot_arm']))
         gaze_target = hand_move_target.worldpos()
-        pose = look_at_pose(current['model'], current['person'], gaze_target)
         # 横並び移動では人の腕を計画した腕に合わせる。
         arm = current['display_waypoints'][idx].get('human_arm')
-        if arm is not None and current['human_arm'] is not None:
-            pose = follow_arm_pose(
-                current['model'], current['person'], pose,
-                current['human_arm'], arm)
         if arm is not current['obstacle_arm']:
             set_obstacles(current['joint_positions'] if arm is None
+                          or current['human_arm'] is None
                           else current['human_arm'].skeleton(arm))
             current['obstacle_arm'] = arm
-        mesh = build_smpl_mesh(current['model'], current['person'], pose)
-        # Play 中の点滅回避のため頂点だけ書き換える。
-        vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        faces = np.asarray(mesh.faces, dtype=np.uint32)
-        handle = human_mesh_handle[0]
-        if handle is None or handle.faces.shape != faces.shape:
-            if handle is not None:
-                handle.remove()
-            human_mesh_handle[0] = viewer._server.scene.add_mesh_simple(
-                'smpl_human', vertices=vertices, faces=faces,
-                color=tuple(SKIN_COLOR[:3]))
+        if current['person'] is None:
+            # SMPL の無い骨格は干渉円柱だけで表示する。
+            if human_mesh_handle[0] is not None:
+                human_mesh_handle[0].remove()
+                human_mesh_handle[0] = None
         else:
-            handle.vertices = vertices
+            pose = look_at_pose(current['model'], current['person'],
+                                gaze_target)
+            if arm is not None and current['human_arm'] is not None:
+                pose = follow_arm_pose(
+                    current['model'], current['person'], pose,
+                    current['human_arm'], arm)
+            mesh = build_smpl_mesh(current['model'], current['person'], pose)
+            # Play 中の点滅回避のため頂点だけ書き換える。
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.uint32)
+            handle = human_mesh_handle[0]
+            if handle is None or handle.faces.shape != faces.shape:
+                if handle is not None:
+                    handle.remove()
+                human_mesh_handle[0] = viewer._server.scene.add_mesh_simple(
+                    'smpl_human', vertices=vertices, faces=faces,
+                    color=tuple(SKIN_COLOR[:3]))
+            else:
+                handle.vertices = vertices
 
         colliding = colliding_link_pairs(
             robot_collision_overlay, verification_pairs,
