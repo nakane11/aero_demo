@@ -189,6 +189,12 @@ CAMERA_LINK_TO_OPTICAL_ROT = np.array([[0.0, 0.0, 1.0],
                                        [-1.0, 0.0, 0.0],
                                        [0.0, -1.0, 0.0]])
 
+# 差し出した手へ首を向けるときの視線の基準点 (``gaze_coords`` の ratio)。接近中・hover は
+# カメラが手を画角に捉えられるよう 0.5、押し込みの最終姿勢は顔が手を向くよう 1.0
+# (hover で再検出が終わった後でカメラは手を見なくてよい)。
+GAZE_HOVER_RATIO = 0.5
+GAZE_FINAL_RATIO = 1.0
+
 # 肘の下限 [deg] (0 度 = 伸ばした状態)。曲げきった不自然な解を避ける。
 ELBOW_MIN_ANGLE_DEG = -120.0
 
@@ -2100,6 +2106,26 @@ def camera_optical_coords(robot):
     return coords
 
 
+def gaze_coords(robot, ratio):
+    """カメラ光軸と同じ向きで、原点をカメラから ``head_link`` の方へ ``ratio`` (0〜1) だけ
+    寄せた視線の基準座標 (``ratio`` 0 はカメラそのもの、1 は顔 = ``head_link`` の高さ)。
+
+    カメラは ``head_link`` の約 19 cm 上にあり、光軸を手へ向けると顔の向きは手より下を
+    向く。原点を下げて手へ向けると、顔が手を向く代わりに掌がカメラ画像の下へ寄る。"""
+    camera = camera_optical_coords(robot)
+    if ratio <= 0.0:
+        return camera
+    name = 'gaze_coords_{:.2f}'.format(ratio)
+    coords = getattr(robot, name, None)
+    if coords is None:
+        coords = CascadedCoords(parent=robot.head_link, name=name)
+        setattr(robot, name, coords)
+    pos = np.array(camera.translation, dtype=np.float64)
+    pos[2] *= 1.0 - ratio
+    coords.newcoords(Coordinates(pos=pos.tolist(), rot=camera.rotation))
+    return coords
+
+
 def gaze_link_list(robot):
     """視線 IK で動かす首のリンク (首ロールを除く)。首ロールを ``NECK_ROLL_FIXED_ANGLE`` にしてから返す。"""
     robot.neck_r_joint.joint_angle(NECK_ROLL_FIXED_ANGLE)
@@ -2183,6 +2209,19 @@ def _body_link_list(whole_body, fix_legs):
             if link.joint.name not in LEG_JOINT_NAMES]
 
 
+def _hover_head_angles(robot, position, stop, rthre):
+    """いまの姿勢のまま、首だけで hover の視線の基準 (``GAZE_HOVER_RATIO``) を ``position`` へ
+    向けたときの首の関節角 (``{関節名: 角度}``)。``robot`` の首は元に戻す。"""
+    head_joints = [link.joint for link in robot.head.link_list]
+    final = [joint.joint_angle() for joint in head_joints]
+    _reaim_gaze(robot, gaze_coords(robot, GAZE_HOVER_RATIO), position, stop,
+                rthre)
+    angles = {joint.name: float(joint.joint_angle()) for joint in head_joints}
+    for joint, angle in zip(head_joints, final):
+        joint.joint_angle(angle)
+    return angles
+
+
 def solve_post_process(robot, robot_arm, palm, target_rot,
                        stop=DEFAULT_POST_PROCESS_IK_STOP,
                        thre=DEFAULT_POST_PROCESS_IK_THRE,
@@ -2208,7 +2247,7 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     body_links = _body_link_list(whole_body, fix_legs)
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
-    head_move_target = camera_optical_coords(robot)
+    head_move_target = gaze_coords(robot, GAZE_FINAL_RATIO)
     head_target = _gaze_target(head_move_target, position)
 
     def solve_arm_only():
@@ -2256,8 +2295,14 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
             robot.angle_vector(initial_angle_vector)
             return None
 
+    hover_head = None
+    if gaze:
+        hover_head = _hover_head_angles(robot, position, gaze_ik_stop,
+                                        gaze_ik_rthre)
+
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
     return dict(
+        hover_head=hover_head,
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
         hand_position=[float(v) for v in move_target.worldpos()],
@@ -2431,8 +2476,19 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
     head_joints = [link.joint for link in robot.head.link_list]
     head_indices = [i for i, joint in enumerate(robot.joint_list)
                     if joint in head_joints]
-    for angle_vector in path:
-        angle_vector[head_indices] = final_angle_vector[head_indices]
+    # 途中の点の首は、hover の視線 (post['hover_head']) から最終姿勢の視線へ線形に補間する
+    # (視線を解かないときは最終姿勢の角度のまま)。
+    hover_head = post.get('hover_head')
+    if hover_head is None:
+        hover_vector = final_angle_vector[head_indices]
+    else:
+        hover_vector = np.array(
+            [hover_head.get(robot.joint_list[i].name, final_angle_vector[i])
+             for i in head_indices], dtype=np.float64)
+    for k, angle_vector in enumerate(path):
+        t = (k + 1) / float(len(path) + 1)
+        angle_vector[head_indices] = (
+            hover_vector + (final_angle_vector[head_indices] - hover_vector) * t)
     post['press_in_path'] = [[float(v) for v in angle_vector]
                              for angle_vector in path]
     post['press_in_base_path'] = base_path

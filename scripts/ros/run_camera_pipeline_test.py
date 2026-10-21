@@ -1949,16 +1949,20 @@ class HandshakePipelineNode(object):
                             hand_seen if hand else seen)
                         if target is None:
                             continue
+                        # 掌は hover の視線の基準 (カメラより少し顔寄り) で追う。
+                        track_coords = (
+                            spik.gaze_coords(gaze_robot, spik.GAZE_HOVER_RATIO)
+                            if hand else gaze_coords)
                         if mode != track_mode:
                             gaze_robot.neck_y_joint.joint_angle(
                                 current_av[neck_y_index])
                             gaze_robot.neck_p_joint.joint_angle(
                                 current_av[neck_p_index])
-                        elif (spik._gaze_error(gaze_coords, target)
+                        elif (spik._gaze_error(track_coords, target)
                               < np.deg2rad(HEAD_FACE_TRACK_DEADBAND_DEG)):
                             continue
                         spik._reaim_gaze(
-                            gaze_robot, gaze_coords, target,
+                            gaze_robot, track_coords, target,
                             HEAD_TRACK_IK_STOP, HEAD_TRACK_IK_RTHRE)
                         target_av[neck_y_index] = \
                             gaze_robot.neck_y_joint.joint_angle()

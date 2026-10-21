@@ -964,7 +964,8 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
 
 def blend_head_to_post_process(robot, motion, handshake):
     """接近区間の ``HEAD_GAZE_BLEND_START`` 以降で首の角度を押し込み姿勢の
-    値へ線形補間する (破壊的。hover 時に掌が画角に入るように)。
+    hover 用の視線 (``post['hover_head']``、無ければ最終姿勢の値) へ線形補間する
+    (破壊的。hover 時に掌が画角に入るように)。
 
     書き換えた waypoint は検証し直さない。書き換えたら True。
     """
@@ -974,6 +975,8 @@ def blend_head_to_post_process(robot, motion, handshake):
         return False
     joint_names = motion['joint_names']
     post_angles = dict(zip(post['joint_names'], post['joint_angle_vector']))
+    # hover の視線は、最終姿勢 (顔が手を向く) ではなくカメラが手を捉える視線にする。
+    post_angles.update(post.get('hover_head') or {})
     head_indices = [joint_names.index(link.joint.name)
                     for link in robot.head.link_list
                     if link.joint.name in post_angles
