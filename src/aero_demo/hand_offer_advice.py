@@ -206,18 +206,8 @@ def _angle_phrase(key, diff, target):
     return '指先を少し{}に向けて'.format('外側' if diff > 0 else '内側')
 
 
-def advice_speech_parts(advice):
-    """``advise`` の結果を句ごとの発話の断片にする (助言なしは空リスト).
-
-    「<句1>、」「<句2>ください。」のように分けるので、断片ごとにロボット側の
-    VOICEVOX のキャッシュに当たる (組合せの数が増えないので事前生成しやすい)。
-    """
-    phrases = [phrase for _, _, phrase in advice]
-    if not phrases:
-        return []
-    return [p + '、' for p in phrases[:-1]] + [phrases[-1] + 'ください。']
-
-
 def advice_speech(advice):
     """``advise`` の結果を 1 つの発話文にする."""
-    return ''.join(advice_speech_parts(advice))
+    if not advice:
+        return ''
+    return '、'.join(phrase for _, _, phrase in advice) + 'ください。'

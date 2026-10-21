@@ -1651,12 +1651,8 @@ class HandshakePipelineNode(object):
         self._log_debug(dict(
             event='advice', person=attempt, cause=cause, measure=measure,
             target=target, advice=[[k, d] for k, d, _ in advice], text=text))
-        # 前半と助言の句を別々の発話にする。ロボット側の VOICEVOX のキャッシュに
-        # 当たれば、合成を待たずに話せる (キャッシュ無しだと合成に音声長の約 1.2 倍)。
-        tail = (hand_offer_advice.advice_speech_parts(advice)
-                or [args.speech_retry_text])
-        front = args.speech_fail_text + '。' if args.speech_fail_text else ''
-        return [front] + tail
+        tail = text or args.speech_retry_text
+        return '。'.join(t for t in (args.speech_fail_text, tail) if t)
 
     @staticmethod
     def _failure_cause(result, motion,
@@ -3175,37 +3171,25 @@ class HandshakePipelineNode(object):
     def _say(self, text, wait=False):
         """``text`` を発話する (非ブロッキング、発話できなければ何もしない)。
 
-        ``text`` は文字列か、順に話す断片のリスト。``wait=True`` なら別スレッドで
-        断片を 1 つずつ発話して完了を待ち、全部終わると set される
+        ``wait=True`` なら別スレッドで発話の完了を待ち、完了で set される
         ``threading.Event`` を返す (発話しないときは set 済み)。
         """
         done = threading.Event()
-        texts = [text] if isinstance(text, str) else list(text)
-        texts = [t for t in texts if t]
-        if self.sound_client is None or not texts:
+        if self.sound_client is None or not text:
             done.set()
             return done if wait else None
         if wait:
-            threading.Thread(target=self._say_and_wait, args=(texts, done),
+            threading.Thread(target=self._say_and_wait, args=(text, done),
                              daemon=True).start()
             return done
         try:
-            self.sound_client.say(''.join(texts), voice=self.args.speech_voice)
+            self.sound_client.say(text, voice=self.args.speech_voice)
         except Exception:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             pass
         return None
 
-    def _say_and_wait(self, texts, done):
-        """``texts`` を 1 つずつ発話して完了を待ち、最後に ``done`` を set する。"""
-        try:
-            for text in texts:
-                if not self._say_piece_and_wait(text):
-                    break
-        finally:
-            done.set()
-
-    def _say_piece_and_wait(self, text):
-        """action で ``text`` を発話して完了を待つ。続けて話してよければ True。
+    def _say_and_wait(self, text, done):
+        """action で ``text`` を発話して完了を待ち、``done`` を set する。
 
         要求から再生開始 (最初の feedback) と完了までの時間をログに出す。action
         サーバが無ければ topic で送り、文字数から見積もった時間だけ待つ。
@@ -3223,7 +3207,7 @@ class HandshakePipelineNode(object):
                 print('[speech] 発話の action サーバが無いため、完了を待たずに '
                       '{:.1f} 秒待ちます。'.format(estimate))
                 time.sleep(estimate)
-                return True
+                return
             goal = SoundRequestGoal()
             goal.sound_request.sound = SoundRequest.SAY
             goal.sound_request.command = SoundRequest.PLAY_ONCE
@@ -3246,10 +3230,10 @@ class HandshakePipelineNode(object):
                 start_delay=(first_feedback[0] - t_request
                              if first_feedback else None),
                 total=t_done - t_request))
-            return True
         except Exception as exc:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             print('[speech] 発話の完了待ちに失敗しました ({})。'.format(exc))
-            return False
+        finally:
+            done.set()
 
     def _execute_waypoint_segment(self, waypoints, joint_names,
                                   min_segment_time=MIN_SEGMENT_TIME,
