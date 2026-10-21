@@ -539,6 +539,25 @@ def flip_palm(palm):
     return flipped
 
 
+def palm_medial_component(joint_positions, palm, side):
+    """``side`` の掌の法線の、体の内側 (反対の肩の方向、水平) 成分。
+
+    差し出した手の掌は体の内側か上下を向くので、大きく負なら掌と甲を取り違えている。
+    肩が無いか水平に縮退していれば None。
+    """
+    own = joint_positions.get(side + 'Shoulder')
+    other = joint_positions.get(('L' if side == 'R' else 'R') + 'Shoulder')
+    if palm is None or own is None or other is None:
+        return None
+    medial = np.asarray(other, dtype=np.float64) - np.asarray(own, dtype=np.float64)
+    medial[2] = 0.0
+    medial = _unit(medial)
+    normal = _unit(np.asarray(palm['y_axis'], dtype=np.float64))
+    if medial is None or normal is None:
+        return None
+    return float(np.dot(normal, medial))
+
+
 def hand_joint_positions(hand, side):
     """``estimate_hands_3d`` の手 1 つを ``side`` の関節名 -> 位置にする
     (Hands の左右は誤りうるので呼び出し側の ``side`` に付け替える)。"""

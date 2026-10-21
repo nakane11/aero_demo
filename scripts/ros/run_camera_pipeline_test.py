@@ -154,6 +154,10 @@ SPEECH_SERVER_TIMEOUT = 1.0  # [s]
 SPEECH_RESULT_TIMEOUT = 60.0  # [s]
 SPEECH_FALLBACK_BASE = 3.0
 SPEECH_FALLBACK_PER_CHAR = 0.2
+# 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
+# 取り違えているとみなして裏返す。実機の差し出し 206 件 (bag のフレームを含む) では
+# 正しい掌は -0.25 以上、-0.8 未満はすべて裏返った推定だった (2026-10-21)。
+OUTWARD_PALM_MAX_MEDIAL = -0.5
 
 # 台車の速度上限。実機の aero_base_link.yaml の max_velocity と一致させること。
 BASE_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
@@ -1444,6 +1448,8 @@ class HandshakePipelineNode(object):
         with self._lock:
             self._latest_offer_selection = selection
 
+        # 再試行の基準 (計画に使った掌) と同じく裏返しを直してから比べる。
+        palms = self._correct_outward_palms(palms, joint_positions)
         if self._retry_reference is not None:
             if not self._offer_changed(palms, stamp):
                 return
@@ -1453,6 +1459,8 @@ class HandshakePipelineNode(object):
             return
         palms, offer_check = self._correct_mirrored_offer(
             palms, offered_hand, stamp)
+        # Hands の照合で外向きに裏返した場合は戻す。
+        palms = self._correct_outward_palms(palms, joint_positions)
         # 首の追従の指令送信中でないときに止める (うなずきが打ち切られないよう)。
         with self._head_lock:
             self._busy = True
@@ -1481,6 +1489,24 @@ class HandshakePipelineNode(object):
             self._reset_view()
             self._arm('失敗', move_to_initial_pose=False,
                       wait_offer_change=True)
+
+    @staticmethod
+    def _correct_outward_palms(palms, joint_positions):
+        """掌の法線が体の外側を大きく向いている (``OUTWARD_PALM_MAX_MEDIAL``
+        未満) 手を、掌と甲の取り違えとみなして裏返した ``palms`` を返す。
+
+        手を上げた直後などに手の点がつぶれると法線だけ反転することがある
+        (2026-10-21 試行1)。
+        """
+        corrected = dict(palms)
+        for side in ('R', 'L'):
+            palm = palms.get(side)
+            medial = epp.palm_medial_component(joint_positions, palm, side)
+            if medial is not None and medial < OUTWARD_PALM_MAX_MEDIAL:
+                corrected[side] = dict(
+                    epp.flip_palm(palm), flipped_by_anatomy=True,
+                    medial_before_flip=medial)
+        return corrected
 
     def _correct_mirrored_offer(self, palms, side, stamp):
         """差し出し手 ``side`` の掌を Hands の左右判定と照合し、取り違え (鏡像) なら
@@ -1544,6 +1570,13 @@ class HandshakePipelineNode(object):
                       '掌を裏返します。'.format(
                           offer_check['n_hands'],
                           offer_check['n_mismatched'], offered_hand))
+        if palms[offered_hand].get('flipped_by_anatomy'):
+            medial = palms[offered_hand]['medial_before_flip']
+            print('[ARMED][WARN] {}手の掌の法線が体の外側を向いていた (内側成分 '
+                  '{:+.2f}) ため、掌と甲を取り違えているとみなして裏返します。'
+                  .format(offered_hand, medial))
+            self._log_debug(dict(event='outward_palm_flip', side=offered_hand,
+                                 medial_before_flip=medial))
         planned = self.planner.plan(
             joint_positions, palms, offered_hand, attempt)
         result, motion = planned['result'], planned['motion']
