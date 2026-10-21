@@ -132,6 +132,11 @@ HEAD_FACE_TRACK_SPEED_DEG = 80.0  # [deg/s] (実機の首ヨーの上限は約 9
 # 指令の変化がこれ未満なら送り直さない (毎周期の再送で head_controller のゴールが
 # 終わらなくなるため)。
 HEAD_TRACK_RESEND_DEG = 0.5
+# 実行中の顔・掌の追従で、目標の方位が首ヨーの可動域からこの角度 [度] を超えて
+# 外れたら追わない。今の首ヨーと目標の方位の差がこの角度 [度] を超えたら、視線
+# IK を方位から解き直す (``_seed_neck_yaw``)。
+HEAD_TRACK_YAW_OUT_MARGIN_DEG = 10.0
+HEAD_TRACK_RESEED_DEG = 45.0
 # 実行中は人の体が近づき、体の一部を人と誤検出して顔が低く出る (bag 2026-10-21 で
 # 高さ 20〜50cm、正常な検出は高さ 11cm・水平 20cm 以内)。実行開始時の顔・体幹から
 # これ以上離れた検出は追従の目標に使わない。
@@ -1977,6 +1982,28 @@ class HandshakePipelineNode(object):
         return (abs(delta[2]) <= HEAD_TRACK_MAX_DZ
                 and float(np.hypot(delta[0], delta[1])) <= HEAD_TRACK_MAX_DXY)
 
+    @staticmethod
+    def _seed_neck_yaw(gaze_robot, target):
+        """視線 IK の前に、首ヨーの初期値を ``target`` (base_link 系) の方位に
+        合わせる。``target`` の方位が首ヨーの可動域から ``HEAD_TRACK_YAW_OUT_MARGIN_DEG``
+        を超えて外れていれば何もせず False。
+
+        今の角度から解くだけだと、台車の回転で目標が背中側を通ったとき首ヨーが
+        可動域の端に張り付き、目標が反対側へ出ても戻れない (bag 2026-10-21 試行6、
+        +119.7 度のまま)。今の角度と方位の差が ``HEAD_TRACK_RESEED_DEG`` を超える
+        ときだけ方位から解き直す。"""
+        joint = gaze_robot.neck_y_joint
+        local = joint.parent_link.worldcoords().inverse_transform_vector(
+            np.asarray(target, dtype=np.float64))
+        yaw = math.atan2(float(local[1]), float(local[0]))
+        margin = np.deg2rad(HEAD_TRACK_YAW_OUT_MARGIN_DEG)
+        if yaw > joint.max_angle + margin or yaw < joint.min_angle - margin:
+            return False
+        if abs(yaw - joint.joint_angle()) > np.deg2rad(HEAD_TRACK_RESEED_DEG):
+            joint.joint_angle(float(np.clip(yaw, joint.min_angle,
+                                            joint.max_angle)))
+        return True
+
     def _head_tracking_loop(self):
         """ARMED 中、人が見えていればカメラ光軸を体幹へ向け、見えなくなって
         ``HEAD_SCAN_START_DELAY`` 秒たったら首ヨーを往復させて探す。
@@ -2052,6 +2079,9 @@ class HandshakePipelineNode(object):
                                 current_av[neck_p_index])
                         elif (spik._gaze_error(track_coords, target)
                               < np.deg2rad(HEAD_FACE_TRACK_DEADBAND_DEG)):
+                            continue
+                        if not self._seed_neck_yaw(gaze_robot, target):
+                            # 首ヨーの可動域の外 (台車の背中側) は追わず今の向きで待つ。
                             continue
                         spik._reaim_gaze(
                             gaze_robot, track_coords, target,

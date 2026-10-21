@@ -423,6 +423,10 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 (`--grasp-capture-duration`) は動き出すまでで打ち切る。
 接近中と横並び移動中は首で人の顔を追い (`--no-head-tracking` で、ARMED 中の追従・見渡しとともに無効)、hover に着いたら首を
 計画の角度 (掌を見る) に戻して押し込む。
+追従の目標の方位が首ヨーの可動域 (約 ±120°) から 10° (`HEAD_TRACK_YAW_OUT_MARGIN_DEG`) を超えて
+外れている間は追わずに今の向きで待ち、今の首ヨーと目標の方位が 45° (`HEAD_TRACK_RESEED_DEG`) を
+超えて離れたら方位から視線 IK を解き直す (`_seed_neck_yaw`。今の角度から解くだけだと、台車の
+回転で目標が背中側を通ったとき首が可動域の端に張り付いて戻れなかった。実機 10/21)。
 
 ログは画面には重要なものだけ出し、詳細 (`[debug]` など) は
 `/tmp/run_camera_pipeline_test_logs/<起動時刻>/` 以下に、起動時 (`startup.log`) と試行 (人)
