@@ -134,7 +134,55 @@ def resolve_trial(planner, args, data_dir, name, attempt):
         if transition is not None:
             record['transition_fraction'] = transition['fraction']
             record['transition_reason'] = transition['reason']
+            record['transition_time'] = transition.get('compute_time')
+        record['motion'] = dict(motion, robot_arm=planned['robot_arm'])
     return record
+
+
+def resolve_transition_only(planner, args, data_dir, name):
+    """保存時の押し込み姿勢 (``handshakes/``) から横並び移動だけを解き直した
+    記録を返す (保存時に押し込みまで解けていなければ None)。IK・軌道の揺れを
+    除いて横並び移動の変更を比べるため。"""
+    path = os.path.join(data_dir, 'handshakes', name)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        result = json.load(f)
+    post = result.get('post_process')
+    if not result.get('solved') or post is None:
+        return None
+    joint_positions = spik.load_skeleton_json(
+        os.path.join(data_dir, 'skeletons', name))
+    offset = spik.human_translation_offset(
+        joint_positions, front_distance=args.human_front_distance)
+    translated_joints = spik.translate_joint_positions(
+        joint_positions, offset)
+    collision_joints = spik.shift_torso_joints_from_surface(
+        translated_joints, offset, args.torso_surface_offset)
+    # untranslate_result の逆。
+    post = dict(post)
+    for key in ('target_position', 'base_position'):
+        post[key] = [post[key][0] + offset[0], post[key][1] + offset[1]] + \
+            list(post[key][2:])
+    np.random.seed(zlib.crc32(name.encode()))
+    t0 = time.time()
+    transition = rcpt.sbs.plan_transition(
+        planner.robot, result['robot_arm'], result['offered_hand'], post,
+        result['turn_deg'], translated_joints, collision_joints,
+        planner.verification_pairs, planner.collision_pairs,
+        planner.base_limits,
+        approach=planner.side_by_side_approach == 'sync')
+    motion = dict(robot_arm=result['robot_arm'], waypoints=[],
+                  transition=transition)
+    rcpt.untranslate_motion(motion, offset)
+    return dict(
+        data_dir=data_dir, name=name, saved_stage=load_saved_stage(
+            data_dir, name),
+        hand=result['offered_hand'], robot_arm=result['robot_arm'],
+        stage='transition_ok' if transition['verified'] else 'motion_ok',
+        time=time.time() - t0, transition_fraction=transition['fraction'],
+        transition_reason=transition['reason'],
+        transition_time=transition.get('compute_time'), motion=motion)
 
 
 def main():
@@ -146,7 +194,15 @@ def main():
         help='skeletons/ と palms/ を持つディレクトリ (複数可)。')
     parser.add_argument('--out', type=str, default=None,
                         help='試行ごとの記録を JSON で保存するパス。')
+    parser.add_argument('--motion-dir', type=str, default=None,
+                        help='解き直した軌道 (横並び移動を含む) を試行ごとの '
+                             'JSON で保存するディレクトリ。')
+    parser.add_argument('--transition-only', action='store_true',
+                        help='保存時の押し込み姿勢から横並び移動だけを解き'
+                             '直す (保存時に押し込みまで解けた試行だけ)。')
+    rcpt.sbs.add_human_arm_arguments(parser)
     my_args, node_argv = parser.parse_known_args()
+    rcpt.sbs.apply_human_arm_arguments(my_args)
     args = rcpt.build_arg_parser().parse_args(node_argv)
 
     planner = rcpt.HandshakePlanner(args)
@@ -161,7 +217,20 @@ def main():
               if name.endswith('.json')]
     records = []
     for i, (data_dir, name) in enumerate(trials):
-        record = resolve_trial(planner, args, data_dir, name, i + 1)
+        if my_args.transition_only:
+            record = resolve_transition_only(planner, args, data_dir, name)
+            if record is None:
+                continue
+        else:
+            record = resolve_trial(planner, args, data_dir, name, i + 1)
+        motion = record.pop('motion', None)
+        if my_args.motion_dir and motion is not None:
+            # 別のディレクトリの同じ名前と区別するため、親の名前を前に付ける。
+            os.makedirs(my_args.motion_dir, exist_ok=True)
+            rcpt.json_io.save_json(os.path.join(
+                my_args.motion_dir, '{}_{}'.format(
+                    os.path.basename(os.path.normpath(data_dir)), name)),
+                motion)
         records.append(record)
         print('[{}/{}] {} {}: {} (保存時 {})'.format(
             i + 1, len(trials), data_dir, name, record['stage'],

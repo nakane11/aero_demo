@@ -228,6 +228,39 @@ HUMAN_ELBOW_FLEX_MAX_DEG = 145.0
 HUMAN_WRIST_BEND_MAX_DEG = 70.0
 HUMAN_TWIST_CHANGE_MAX_DEG = 90.0
 
+# --- 人の手首 (人の手をロボットの手に固定したモデル) -----------------------
+# 人の手はロボットの手について回るとみなし、人の手の向きをロボットの手先の
+# 向きから押し込み時の握りの向きで逆算する (``hand_on_robot``)。前腕
+# (HumanArm の肘 -> 手首) に対する手の曲げを、掌屈 (+)・背屈 (-)、撓屈 (+)・
+# 尺屈 (-)、押し込み時からの前腕のひねりに分ける (``human_wrist_angles``)。
+# HUMAN_WRIST_CHECK: 'hand_fixed' はこの角度が目安を超える移動先を捨て、
+# 経路はその手前で止める。'turn_cap' は握りの向きの押し込み時からの変化が
+# HUMAN_TURN_CAP_DEG を超えるものを同じく扱う (簡易版)。'off' は見ない。
+HUMAN_WRIST_CHECKS = ('hand_fixed', 'turn_cap', 'off')
+HUMAN_WRIST_CHECK = 'hand_fixed'
+HUMAN_WRIST_RADIAL_MAX_DEG = 20.0
+HUMAN_WRIST_ULNAR_MAX_DEG = 30.0
+HUMAN_WRIST_FLEX_MAX_DEG = 60.0
+HUMAN_WRIST_TWIST_MAX_DEG = LOWERED_TWIST_MAX_DEG
+HUMAN_TURN_CAP_DEG = 20.0
+# 押し込み時にすでにこれ以上曲がっている成分は、押し込み時の値 + この余裕
+# [度] までを許す (骨格・掌の推定の手首の曲げは誤差が大きく、押し込み直後で
+# 止まらないように)。
+HUMAN_WRIST_PRESS_SLACK_DEG = 5.0
+
+# --- 人の前腕・手の甲を障害物にする ----------------------------------------
+# 移動先のバッチ IK と検証で、人の前腕 (肘 -> 手首) と手の甲側 (手首 -> 掌 +
+# 指先 HUMAN_FINGER_LENGTH を、掌の面から甲側へ HUMAN_HAND_BACK_RADIUS ずらした
+# 円柱。掌の接触面は含まない) を、ロボットの差し出す腕の TRANSITION_FOREARM_LINKS
+# から OFFERED_HAND_CLEARANCE 離す。手首の評価 (HUMAN_WRIST_CHECK) だけで前腕の
+# 近さもほぼ無くなり、こちらは成功数が減り計画時間が延びるので既定では使わない
+# (docs/ik_and_motion_constraints.md の 5 節)。
+HUMAN_FOREARM_OBSTACLE = False
+HUMAN_FINGER_LENGTH = 0.08
+HUMAN_HAND_BACK_RADIUS = 0.02
+TRANSITION_FOREARM_LINKS = ('{}_elbow_link', '{}_forearm_link',
+                            '{}_hand_yaw_link')
+
 
 def _wrap(angle):
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -266,15 +299,10 @@ def human_palm_from_press(post, turn_deg, robot_arm):
     """押し込み目標 (``post`` の ``target_position``/``target_rot``) から、
     それを作った人の掌を逆算する (``solve_palm_ik.palm_target_rot`` と
     ``POST_PROCESS_TARGET_HOVER_OFFSET`` の逆)。"""
-    rot = np.asarray(post['target_rot'], dtype=np.float64)
-    if robot_arm == 'l':
-        rot = np.column_stack([rot[:, 0], -rot[:, 1], -rot[:, 2]])
-    rot = spik._turn_about_y(rot, -turn_deg)
-    fingers, normal = rot[:, 0], -rot[:, 1]
+    rot = hand_on_robot(post['target_rot'], turn_deg, robot_arm)
     palm = palm_from_frame(
         np.asarray(post['target_position'], dtype=np.float64)
-        - normal * spik.POST_PROCESS_TARGET_HOVER_OFFSET,
-        np.column_stack([fingers, normal, np.cross(fingers, normal)]))
+        - rot[:, 1] * spik.POST_PROCESS_TARGET_HOVER_OFFSET, rot)
     # 最終目標は指先方向へ PRESS_IN_ADVANCE 進めてあるので、その分を戻す。
     palm['position'] = [float(v) for v in (
         np.asarray(palm['position'])
@@ -282,6 +310,110 @@ def human_palm_from_press(post, turn_deg, robot_arm):
             palm, np.asarray(post['target_rot'], dtype=np.float64))
         * spik.PRESS_IN_ADVANCE)]
     return palm
+
+
+def hand_on_robot(robot_rot, turn_deg, robot_arm):
+    """ロボットの手先 (``{l,r}arm_end_coords``) の回転行列 ``robot_rot`` に、
+    握りの向き ``turn_deg`` で掌を合わせている人の手の回転行列 (列が指先・
+    法線・指先 x 法線、``palm_frame`` と同じ)。``palm_target_rot`` の逆。"""
+    rot = spik._correct_grasp_frame(
+        np.asarray(robot_rot, dtype=np.float64), robot_arm)
+    rot = spik._turn_about_y(rot, -turn_deg)
+    fingers, normal = rot[:, 0], -rot[:, 1]
+    return np.column_stack([fingers, normal, np.cross(fingers, normal)])
+
+
+def _twist_angle(ref_forearm, ref_normal, forearm, normal):
+    """前腕 ``ref_forearm`` で掌の法線が ``ref_normal`` だったときから、前腕
+    ``forearm``・法線 ``normal`` までの前腕まわりのひねり [度]。"""
+    a0, ref0 = HumanArm._twist_reference(ref_forearm, ref_normal)
+    a1, ref1 = HumanArm._twist_reference(forearm, normal)
+    moved = _rotation_between(a0, a1) @ ref0
+    return math.degrees(math.atan2(float(np.dot(np.cross(moved, ref1), a1)),
+                                   float(np.dot(moved, ref1))))
+
+
+def human_wrist_angles(elbow, wrist, hand_rot, hand, press_forearm,
+                       press_normal):
+    """前腕 ``elbow`` -> ``wrist`` に対する手 ``hand_rot`` (``palm_frame`` の
+    回転行列) の手首の角度 [度] の dict: ``flexion_deg`` (掌屈が正、背屈が
+    負)、``deviation_deg`` (撓屈 = 親指側が正、尺屈が負)、``twist_deg``
+    (押し込み時の前腕 ``press_forearm``・掌の法線 ``press_normal`` からの
+    前腕まわりのひねり)。曲げは指先が前腕の向きのときを 0 とする。"""
+    forearm = np.asarray(wrist, dtype=np.float64) - np.asarray(
+        elbow, dtype=np.float64)
+    a = _unit(forearm)
+    hand_rot = np.asarray(hand_rot, dtype=np.float64)
+    fingers, normal = hand_rot[:, 0], hand_rot[:, 1]
+    # 指先 x 法線は右手では親指側、左手では小指側。
+    radial = hand_rot[:, 2] if hand == 'R' else -hand_rot[:, 2]
+    along = float(np.dot(a, fingers))
+    # 掌屈 (指先が掌の側へ曲がる) では前腕が手から見て甲の側へ傾く。
+    return dict(
+        flexion_deg=math.degrees(math.atan2(-float(np.dot(a, normal)),
+                                            along)),
+        deviation_deg=math.degrees(math.atan2(-float(np.dot(a, radial)),
+                                              along)),
+        twist_deg=_twist_angle(press_forearm, press_normal, forearm, normal))
+
+
+def wrist_limits(press_angles, s=1.0):
+    """押し込み時の手首の角度 ``press_angles`` から、腕を下ろす動きの割合
+    ``s`` で許す範囲の dict (``flexion``/``deviation``/``twist`` の (下限,
+    上限) [度])。押し込み時にすでに目安を超えている側は、押し込み時の値 +
+    ``HUMAN_WRIST_PRESS_SLACK_DEG`` までの超過を、``HumanArm`` が手首の曲げを
+    戻すのと同じく ``s`` に比例して減らしながら許す (下ろしきれば目安どおり)。"""
+    slack = HUMAN_WRIST_PRESS_SLACK_DEG
+    keep = 1.0 - min(1.0, max(0.0, s))
+
+    def bounds(value, lower, upper):
+        return (-lower - keep * max(0.0, -lower - (value - slack)),
+                upper + keep * max(0.0, value + slack - upper))
+    return dict(
+        flexion=bounds(press_angles['flexion_deg'], HUMAN_WRIST_FLEX_MAX_DEG,
+                       HUMAN_WRIST_FLEX_MAX_DEG),
+        deviation=bounds(press_angles['deviation_deg'],
+                         HUMAN_WRIST_ULNAR_MAX_DEG,
+                         HUMAN_WRIST_RADIAL_MAX_DEG),
+        twist=bounds(press_angles['twist_deg'], HUMAN_WRIST_TWIST_MAX_DEG,
+                     HUMAN_WRIST_TWIST_MAX_DEG))
+
+
+def wrist_violation(angles, limits):
+    """手首の角度 ``angles`` が範囲 ``limits`` を超えていればその説明、
+    超えていなければ None。"""
+    labels = dict(flexion=('掌屈', '背屈'), deviation=('撓屈', '尺屈'),
+                  twist=('ひねり', 'ひねり'))
+    for key, (lo, hi) in limits.items():
+        value = angles['{}_deg'.format(key)]
+        if value > hi or value < lo:
+            return '人の手首の{} {:.0f} 度'.format(
+                labels[key][0 if value > 0 else 1], abs(value))
+    return None
+
+
+def hand_back_segment(wrist, palm_pos, palm_rot):
+    """人の手の甲側の円柱 (半径 ``HUMAN_HAND_BACK_RADIUS``) の軸の両端: 手首を
+    掌の面に移した点から掌 + 指先 ``HUMAN_FINGER_LENGTH`` まで、掌の面から甲側
+    へ半径分ずらす (掌の側の面が掌の面に接し、接触面を含まない)。"""
+    palm_pos = np.asarray(palm_pos, dtype=np.float64)
+    palm_rot = np.asarray(palm_rot, dtype=np.float64)
+    fingers, normal = palm_rot[:, 0], palm_rot[:, 1]
+    wrist = np.asarray(wrist, dtype=np.float64)
+    base = wrist - normal * float(np.dot(wrist - palm_pos, normal))
+    tip = palm_pos + fingers * HUMAN_FINGER_LENGTH
+    shift = -normal * HUMAN_HAND_BACK_RADIUS
+    return base + shift, tip + shift
+
+
+def forearm_obstacles(elbow, wrist, palm_pos, palm_rot):
+    """人の前腕と手の甲側の ``Cylinder`` 2 つ (``HUMAN_FOREARM_OBSTACLE``)。"""
+    radius = dict(('{}-{}'.format(a, b), r) for a, b, r
+                  in spik.HUMAN_COLLISION_SEGMENTS)['RElbow-RWrist']
+    return [spik._cylinder_between(elbow, wrist, radius),
+            spik._cylinder_between(
+                *hand_back_segment(wrist, palm_pos, palm_rot),
+                HUMAN_HAND_BACK_RADIUS)]
 
 
 def press_target(palm, turn_deg, robot_arm):
@@ -308,8 +440,13 @@ class HumanArm(object):
     2 リンクの IK で、下・少し外を向く側に置く。
     """
 
-    def __init__(self, joint_positions, hand, palm):
+    def __init__(self, joint_positions, hand, palm, press_turn=0.0,
+                 robot_arm='r'):
         self.hand = hand
+        # 押し込み時の握りの向きとロボットの腕 (人の手をロボットの手に固定した
+        # ときの手首の角度 ``robot_hand_wrist`` 用)。
+        self.press_turn = float(press_turn)
+        self.robot_arm = robot_arm
         self.joints = joint_positions
         self.shoulder = np.asarray(
             joint_positions['{}Shoulder'.format(hand)], dtype=np.float64)
@@ -326,6 +463,28 @@ class HumanArm(object):
         self.hand_prefix = '{}Hand'.format(hand)
         self.twist_ref0 = self._twist_reference(
             self.wrist0 - self.elbow0, self.palm_rot0[:, 1])
+        press_elbow = self.elbow_for(self.wrist0)
+        self.press_forearm = self.wrist0 - press_elbow
+        self.press_wrist = human_wrist_angles(
+            press_elbow, self.wrist0, self.palm_rot0, hand,
+            self.press_forearm, self.palm_rot0[:, 1])
+
+    def arm_fraction(self, s):
+        """経路の割合 ``s`` のときの腕を下ろす動きの割合。"""
+        return s
+
+    def hand_wrist(self, arm, hand_rot):
+        """腕 ``arm`` (``pose``) で手が ``hand_rot`` のときの手首の角度
+        (``human_wrist_angles``)。"""
+        return human_wrist_angles(arm['elbow'], arm['wrist'], hand_rot,
+                                  self.hand, self.press_forearm,
+                                  self.palm_rot0[:, 1])
+
+    def robot_hand_wrist(self, robot, arm):
+        """人の手をロボットの手先に固定したときの、腕 ``arm`` の手首の角度。"""
+        end = getattr(robot, '{}arm_end_coords'.format(self.robot_arm))
+        return self.hand_wrist(arm, hand_on_robot(
+            end.worldrot(), self.press_turn, self.robot_arm))
 
     def _transform(self, palm_pos, palm_rot):
         rot = palm_rot @ self.palm_rot0.T
@@ -950,6 +1109,36 @@ class TransitionChecker(object):
             self.base_pairs = (
                 source.with_pairs(pairs)
                 if isinstance(source, spik.VerificationPairs) else pairs)
+        # ロボットの差し出す腕の前腕・肘・手首と、人の前腕 (0)・手の甲 (1)
+        # (``forearm_obstacles``) の組。
+        self.forearm_pairs = None
+        if source is not None:
+            names = {name.format(robot_arm)
+                     for name in TRANSITION_FOREARM_LINKS}
+            links = []
+            for pair in source:
+                if (isinstance(pair[1], int) and pair[0].name in names
+                        and pair[0] not in links):
+                    links.append(pair[0])
+            pairs = [(link, i) for link in links for i in (0, 1)]
+            self.forearm_pairs = (
+                source.with_pairs(pairs)
+                if isinstance(source, spik.VerificationPairs) else pairs)
+
+    def forearm_clearances(self, robot, arm,
+                           cull_distance=spik.OFFERED_HAND_CLEARANCE):
+        """ロボットの差し出す腕の前腕・肘・手首から、人の腕 ``arm``
+        (``HumanArm.pose``) の前腕・手の甲までの距離 [m] の (前腕, 手の甲)。
+        ``cull_distance`` 以上の距離は下界 (``human_obstacle_clearances``)。"""
+        if not self.forearm_pairs:
+            return None
+        clearances = spik.human_obstacle_clearances(
+            robot, self.forearm_pairs, forearm_obstacles(
+                arm['elbow'], arm['wrist'], arm['palm_position'],
+                arm['palm_rot']),
+            cull_distance=cull_distance)
+        return (clearances.get(0, float('inf')),
+                clearances.get(1, float('inf')))
 
     def check_base_path(self, robot, av, base_path, joint_positions):
         """台車を経路 ``base_path`` (``BasePath``、``plan_path`` と同じ) で
@@ -974,14 +1163,22 @@ class TransitionChecker(object):
                     names[index], clearances[index])
         return None
 
-    def check(self, robot, joint_positions):
+    def check(self, robot, joint_positions, arm=None):
         """``robot`` の今の姿勢を、人の骨格 ``joint_positions`` に対して
-        検証し、問題があればその説明、無ければ ``None`` を返す。"""
+        検証し、問題があればその説明、無ければ ``None`` を返す。人の腕
+        ``arm`` (``HumanArm.pose``) を与え ``HUMAN_FOREARM_OBSTACLE`` なら、
+        前腕・手の甲からも ``OFFERED_HAND_CLEARANCE`` 離れているかを見る。"""
         dist, pair = spik.collision_pairs_min_distance(
             robot, self.self_pairs, None, return_pair=True)
         if dist < -self.tolerance:
             return '自己干渉 {:.3f} m ({} x {})'.format(
                 -dist, *spik.collision_pair_name(pair))
+        if arm is not None and HUMAN_FOREARM_OBSTACLE:
+            clearances = self.forearm_clearances(robot, arm)
+            if clearances is not None:
+                for label, value in zip(('前腕', '手の甲'), clearances):
+                    if value < spik.OFFERED_HAND_CLEARANCE:
+                        return '人の{}まで {:.3f} m'.format(label, value)
         if not joint_positions or not self.clearance_pairs:
             return None
         clearances = spik.human_obstacle_clearances(
@@ -1005,6 +1202,79 @@ class TransitionChecker(object):
                         spik.human_obstacle_names()[index],
                         clearances[index])
         return None
+
+
+def wrist_problem(human_arm, robot, arm, s, turn_deg):
+    """人の手をロボットの手に固定したときの手首の角度 (``robot_hand_wrist``)
+    と、``HUMAN_WRIST_CHECK`` で目安を超えていればその説明 (無ければ None)
+    の組。``s`` は腕を下ろす動きの割合、``turn_deg`` は今の握りの向き。"""
+    angles = human_arm.robot_hand_wrist(robot, arm)
+    if HUMAN_WRIST_CHECK == 'hand_fixed':
+        return angles, wrist_violation(
+            angles, wrist_limits(human_arm.press_wrist, s))
+    if HUMAN_WRIST_CHECK == 'turn_cap':
+        change = math.degrees(_wrap(math.radians(
+            turn_deg - human_arm.press_turn)))
+        if abs(change) > HUMAN_TURN_CAP_DEG:
+            return angles, '握りの向きの変化 {:.0f} 度'.format(abs(change))
+    return angles, None
+
+
+# 移動先の握りの向きを人の手首の目安に収めて解き直すとき、目安の端からさらに
+# 内側へ寄せる角度 [度] (IK の回転の許容 5 度で端を超えないように)。
+WRIST_TURN_MARGIN_DEG = 5.0
+
+
+def wrist_ok_turn(human_arm, arm, palm_pos, palm_rot, turn_deg, s=1.0):
+    """掌 ``palm_pos``/``palm_rot`` に合わせたまま、人の手首が目安に収まる
+    握りの向きのうち ``turn_deg`` に一番近いもの (収まる範囲の端から
+    ``WRIST_TURN_MARGIN_DEG`` 内側、収まらなければ端) [度]。無ければ None。"""
+    palm = palm_from_frame(palm_pos, palm_rot)
+    limits = wrist_limits(human_arm.press_wrist, s)
+
+    def ok(turn):
+        if HUMAN_WRIST_CHECK == 'turn_cap':
+            return abs(math.degrees(_wrap(math.radians(
+                turn - human_arm.press_turn)))) <= HUMAN_TURN_CAP_DEG
+        rot = hand_on_robot(spik.palm_target_rot(palm, turn,
+                                                 human_arm.robot_arm),
+                            human_arm.press_turn, human_arm.robot_arm)
+        return wrist_violation(human_arm.hand_wrist(arm, rot), limits) is None
+
+    for delta in sorted(range(-180, 181), key=abs):
+        if ok(turn_deg + delta):
+            inner = turn_deg + delta + math.copysign(WRIST_TURN_MARGIN_DEG,
+                                                     delta)
+            return inner if delta and ok(inner) else turn_deg + delta
+    return None
+
+
+def fix_goal_wrist(robot, robot_arm, human_arm, arm, palm_pos, palm_rot,
+                   gaze_point, turn_deg):
+    """移動先の姿勢 (``robot`` の今の姿勢、握りの向き ``turn_deg``) で人の
+    手首が目安を超えていれば、収まる握りの向き (``wrist_ok_turn``) に固定して
+    解き直す。``(握りの向き, 問題の説明 or None)`` を返す (直せなければ
+    姿勢は元のまま)。"""
+    if HUMAN_WRIST_CHECK == 'off':
+        return turn_deg, None
+    _, problem = wrist_problem(human_arm, robot, arm, 1.0, turn_deg)
+    if problem is None:
+        return turn_deg, None
+    turn = wrist_ok_turn(human_arm, arm, palm_pos, palm_rot, turn_deg)
+    if turn is None:
+        return turn_deg, problem
+    before = robot.angle_vector().copy()
+    palm = palm_from_frame(palm_pos, palm_rot)
+    if _press_ik(robot, robot_arm, press_target(palm, turn, robot_arm),
+                 gaze_point):
+        if gaze_point is not None:
+            _aim_head(robot, gaze_point)
+        turn = grip_turn_deg(robot, robot_arm, palm)
+        if wrist_problem(human_arm, robot, arm, 1.0, turn)[1] is None:
+            return turn, None
+    robot.angle_vector(before)
+    _sync_leg_mimics(robot)
+    return turn_deg, problem
 
 
 def _branch_joint_indices(robot, robot_arm):
@@ -1058,9 +1328,29 @@ def _transition_pairs(robot, robot_arm, hand):
     return pairs
 
 
+def _forearm_obstacle_slots(obstacles, lowered_forearms):
+    """``HUMAN_FOREARM_OBSTACLE`` なら、障害物 ``obstacles`` の後ろに人の
+    前腕・手の甲 (目標ごとに 2 本、``forearm_obstacles``) を足し、足した添字の
+    リストを返す。距離が ``OFFERED_HAND_CLEARANCE`` になるよう細らせ、無い
+    目標の分はダミーで埋める (個数は常に ``2 * LOWERED_TARGET_COUNT``)。"""
+    if not HUMAN_FOREARM_OBSTACLE:
+        return []
+    start = len(obstacles)
+    for k in range(LOWERED_TARGET_COUNT):
+        if k < len(lowered_forearms):
+            obstacles += [
+                spik.offered_hand_penalty_obstacle(
+                    o, spik.DEFAULT_COLLISION_MARGIN)
+                for o in forearm_obstacles(*lowered_forearms[k])]
+        else:
+            obstacles += [spik._dummy_cylinder(0.04),
+                          spik._dummy_cylinder(HUMAN_HAND_BACK_RADIUS)]
+    return list(range(start, len(obstacles)))
+
+
 def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
               collision_pairs, base_limits, attempts_per_pose,
-              free_turn=False, lowered_arms=()):
+              free_turn=False, lowered_arms=(), lowered_forearms=()):
     """押し込み目標 ``targets`` (3 つ) に対して台車も動かす干渉回避付き
     バッチ IK (``solve_person_ik`` と同じ形: 目標 3 つ・初期値・干渉ペア)。
     人の差し出した手・前腕・上腕は手を合わせているので障害物から外す
@@ -1082,6 +1372,10 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
                                        lowered_arms):
         obstacles[slot] = spik._cylinder_between(shoulder, elbow,
                                                  upper_radius)
+    # 下ろした人の前腕・手の甲 (``lowered_forearms``、目標ごとの (肘, 手首,
+    # 掌の位置, 掌の回転行列)) を後ろに足し、ロボットの差し出す腕の前腕・肘・
+    # 手首に避けさせる。
+    forearm_slots = _forearm_obstacle_slots(obstacles, lowered_forearms)
     pairs = None
     if collision_pairs:
         links_by_name = {link.name: link for link in
@@ -1094,6 +1388,10 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
             if name.format(robot_arm) in links_by_name for i in offered
             if i not in _lowered_arm_slots(hand)]
         pairs += _transition_pairs(robot, robot_arm, hand)
+        pairs += [(links_by_name[name.format(robot_arm)], i)
+                  for name in TRANSITION_FOREARM_LINKS
+                  if name.format(robot_arm) in links_by_name
+                  for i in forearm_slots]
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     # バッチ IK は台車をワールド原点から動かす (base_limits もその前提の
     # 絶対座標)。
@@ -1212,7 +1510,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           branch_range_deg=GOAL_BRANCH_JOINT_RANGE_DEG,
                           free_turn=False, lowered_arms=(),
                           max_waist_z=None, y_window=None,
-                          yaw_margin_deg=None):
+                          yaw_margin_deg=None, lowered_forearms=()):
     """下ろした手の候補 ``goal_palms`` (腕の低い順の 3 つの ``(位置,
     回転行列)``) への押し込み目標を、握りの向き ``turn_degs`` ごとに 1 回の
     バッチ IK で解き、移動先の台車・姿勢の候補 (前後は人の立ち位置
@@ -1248,6 +1546,10 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                               for name, p in collision_joints.items()}
     local_arms = [[to_local.transform_point(p) for p in arm]
                   for arm in lowered_arms]
+    local_forearms = [
+        (to_local.transform_point(elbow), to_local.transform_point(wrist),
+         to_local.transform_point(palm_pos), to_local.rot @ palm_rot)
+        for elbow, wrist, palm_pos, palm_rot in lowered_forearms]
 
     def local_targets(turn_deg):
         targets = []
@@ -1292,7 +1594,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                 robot, robot_arm, hand, local_targets(turn_deg), seed_av,
                 local_collision_joints, collision_pairs, window,
                 attempts_per_pose, free_turn=free_turn,
-                lowered_arms=local_arms):
+                lowered_arms=local_arms, lowered_forearms=local_forearms):
             if np.any(np.abs(av[branch] - seed[branch]) > branch_range):
                 continue
             # 指先の上下は台車の yaw に依らないので、解いた座標系のまま。
@@ -1485,13 +1787,19 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
             reason = '{}/{} で関節角が飛ぶ ({} {:.0f} 度)'.format(
                 k, n, names[jump], math.degrees(av[jump] - prev[jump]))
             break
-        problem = checker.check(robot, human_arm.skeleton(arm))
+        problem = checker.check(robot, human_arm.skeleton(arm), arm)
+        if problem is None:
+            actual_turn = grip_turn_deg(
+                robot, robot_arm, palm_from_frame(palm_pos, palm_rot))
+            arm_s = human_arm.arm_fraction(s)
+            wrist, problem = wrist_problem(human_arm, robot, arm, arm_s,
+                                           actual_turn)
         if problem is not None:
             reason = '{}/{} で{}'.format(k, n, problem)
             break
         if free_turn:
-            turn_deg = grip_turn_deg(
-                robot, robot_arm, palm_from_frame(palm_pos, palm_rot))
+            turn_deg = actual_turn
+        arm = dict(arm, s=float(arm_s), robot_hand_wrist=wrist)
         waypoints.append(dict(
             base_position=[float(base[0]), float(base[1]), 0.0],
             base_yaw=float(base[2]),
@@ -1702,8 +2010,9 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     start_waist_z = waist_height(robot)
 
     palm = human_palm_from_press(post, turn_deg, robot_arm)
-    human_arm = HumanArm(translated_joints, hand, palm)
-    result['press_arm'] = human_arm.pose(*palm_frame(palm))
+    human_arm = HumanArm(translated_joints, hand, palm, turn_deg, robot_arm)
+    result['press_arm'] = dict(human_arm.pose(*palm_frame(palm)),
+                               s=0.0, robot_hand_wrist=human_arm.press_wrist)
     press_palm_z = result['press_arm']['palm_position'][2]
     gaze_forward = forward_gaze_point(translated_joints)
     standing = spik.human_standing_xy(translated_joints)
@@ -1733,6 +2042,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         lowered_arms = [(human_arm.shoulder,
                          human_arm.lowering_pose(lowering, 1.0)[0])
                         for lowering in lowerings]
+        lowered_forearms = [human_arm.lowering_pose(lowering, 1.0)
+                            for lowering in lowerings]
         for turn_degs in turn_groups:
             if out_of_time():
                 return True
@@ -1742,7 +2053,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 base_limits, turn_degs=turn_degs,
                 attempts_per_pose=attempts_per_pose, free_turn=free_turn,
                 lowered_arms=lowered_arms, max_waist_z=start_waist_z,
-                yaw_margin_deg=yaw_margin_deg)
+                yaw_margin_deg=yaw_margin_deg,
+                lowered_forearms=lowered_forearms)
             if not candidates:
                 reasons.append('移動先の IK が解けない (腕 {} 度、握りの向き '
                                '{})'.format(
@@ -1761,9 +2073,10 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                     return True
                 lowering = lowerings[palm_index]
                 goal_palm = lowering['palm']
-                goal_skeleton = human_arm.skeleton(human_arm.pose(
+                goal_arm = human_arm.pose(
                     *goal_palm,
-                    elbow=human_arm.lowering_pose(lowering, 1.0)[0]))
+                    elbow=human_arm.lowering_pose(lowering, 1.0)[0])
+                goal_skeleton = human_arm.skeleton(goal_arm)
                 # yaw を押し込み時から近い回り方の値にする。
                 goal_base = np.array([goal_base[0], goal_base[1],
                                       start_base[2]
@@ -1805,7 +2118,12 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 if free_turn:
                     goal_turn = grip_turn_deg(robot, robot_arm,
                                               palm_from_frame(*goal_palm))
-                problem = checker.check(robot, goal_skeleton)
+                # 人の手首が目安を超えるなら、収まる握りの向きで解き直す。
+                goal_turn, problem = fix_goal_wrist(
+                    robot, robot_arm, human_arm, goal_arm, *goal_palm,
+                    gaze_forward, goal_turn)
+                if problem is None:
+                    problem = checker.check(robot, goal_skeleton, goal_arm)
                 if problem is not None:
                     reasons.append('移動先で{}'.format(problem.split(' ')[0]))
                     continue
@@ -1905,7 +2223,6 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         return result
     waypoints, fraction = best
     last = waypoints[-1]
-    arms = [result['press_arm']] + [wp['human_arm'] for wp in waypoints]
     names = list(post['joint_names'])
 
     def legs(av):
@@ -1920,13 +2237,29 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         reason=None if fraction >= 1.0 else ', '.join(sorted(set(reasons))),
         placement_after=spik.base_placement_metrics(
             translated_joints, last['base_position'], last['base_yaw']),
-        human_max=dict(
-            reach=max(a['reach'] for a in arms),
-            elbow_flex_deg=max(a['elbow_flex_deg'] for a in arms),
-            wrist_bend_deg=max(a['wrist_bend_deg'] for a in arms),
-            twist_change_deg=max(abs(a['twist_change_deg']) for a in arms)),
+        human_max=human_arm_max(waypoints),
         compute_time=time.time() - t0)
     return result
+
+
+def human_arm_max(waypoints):
+    """waypoint (押し込み時は含まない) の人の腕の目安の最大値の dict。手首の
+    角度 (``robot_hand_wrist``) は掌屈・背屈・撓屈・尺屈・ひねりに分ける。"""
+    arms = [wp['human_arm'] for wp in waypoints if 'human_arm' in wp]
+    out = dict(
+        reach=max(a['reach'] for a in arms),
+        elbow_flex_deg=max(a['elbow_flex_deg'] for a in arms),
+        wrist_bend_deg=max(a['wrist_bend_deg'] for a in arms),
+        twist_change_deg=max(abs(a['twist_change_deg']) for a in arms))
+    wrists = [a['robot_hand_wrist'] for a in arms if 'robot_hand_wrist' in a]
+    if wrists:
+        out.update(
+            flexion_deg=max(0.0, max(w['flexion_deg'] for w in wrists)),
+            extension_deg=max(0.0, -min(w['flexion_deg'] for w in wrists)),
+            radial_deg=max(0.0, max(w['deviation_deg'] for w in wrists)),
+            ulnar_deg=max(0.0, -min(w['deviation_deg'] for w in wrists)),
+            hand_twist_deg=max(abs(w['twist_deg']) for w in wrists))
+    return out
 
 
 class _StaticArm(object):
@@ -1939,6 +2272,13 @@ class _StaticArm(object):
                                    dtype=np.float64)
         self.palm_rot = np.asarray(arm_pose['palm_rot'], dtype=np.float64)
         self.elbow = np.asarray(arm_pose['elbow'], dtype=np.float64)
+
+    def __getattr__(self, name):
+        # 押し込み時の手首の角度など、ほかは本物の腕のもの。
+        return getattr(self.real, name)
+
+    def arm_fraction(self, s):
+        return 1.0
 
     def lowering_pose(self, lowering, s):
         return self.elbow, None, self.palm_pos, self.palm_rot
@@ -1990,7 +2330,7 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     left = np.array([-facing[1], facing[0]])
     side = 1.0 if hand == 'L' else -1.0
     palm0 = human_palm_from_press(post, turn_deg, robot_arm)
-    real = HumanArm(translated_joints, hand, palm0)
+    real = HumanArm(translated_joints, hand, palm0, turn_deg, robot_arm)
     arm_pose = last['human_arm']
     static = _StaticArm(real, arm_pose)
     palm = palm_from_frame(static.palm_pos, static.palm_rot)
@@ -2016,7 +2356,9 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             lowered_arms=[(real.shoulder, static.elbow)] * 3,
             max_waist_z=start_waist_z, branch_range_deg=100.0,
             y_window=(lo, hi), yaw_margin_deg=yaw_margin_deg,
-            attempts_per_pose=attempts_per_pose)
+            attempts_per_pose=attempts_per_pose,
+            lowered_forearms=[(static.elbow, arm_pose['wrist'],
+                               static.palm_pos, static.palm_rot)] * 3)
         if not candidates:
             reasons.append('窓 {}-{} m の移動先の IK が解けない'.format(lo, hi))
             continue
@@ -2045,10 +2387,14 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
                     > math.radians(UPPER_BODY_LIMIT_DEG) + 1e-3:
                 reasons.append('移動先で上半身が範囲外')
                 continue
-            goal_av = robot.angle_vector().copy()
             if GOAL_FREE_TURN:
                 goal_turn = grip_turn_deg(robot, robot_arm, palm)
-            problem = checker.check(robot, skeleton)
+            goal_turn, problem = fix_goal_wrist(
+                robot, robot_arm, static, arm_pose, static.palm_pos,
+                static.palm_rot, None, goal_turn)
+            goal_av = robot.angle_vector().copy()
+            if problem is None:
+                problem = checker.check(robot, skeleton, arm_pose)
             if problem is not None:
                 reasons.append('移動先で' + problem.split(' ')[0])
                 continue
@@ -2118,6 +2464,7 @@ def _add_approach(robot, robot_arm, hand, post, turn_deg, result,
     result['approach'] = approach
     if waypoints:
         result['waypoints'] = result['waypoints'] + waypoints
+        result['human_max'] = human_arm_max(result['waypoints'])
         result['placement_after'] = spik.base_placement_metrics(
             translated_joints, waypoints[-1]['base_position'],
             waypoints[-1]['base_yaw'])
@@ -2238,6 +2585,39 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     return best
 
 
+def add_human_arm_arguments(parser):
+    """人の前腕の障害物・手首の評価を切り替える引数を ``parser`` に足す
+    (``apply_human_arm_arguments`` で反映する)。"""
+    parser.add_argument(
+        '--transition-forearm-obstacle', choices=('on', 'off'),
+        default='on' if HUMAN_FOREARM_OBSTACLE else 'off',
+        help='横並び移動で人の前腕・手の甲をロボットの前腕の障害物にするか。')
+    parser.add_argument(
+        '--transition-human-wrist', choices=HUMAN_WRIST_CHECKS,
+        default=HUMAN_WRIST_CHECK,
+        help='横並び移動で人の手首をどう評価するか (hand_fixed: 人の手を'
+             'ロボットの手に固定した手首の角度、turn_cap: 握りの向きの変化、'
+             'off: 見ない。既定 {})。'.format(HUMAN_WRIST_CHECK))
+    parser.add_argument(
+        '--transition-wrist-limits', type=float, nargs=3, default=None,
+        metavar=('RADIAL', 'ULNAR', 'FLEX'),
+        help='hand_fixed の手首の目安 [度] (撓屈・尺屈・掌屈/背屈、既定 '
+             '{:.0f} {:.0f} {:.0f})。'.format(
+                 HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG,
+                 HUMAN_WRIST_FLEX_MAX_DEG))
+
+
+def apply_human_arm_arguments(args):
+    global HUMAN_FOREARM_OBSTACLE, HUMAN_WRIST_CHECK
+    global HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG
+    global HUMAN_WRIST_FLEX_MAX_DEG
+    HUMAN_FOREARM_OBSTACLE = args.transition_forearm_obstacle == 'on'
+    HUMAN_WRIST_CHECK = args.transition_human_wrist
+    if args.transition_wrist_limits is not None:
+        (HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG,
+         HUMAN_WRIST_FLEX_MAX_DEG) = args.transition_wrist_limits
+
+
 def human_arm_text(arm):
     """人の腕の目安の 1 行の説明 (目安を超えたものに印を付ける)。"""
     def mark(value, limit):
@@ -2251,7 +2631,25 @@ def human_arm_text(arm):
                 mark(arm['elbow_flex_deg'], HUMAN_ELBOW_FLEX_MAX_DEG),
                 mark(arm['wrist_bend_deg'], HUMAN_WRIST_BEND_MAX_DEG),
                 mark(abs(arm['twist_change_deg']),
-                     HUMAN_TWIST_CHANGE_MAX_DEG)))
+                     HUMAN_TWIST_CHANGE_MAX_DEG))
+            + robot_hand_wrist_text(arm))
+
+
+def robot_hand_wrist_text(arm):
+    """``human_arm_max`` の手首の角度 (人の手をロボットの手に固定したとき)
+    の説明 (無ければ空)。"""
+    if 'flexion_deg' not in arm:
+        return ''
+
+    def mark(value, limit):
+        return '{:.0f}{}'.format(value, ' (!)' if value > limit else '')
+    return ('、手首 (ロボットの手に固定) 掌屈 {}・背屈 {}・撓屈 {}・尺屈 {}・'
+            'ひねり {} 度'.format(
+                mark(arm['flexion_deg'], HUMAN_WRIST_FLEX_MAX_DEG),
+                mark(arm['extension_deg'], HUMAN_WRIST_FLEX_MAX_DEG),
+                mark(arm['radial_deg'], HUMAN_WRIST_RADIAL_MAX_DEG),
+                mark(arm['ulnar_deg'], HUMAN_WRIST_ULNAR_MAX_DEG),
+                mark(arm['hand_twist_deg'], HUMAN_WRIST_TWIST_MAX_DEG)))
 
 
 _PALM_FACING_NAMES = dict(inward='人側', forward='前向き', backward='後ろ向き',
@@ -2278,7 +2676,8 @@ def transition_summary(transition):
     text = ('前方ずれ {:+.2f} -> {:+.2f} m、向きのずれ {:+.0f} -> {:+.0f} 度、'
             '方位 {:+.0f} -> {:+.0f} 度、脚 (ankle/knee) {:.0f}/{:.0f} -> '
             '{:.0f}/{:.0f} 度、握りの向き {:.0f} -> {:.0f} 度、人の腕 {} '
-            '(移動先の {:.0f}%、窓 ±{} m、{:.2f} 秒)。人の腕の最大: {}'.format(
+            '(移動先の {:.0f}%、窓 ±{} m、{:.2f} 秒)。人の腕の最大 (押し込み時を'
+            '除く): {}'.format(
                 before.get('front_offset', float('nan')),
                 after.get('front_offset', float('nan')),
                 before.get('yaw_offset_deg', float('nan')),
@@ -2290,9 +2689,7 @@ def transition_summary(transition):
                 lowered_arm_text(transition), transition['fraction'] * 100.0,
                 transition['x_margin'],
                 transition['compute_time'],
-                human_arm_text(dict(transition['human_max'],
-                                    twist_change_deg=transition['human_max']
-                                    ['twist_change_deg']))))
+                human_arm_text(transition['human_max'])))
     approach = transition.get('approach')
     if approach is not None:
         if approach['n_waypoints']:

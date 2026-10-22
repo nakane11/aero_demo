@@ -1288,7 +1288,9 @@ def main():
         '--leg-low-margin', type=float, default=None,
         help='足首の上限・膝の下限を全域幅のこの割合だけ狭める '
             '(solve_palm_ik.py と同じにする)。')
+    sbs.add_human_arm_arguments(parser)
     args = parser.parse_args()
+    sbs.apply_human_arm_arguments(args)
     if args.leg_low_margin is not None:
         spik.LEG_LOW_SIDE_MARGIN_RATIO = args.leg_low_margin
     if args.leg_rise_allow is not None:
