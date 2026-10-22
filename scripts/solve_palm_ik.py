@@ -126,10 +126,10 @@ PRESS_IN_LIFT = 0.04  # [m]
 PRESS_IN_SLIDE = 0.15  # [m]
 # 最終目標を掌の位置からさらに指先方向へ進める量。hover の位置は変えずに、押し出す
 # 距離が PRESS_IN_SLIDE + PRESS_IN_ADVANCE になる。
-PRESS_IN_ADVANCE = 0.02  # [m]
+PRESS_IN_ADVANCE = 0.0  # [m]
 # 指先方向の進み u (0 -> 1) に対し、法線方向は 1 - u**指数 で詰める
 # (大きいほど押し出しの終盤で詰める、1 で直線)。
-PRESS_IN_CURVE_EXPONENT = 3.0
+PRESS_IN_CURVE_EXPONENT = 4.0
 # 押し込み中に台車が受け持つ、指先方向の押し出しの水平成分の割合 (0 で台車固定)。
 PRESS_IN_BASE_RATIO = 1.0
 # 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。
