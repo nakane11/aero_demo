@@ -244,6 +244,9 @@ PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は掌甲を取り違えて法線が反転することがあるので score と法線角の両方で弾く。
 PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
 PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
+# --press-in-base-shift: 検出し直した掌が計画から水平にこれ以上ずれていたら、
+# 腕だけで吸収せず先にその分だけ台車を寄せる。
+PRESS_IN_BASE_SHIFT_MIN = 0.06  # [m]
 # 接近の螺旋〜押し込み直前、首は差し出し手の掌を向く。候補は直前位置からこの距離
 # 以内・score 以上のみ。
 HAND_FOLLOW_MAX_JUMP = 0.25  # [m]
@@ -2830,6 +2833,67 @@ class HandshakePipelineNode(object):
         self.robot.newcoords(Coordinates())
         apply_waypoint_pose(self.robot, joint_names, [waypoint], 0)
 
+    def _detect_offered_palm(self, offered_hand, expected_position,
+                             expected_normal):
+        """``PRESS_IN_REFINE_FRAMES`` 枚で差し出し手を検出し直し、
+        ``(palm (今の base_link 系) or None, hand_frames, distances, candidates)``
+        を返す。"""
+        hand_frames = self._collect_hand_frames(
+            PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+        joint_positions, distances, candidates, camera_position = \
+            self._select_offered_hand(hand_frames, offered_hand,
+                                      expected_position, expected_normal)
+        palm = None
+        if joint_positions is not None:
+            palm = self.palm_estimator.estimate_palm(
+                joint_positions, offered_hand, camera_position,
+                expected_normal)
+        return palm, hand_frames, distances, candidates
+
+    def _shift_base_to_palm(self, palm, offered_hand, expected_position,
+                            expected_normal):
+        """検出した掌 ``palm`` (今の base_link 系) が計画時の位置から水平に
+        ``PRESS_IN_BASE_SHIFT_MIN`` 以上ずれていれば、そのずれだけ台車を平行移動して
+        掌を検出し直し、移動後の掌を返す (検出できなければ移動量を引いた掌)。
+
+        腕だけで大きなずれを吸収すると押し込みの途中点が届かずに飛ばされ、hover から
+        最終目標へ直行して手の甲側を通ることがあるため (10/22 試行2)。
+        """
+        shift = np.asarray(palm['position'], dtype=np.float64) - expected_position
+        shift[2] = 0.0
+        distance = float(np.linalg.norm(shift))
+        record = dict(event='press_in_base_shift',
+                      shift=[float(v) for v in shift[:2]], applied=False)
+        if distance < PRESS_IN_BASE_SHIFT_MIN:
+            self._log_debug(record)
+            return palm
+        sec, = self._limited_time_list(
+            None, [[shift[0], shift[1], 0.0]], [BASE_CORRECTION_MIN_TIME])
+        before = self._odom_pose(self.ri.odom)
+        self._send_base_trajectory([[shift[0], shift[1], 0.0]], [sec],
+                                   wait=True)
+        settle_time, _ = self._wait_odom_settle(BASE_CORRECTION_SETTLE_TIMEOUT)
+        moved = scan_matching.relative(before, self._odom_pose(self.ri.odom))
+        detected, _, _, _ = self._detect_offered_palm(
+            offered_hand, expected_position, expected_normal)
+        redetected = detected is not None
+        if not redetected:
+            detected = dict(palm, position=[
+                float(v) for v in np.asarray(palm['position']) - shift])
+        residual = np.asarray(detected['position']) - expected_position
+        record.update(applied=True, time=sec, settle_time=settle_time,
+                      odom_moved=[float(v) for v in moved],
+                      redetected=redetected,
+                      residual=[float(v) for v in residual])
+        self._log_debug(record)
+        print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm ずれていた'
+              'ため、台車を ({:+.3f}m, {:+.3f}m) 寄せてから押し込み姿勢を補正'
+              'します (odom 上の移動 {:+.3f}m, {:+.3f}m、寄せた後の掌のずれ '
+              '{:.0f}mm)。'.format(
+                  distance * 1e3, shift[0], shift[1], moved[0], moved[1],
+                  float(np.linalg.norm(residual[:2])) * 1e3))
+        return detected
+
     def _refine_press_in(self, hover_wp, joint_names, result):
         """hover 到達後に手を検出し直して押し込み姿勢を解き直し、押し込み区間の
         waypoint (``hover_wp`` の次以降) を返す (失敗なら None)。
@@ -2851,17 +2915,12 @@ class HandshakePipelineNode(object):
         expected_position = base_rot.T @ (
             np.asarray(planned_palm['position']) - base_pos)
         expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
-        hand_frames = self._collect_hand_frames(
-            PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
-        joint_positions, distances, candidates, camera_position = \
-            self._select_offered_hand(hand_frames, offered_hand,
-                                      expected_position, expected_normal)
+        palm, hand_frames, distances, candidates = self._detect_offered_palm(
+            offered_hand, expected_position, expected_normal)
+        if palm is not None and self.args.press_in_base_shift:
+            palm = self._shift_base_to_palm(
+                palm, offered_hand, expected_position, expected_normal)
         wait_time = time.time() - t0
-        palm = None
-        if joint_positions is not None:
-            palm = self.palm_estimator.estimate_palm(
-                joint_positions, offered_hand, camera_position,
-                expected_normal)
         if palm is None:
             nearest = [c['distance'] for frame in candidates for c in frame
                        if c['distance'] is not None and c['rejected'] is None]
@@ -4160,6 +4219,11 @@ def build_arg_parser():
     parser.add_argument(
         '--no-press-in-refine', dest='press_in_refine', action='store_false',
         help='hover 到達後に手を検出し直して押し込み姿勢を補正しない。')
+    parser.add_argument(
+        '--press-in-base-shift', action='store_true',
+        help='押し込み直前の補正で、検出した掌が計画から水平に '
+             '{:.0f}cm 以上ずれていたら、先にその分だけ台車を寄せる '
+             '(既定は腕だけで吸収)。'.format(PRESS_IN_BASE_SHIFT_MIN * 100))
     parser.add_argument(
         '--speech-done-text', type=str, default='どうぞ、手を握ってください',
         help='掌を差し出し終えたときの発話 (空で発話しない)。')
