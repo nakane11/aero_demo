@@ -25,7 +25,7 @@ data/
 | 変更後も骨格検出から横並び移動の計画まで通るか (動作確認) | `real/2026-10-15/trial1_side_by_side/` | `bash replay.sh`。再生で 3/3 成功している安定した試行なので、まずこれを回す |
 | 左右どちらの腕でも通るか | 上に加えて `real/2026-10-13/trial22_side_by_side/` | trial1 は R手/l腕、trial22 は L手/r腕。trial22 は 0.5 倍速 (既定) で回す |
 | 境界の試行で改善・悪化したか | `real/2026-10-15/trial2_side_by_side/` | 変更前でも 2/5 しか成功しない。何回か回して成功率で比べ、1 回の失敗を回帰とみなさない |
-| IK・軌道計画・横並びの成功率を実機の人で前後比較 | `real/2026-10-13/logs/` の 22 試行 (+ `real/2026-10-15/logs/` の 2 試行) | `tools/ros/resolve_saved_trials.py` で保存した skeletons/palms の JSON を解き直す (下記) |
+| IK・軌道計画・横並びの成功率を実機の人で前後比較 | `real/2026-10-13/logs/` の 22 試行 (+ `real/2026-10-15/logs/` の 2 試行、`real/2026-10-22/logs/*` の 13 試行) | `tools/ros/resolve_saved_trials.py` で保存した skeletons/palms の JSON を解き直す (下記) |
 | 差し出し判定 (どちらの手か・見逃し・誤トリガー) | `real/2026-09-30_session1/` (ラベル 167 件)、`real/2026-09-30_session3/` (差し出し無し) | `tools/tune_offer_selector.py` などで抽出フレームを評価する ([dev_tools.md](dev_tools.md)) |
 
 - 切り出し bag の再生では、骨格検出が毎回少しずつ違うフレームで差し出しを判定するので、掌の向きが実機と数度〜数十度ずれる。結果は実機との一致ではなく、ARMED になった手と IK・軌道計画の成否で見る。
@@ -82,6 +82,28 @@ data/
 | `2026-10-15/` | `logs/` (試行 1・2)、`grasp_captures/`、`refine_failures/`、`trial1_side_by_side/`、`trial2_side_by_side/` |
 | `2026-10-16/` | `trial3_side_by_side/`、`trial6_side_by_side/` (試行 3・6 の person_NN.log・JSON と、その試行の `grasp_captures/`・`refine_failures/` を中に置いた) |
 | `2026-10-21/` | `trial1_side_by_side/`、`trial2_ik_fail/`、`trial3_side_by_side/`、`trial4_side_by_side/` (切り出し bag・person_NN.log・JSON・`replay.sh`、成功した試行には押し込み後の `grasp_captures/`) |
+| `2026-10-22/` | `logs/<起動時刻>/` (起動 5 回・計 13 試行。下の表)、`grasp_captures/` (押し込み後の画像 7 個)、`refine_failures/` (`20261022_181435`、record.json のみ) |
+
+10/22 の `logs/` は起動が 5 回あり `person_NN.log` の名前が重なるので、10/13 のように
+`logs/` 直下へまとめず、起動ごとのサブディレクトリ (`/tmp/run_camera_pipeline_test_logs/<起動時刻>/`
+をそのまま。skeletons/ palms/ handshakes/ motions/ person_NN.log startup.log) にした。
+試行はすべて L手/r腕。
+
+| 起動 | 試行 | 内容 | 全体 bag |
+|---|---|---|---|
+| `20261022_154229` | 3 | 試行1 IK 失敗、試行2・3 横並びまで実行 | 15-52-08、15-53-29 |
+| `20261022_155643` | 1 | 試行1 横並びまで実行 | 15-57-54 |
+| `20261022_160029` | 4 | 試行1 IK 失敗、試行2 軌道 NG (干渉検証)、試行3・4 横並びまで実行 | 16-01-13、16-05-25 |
+| `20261022_161835` | 2 | 試行1 軌道 NG (干渉検証)、試行2 横並びまで実行 (「離れてから近づく・手が下がらない」と報告した試行。16:20:35〜16:21:11 付近) | 16-19-15 |
+| `20261022_170254` | 3 | 試行1 IK 失敗、試行2・3 横並びまで実行 (試行3 は hover で手を再検出できず no_hand、押し込み後の画像 0 フレーム) | 17-03-43、18-13-47 |
+
+- この日のコードは 10/22 夕方時点 (commit `822cf5f` まで)。横並びまで実行した 8 試行は、
+  どれも裏の計画を実行している (ログの「裏の計画の横並び移動を使います」)。ただし
+  motions の JSON には裏の計画 (`transition_refined`) が入っていない (保存するように
+  したのは `bda60dd` 以降)。
+- 全体 bag 8 本 (計 約 205 GB) は `data/bags/camera_pipeline_2026-10-22-*.bag` に残っている:
+  15-52-08、15-53-29、15-57-54、16-01-13 (62 GB)、16-05-25、16-19-15、17-03-43、18-13-47。
+  まだ切り出していない (候補は 16-19-15 の試行2)。
 
 ### 試行の切り出し bag (再生テスト用)
 
