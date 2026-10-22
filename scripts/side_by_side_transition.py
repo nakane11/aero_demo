@@ -262,17 +262,18 @@ HUMAN_TURN_CAP_DEG = 20.0
 HUMAN_WRIST_PRESS_SLACK_DEG = 5.0
 
 # --- 人の前腕・手の甲を障害物にする ----------------------------------------
-# 移動先のバッチ IK と検証で、人の前腕 (肘 -> 手首) と手の甲側 (手首 -> 掌 +
-# 指先 HUMAN_FINGER_LENGTH を、掌の面から甲側へ HUMAN_HAND_BACK_RADIUS ずらした
-# 円柱。掌の接触面は含まない) を、ロボットの差し出す腕の TRANSITION_FOREARM_LINKS
-# から OFFERED_HAND_CLEARANCE 離す。手首の評価 (HUMAN_WRIST_CHECK) だけで前腕の
-# 近さもほぼ無くなり、こちらは成功数が減り計画時間が延びるので既定では使わない
-# (docs/ik_and_motion_constraints.md の 5 節)。
-HUMAN_FOREARM_OBSTACLE = False
-HUMAN_FINGER_LENGTH = 0.08
-HUMAN_HAND_BACK_RADIUS = 0.02
-TRANSITION_FOREARM_LINKS = ('{}_elbow_link', '{}_forearm_link',
-                            '{}_hand_yaw_link')
+# 移動先のバッチ IK と検証で、人の前腕と手の甲側 (``spik.forearm_obstacles``、
+# 掌の接触面は含まない) を、ロボットの差し出す腕の肘・前腕・手首
+# (``spik.FOREARM_CHECK_LINKS``) から OFFERED_HAND_CLEARANCE 離す。
+# FOREARM_PRESS_ALLOWANCE なら、押し込み時にすでにそれより近い分は、腕を下ろす
+# 割合 s に比例して減らしながら許す (s=1 で OFFERED_HAND_CLEARANCE)。
+HUMAN_FOREARM_OBSTACLE = True
+FOREARM_PRESS_ALLOWANCE = True
+# 押し込み時の距離から許す余裕 [m] (IK の解の揺れで最初の waypoint が押し込み
+# 時よりわずかに近づいても止めないように)。
+FOREARM_PRESS_SLACK = 0.005
+HUMAN_FINGER_LENGTH = spik.HUMAN_FINGER_LENGTH
+TRANSITION_FOREARM_LINKS = spik.FOREARM_CHECK_LINKS
 
 
 def _wrap(angle):
@@ -405,28 +406,7 @@ def wrist_violation(angles, limits):
     return None
 
 
-def hand_back_segment(wrist, palm_pos, palm_rot):
-    """人の手の甲側の円柱 (半径 ``HUMAN_HAND_BACK_RADIUS``) の軸の両端: 手首を
-    掌の面に移した点から掌 + 指先 ``HUMAN_FINGER_LENGTH`` まで、掌の面から甲側
-    へ半径分ずらす (掌の側の面が掌の面に接し、接触面を含まない)。"""
-    palm_pos = np.asarray(palm_pos, dtype=np.float64)
-    palm_rot = np.asarray(palm_rot, dtype=np.float64)
-    fingers, normal = palm_rot[:, 0], palm_rot[:, 1]
-    wrist = np.asarray(wrist, dtype=np.float64)
-    base = wrist - normal * float(np.dot(wrist - palm_pos, normal))
-    tip = palm_pos + fingers * HUMAN_FINGER_LENGTH
-    shift = -normal * HUMAN_HAND_BACK_RADIUS
-    return base + shift, tip + shift
-
-
-def forearm_obstacles(elbow, wrist, palm_pos, palm_rot):
-    """人の前腕と手の甲側の ``Cylinder`` 2 つ (``HUMAN_FOREARM_OBSTACLE``)。"""
-    radius = dict(('{}-{}'.format(a, b), r) for a, b, r
-                  in spik.HUMAN_COLLISION_SEGMENTS)['RElbow-RWrist']
-    return [spik._cylinder_between(elbow, wrist, radius),
-            spik._cylinder_between(
-                *hand_back_segment(wrist, palm_pos, palm_rot),
-                HUMAN_HAND_BACK_RADIUS)]
+forearm_obstacles = spik.forearm_obstacles
 
 
 def press_target(palm, turn_deg, robot_arm):
@@ -1124,19 +1104,27 @@ class TransitionChecker(object):
                 if isinstance(source, spik.VerificationPairs) else pairs)
         # ロボットの差し出す腕の前腕・肘・手首と、人の前腕 (0)・手の甲 (1)
         # (``forearm_obstacles``) の組。
-        self.forearm_pairs = None
-        if source is not None:
-            names = {name.format(robot_arm)
-                     for name in TRANSITION_FOREARM_LINKS}
-            links = []
-            for pair in source:
-                if (isinstance(pair[1], int) and pair[0].name in names
-                        and pair[0] not in links):
-                    links.append(pair[0])
-            pairs = [(link, i) for link in links for i in (0, 1)]
-            self.forearm_pairs = (
-                source.with_pairs(pairs)
-                if isinstance(source, spik.VerificationPairs) else pairs)
+        self.forearm_pairs = spik.forearm_clearance_pairs(source, robot_arm)
+        # 押し込み時の (前腕, 手の甲) までの距離 [m] (``set_press``)。
+        self.press_forearm = None
+
+    def set_press(self, robot, arm):
+        """``robot`` の今の姿勢 (押し込み姿勢) と押し込み時の人の腕 ``arm``
+        で、前腕・手の甲までの距離を測って覚える (``FOREARM_PRESS_ALLOWANCE``)。"""
+        self.press_forearm = self.forearm_clearances(
+            robot, arm, cull_distance=spik.OFFERED_HAND_CLEARANCE * 2.0)
+
+    def forearm_limits(self, s):
+        """腕を下ろす割合 ``s`` で、前腕・手の甲から空ける距離 [m] の組。
+        押し込み時にすでに ``OFFERED_HAND_CLEARANCE`` より近い分
+        (``FOREARM_PRESS_SLACK`` の余裕を足す) は、``s`` に比例して減らしながら
+        許す。"""
+        need = spik.OFFERED_HAND_CLEARANCE
+        if not FOREARM_PRESS_ALLOWANCE or self.press_forearm is None:
+            return need, need
+        keep = 1.0 - min(1.0, max(0.0, s))
+        return tuple(need - keep * max(0.0, need - (press - FOREARM_PRESS_SLACK))
+                     for press in self.press_forearm)
 
     def forearm_clearances(self, robot, arm,
                            cull_distance=spik.OFFERED_HAND_CLEARANCE):
@@ -1179,8 +1167,9 @@ class TransitionChecker(object):
     def check(self, robot, joint_positions, arm=None):
         """``robot`` の今の姿勢を、人の骨格 ``joint_positions`` に対して
         検証し、問題があればその説明、無ければ ``None`` を返す。人の腕
-        ``arm`` (``HumanArm.pose``) を与え ``HUMAN_FOREARM_OBSTACLE`` なら、
-        前腕・手の甲からも ``OFFERED_HAND_CLEARANCE`` 離れているかを見る。"""
+        ``arm`` (``HumanArm.pose``、腕を下ろす割合 ``s`` 付き、無ければ 1) を
+        与え ``HUMAN_FOREARM_OBSTACLE`` なら、前腕・手の甲からも
+        ``forearm_limits`` だけ離れているかを見る。"""
         dist, pair = spik.collision_pairs_min_distance(
             robot, self.self_pairs, None, return_pair=True)
         if dist < -self.tolerance:
@@ -1189,8 +1178,10 @@ class TransitionChecker(object):
         if arm is not None and HUMAN_FOREARM_OBSTACLE:
             clearances = self.forearm_clearances(robot, arm)
             if clearances is not None:
-                for label, value in zip(('前腕', '手の甲'), clearances):
-                    if value < spik.OFFERED_HAND_CLEARANCE:
+                limits = self.forearm_limits(arm.get('s', 1.0))
+                for label, value, limit in zip(('前腕', '手の甲'), clearances,
+                                               limits):
+                    if value < limit:
                         return '人の{}まで {:.3f} m'.format(label, value)
         if not joint_positions or not self.clearance_pairs:
             return None
@@ -1356,8 +1347,8 @@ def _forearm_obstacle_slots(obstacles, lowered_forearms):
                     o, spik.DEFAULT_COLLISION_MARGIN)
                 for o in forearm_obstacles(*lowered_forearms[k])]
         else:
-            obstacles += [spik._dummy_cylinder(0.04),
-                          spik._dummy_cylinder(HUMAN_HAND_BACK_RADIUS)]
+            obstacles += [spik._dummy_cylinder(spik.HUMAN_FOREARM_RADIUS),
+                          spik._dummy_cylinder(spik.HUMAN_HAND_BACK_RADIUS)]
     return list(range(start, len(obstacles)))
 
 
@@ -1802,11 +1793,12 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
             reason = '{}/{} で関節角が飛ぶ ({} {:.0f} 度)'.format(
                 k, n, names[jump], math.degrees(av[jump] - prev[jump]))
             break
-        problem = checker.check(robot, human_arm.skeleton(arm), arm)
+        arm_s = human_arm.arm_fraction(s)
+        problem = checker.check(robot, human_arm.skeleton(arm),
+                                dict(arm, s=arm_s))
         if problem is None:
             actual_turn = grip_turn_deg(
                 robot, robot_arm, palm_from_frame(palm_pos, palm_rot))
-            arm_s = human_arm.arm_fraction(s)
             wrist, problem = wrist_problem(human_arm, robot, arm, arm_s,
                                            actual_turn)
         if problem is not None:
@@ -2032,6 +2024,9 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     gaze_forward = forward_gaze_point(translated_joints)
     standing = spik.human_standing_xy(translated_joints)
     checker = TransitionChecker(robot_arm, hand, verification_pairs)
+    _place(robot, start_av, start_base)
+    checker.set_press(robot, result['press_arm'])
+    result['press_forearm_clearance'] = checker.press_forearm
     reasons = []
     best = [None]
     # plan_path を呼んだ回数と、100% に届いた (最初の) 回数。
@@ -2508,6 +2503,10 @@ def _direct_to_approach_end(robot, robot_arm, hand, post, turn_deg, result,
     base_path = BasePath(start_base, goal_base,
                          spik.human_standing_xy(translated_joints))
     checker = TransitionChecker(robot_arm, hand, verification_pairs)
+    start_av = np.asarray(post['joint_angle_vector'], dtype=np.float64)
+    _place(robot, start_av, start_base)
+    checker.set_press(robot, human_arm.pose(human_arm.palm_pos0,
+                                            human_arm.palm_rot0))
     waypoints, fraction, why = plan_path(
         robot, robot_arm, hand, turn_deg, end['turn_deg'], human_arm,
         lowering, np.asarray(post['joint_angle_vector'], dtype=np.float64),
@@ -2700,6 +2699,11 @@ def add_human_arm_arguments(parser):
         help='移動先のバッチ IK の目標の作り方 (既定 {})。'.format(
             LOWERED_ARM_BATCH))
     parser.add_argument(
+        '--transition-forearm-press-allowance', choices=('on', 'off'),
+        default='on' if FOREARM_PRESS_ALLOWANCE else 'off',
+        help='押し込み時にすでに人の前腕・手の甲に近い分を、腕を下ろすにつれ'
+             '減らしながら許すか。')
+    parser.add_argument(
         '--transition-merge-approach', choices=('on', 'off'),
         default='on' if MERGE_APPROACH else 'off',
         help='寄せの終点へ押し込み姿勢から 1 本の経路で解き直すか。')
@@ -2714,8 +2718,9 @@ def apply_human_arm_arguments(args):
     global HUMAN_FOREARM_OBSTACLE, HUMAN_WRIST_CHECK
     global HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG
     global HUMAN_WRIST_FLEX_MAX_DEG, LOWERED_ARM_BATCH, GOAL_LATERAL_WEIGHT
-    global MERGE_APPROACH
+    global MERGE_APPROACH, FOREARM_PRESS_ALLOWANCE
     MERGE_APPROACH = args.transition_merge_approach == 'on'
+    FOREARM_PRESS_ALLOWANCE = args.transition_forearm_press_allowance == 'on'
     HUMAN_FOREARM_OBSTACLE = args.transition_forearm_obstacle == 'on'
     HUMAN_WRIST_CHECK = args.transition_human_wrist
     LOWERED_ARM_BATCH = args.transition_lowering_batch

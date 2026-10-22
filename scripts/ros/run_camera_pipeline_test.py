@@ -516,6 +516,8 @@ class HandshakePlanner(object):
 
     def __init__(self, args):
         self.args = args
+        if hasattr(args, 'press_in_forearm_clearance'):
+            spik.apply_press_in_forearm_argument(args)
         self.robot, self.verification_pairs = self._build_robot_and_pairs()
         self.motion_verification_pairs = self.verification_pairs
         # JIT キャッシュのためノードの寿命で使い回す。
@@ -4329,6 +4331,7 @@ def build_arg_parser():
     parser.add_argument(
         '--no-head-tracking', dest='head_tracking', action='store_false',
         help='ARMED 中に首を人の方へ向けたり、見渡して人を探したりしない。')
+    spik.add_press_in_forearm_argument(parser)
     return parser
 
 

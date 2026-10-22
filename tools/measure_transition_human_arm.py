@@ -125,7 +125,9 @@ def measure(robot, checkers, motion):
         lateral = dict(lateral_before=transition.get('lateral_before'),
                        lateral_max=max(laterals), lateral_after=laterals[-1],
                        lateral_overshoot=max(laterals) - laterals[-1])
+    press_clear = transition.get('press_forearm_clearance')
     return dict(
+        press_clear=(min(press_clear) if press_clear else None),
         palm_z_press=press['palm_position'][2], palm_z_after=palm_z[-1],
         palm_drop=press['palm_position'][2] - palm_z[-1],
         arm_deg=transition.get('arm_deg'),

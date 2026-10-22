@@ -1015,6 +1015,82 @@ def offered_hand_obstacle_indices(hand):
 OFFERED_HAND_PENALTY_LINKS = ('{}_hand_link', '{}_thumb_box_link',
                               '{}_hand_yaw_link', '{}_forearm_link')
 
+# --- 人の前腕・手の甲とロボットの前腕 ---------------------------------------
+# 押し込み区間と横並び移動で、ロボットの差し出す腕の肘・前腕・手首
+# (FOREARM_CHECK_LINKS、手は人の掌に触れるので除く) を、人の差し出した前腕
+# (肘 -> 手首) と手の甲 (``hand_back_segment``) から離す距離 [m]。押し込み区間
+# は PRESS_IN_FOREARM_CLEARANCE (None で見ない)。
+FOREARM_CHECK_LINKS = ('{}_elbow_link', '{}_forearm_link', '{}_hand_yaw_link')
+PRESS_IN_FOREARM_CLEARANCE = OFFERED_HAND_CLEARANCE
+HUMAN_FOREARM_RADIUS = 0.04  # HUMAN_COLLISION_SEGMENTS の肘-手首と同じ
+HUMAN_FINGER_LENGTH = 0.08
+HUMAN_HAND_BACK_RADIUS = 0.02
+
+
+def hand_back_segment(wrist, palm_pos, palm_rot):
+    """人の手の甲側の円柱 (半径 ``HUMAN_HAND_BACK_RADIUS``) の軸の両端: 手首を
+    掌の面に移した点から掌 + 指先 ``HUMAN_FINGER_LENGTH`` まで、掌の面から甲側
+    へ半径分ずらす (掌の側の面が掌の面に接し、接触面を含まない)。
+    ``palm_rot`` は列が指先・法線の回転行列。"""
+    palm_pos = np.asarray(palm_pos, dtype=np.float64)
+    palm_rot = np.asarray(palm_rot, dtype=np.float64)
+    fingers, normal = palm_rot[:, 0], palm_rot[:, 1]
+    wrist = np.asarray(wrist, dtype=np.float64)
+    base = wrist - normal * float(np.dot(wrist - palm_pos, normal))
+    tip = palm_pos + fingers * HUMAN_FINGER_LENGTH
+    shift = -normal * HUMAN_HAND_BACK_RADIUS
+    return base + shift, tip + shift
+
+
+def forearm_obstacles(elbow, wrist, palm_pos, palm_rot):
+    """人の前腕と手の甲側の ``Cylinder`` 2 つ (この順)。"""
+    return [_cylinder_between(elbow, wrist, HUMAN_FOREARM_RADIUS),
+            _cylinder_between(*hand_back_segment(wrist, palm_pos, palm_rot),
+                              HUMAN_HAND_BACK_RADIUS)]
+
+
+def palm_rotation(palm):
+    """掌 dict (``x_axis`` 指先・``y_axis`` 法線) の回転行列 (列が指先・
+    法線・指先 x 法線)。"""
+    x = np.asarray(palm['x_axis'], dtype=np.float64)
+    x = x / np.linalg.norm(x)
+    n = np.asarray(palm['y_axis'], dtype=np.float64)
+    n = n - np.dot(n, x) * x
+    n = n / np.linalg.norm(n)
+    return np.column_stack([x, n, np.cross(x, n)])
+
+
+def add_press_in_forearm_argument(parser):
+    parser.add_argument(
+        '--press-in-forearm-clearance', type=float,
+        default=PRESS_IN_FOREARM_CLEARANCE,
+        help='押し込み区間でロボットの肘・前腕・手首を人の前腕・手の甲から離す'
+             '距離 [m] (既定 {}、負で見ない)。'.format(
+                 PRESS_IN_FOREARM_CLEARANCE))
+
+
+def apply_press_in_forearm_argument(args):
+    global PRESS_IN_FOREARM_CLEARANCE
+    value = args.press_in_forearm_clearance
+    PRESS_IN_FOREARM_CLEARANCE = (None if value is None or value < 0.0
+                                  else value)
+
+
+def forearm_clearance_pairs(source, robot_arm):
+    """人体との距離の組 ``source`` のリンクから、``FOREARM_CHECK_LINKS`` と
+    ``forearm_obstacles`` (添字 0: 前腕、1: 手の甲) の組を作る。"""
+    if source is None:
+        return None
+    names = {name.format(robot_arm) for name in FOREARM_CHECK_LINKS}
+    links = []
+    for pair in source:
+        if (isinstance(pair[1], int) and pair[0].name in names
+                and pair[0] not in links):
+            links.append(pair[0])
+    pairs = [(link, i) for link in links for i in (0, 1)]
+    return (source.with_pairs(pairs) if isinstance(source, VerificationPairs)
+            else pairs)
+
 
 def human_clearance_thresholds(hand, clearance,
                                hand_clearance=OFFERED_HAND_CLEARANCE):
@@ -2789,6 +2865,31 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         human_clearance_thresholds(hand, hover_human_clearance)
     press_thresholds = human_clearance_thresholds(
         hand, PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
+    # 押し込み区間で、ロボットの前腕まわりを人の前腕・手の甲から離す。
+    press_forearm_pairs = press_forearm_obstacles = None
+    if (PRESS_IN_FOREARM_CLEARANCE is not None and joint_positions
+            and '{}Elbow'.format(hand) in joint_positions
+            and '{}Wrist'.format(hand) in joint_positions):
+        press_forearm_pairs = forearm_clearance_pairs(clearance_source,
+                                                      robot_arm)
+        press_forearm_obstacles = forearm_obstacles(
+            joint_positions['{}Elbow'.format(hand)],
+            joint_positions['{}Wrist'.format(hand)], palm['position'],
+            palm_rotation(palm))
+
+    def _forearm_too_close(label, k):
+        if not press_forearm_pairs:
+            return False
+        clearances = human_obstacle_clearances(
+            robot, press_forearm_pairs, press_forearm_obstacles,
+            cull_distance=PRESS_IN_FOREARM_CLEARANCE)
+        for index, part in ((0, '前腕'), (1, '手の甲')):
+            if clearances.get(index, np.inf) < PRESS_IN_FOREARM_CLEARANCE:
+                print('  [press-in-forearm] {} の候補は押し込み区間の {} 点目で'
+                      'ロボットの前腕が人の{}まで {:.3f} m のため棄却します。'
+                      .format(label, k + 1, part, clearances[index]))
+                return True
+        return False
 
     def _too_close_to_human(pairs, label, thresholds=hover_thresholds,
                             what='hover-clearance'):
@@ -2828,6 +2929,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                 return None
             if _too_close_to_human(clearance_source, label, press_thresholds,
                                    'press-in-clearance'):
+                return None
+            if _forearm_too_close(label, k):
                 return None
             replaced.append([float(v) for v in angle_vector])
         return replaced
@@ -3376,6 +3479,7 @@ def main():
         default=DEFAULT_HOVER_HUMAN_CLEARANCE,
         help='hover 姿勢でロボットと人体の間に空ける距離 [m] (既定 {}、'
             '負で無効)。'.format(DEFAULT_HOVER_HUMAN_CLEARANCE))
+    add_press_in_forearm_argument(parser)
     parser.add_argument(
         '--press-in-slide', type=float, default=PRESS_IN_SLIDE,
         help='hover 目標を押し込みの最終目標からロボットの指先と逆向きに '
@@ -3425,6 +3529,7 @@ def main():
             '[m]。実カメラの骨格では {} を指定する (既定 0)。'.format(
                 DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
+    apply_press_in_forearm_argument(args)
     PRESS_IN_SLIDE = args.press_in_slide
     PRESS_IN_ADVANCE = args.press_in_advance
     PRESS_IN_LIFT = args.press_in_lift
