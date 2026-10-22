@@ -53,6 +53,13 @@ LOWERED_ARM_GROUPS = tuple(
 LOWERED_PALM_FACINGS = ('inward', 'forward', 'backward')
 LOWERED_TARGET_COUNT = 3
 
+# 移動先のバッチ IK の目標の作り方。'per_angle' は上腕の角度ごとに 3 つとも
+# 同じ下ろし方 (初期値を 3 倍に使う)、'group' は組の 3 つの角度を 1 バッチで
+# 解く。'group' は障害物が目標の間で共有されるので、低い下ろし方の目標も
+# 高い下ろし方の上腕を避け、低い下ろし方が解けにくい (10/22 実機試行 2)。
+LOWERED_ARM_BATCHES = ('per_angle', 'group')
+LOWERED_ARM_BATCH = 'per_angle'
+
 # 腕を下ろす途中で上腕を外へ膨らませる角度 [度] (両端の姿勢は変えない)。
 # 前腕が人の腰・太ももに近づくのをよける。
 LOWERED_BULGE_DEG = 10.0
@@ -101,6 +108,12 @@ GOAL_ATTEMPTS_PER_POSE = 128
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
 # 上体の前後ずれ |ankle + knee| [rad]。
 GOAL_FRONT_OFFSET_WEIGHT = 100.0
+# 移動先のコストで、台車の人からの横の距離が GOAL_LATERAL_TARGET [m] を超えた
+# 分 [m] に掛ける重み (遠くへ離れてから寄せで戻る動きを避ける)。0 で無効。
+# 段階 1 の移動先は腕の枝の制限で人の近くの解がほとんど無く、100 でも離れて
+# 戻る量が変わらなかったので使わない (MERGE_APPROACH で対処)。
+GOAL_LATERAL_WEIGHT = 0.0
+GOAL_LATERAL_TARGET = 0.6
 GOAL_FACING_YAW_WEIGHT = spik.DEFAULT_FACING_YAW_WEIGHT
 GOAL_LEG_OFFSET_WEIGHT = 10.0
 
@@ -1626,7 +1639,9 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     + GOAL_ROBOT_FINGER_DOWN_WEIGHT
                     * (1.0 + float(finger[2]))
                     + GOAL_WRIST_BEND_WEIGHT
-                    * sum(abs(av[index]) for index, _, _ in wrist))
+                    * sum(abs(av[index]) for index, _, _ in wrist)
+                    + GOAL_LATERAL_WEIGHT * max(0.0, human_lateral(
+                        translated_joints, base, hand) - GOAL_LATERAL_TARGET))
             candidates.append((cost, av, base, turn_deg, palm_index))
             finger_zs.append(float(finger[2]))
             waist_zs.append(waist_height(robot))
@@ -2063,6 +2078,10 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                                    '/'.join('{:.0f}'.format(t)
                                             for t in turn_degs)))
                 continue
+            if all(lw is lowerings[0] for lw in lowerings):
+                # 3 つとも同じ下ろし方なら、1 つの目標としてコストの安い順。
+                candidates = sorted(
+                    [c[:4] + (0,) for c in candidates], key=lambda c: c[0])
             tried = {}
             checked = {}
             for _, goal_av, goal_base, goal_turn, palm_index in candidates:
@@ -2214,7 +2233,19 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                            .format('/'.join('{:.0f}'.format(d)
                                             for d in arm_degs)))
         ordered.sort(key=lambda item: item[0])
-        if any(try_lowerings(lowerings) for _, lowerings in ordered):
+        if LOWERED_ARM_BATCH == 'per_angle':
+            # 上腕の角度ごとに、3 つとも同じ下ろし方の目標で解く (低い角度
+            # から、同じ角度の中では上の順)。
+            batches = []
+            seen = set()
+            for j in range(len(arm_degs)):
+                for _, lowerings in ordered:
+                    if id(lowerings[j]) not in seen:
+                        seen.add(id(lowerings[j]))
+                        batches.append([lowerings[j]] * len(lowerings))
+        else:
+            batches = [lowerings for _, lowerings in ordered]
+        if any(try_lowerings(lowerings) for lowerings in batches):
             break
     best = best[0]
     result.update(n_paths=n_paths[0], n_paths_full=n_paths_full[0],
@@ -2240,6 +2271,9 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         placement_after=spik.base_placement_metrics(
             translated_joints, last['base_position'], last['base_yaw']),
         human_max=human_arm_max(waypoints),
+        lateral_before=human_lateral(translated_joints, start_base, hand),
+        laterals=[human_lateral(translated_joints, wp['base_position'], hand)
+                  for wp in waypoints],
         compute_time=time.time() - t0)
     return result
 
@@ -2450,6 +2484,38 @@ def _approach_ok(result):
                 and approach['lateral_after'] <= APPROACH_FALLBACK_LATERAL)
 
 
+# 寄せられたら、押し込み姿勢から寄せの終点へ 1 本の経路で解き直し、横並びまで
+# 進めればそちらを使うか (``_direct_to_approach_end``)。
+MERGE_APPROACH = True
+
+
+def _direct_to_approach_end(robot, robot_arm, hand, post, turn_deg, result,
+                            end, translated_joints, verification_pairs):
+    """押し込み姿勢から、腕を段階 1 と同じく下ろしながら、台車を寄せの終点
+    ``end`` (waypoint) へ直接動かす経路を ``plan_path`` で解く。移動先まで
+    進めればその waypoint と None、進めなければ None と止めた理由。"""
+    palm = human_palm_from_press(post, turn_deg, robot_arm)
+    human_arm = HumanArm(translated_joints, hand, palm, turn_deg, robot_arm)
+    lowering = human_arm.lowering(result['arm_deg'], result['abduction_deg'],
+                                  result['palm_facing'])
+    if lowering is None:
+        return None, '下ろし方が作れない'
+    start_base = np.array([post['base_position'][0],
+                           post['base_position'][1], post['base_yaw']])
+    goal_base = np.array([end['base_position'][0], end['base_position'][1],
+                          start_base[2] + _wrap(end['base_yaw']
+                                                - start_base[2])])
+    base_path = BasePath(start_base, goal_base,
+                         spik.human_standing_xy(translated_joints))
+    checker = TransitionChecker(robot_arm, hand, verification_pairs)
+    waypoints, fraction, why = plan_path(
+        robot, robot_arm, hand, turn_deg, end['turn_deg'], human_arm,
+        lowering, np.asarray(post['joint_angle_vector'], dtype=np.float64),
+        base_path, np.asarray(end['joint_angle_vector'], dtype=np.float64),
+        checker, free_turn=GOAL_FREE_TURN)
+    return (waypoints, None) if fraction >= 1.0 else (None, why)
+
+
 def _add_approach(robot, robot_arm, hand, post, turn_deg, result,
                   translated_joints, collision_joints, verification_pairs,
                   collision_pairs, base_limits, yaw_margin_deg,
@@ -2464,9 +2530,24 @@ def _add_approach(robot, robot_arm, hand, post, turn_deg, result,
     waypoints = approach.pop('waypoints')
     approach['n_waypoints'] = len(waypoints)
     result['approach'] = approach
+    if waypoints and MERGE_APPROACH:
+        merged, why = _direct_to_approach_end(
+            robot, robot_arm, hand, post, turn_deg, result, waypoints[-1],
+            translated_joints, verification_pairs)
+        approach['merged'] = merged is not None
+        approach['merge_reason'] = why
+        if merged is not None:
+            # 段階 1 と寄せを、押し込み姿勢から寄せの終点への 1 本の経路に
+            # 置き換える (一度離れてから寄せで戻る動きをしない)。
+            result['waypoints'] = []
+            result['laterals'] = []
+            waypoints = merged
     if waypoints:
         result['waypoints'] = result['waypoints'] + waypoints
         result['human_max'] = human_arm_max(result['waypoints'])
+        result['laterals'] = list(result.get('laterals') or []) + [
+            human_lateral(translated_joints, wp['base_position'], hand)
+            for wp in waypoints]
         result['placement_after'] = spik.base_placement_metrics(
             translated_joints, waypoints[-1]['base_position'],
             waypoints[-1]['base_yaw'])
@@ -2613,14 +2694,32 @@ def add_human_arm_arguments(parser):
              '{:.0f} {:.0f} {:.0f})。'.format(
                  HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG,
                  HUMAN_WRIST_FLEX_MAX_DEG))
+    parser.add_argument(
+        '--transition-lowering-batch', choices=LOWERED_ARM_BATCHES,
+        default=LOWERED_ARM_BATCH,
+        help='移動先のバッチ IK の目標の作り方 (既定 {})。'.format(
+            LOWERED_ARM_BATCH))
+    parser.add_argument(
+        '--transition-merge-approach', choices=('on', 'off'),
+        default='on' if MERGE_APPROACH else 'off',
+        help='寄せの終点へ押し込み姿勢から 1 本の経路で解き直すか。')
+    parser.add_argument(
+        '--transition-lateral-weight', type=float,
+        default=GOAL_LATERAL_WEIGHT,
+        help='移動先の台車の横の距離のコストの重み (既定 {})。'.format(
+            GOAL_LATERAL_WEIGHT))
 
 
 def apply_human_arm_arguments(args):
     global HUMAN_FOREARM_OBSTACLE, HUMAN_WRIST_CHECK
     global HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG
-    global HUMAN_WRIST_FLEX_MAX_DEG
+    global HUMAN_WRIST_FLEX_MAX_DEG, LOWERED_ARM_BATCH, GOAL_LATERAL_WEIGHT
+    global MERGE_APPROACH
+    MERGE_APPROACH = args.transition_merge_approach == 'on'
     HUMAN_FOREARM_OBSTACLE = args.transition_forearm_obstacle == 'on'
     HUMAN_WRIST_CHECK = args.transition_human_wrist
+    LOWERED_ARM_BATCH = args.transition_lowering_batch
+    GOAL_LATERAL_WEIGHT = args.transition_lateral_weight
     if args.transition_wrist_limits is not None:
         (HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG,
          HUMAN_WRIST_FLEX_MAX_DEG) = args.transition_wrist_limits
@@ -2701,9 +2800,10 @@ def transition_summary(transition):
     approach = transition.get('approach')
     if approach is not None:
         if approach['n_waypoints']:
-            text += ' / 寄せ: 横 {:.2f} -> {:.2f} m ({})'.format(
+            text += ' / 寄せ: 横 {:.2f} -> {:.2f} m ({}{})'.format(
                 approach['lateral_before'], approach['lateral_after'],
-                approach['mode'])
+                approach['mode'],
+                '、押し込みから 1 本の経路' if approach.get('merged') else '')
         else:
             text += ' / 寄せない ({})'.format(approach['reason'])
     if transition['reason']:

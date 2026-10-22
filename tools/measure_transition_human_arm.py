@@ -61,6 +61,9 @@ def load_robot():
 def measure(robot, checkers, motion):
     """1 人の横並び移動の計画を測った dict (計画が無ければ None)。"""
     transition = motion.get('transition')
+    if motion.get('transition_executed') == 'refined':
+        # 実機で実行した裏の計画 (寄せあり)。
+        transition = motion['transition_refined']
     if not transition or not transition.get('verified'):
         return None
     robot_arm = motion['robot_arm']
@@ -113,7 +116,20 @@ def measure(robot, checkers, motion):
                 wp['turn_deg'] - turn_before)))),
             violation=sbs.wrist_violation(
                 wrist, sbs.wrist_limits(press_angles, s)), **wrist))
+    palm_z = [wp['human_arm']['palm_position'][2]
+              for wp in transition['waypoints']]
+    laterals = transition.get('laterals') or []
+    lateral = {}
+    if laterals:
+        # 一度離れてから寄せで戻った量 (台車の横の距離の最大 - 終点)。
+        lateral = dict(lateral_before=transition.get('lateral_before'),
+                       lateral_max=max(laterals), lateral_after=laterals[-1],
+                       lateral_overshoot=max(laterals) - laterals[-1])
     return dict(
+        palm_z_press=press['palm_position'][2], palm_z_after=palm_z[-1],
+        palm_drop=press['palm_position'][2] - palm_z[-1],
+        arm_deg=transition.get('arm_deg'),
+        abduction_deg=transition.get('abduction_deg'), **lateral,
         hand=hand, robot_arm=robot_arm, fraction=transition['fraction'],
         n_waypoints=len(rows), turn_before=turn_before,
         turn_after=transition.get('turn_after'),
@@ -200,6 +216,17 @@ def main():
                            ('max_twist', 'ひねり'),
                            ('max_turn_change', '握りの向きの変化')):
             print('[summary] {} の最大 [度]: {}'.format(label, stats(key)))
+        drops = np.array([r['palm_drop'] for r in measured]) * 100
+        print('[summary] 掌を下ろした量 [cm]: 中央値 {:.1f} / 最小 {:.1f} / '
+              '最大 {:.1f}'.format(np.median(drops), drops.min(), drops.max()))
+        with_lat = [r for r in measured if 'lateral_after' in r]
+        if with_lat:
+            for key, label in (('lateral_after', '終点の台車の横の距離 [m]'),
+                               ('lateral_overshoot',
+                                '一度離れてから戻った量 [m]')):
+                values = np.array([r[key] for r in with_lat])
+                print('[summary] {}: 中央値 {:.2f} / 最大 {:.2f}'.format(
+                    label, np.median(values), values.max()))
         print('[summary] 手首の目安を超える waypoint がある人: {}/{}'.format(
             sum(r['n_violations'] > 0 for r in measured), len(measured)))
         times = [r['compute_time'] for r in measured if r.get('compute_time')]

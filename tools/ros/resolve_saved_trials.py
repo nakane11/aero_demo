@@ -174,15 +174,33 @@ def resolve_transition_only(planner, args, data_dir, name):
         approach=planner.side_by_side_approach == 'sync')
     motion = dict(robot_arm=result['robot_arm'], waypoints=[],
                   transition=transition)
+    if planner.refine_robot is not None and transition['verified']:
+        # ノードが動作中に裏で解く計画 (寄せあり) も解き、ノードと同じ基準で
+        # 実行する方を選ぶ (_refined_transition_waypoints)。
+        refined = rcpt.sbs.refine_transition(
+            planner.refine_robot, result['robot_arm'],
+            result['offered_hand'], post, result['turn_deg'],
+            translated_joints, collision_joints,
+            planner.refine_verification_pairs, planner.refine_collision_pairs,
+            planner.base_limits, transition)
+        motion['transition_refined'] = refined
+        motion['transition_executed'] = (
+            'refined' if refined.get('verified')
+            and refined['fraction'] >= transition['fraction'] else 'secured')
+        rcpt.untranslate_motion(dict(waypoints=[], transition=refined),
+                                offset)
+    executed = motion.get('transition_refined') \
+        if motion.get('transition_executed') == 'refined' else transition
     rcpt.untranslate_motion(motion, offset)
     return dict(
         data_dir=data_dir, name=name, saved_stage=load_saved_stage(
             data_dir, name),
         hand=result['offered_hand'], robot_arm=result['robot_arm'],
         stage='transition_ok' if transition['verified'] else 'motion_ok',
-        time=time.time() - t0, transition_fraction=transition['fraction'],
-        transition_reason=transition['reason'],
-        transition_time=transition.get('compute_time'), motion=motion)
+        time=time.time() - t0, transition_fraction=executed['fraction'],
+        transition_reason=executed['reason'],
+        transition_time=transition.get('compute_time'),
+        transition_executed=motion.get('transition_executed'), motion=motion)
 
 
 def main():
