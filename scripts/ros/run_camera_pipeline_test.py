@@ -1046,6 +1046,8 @@ class HandshakePipelineNode(object):
         self._display_n_approach = 0      # 経路計画済みのフレーム数
         self._display_n_transition = 0    # 末尾の押し込み後の横並び移動のフレーム数
         self._refine_lock = threading.Lock()  # 寄せの裏の計画を 1 つずつ
+        # 保存した軌道の JSON のパス (id(motion) -> パス、_resave_motion 用)。
+        self._motion_paths = {}
         self._collision_pairs_text = ''   # 指ありでの事後検証結果
         self._last_detected_joint_positions = None
         self._last_detected_time = None
@@ -1771,6 +1773,8 @@ class HandshakePipelineNode(object):
                     return
             with self._lock:
                 motion['transition_refined'] = transition
+            # 計画の直後に保存した JSON に、裏の計画も書き足す。
+            self._resave_motion(motion)
             approach = transition.get('approach') or {}
             print('[transition] 試行{}: 裏の計画 ({:.1f} 秒) 横並び移動 {}'
                   .format(job['attempt'], time.time() - t0,
@@ -1798,12 +1802,15 @@ class HandshakePipelineNode(object):
             if self.planner.refine_robot is not None:
                 print('[execute] 裏の計画 (寄せ) が間に合わなかったため、確保'
                       '済みの横並び移動で進めます。')
+            self._record_executed_transition(motion, 'secured')
             return secured_waypoints
         if (not refined.get('verified')
                 or refined['fraction'] < secured.get('fraction', 0.0)):
             print('[execute] 裏の計画が確保済みの横並び移動より進めなかった'
                   'ため、確保済みの方で進めます。')
+            self._record_executed_transition(motion, 'secured')
             return secured_waypoints
+        self._record_executed_transition(motion, 'refined')
         approach = refined.get('approach') or {}
         print('[execute] 裏の計画の横並び移動を使います (掌は {}、寄せ '
               '{})。'.format(
@@ -1813,6 +1820,26 @@ class HandshakePipelineNode(object):
                   if approach.get('n_waypoints') else 'なし'))
         return transition_waypoints(dict(
             transition=refined, joint_names=motion['joint_names']))
+
+    def _record_executed_transition(self, motion, which):
+        """実行した横並び移動 (``which``: 'secured' = ``transition``、
+        'refined' = ``transition_refined``) を ``motion`` と保存した JSON に
+        残す。"""
+        with self._lock:
+            motion['transition_executed'] = which
+        self._resave_motion(motion)
+
+    def _resave_motion(self, motion):
+        """``_save_attempt`` で保存した ``motion`` の JSON を、今の内容で
+        書き直す (保存していなければ何もしない)。失敗しても試行は続ける。"""
+        path = self._motion_paths.get(id(motion))
+        if path is None:
+            return
+        try:
+            with self._lock:
+                json_io.save_json(path, motion)
+        except Exception as e:  # noqa: BLE001 (保存の失敗で実機を止めない)
+            print('[save] 軌道の JSON を書き直せませんでした: {!r}'.format(e))
 
     def _execution_verified(self, motion):
         """実機で実行してよい軌道か。接近・押し込みが検証に通り、横並び
@@ -1850,7 +1877,11 @@ class HandshakePipelineNode(object):
         json_io.save_json(os.path.join(palm_dir, name), palms)
         json_io.save_json(os.path.join(handshake_dir, name), result)
         if motion is not None:
-            json_io.save_json(os.path.join(motion_dir, name), motion)
+            path = os.path.join(motion_dir, name)
+            with self._lock:
+                json_io.save_json(path, motion)
+                # 裏の計画が終わったら書き足す (_resave_motion)。
+                self._motion_paths[id(motion)] = path
             subdirs = '{skeletons,palms,handshakes,motions}'
         else:
             subdirs = '{skeletons,palms,handshakes}'
