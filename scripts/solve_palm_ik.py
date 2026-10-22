@@ -3079,9 +3079,10 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  collision_obstacles, base_limits,
                                  standing_x,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
-                                 **kwargs):
+                                 deadline=None, **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に狭い順に絞って ``solve_person_ik`` を解き、
     後処理まで解けた最初の結果を返す。肩ヨーがねじれた解なら、次の有限の窓でねじれずに解ければそちらを返す。
+    ``deadline`` (``time.time()`` の値) を過ぎたら次の窓を解かない。
 
     ``(picked, collision_ik_time, candidate_selection_time, base_limits, x_margin)`` を返す
     (時間は合計、窓は採った解のもの)。
@@ -3092,8 +3093,13 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
     # 後処理まで通ってねじれていない解が無ければ、ねじれた解、それも無ければ
     # 最初に見つかった後処理前の解を返す。
     chosen = fallback = twisted = None
-    for x_margin in x_margins:
+    for i, x_margin in enumerate(x_margins):
         if twisted is not None and x_margin < 0.0:
+            break
+        if i > 0 and deadline is not None and time.time() >= deadline:
+            print('  [base-x] 計画の時間の上限を過ぎたため、立ち位置 ±{} m '
+                  '以降の窓は解きません。'.format(
+                      x_margin if x_margin >= 0.0 else 'inf'))
             break
         person_base_limits = [restrict_base_x_range_to_human_standing(
             base_limits[0], standing_x, margin=x_margin),

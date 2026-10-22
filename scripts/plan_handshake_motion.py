@@ -873,20 +873,23 @@ def other_hand_min_clearance(robot, robot_arm, motion):
 
 def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
                        args, verification_pairs, solver,
-                       initial_base_pose=INITIAL_BASE_POSE):
+                       initial_base_pose=INITIAL_BASE_POSE, deadline=None):
     """1 人分の握手動作の軌道を計画し、結果 dict を返す。
 
     差し出さない手の指先が台車に入って通らない場合は、その腕を 1 段ずつ
     曲げて計画し直す。通れば ``handshake`` を破壊的に書き換え、
     ``other_arm_posture_replanned`` に姿勢 [deg] を入れる。
+    ``deadline`` (``time.time()`` の値) を過ぎたら残りの候補・姿勢を試さない。
     """
     start_time = time.time()
     tolerance = DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE
     motion = _plan_person_motion_once(
         robot, robot_arm, handshake, joint_positions, human_xy, args,
-        verification_pairs, solver, initial_base_pose=initial_base_pose)
+        verification_pairs, solver, initial_base_pose=initial_base_pose,
+        deadline=deadline)
     posture = current_other_arm_posture(robot_arm, handshake)
     while (not (motion['verified'] and motion['lead_in_verified'])
+           and (deadline is None or time.time() < deadline)
            and posture + 1 < len(spik.OTHER_ARM_POSTURES_DEG)
            and other_hand_min_clearance(robot, robot_arm, motion)
            < -tolerance):
@@ -898,7 +901,8 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
             continue
         retry = _plan_person_motion_once(
             robot, robot_arm, candidate, joint_positions, human_xy, args,
-            verification_pairs, solver, initial_base_pose=initial_base_pose)
+            verification_pairs, solver, initial_base_pose=initial_base_pose,
+            deadline=deadline)
         if retry['verified'] and retry['lead_in_verified']:
             handshake.clear()
             handshake.update(candidate)
@@ -912,11 +916,13 @@ def plan_person_motion(robot, robot_arm, handshake, joint_positions, human_xy,
 
 def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
                              human_xy, args, verification_pairs, solver,
-                             initial_base_pose=INITIAL_BASE_POSE):
+                             initial_base_pose=INITIAL_BASE_POSE,
+                             deadline=None):
     """1 人分の軌道を計画する (差し出さない腕の差し替えなし)。
 
     まず角度 0 の接近開始位置で最適化込みで計画し、通らなければ
-    ``approach_start_candidates`` の残りを経路長順に最適化なしで試す。
+    ``approach_start_candidates`` の残りを経路長順に最適化なしで試す
+    (``deadline`` を過ぎたら残りの候補と最適化を試さない)。
     結果に lead-in の検証結果 (``lead_in_*``) と採用角度 ``approach_angle``
     [rad] を入れる。``solver`` は jit キャッシュのため人物間で使い回すこと。
     """
@@ -949,6 +955,9 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         verified = motion_passes(distances, clearances)
         return lead_in, distances, clearances, verified
 
+    def out_of_time():
+        return deadline is not None and time.time() >= deadline
+
     pretouch_cache = {}
     zero,others = candidates[0], candidates[1:]
     zero_lead_in = check_lead_in(zero[1])
@@ -966,6 +975,8 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         # 残りの候補は最適化なしで試す。
         first_lead_in_ok = None
         for candidate in others:
+            if out_of_time():
+                break
             n_tried += 1
             lead_in_check = check_lead_in(candidate[1])
             if not lead_in_check[-1]:
@@ -980,7 +991,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
                 best = (candidate, lead_in_check, motion)
                 break
         if best is None and zero_motion is None \
-                and first_lead_in_ok is not None:
+                and first_lead_in_ok is not None and not out_of_time():
             # lead-in が通った最短の候補で最適化まで行う。
             candidate, lead_in_check = first_lead_in_ok
             best = (candidate, lead_in_check, _plan_from_start(

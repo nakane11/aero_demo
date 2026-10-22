@@ -233,6 +233,11 @@ OFFER_HANDS_WINDOW = 1.0  # [s]
 OFFER_HANDS_MIN_FRAMES = 5
 OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
 
+# 差し出された掌に対する計画 (IK -> 軌道計画 -> 横並び移動) 全体の時間の上限
+# [s]。超えたら残りの探索をやめ、それまでに解けていなければ失敗としてすぐ
+# やり直せるようにする (処理の途中では止めないので少し超えることがある)。
+PLAN_TIME_LIMIT = 5.0
+
 PRESS_IN_REFINE_FRAMES = 3
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
@@ -707,6 +712,17 @@ class HandshakePlanner(object):
         args = self.args
         robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
         palm = palms[offered_hand]
+        plan_t0 = time.time()
+        time_limit = getattr(args, 'plan_time_limit', PLAN_TIME_LIMIT)
+        deadline = (plan_t0 + time_limit
+                    if time_limit is not None and time_limit > 0 else None)
+
+        def out_of_time(stage):
+            if deadline is None or time.time() < deadline:
+                return False
+            print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) を過ぎたため、'
+                  '{}をしません。'.format(attempt, time_limit, stage))
+            return True
 
         offset = spik.human_translation_offset(
             joint_positions, front_distance=args.human_front_distance)
@@ -758,7 +774,8 @@ class HandshakePlanner(object):
                 collision_pairs=self.collision_pairs,
                 joint_positions=collision_joints,
                 placement_joint_positions=translated_joints,
-                verification_pairs=self.verification_pairs)
+                verification_pairs=self.verification_pairs,
+                deadline=deadline)
 
         if picked is None:
             result = spik.unsolved_result(
@@ -781,6 +798,10 @@ class HandshakePlanner(object):
         if result['solved'] and result.get('post_process') is None:
             print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
                   'かったため、軌道計画をしません。'.format(attempt))
+        elif result['solved'] and out_of_time('軌道計画'):
+            # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
+            # 実行しない。
+            result['plan_timed_out'] = True
         elif result['solved']:
             human_xy = spik.human_standing_xy(translated_joints)
             if human_xy is None:
@@ -792,7 +813,7 @@ class HandshakePlanner(object):
             motion = phm.plan_person_motion(
                 self.robot, robot_arm, result, collision_joints, human_xy,
                 motion_args, self.motion_verification_pairs, self.solver,
-                initial_base_pose=initial_base_pose)
+                initial_base_pose=initial_base_pose, deadline=deadline)
             log_debug_event(dict(
                 event='motion', person=attempt,
                 verified=motion['verified'],
@@ -813,7 +834,10 @@ class HandshakePlanner(object):
                     translated_joints, collision_joints,
                     self.verification_pairs,
                     self.collision_pairs, self.base_limits,
-                    approach=self.side_by_side_approach == 'sync')
+                    approach=self.side_by_side_approach == 'sync',
+                    time_limit=(sbs.TRANSITION_TIME_LIMIT if deadline is None
+                                else min(sbs.TRANSITION_TIME_LIMIT,
+                                         max(0.0, deadline - time.time()))))
                 motion['transition'] = transition
                 if (self.refine_robot is not None
                         and transition['verified']):
@@ -863,7 +887,9 @@ class HandshakePlanner(object):
             print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画なし{}。'.format(
                 attempt, offered_hand, robot_arm,
                 ' (押し込み姿勢が解けない)'
-                if result.get('post_process') is None else ''))
+                if result.get('post_process') is None
+                else ' (計画の時間の上限)' if result.get('plan_timed_out')
+                else ''))
         else:
             print('[result] 試行{} ({}手/{}腕): IK 成功、軌道計画{} '
                   '({}、IK {:.1f} 秒 + 軌道 {:.1f} 秒)。'.format(
@@ -873,6 +899,8 @@ class HandshakePlanner(object):
                       phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                       collision_ik_time + candidate_selection_time,
                       motion['compute_time']))
+        print('[plan] 試行{}: 計画全体 {:.1f} 秒。'.format(
+            attempt, time.time() - plan_t0))
         return dict(result=result, motion=motion, robot_arm=robot_arm,
                     transition_refine=refine_job)
 
@@ -4169,6 +4197,11 @@ def build_arg_parser():
     parser.add_argument(
         '--side-by-side-delay', type=float, default=4.0,
         help='押し込み終了から横並び移動を始めるまでの時間 [秒]。')
+    parser.add_argument(
+        '--plan-time-limit', type=float, default=PLAN_TIME_LIMIT,
+        help='差し出された掌に対する計画 (IK -> 軌道計画 -> 横並び移動) 全体の'
+             '時間の上限 [秒]。超えたら残りの探索をやめて失敗にする '
+             '(0 以下で無制限)。')
     parser.add_argument(
         '--side-by-side-approach', choices=('background', 'sync', 'off'),
         default='background',

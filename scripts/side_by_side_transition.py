@@ -2144,6 +2144,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                     reasons.append('経路の{}'.format(why))
                 if best[0] is None or fraction > best[0][1]:
                     best[0] = (waypoints, fraction)
+                    result.setdefault('fraction_times', []).append(
+                        (time.time(), float(fraction)))
                     result.update(arm_deg=lowering['arm_deg'],
                                   abduction_deg=lowering['abduction_deg'],
                                   palm_facing=lowering['palm_facing'],
@@ -2550,7 +2552,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                     facings=group, yaw_margin_deg=margin, deadline=deadline)
                 result.update(yaw_margin=margin, approach=None)
                 if approach and result['verified'] \
-                        and result['fraction'] >= 1.0:
+                        and result['fraction'] >= 1.0 and not out_of_time():
                     _add_approach(
                         robot, robot_arm, hand, post, turn_deg, result,
                         translated_joints, collision_joints,
@@ -2580,6 +2582,12 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     best = min(_low_arm_results(results),
                key=lambda r: _result_key(r, translated_joints, hand))
     best['tries'] = len(results)
+    for key, threshold in (('first_verified_time', MIN_FRACTION),
+                           ('first_full_time', 1.0)):
+        times = [ft - t0 for r in results
+                 for ft, fraction in r.get('fraction_times', ())
+                 if fraction >= threshold]
+        best[key] = min(times) if times else None
     best['timed_out'] = out_of_time()
     best['compute_time'] = time.time() - t0
     return best
