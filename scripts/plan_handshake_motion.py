@@ -23,6 +23,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -1221,6 +1222,33 @@ def _warmup_solver(robot, solver, args):
     robot.base_link.newcoords(Coordinates())
 
 
+def transition_start_time(robot, motion, handshake, initial_base_pose):
+    """実機ノードで、計画が終わってから横並び移動を始めるまでの時間 [秒] の
+    見積もり。表示ツールのシミュレーション表示と同じ ``PlanTimeline`` で、
+    lead-in・接近・押し込みを実機と同じ区間時間で動かし、うなずき・hover での
+    補正・押し込み後の待ちは ``handshake_stages.SIMULATED_DURATIONS`` の固定値と
+    する (実機ノードの裏の計画は、計画の直後からこの時刻までに終われば使われる)。
+    ``robot`` の姿勢は書き換わる。"""
+    from aero_demo import handshake_stages
+    from aero_demo.handshake_timeline import PlanTimeline
+    import handshake_viewer_common as viewer
+    names = list(motion['joint_names'])
+    display, n_approach = viewer.build_display_waypoints(
+        dict(motion, transition=None), handshake)
+    start_angles = dict(zip([joint.name for joint in robot.joint_list],
+                            arms_down_angles(robot, robot.joint_list)))
+    prepend = build_lead_in_waypoints(
+        list(initial_base_pose), display[0], names,
+        start_joint_angles=start_angles)
+    timeline = PlanTimeline(
+        prepend + display, len(prepend), n_approach, 0, names,
+        {joint.name: joint for joint in robot.joint_list})
+    # n_transition=0 の timeline は押し込み後の「握る」までなので、横並び移動の
+    # 開始待ちを足す。
+    return timeline.duration + handshake_stages.SIMULATED_DURATIONS[
+        handshake_stages.STAGE_TRANSITION_WAIT[0]]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='握手姿勢へ至る干渉回避付きの軌道を計画し JSON に保存する。')
@@ -1273,7 +1301,21 @@ def main():
             '実カメラなら {})。'.format(spik.DEFAULT_TORSO_SURFACE_OFFSET))
     parser.add_argument(
         '--side-by-side-transition', action='store_true',
-        help='押し込み後の横並び移動も計画し transition に保存する。')
+        help='押し込み後の横並び移動も計画し transition に保存する。実機ノード '
+             'と同じく、動く前に確保する計画 (寄せなし) を締め切りの残りで解き '
+             '(transition)、寄せと残りの掌の向きは裏の計画と同じ '
+             'refine_transition で解く (transition_refined、実行する方は '
+             'transition_executed)。')
+    parser.add_argument(
+        '--no-refine-budget', action='store_true',
+        help='裏の計画 (refine_transition) を、実機ノードで横並び移動を始める '
+             '時刻 (transition_start_time) で打ち切らず最後まで解く。')
+    parser.add_argument(
+        '--plan-time-limit', type=float, default=spik.PLAN_TIME_LIMIT,
+        help='1 人の計画全体 (IK -> 軌道計画 -> 確保する横並び移動) の時間の '
+             '上限 [秒] (実機ノードと同じ、既定 {})。IK の時間は握手姿勢 JSON '
+             'の collision_ik_time + candidate_selection_time を引く。0 以下なら'
+             '上限なし。'.format(spik.PLAN_TIME_LIMIT))
     parser.add_argument(
         '--collision-pairs', type=str,
         default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
@@ -1403,28 +1445,93 @@ def main():
         if human_xy is None:
             human_xy = np.array([spik.HUMAN_FRONT_DISTANCE, 0.0])
 
+        # 計画全体の締め切り (実機ノードと同じ)。IK にかかった時間を引く。
+        deadline = None
+        if args.plan_time_limit > 0:
+            deadline = time.time() + args.plan_time_limit - (
+                (handshake.get('collision_ik_time') or 0.0)
+                + (handshake.get('candidate_selection_time') or 0.0))
+            if time.time() >= deadline:
+                json_io.save_json(out_path,
+                                  not_planned_result('plan_timed_out'))
+                n_not_planned += 1
+                print('[{}/{}] {} -> {} (not planned: IK で計画の時間の上限 '
+                      '{:.1f} 秒を過ぎた)'.format(
+                          i + 1, len(files), os.path.basename(path), out_path,
+                          args.plan_time_limit))
+                continue
+
         # 干渉判定用に体幹をずらした骨格。
         collision_joints = spik.shift_torso_joints_from_surface(
             joint_positions, offset, args.torso_surface_offset)
         result = plan_person_motion(
             robot, handshake['robot_arm'], handshake, collision_joints,
             human_xy, args, verification_pairs, solver,
-            initial_base_pose=np.array(args.initial_base_pose))
+            initial_base_pose=np.array(args.initial_base_pose),
+            deadline=deadline)
         n_total += 1
         n_optimized += int(result['optimized'])
         n_verified += int(result['verified'])
         post = handshake.get('post_process')
-        if args.side_by_side_transition and post is not None:
+        if (args.side_by_side_transition and post is not None
+                and result['verified'] and result['lead_in_verified']):
+            # 実機ノードと同じく、軌道が通った人だけ。動く前に確保する計画
+            # (寄せなし) を締め切りの残りで解く。
+            common = (robot, handshake['robot_arm'],
+                      handshake['offered_hand'], post, handshake['turn_deg'],
+                      joint_positions, collision_joints, verification_pairs,
+                      transition_pairs, base_limits)
             transition = sbs.plan_transition(
-                robot, handshake['robot_arm'], handshake['offered_hand'],
-                post, handshake['turn_deg'], joint_positions,
-                collision_joints, verification_pairs, transition_pairs,
-                base_limits)
+                *common, approach=False,
+                time_limit=(None if deadline is None
+                            else max(0.0, deadline - time.time())))
             result['transition'] = transition
             n_transition += 1
             n_transition_verified += int(transition['verified'])
-            print('  [transition] 横並び移動: {}'.format(
+            print('  [transition] 横並び移動 (確保): {}'.format(
                 sbs.transition_summary(transition)))
+            if transition['verified']:
+                # 実機ノードが動作中に裏で解く計画 (寄せと残りの掌の向き)。
+                # 実機ノードと同じく、横並び移動を始める時刻 (計画の直後から
+                # transition_start_time) までに終わらなければ止めて確保した
+                # 計画を使う。実行するのは確保した計画以上に進めた方
+                # (_refined_transition_waypoints と同じ)。
+                budget = (None if args.no_refine_budget else
+                          transition_start_time(
+                              robot, result, handshake,
+                              args.initial_base_pose))
+                stop = threading.Event()
+                timer = None
+                if budget is not None:
+                    timer = threading.Timer(budget, stop.set)
+                    timer.daemon = True
+                    timer.start()
+                refine_t0 = time.time()
+                try:
+                    refined = sbs.refine_transition(*common, transition,
+                                                    stop=stop)
+                except sbs.TransitionStopped:
+                    refined = None
+                finally:
+                    if timer is not None:
+                        timer.cancel()
+                result['transition_refine'] = dict(
+                    budget=budget, time=time.time() - refine_t0,
+                    in_time=refined is not None)
+                if refined is not None:
+                    result['transition_refined'] = refined
+                result['transition_executed'] = (
+                    'refined' if refined is not None
+                    and refined.get('verified')
+                    and refined['fraction'] >= transition['fraction']
+                    else 'secured')
+                print('  [transition] 横並び移動 (裏の計画、{:.1f} 秒、横並びの'
+                      '開始まで {}): {}'.format(
+                          time.time() - refine_t0,
+                          '-' if budget is None
+                          else '{:.1f} 秒'.format(budget),
+                          '間に合わず確保した計画' if refined is None
+                          else sbs.transition_summary(refined)))
         json_io.save_json(out_path, result)
         if result.get('other_arm_posture_replanned') is not None:
             # 差し替えた姿勢を IK 結果の JSON にも反映する。

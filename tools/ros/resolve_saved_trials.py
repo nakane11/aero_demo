@@ -164,6 +164,17 @@ def resolve_transition_only(planner, args, data_dir, name):
     for key in ('target_position', 'base_position'):
         post[key] = [post[key][0] + offset[0], post[key][1] + offset[1]] + \
             list(post[key][2:])
+    # ノードと同じく、計画全体の締め切り (--plan-time-limit) から保存時の IK と
+    # 軌道計画にかかった時間を引いた残りで解く。
+    time_limit = None
+    if args.plan_time_limit is not None and args.plan_time_limit > 0:
+        spent = ((result.get('collision_ik_time') or 0.0)
+                 + (result.get('candidate_selection_time') or 0.0))
+        motion_path = os.path.join(data_dir, 'motions', name)
+        if os.path.exists(motion_path):
+            with open(motion_path) as f:
+                spent += json.load(f).get('compute_time') or 0.0
+        time_limit = max(0.0, args.plan_time_limit - spent)
     np.random.seed(zlib.crc32(name.encode()))
     t0 = time.time()
     transition = rcpt.sbs.plan_transition(
@@ -171,7 +182,8 @@ def resolve_transition_only(planner, args, data_dir, name):
         result['turn_deg'], translated_joints, collision_joints,
         planner.verification_pairs, planner.collision_pairs,
         planner.base_limits,
-        approach=planner.side_by_side_approach == 'sync')
+        approach=planner.side_by_side_approach == 'sync',
+        time_limit=time_limit)
     motion = dict(robot_arm=result['robot_arm'], waypoints=[],
                   transition=transition)
     if planner.refine_robot is not None and transition['verified']:
@@ -200,6 +212,7 @@ def resolve_transition_only(planner, args, data_dir, name):
         time=time.time() - t0, transition_fraction=executed['fraction'],
         transition_reason=executed['reason'],
         transition_time=transition.get('compute_time'),
+        transition_time_limit=time_limit,
         transition_executed=motion.get('transition_executed'), motion=motion)
 
 

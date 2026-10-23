@@ -91,6 +91,12 @@ DEFAULT_ROBOT_ARM = {'L': 'r', 'R': 'l'}
 # 人物をこの距離だけ Aero (原点) の前方 (+x) に平行移動してから解く。
 HUMAN_FRONT_DISTANCE = 3.0  # [m]
 
+# 差し出された掌 1 回に対する計画 (IK -> 接近の軌道計画 -> 動く前に確保する
+# 横並び移動) 全体の時間の上限 [秒]。超えたら残りの探索をやめる。実機ノード
+# (run_camera_pipeline_test.py --plan-time-limit) と合成 (solve_palm_ik.py・
+# plan_handshake_motion.py の --plan-time-limit) で共有する。
+PLAN_TIME_LIMIT = 5.0
+
 # 台車の可動域の半幅 (人物の立ち位置中心)。
 BASE_X_MOVABLE_HALF_RANGE = 3.0  # [m]
 BASE_Y_MOVABLE_HALF_RANGE = 3.0  # [m]
@@ -3453,6 +3459,11 @@ def main():
         help='台車の yaw を人の正面方向 ± この角度 [deg] に絞る (既定 {})。'
             .format(DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
     parser.add_argument(
+        '--plan-time-limit', type=float, default=PLAN_TIME_LIMIT,
+        help='1 人の計画全体 (IK -> 軌道計画 -> 横並び移動) の時間の上限 '
+             '[秒] (実機ノードと同じ、既定 {})。IK はこの時間を過ぎたら次の '
+             'x の窓を解かない。0 以下なら上限なし。'.format(PLAN_TIME_LIMIT))
+    parser.add_argument(
         '--no-base-y-side-restriction', action='store_true',
         help='台車の y を差し出した手の側に絞らない。')
     parser.add_argument(
@@ -3685,6 +3696,10 @@ def main():
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
         rots = palm_to_target_rots(palm, human_hand, robot_arm)
+        # 計画全体の締め切り (実機ノードと同じ。軌道計画以降は
+        # plan_handshake_motion.py が IK の時間を引いた残りで解く)。
+        deadline = (time.time() + args.plan_time_limit
+                    if args.plan_time_limit > 0 else None)
         (picked, collision_ik_time, candidate_selection_time,
          person_base_limits, x_margin) = solve_person_ik_side_by_side(
             robot, palm, human_hand, robot_arm, collision_obstacles,
@@ -3693,7 +3708,8 @@ def main():
             front_offset_weight=args.front_offset_weight,
             facing_yaw_weight=args.facing_yaw_weight,
             joint_positions=collision_joints,
-            placement_joint_positions=joint_positions, **ik_kwargs)
+            placement_joint_positions=joint_positions, deadline=deadline,
+            **ik_kwargs)
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, rots[-1], person_base_limits,

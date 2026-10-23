@@ -236,7 +236,8 @@ OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
 # 差し出された掌に対する計画 (IK -> 軌道計画 -> 横並び移動) 全体の時間の上限
 # [s]。超えたら残りの探索をやめ、それまでに解けていなければ失敗としてすぐ
 # やり直せるようにする (処理の途中では止めないので少し超えることがある)。
-PLAN_TIME_LIMIT = 5.0
+# 合成 (solve_palm_ik.py・plan_handshake_motion.py) と同じ値。
+PLAN_TIME_LIMIT = spik.PLAN_TIME_LIMIT
 
 PRESS_IN_REFINE_FRAMES = 3
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
@@ -880,9 +881,8 @@ class HandshakePlanner(object):
                     self.verification_pairs,
                     self.collision_pairs, self.base_limits,
                     approach=self.side_by_side_approach == 'sync',
-                    time_limit=(sbs.TRANSITION_TIME_LIMIT if deadline is None
-                                else min(sbs.TRANSITION_TIME_LIMIT,
-                                         max(0.0, deadline - time.time()))))
+                    time_limit=(None if deadline is None
+                                else max(0.0, deadline - time.time())))
                 motion['transition'] = transition
                 if (self.refine_robot is not None
                         and transition['verified']):
@@ -949,15 +949,17 @@ class HandshakePlanner(object):
         return dict(result=result, motion=motion, robot_arm=robot_arm,
                     transition_refine=refine_job)
 
-    def refine_transition(self, job):
+    def refine_transition(self, job, stop=None):
         """``plan`` が返した ``transition_refine`` の横並び移動を、寄せ (段階 2) と
         掌の向きで良くして解き、base_link 系に戻す (裏スレッド用。
-        ``self.refine_robot`` のみ使う)。"""
+        ``self.refine_robot`` のみ使う)。``stop`` (``threading.Event``) が立つと
+        ``sbs.TransitionStopped`` を投げて打ち切る。"""
         transition = sbs.refine_transition(
             self.refine_robot, job['robot_arm'], job['hand'], job['post'],
             job['turn_deg'], job['translated_joints'],
             job['collision_joints'], self.refine_verification_pairs,
-            self.refine_collision_pairs, self.base_limits, job['secured'])
+            self.refine_collision_pairs, self.base_limits, job['secured'],
+            stop=stop)
         untranslate_motion(dict(waypoints=[], transition=transition),
                            job['offset'])
         return transition
@@ -1088,6 +1090,8 @@ class HandshakePipelineNode(object):
         self._display_n_approach = 0      # 経路計画済みのフレーム数
         self._display_n_transition = 0    # 末尾の押し込み後の横並び移動のフレーム数
         self._refine_lock = threading.Lock()  # 寄せの裏の計画を 1 つずつ
+        # 動いている裏の計画を止める合図 (id(motion) -> threading.Event)。
+        self._refine_stops = {}
         # 保存した軌道の JSON のパス (id(motion) -> パス、_resave_motion 用)。
         self._motion_paths = {}
         self._collision_pairs_text = ''   # 指ありでの事後検証結果
@@ -2110,20 +2114,44 @@ class HandshakePipelineNode(object):
     def _start_transition_refine(self, job, motion):
         """寄せ (横並び移動の段階 2) と掌の向きを裏スレッドで解き、終わったら
         ``motion['transition_refined']`` に入れる (``_refined_transition_waypoints``
-        が使う)。裏の計画は 1 つずつ行う。"""
+        が使う)。裏の計画は 1 つずつ行う。横並び移動を始める時点で終わって
+        いなければ (``_refined_transition_waypoints``)、または次の裏の計画を
+        始めるときは、止める合図で打ち切る (結果を使わないため)。"""
+        stop = threading.Event()
+        with self._lock:
+            for previous in self._refine_stops.values():
+                previous.set()
+            self._refine_stops[id(motion)] = stop
+
         def run():
-            with self._refine_lock:
-                t0 = time.time()
-                self._set_background_activity(BACKGROUND_TRANSITION_REFINE)
-                try:
-                    transition = self.planner.refine_transition(job)
-                except Exception as e:  # noqa: BLE001 (確保済みの解で動ける)
-                    print('[transition] 試行{}: 裏の計画 (寄せ) が失敗しました'
-                          ' ({}: {})。確保済みの横並び移動を使います。'.format(
-                              job['attempt'], type(e).__name__, e))
-                    return
-                finally:
-                    self._set_background_activity(None)
+            try:
+                with self._refine_lock:
+                    if stop.is_set():
+                        print('[transition] 試行{}: 裏の計画 (寄せ) は始める前に'
+                              '打ち切りました。'.format(job['attempt']))
+                        return
+                    t0 = time.time()
+                    self._set_background_activity(
+                        BACKGROUND_TRANSITION_REFINE)
+                    try:
+                        transition = self.planner.refine_transition(
+                            job, stop=stop)
+                    except sbs.TransitionStopped:
+                        print('[transition] 試行{}: 裏の計画 (寄せ) を {:.1f} 秒で'
+                              '打ち切りました (確保済みの横並び移動で進めるため)。'
+                              .format(job['attempt'], time.time() - t0))
+                        return
+                    except Exception as e:  # noqa: BLE001 (確保済みの解で動ける)
+                        print('[transition] 試行{}: 裏の計画 (寄せ) が失敗しま'
+                              'した ({}: {})。確保済みの横並び移動を使います。'
+                              .format(job['attempt'], type(e).__name__, e))
+                        return
+                    finally:
+                        self._set_background_activity(None)
+            finally:
+                with self._lock:
+                    if self._refine_stops.get(id(motion)) is stop:
+                        del self._refine_stops[id(motion)]
             with self._lock:
                 motion['transition_refined'] = transition
             # 計画の直後に保存した JSON に、裏の計画も書き足す。
@@ -2150,8 +2178,12 @@ class HandshakePipelineNode(object):
         でなければ ``secured_waypoints``。"""
         with self._lock:
             refined = motion.get('transition_refined')
+            stop = self._refine_stops.get(id(motion))
         secured = motion.get('transition') or {}
         if refined is None:
+            if stop is not None:
+                # 間に合わなかった裏の計画は使わないので止める。
+                stop.set()
             if self.planner.refine_robot is not None:
                 print('[execute] 裏の計画 (寄せ) が間に合わなかったため、確保'
                       '済みの横並び移動で進めます。')

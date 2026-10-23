@@ -200,9 +200,11 @@ UPPER_BODY_LIMIT_DEG = 20.0
 UPPER_BODY_WEIGHT = 100.0
 UPPER_BODY_START_SLACK_DEG = 3.0
 
-# 横並び移動の計画 (``plan_transition``) の探索の時間の上限 [秒]。超えたら
-# それまでの一番良い解 (無ければ横並びしない) で終える。
-TRANSITION_TIME_LIMIT = 10.0
+# 動作中に裏で解く計画 (``refine_transition``) の、残りの掌の向きの探索
+# (``_plan_transition``) の時間の上限 [秒]。超えたらそれまでの一番良い解で
+# 終える。動く前に確保する計画 (``plan_transition``) は、呼び出し元が計画全体
+# の締め切り (``solve_palm_ik.PLAN_TIME_LIMIT``) の残りを ``time_limit`` に渡す。
+REFINE_TIME_LIMIT = 10.0
 
 # 移動先の台車の向きを人の正面から ±GOAL_YAW_MARGIN_DEG に絞る。
 # 寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人だけ
@@ -1814,6 +1816,7 @@ def _plan_path_impl(robot, robot_arm, hand, start_turn, goal_turn,
     waypoints = []
     reason = None
     for k in range(1, n + 1):
+        _check_stop()
         s = k / float(n)
         _UPPER.s = s
         base = base_path.at(s)
@@ -1971,10 +1974,25 @@ def _with_press_seed(post, function, *args, **kwargs):
         np.random.set_state(state)
 
 
+class TransitionStopped(Exception):
+    """裏の計画 (``refine_transition``) が止める合図で打ち切られた。"""
+
+
+# スレッドごとの止める合図 (refine_transition の ``stop``)。
+_STOP = threading.local()
+
+
+def _check_stop():
+    """このスレッドの止める合図が立っていれば ``TransitionStopped`` を投げる。"""
+    stop = getattr(_STOP, 'event', None)
+    if stop is not None and stop.is_set():
+        raise TransitionStopped()
+
+
 def refine_transition(robot, robot_arm, hand, post, turn_deg,
                       translated_joints, collision_joints, verification_pairs,
                       collision_pairs, base_limits, secured,
-                      attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
+                      attempts_per_pose=GOAL_ATTEMPTS_PER_POSE, stop=None):
     """動かす前に確保した横並び移動 ``secured`` (``plan_transition`` の
     approach=False の結果) を、寄せ (段階 2) と残りの掌の向きで良くした計画を
     返す (実機ノードは動いている間に裏のスレッドで解く)。
@@ -1983,11 +2001,19 @@ def refine_transition(robot, robot_arm, hand, post, turn_deg,
     ``APPROACH_STOP_LATERAL`` 以下ならそれを返す。そうでなければ残りの向きも
     解き (``_plan_transition``)、``secured`` より腕を上げないもの
     (``_low_arm_results``) のうち寄せ後の一番近いものを返す。``robot`` は、
-    ほかで使っていないロボットモデルにすること (IK で姿勢を書き換える)。"""
-    return _with_press_seed(
-        post, _refine_transition, robot, robot_arm, hand, post, turn_deg,
-        translated_joints, collision_joints, verification_pairs,
-        collision_pairs, base_limits, secured, attempts_per_pose)
+    ほかで使っていないロボットモデルにすること (IK で姿勢を書き換える)。
+
+    ``stop`` (``threading.Event``) が立つと、探索の区切り (下ろし方・移動先の
+    候補・経路の waypoint ごと) で ``TransitionStopped`` を投げて打ち切る
+    (実機ノードは、横並び移動を始める時点で終わっていなければ止める)。"""
+    _STOP.event = stop
+    try:
+        return _with_press_seed(
+            post, _refine_transition, robot, robot_arm, hand, post, turn_deg,
+            translated_joints, collision_joints, verification_pairs,
+            collision_pairs, base_limits, secured, attempts_per_pose)
+    finally:
+        _STOP.event = None
 
 
 def _refine_transition(robot, robot_arm, hand, post, turn_deg,
@@ -2021,6 +2047,7 @@ def _refine_transition(robot, robot_arm, hand, post, turn_deg,
         secured_z = _lowered_palm_z(secured) if secured else None
         results.append(_plan_transition(
             *common, attempts_per_pose=attempts_per_pose, facings=rest,
+            time_limit=REFINE_TIME_LIMIT,
             max_palm_z=(secured_z + LOWERED_HEIGHT_TOLERANCE
                         if PRUNE_HIGH_LOWERINGS and secured_z is not None
                         else None)))
@@ -2161,6 +2188,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     turn_groups = ((0.0,),) if free_turn else GOAL_TURN_DEG_GROUPS
 
     def out_of_time():
+        _check_stop()
         if deadline is None or time.time() < deadline:
             return False
         if not result['timed_out']:
@@ -2671,6 +2699,7 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
         for _, goal_av, goal_base, goal_turn, _ in candidates:
             if tried >= APPROACH_MAX_GOAL_TRIES:
                 break
+            _check_stop()
             # 台車の向きは変えない
             goal_base = np.array([goal_base[0], goal_base[1], start[2]])
             base_path = BasePath(start, goal_base)
@@ -2835,7 +2864,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                      use_facing_variants=True, approach=True, facings=None,
                      stop_lateral=APPROACH_STOP_LATERAL,
                      approach_kwargs=None,
-                     time_limit=TRANSITION_TIME_LIMIT, max_palm_z=None):
+                     time_limit=None, max_palm_z=None):
     """押し込み姿勢 ``post`` から、つないだ手を人の体の横へ下ろしながら
     ロボットも人と横並びになる位置・姿勢へ移り (段階 1、``_plan_stage1``)、
     さらに台車を人の方へ寄せる (段階 2、``plan_approach``) waypoint を計画する。
@@ -2885,6 +2914,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     done = False
 
     def out_of_time():
+        _check_stop()
         return deadline is not None and time.time() >= deadline
     with _upper_body_limit(human_yaw):
         for margin in margins:
