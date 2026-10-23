@@ -36,6 +36,7 @@ import message_filters
 import tf2_ros
 import trajectory_msgs.msg
 from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -264,6 +265,19 @@ def collision_pairs_text(colliding):
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
+def _json_default(value):
+    """``json.dumps`` で numpy の値を素の値にする。"""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError('{} is not JSON serializable'.format(type(value)))
+
+
+def to_json(data):
+    return json.dumps(data, default=_json_default)
+
+
 def face_point(joint_positions):
     """骨格の顔の位置 (鼻、なければ両耳の中点、どちらも無ければ None)。"""
     nose = joint_positions.get('Nose')
@@ -285,6 +299,17 @@ def project_base_point(frame, point):
         return None, None
     return ((int(intr.fx * p[0] / p[2] + intr.cx),
              int(intr.fy * p[1] / p[2] + intr.cy)), p[2])
+
+
+def hand_frame_record(frame):
+    """``_collect_hand_frames`` の 1 フレームから画像を除いた ``record.json``
+    用の内訳 (Hands の検出結果は ``pixels`` も含めて全部残す)。"""
+    intr = frame['intrinsics']
+    return dict(
+        stamp=frame['stamp'],
+        camera_to_base=np.asarray(frame['camera_to_base']).tolist(),
+        intrinsics=dict(fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy),
+        hands=frame['hands'])
 
 
 # 重要なログは print で画面とファイルへ、詳細は log_debug でファイルだけへ。
@@ -1119,6 +1144,11 @@ class HandshakePipelineNode(object):
 
         self.skeleton_image_pub = rospy.Publisher(
             '~skeleton_image', Image, queue_size=1)
+        # 画像を残さない試行 (知らない人) でも後から解析できるよう、処理した
+        # フレームごとの検出結果 (骨格・手・掌・差し出し判定) を JSON で出す
+        # (購読者がいるときだけ。record_camera_pipeline.launch が録る)。
+        self.detections_pub = rospy.Publisher(
+            '~detections', String, queue_size=10)
 
         # camera_info は同期に含めず最新 1 つだけ持つ (画像が遅れると組ができない)。
         self._latest_camera_info = None
@@ -1347,10 +1377,30 @@ class HandshakePipelineNode(object):
             hand_tracking = self._hand_tracking
             hand_follow = self._hand_follow
         armed = self.state == 'armed'
+        detection = None
+        if self.detections_pub.get_num_connections() > 0:
+            detection = dict(
+                stamp=color_msg.header.stamp.to_sec(), state=self.state,
+                frame=('base_link' if is_base_frame else 'camera'),
+                camera_to_base=camera_to_base,
+                intrinsics=dict(fx=intrinsics.fx, fy=intrinsics.fy,
+                                cx=intrinsics.cx, cy=intrinsics.cy,
+                                width=color.shape[1], height=color.shape[0]),
+                n_people=len(people),
+                # 2D は [u, v, visibility] (手は [u, v, MediaPipe の推定深度, 1])。
+                joints_2d=({j['limb']: [j['x'], j['y']] + (
+                    [j['z']] if 'z' in j else []) + [j['score']]
+                    for j in joints_2d[0] if j['score'] > 0}
+                    if joints_2d else None),
+                raw_joint_positions=raw_joint_positions,
+                joint_positions=preview_joint_positions,
+                hands=None)
         if ((hand_frames_requested or hand_tracking or armed
              or hand_follow is not None) and is_base_frame):
             hands = self.pose_estimator.estimate_hands_3d(
                 color, depth_m, intrinsics, output_transform=camera_to_base)
+            if detection is not None:
+                detection['hands'] = hands
             stamp = color_msg.header.stamp.to_sec()
             if hand_follow is not None:
                 self._update_hand_follow(
@@ -1373,8 +1423,24 @@ class HandshakePipelineNode(object):
         if self.state == 'armed' and armed_joint_positions is not None:
             self.offered_hand_selector.robot_position = \
                 self._resolve_robot_position()
+            # 差し出し判定の内訳を足してから出す (計画は同じスレッドで長くかかる)。
             self._try_handshake(armed_joint_positions,
-                                color_msg.header.stamp.to_sec())
+                                color_msg.header.stamp.to_sec(),
+                                detection=detection)
+        else:
+            self._publish_detection(detection)
+
+    def _publish_detection(self, detection):
+        """``_on_frame`` の 1 フレームの検出結果を ``~detections`` に出す。"""
+        if detection is None:
+            return
+        try:
+            text = to_json(detection)
+        except (TypeError, ValueError) as e:
+            rospy.logwarn_throttle(
+                10.0, '検出結果を JSON にできませんでした: {!r}'.format(e))
+            return
+        self.detections_pub.publish(String(data=text))
 
     def _arm(self, reason, move_to_initial_pose=True, wait_offer_change=False):
         """ARMED にする (差し出し手を時間制限なく待つ)。
@@ -1486,7 +1552,7 @@ class HandshakePipelineNode(object):
                         .format(side, displacement * 1e3, rotation))
         return None
 
-    def _try_handshake(self, joint_positions, stamp):
+    def _try_handshake(self, joint_positions, stamp, detection=None):
         handshake_t0 = time.time()
         # stamp は静止判定に使う。
         palms = self.palm_estimator.estimate(joint_positions, t=stamp)
@@ -1497,6 +1563,13 @@ class HandshakePipelineNode(object):
 
         # 再試行の基準 (計画に使った掌) と同じく裏返しを直してから比べる。
         palms = self._correct_outward_palms(palms, joint_positions)
+        if detection is not None:
+            detection.update(
+                palms=palms, offer_selection=selection,
+                offer_score_min=self.offered_hand_selector.score_min,
+                robot_position=self.offered_hand_selector.robot_position,
+                waiting_retry=self._retry_reference is not None)
+            self._publish_detection(detection)
         if self._retry_reference is not None:
             if not self._offer_changed(palms, stamp):
                 return
@@ -2713,7 +2786,9 @@ class HandshakePipelineNode(object):
 
     def _save_refine_failure(self, hand_frames, expected_position, candidates,
                              record):
-        """押し込み直前の手の再検出に失敗したときの画像と ``record.json`` を保存する。"""
+        """押し込み直前の手の再検出に失敗したときの画像と ``record.json`` を保存する
+        (``--no-save-images`` なら画像は保存せず、各フレームの検出結果を
+        ``record.json`` に入れる)。"""
         root = (os.path.join(self.args.save_dir, 'refine_failures')
                 if self.args.save_dir else '/tmp/aero_demo_refine_failures')
         out_dir = os.path.join(root, time.strftime('%Y%m%d_%H%M%S'))
@@ -2721,6 +2796,8 @@ class HandshakePipelineNode(object):
             os.makedirs(out_dir, exist_ok=True)
             for i, (frame, frame_candidates) in enumerate(
                     zip(hand_frames, candidates)):
+                if not self.args.save_images:
+                    continue
                 color = frame['color']
                 cv2.imwrite(os.path.join(out_dir, 'frame{}_raw.png'.format(i)),
                             color)
@@ -2756,10 +2833,17 @@ class HandshakePipelineNode(object):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imwrite(os.path.join(out_dir, 'frame{}.png'.format(i)),
                             image)
-            json_io.save_json(os.path.join(out_dir, 'record.json'), dict(
-                record, stamps=[frame['stamp'] for frame in hand_frames]))
-            log_debug('[execute][refine] 手の再検出に失敗したときの画像を {} に '
-                  '保存しました。'.format(out_dir))
+            # numpy の値が混ざるので to_json を通す。
+            json_io.save_json(os.path.join(out_dir, 'record.json'), json.loads(
+                to_json(dict(
+                    record, stamps=[frame['stamp'] for frame in hand_frames],
+                    frames=[dict(hand_frame_record(frame), candidates=cands)
+                            for frame, cands in zip(hand_frames,
+                                                    candidates)]))))
+            log_debug('[execute][refine] 手の再検出に失敗したときの{}を {} に '
+                  '保存しました。'.format(
+                      '画像' if self.args.save_images else '検出結果',
+                      out_dir))
         except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
             print('[execute][refine][WARN] 画像の保存に失敗しました ({})。'
                   .format(exc))
@@ -2801,7 +2885,8 @@ class HandshakePipelineNode(object):
 
     def _save_grasp_capture(self, hand_frames, record):
         """集めたフレームの元画像・深度 (16bit mm、欠損 0)・注釈画像と
-        ``record.json`` を保存する。"""
+        ``record.json`` を保存する (``--no-save-images`` なら ``record.json``
+        だけ)。"""
         root = (os.path.join(self.args.save_dir, 'grasp_captures')
                 if self.args.save_dir else '/tmp/aero_demo_grasp_captures')
         out_dir = os.path.join(root, time.strftime('%Y%m%d_%H%M%S'))
@@ -2813,6 +2898,9 @@ class HandshakePipelineNode(object):
         try:
             os.makedirs(out_dir, exist_ok=True)
             for i, frame in enumerate(hand_frames):
+                frames.append(hand_frame_record(frame))
+                if not self.args.save_images:
+                    continue
                 prefix = os.path.join(out_dir, 'frame{:03d}'.format(i))
                 cv2.imwrite(prefix + '_raw.png', frame['color'])
                 depth_mm = np.nan_to_num(frame['depth'] * 1e3, nan=0.0,
@@ -2840,23 +2928,11 @@ class HandshakePipelineNode(object):
                             (int(u0), int(v0) + 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imwrite(prefix + '.png', image)
-                intr = frame['intrinsics']
-                frames.append(dict(
-                    stamp=frame['stamp'],
-                    camera_to_base=np.asarray(frame['camera_to_base']).tolist(),
-                    intrinsics=dict(fx=intr.fx, fy=intr.fy, cx=intr.cx,
-                                    cy=intr.cy),
-                    hands=[dict(side=hand['side'], score=float(hand['score']),
-                                positions={k: [float(x) for x in p] for k, p
-                                           in hand['positions'].items()},
-                                model_positions={
-                                    k: [float(x) for x in p] for k, p
-                                    in hand.get('model_positions', {}).items()})
-                           for hand in frame['hands']]))
-            json_io.save_json(os.path.join(out_dir, 'record.json'),
-                              dict(record, frames=frames))
-            print('[execute][grasp] 押し込み後の画像 {} 枚を {} に保存しました。'
-                  .format(len(hand_frames), out_dir))
+            json_io.save_json(os.path.join(out_dir, 'record.json'), json.loads(
+                to_json(dict(record, frames=frames))))
+            print('[execute][grasp] 押し込み後の{} {} フレームを {} に保存しました。'
+                  .format('画像' if self.args.save_images else '検出結果',
+                          len(hand_frames), out_dir))
         except Exception as exc:  # noqa: BLE001  (保存失敗で実機動作を止めない)
             print('[execute][grasp][WARN] 画像の保存に失敗しました ({})。'
                   .format(exc))
@@ -4264,6 +4340,12 @@ def build_arg_parser():
         '--grasp-capture-duration', type=float, default=3.0,
         help='押し込み後にカメラ画像を保存する秒数 (0 で保存しない)。')
     parser.add_argument(
+        '--no-save-images', dest='save_images', action='store_false',
+        help='カメラ画像 (押し込み後・押し込み前の手の再検出失敗) をファイルに '
+             '保存しない (知らない人の試行用)。代わりに各フレームの手の検出結果を '
+             'record.json に残す。bag は record_camera_pipeline.launch '
+             'save_images:=false で録る。')
+    parser.add_argument(
         '--speech-fail-text', type=str,
         default='ごめんなさい、うまく手を出せませんでした',
         help='実機を動かせなかったときの発話 (空で発話しない)。')
@@ -4342,6 +4424,9 @@ def main():
     log_path = setup_log_dir()
     print('[log] 詳細なログ ([debug] など) は画面に出さず {} 以下に試行 (人) '
           'ごとのファイルで保存します (起動時: {})。'.format(LOG_DIR, log_path))
+    if not args.save_images:
+        print('[log] --no-save-images: カメラ画像はファイルに保存しません '
+              '(検出結果は ~detections と record.json に残します)。')
 
     bag_process = None
     if args.bag:

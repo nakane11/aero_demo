@@ -8,6 +8,14 @@
          roslaunch aero_demo record_camera_pipeline.launch
          # 保存先を変える場合
          roslaunch aero_demo record_camera_pipeline.launch prefix:=/tmp/session1
+         # 知らない人の試行: カメラ画像を録らない (ノードも no-save-images オプションで起動)
+         roslaunch aero_demo record_camera_pipeline.launch save_images:=false
+
+       save_images:=false の bag は画像が無いので run_camera_pipeline_test.py の
+       bag 再生テストには使えない。代わりにノードの ~detections (フレームごとの
+       2D/3D 骨格・Hands の手・掌・差し出し判定の内訳、JSON) と ~status・~plan を
+       録るので、検出・判定・計画・実機の動きは画像なしで追える
+       (~detections・~status・~plan は画像ありでも録る)。
 
        録画した全体 bag は data/bags/ に溜まる。テストに使う区間は切り出して
        data/real/<日付>/ に置き、元 bag は消してよい (docs/test_data.md)。
@@ -17,17 +25,32 @@
        roslaunch では相対パスが ~/.ros 基準になるので絶対パスで指定する。
        ディレクトリは自動では作られない。 -->
   <arg name="prefix" default="$(find aero_demo)/data/bags/camera_pipeline" />
+  <!-- カメラ画像 (カラー・深度) を録る。false で録らない (record_compressed も無視) -->
+  <arg name="save_images" default="true" />
   <!-- 圧縮画像 (decompress 前) も一緒に残す -->
   <arg name="record_compressed" default="false" />
   <!-- 追加で録るトピック (スペース区切り) -->
   <arg name="extra_topics" default="" />
+  <!-- run_camera_pipeline_test.py のノード名 (~detections 等の名前空間) -->
+  <arg name="pipeline_node" default="/run_camera_pipeline_test" />
 
-  <!-- 画像・TF (骨格検出・差し出し判定・base_link 座標への変換) -->
-  <arg name="camera_topics"
+  <!-- 画像 (骨格検出・差し出し判定) -->
+  <arg name="image_topics"
        value="/camera/color/image_raw/decompressed
-              /camera/depth/image_raw/decompressed
+              /camera/depth/image_raw/decompressed"
+       if="$(arg save_images)" />
+  <arg name="image_topics" value="" unless="$(arg save_images)" />
+  <!-- camera_info・TF (base_link 座標への変換、画像なしでも投影の確認に使う) -->
+  <arg name="camera_topics"
+       value="$(arg image_topics)
               /camera/color/camera_info
               /tf /tf_static" />
+  <!-- ノードの検出結果・状態・計画 (JSON の std_msgs/String)。
+       ~skeleton_image は画像なので録らない。 -->
+  <arg name="pipeline_topics"
+       value="$(arg pipeline_node)/detections
+              $(arg pipeline_node)/status
+              $(arg pipeline_node)/plan" />
   <!-- /scan: 押し込み前の台車位置補正 (base-correction scan)。
        /joint_states, /odom: AeroROSRobotInterface が購読する実機の状態。 -->
   <arg name="robot_topics"
@@ -67,14 +90,18 @@
               /rhand_controller/follow_joint_trajectory/result
               /aero_hand/command /aero_hand/is_grasped
               /cmd_vel /amcl_pose /estop" />
-  <arg name="compressed_topics"
+  <arg name="requested_compressed_topics"
        value="/camera/color/image_raw/compressed
               /camera/depth/image_raw/compressedDepth"
        if="$(arg record_compressed)" />
-  <arg name="compressed_topics" value="" unless="$(arg record_compressed)" />
+  <arg name="requested_compressed_topics" value=""
+       unless="$(arg record_compressed)" />
+  <arg name="compressed_topics" value="$(arg requested_compressed_topics)"
+       if="$(arg save_images)" />
+  <arg name="compressed_topics" value="" unless="$(arg save_images)" />
 
   <node pkg="rosbag" type="record" name="record_camera_pipeline" output="screen"
         args="-o $(arg prefix) --buffsize=2048
-              $(arg camera_topics) $(arg robot_topics) $(arg exec_topics)
-              $(arg compressed_topics) $(arg extra_topics)" />
+              $(arg camera_topics) $(arg pipeline_topics) $(arg robot_topics)
+              $(arg exec_topics) $(arg compressed_topics) $(arg extra_topics)" />
 </launch>

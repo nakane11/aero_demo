@@ -56,6 +56,15 @@ data/
   (`/tmp/aero_demo_refine_failures`) は `--save-dir` を指定しないと別に /tmp に出る。
   実機デモの後に `data/real/<日付>/` の `logs/`・`grasp_captures/`・
   `refine_failures/` へ移す。
+- 知らない人の試行はカメラ画像を残さない: `record_camera_pipeline.launch save_images:=false`
+  (カラー・深度・圧縮画像を録らない) と `run_camera_pipeline_test.py --no-save-images`
+  (押し込み後・再検出失敗の PNG を書かず、各フレームの Hands の検出結果を `record.json` に残す)
+  を併用する。この bag は画像が無いので bag 再生テストには使えないが、ノードの
+  `~detections` (処理したフレームごとの 2D/3D 骨格・Hands の手・掌・差し出し判定の内訳、
+  JSON の `std_msgs/String`、約 12KB/フレーム) と `~status`・`~plan` を録るので、
+  検出・判定・計画は画像なしで追える (10/23 以降は画像ありの bag にも入る)。
+  試行ごとの skeletons/palms/handshakes/motions の JSON とログは従来どおり残るので、
+  IK・軌道の解き直し (`tools/ros/resolve_saved_trials.py`) はそのまま使える。
 
 ## 実機・実カメラ (`data/real/`)
 
