@@ -20,6 +20,7 @@
 見ない。
 """
 
+import collections
 import contextlib
 import copy
 import math
@@ -59,6 +60,29 @@ LOWERED_TARGET_COUNT = 3
 # 高い下ろし方の上腕を避け、低い下ろし方が解けにくい (10/22 実機試行 2)。
 LOWERED_ARM_BATCHES = ('per_angle', 'group')
 LOWERED_ARM_BATCH = 'per_angle'
+
+# 'per_angle' のとき、同じ上腕の角度・脇の開きで掌の向きだけが違う下ろし方を、
+# PALM_FACING_ORDER の順に最大 LOWERED_TARGET_COUNT 個まとめて 1 回のバッチ IK
+# で解き、人ごとのキャッシュ (_person_cache) に置く (試す順は変えない)。上腕は
+# 同じなので障害物の共有で低い下ろし方が解けなくなることはない。バッチ IK の
+# 時間は初期値の数よりも呼び出しの回数で決まる (384 -> 1152 レーンで 0.20 ->
+# 0.33 秒)。目標 1 つあたりの初期値は GOAL_BUNDLE_ATTEMPTS_PER_POSE。まとめ
+# ないときもこの数で解き、バッチ IK の形を 1 つにする (形が増えると warmup の
+# コンパイルが実機ノードで約 20 秒延びる)。384 (まとめないときの同じ目標 3 つ
+# と同じ数) は、確保する計画で横並びまで解けた人の時間が中央値で +0.5 秒延び、
+# 成功数は 128 と同じだった (2026-10-23)。
+GOAL_BUNDLE_FACINGS = True
+GOAL_BUNDLE_ATTEMPTS_PER_POSE = 128
+# 段階 1 の下ろし方ごとの結果 (経路まで) を人ごとのキャッシュに置き、同じ人の
+# 計画で再利用する (実機ノードは、動く前に確保した計画で試した下ろし方を、
+# 動作中に裏で解く計画 refine_transition で解き直さない)。
+GOAL_REUSE_OUTCOMES = True
+# 横並びまで進んだ計画の中で掌が一番低いものより LOWERED_HEIGHT_TOLERANCE を
+# 超えて高い下ろし方は、選ばれない (_low_arm_results) ので解かない。
+PRUNE_HIGH_LOWERINGS = True
+# 下ろした掌で人の手首が目安に収まる握りの向きが 1 つも無い下ろし方は、移動先
+# がすべて fix_goal_wrist で捨てられるので、バッチ IK の前に打ち切る。
+GOAL_PRECHECK_WRIST = True
 
 # 腕を下ろす途中で上腕を外へ膨らませる角度 [度] (両端の姿勢は変えない)。
 # 前腕が人の腰・太ももに近づくのをよける。
@@ -212,6 +236,11 @@ APPROACH_WINDOW_COUNT = 5
 APPROACH_STEP = 0.04  # 台車の 1 waypoint あたりの移動 [m] (直線寄せ)
 APPROACH_MIN_GAIN = 0.03  # これ未満しか寄れないなら寄せない [m]
 APPROACH_MAX_GOAL_TRIES = 6
+# 寄せの移動先を、試す窓をすべて合わせた範囲の 1 回のバッチ IK で解き、
+# 近い窓から順にその窓に入る候補を試す (窓ごとに解くと寄せ 1 回に 4〜5 回)。
+# そのときの目標 1 つあたりの初期値の数 (目標は 3 つとも同じ掌)。
+APPROACH_SINGLE_BATCH = True
+APPROACH_SINGLE_BATCH_ATTEMPTS = 128
 
 # 移動先の候補のうち、経路まで試す数と、押し込み IK・検証まで試す数
 # (どちらも目標 1 つあたり)。
@@ -1029,11 +1058,16 @@ def _press_ik_once(robot, robot_arm, target, gaze_point, free_legs=False,
 
 # 首だけで視線を向け直す IK の最大繰り返し回数 (_aim_head)。
 AIM_HEAD_ROUNDS = 10
+# _aim_head で、今の首の角度から解いた視線のずれがこれ以下 [rad] なら、首 0 度
+# からは解かない。
+AIM_HEAD_GOOD_ERROR = math.radians(0.5)
 
 
 def _aim_head(robot, gaze_point):
     """首だけで、カメラの光軸を ``gaze_point`` へ向ける。今の首の角度と首 0 度
-    の両方から解き、視線のずれの小さい方にする。視線のずれ [rad] を返す。"""
+    の両方から解き、視線のずれの小さい方にする (今の首の角度からで
+    ``AIM_HEAD_GOOD_ERROR`` 以下なら首 0 度からは解かない)。視線のずれ [rad]
+    を返す。"""
     gaze_coords = spik.camera_optical_coords(robot)
     joints = [link.joint for link in spik.gaze_link_list(robot)]
     best = None
@@ -1048,6 +1082,9 @@ def _aim_head(robot, gaze_point):
         error = spik._gaze_error(gaze_coords, gaze_point)
         if best is None or error < best[0]:
             best = (error, [joint.joint_angle() for joint in joints])
+        if best[0] <= AIM_HEAD_GOOD_ERROR:
+            # 今の首の角度から十分向けられたら、首 0 度からは解かない。
+            break
     for joint, angle in zip(joints, best[1]):
         joint.joint_angle(angle)
     return best[0]
@@ -1236,29 +1273,53 @@ def wrist_ok_turn(human_arm, arm, palm_pos, palm_rot, turn_deg, s=1.0):
     palm = palm_from_frame(palm_pos, palm_rot)
     limits = wrist_limits(human_arm.press_wrist, s)
 
-    def ok(turn):
+    def ok(turns):
+        """握りの向き ``turns`` (配列) ごとに、手首が目安に収まるか。"""
+        turns = np.asarray(turns, dtype=np.float64)
         if HUMAN_WRIST_CHECK == 'turn_cap':
-            return abs(math.degrees(_wrap(math.radians(
-                turn - human_arm.press_turn)))) <= HUMAN_TURN_CAP_DEG
-        rot = hand_on_robot(spik.palm_target_rot(palm, turn,
-                                                 human_arm.robot_arm),
-                            human_arm.press_turn, human_arm.robot_arm)
-        return wrist_violation(human_arm.hand_wrist(arm, rot), limits) is None
+            change = (turns - human_arm.press_turn + 180.0) % 360.0 - 180.0
+            return np.abs(change) <= HUMAN_TURN_CAP_DEG
+        # 握りの向きは掌の法線まわりの回転なので、法線と前腕のひねりは
+        # 変わらず、指先 (と指先 x 法線) が 2 つの向きの cos・sin の和になる。
+        rot0, rot90 = [hand_on_robot(
+            spik.palm_target_rot(palm, base, human_arm.robot_arm),
+            human_arm.press_turn, human_arm.robot_arm)
+            for base in (turns[0], turns[0] + 90.0)]
+        angles = human_arm.hand_wrist(arm, rot0)
+        d = np.radians(turns - turns[0])[:, None]
+        fingers = np.cos(d) * rot0[:, 0] + np.sin(d) * rot90[:, 0]
+        side = np.cos(d) * rot0[:, 2] + np.sin(d) * rot90[:, 2]
+        radial = side if human_arm.hand == 'R' else -side
+        a = _unit(np.asarray(arm['wrist'], dtype=np.float64)
+                  - np.asarray(arm['elbow'], dtype=np.float64))
+        along = fingers @ a
+        values = dict(
+            flexion=np.degrees(np.arctan2(-float(np.dot(a, rot0[:, 1])),
+                                          along)),
+            deviation=np.degrees(np.arctan2(-(radial @ a), along)),
+            twist=np.full(len(turns), angles['twist_deg']))
+        good = np.ones(len(turns), dtype=bool)
+        for key, (lo, hi) in limits.items():
+            good &= (values[key] >= lo) & (values[key] <= hi)
+        return good
 
-    for delta in sorted(range(-180, 181), key=abs):
-        if ok(turn_deg + delta):
-            inner = turn_deg + delta + math.copysign(WRIST_TURN_MARGIN_DEG,
-                                                     delta)
-            return inner if delta and ok(inner) else turn_deg + delta
-    return None
+    deltas = np.array(sorted(range(-180, 181), key=abs), dtype=np.float64)
+    good = np.flatnonzero(ok(turn_deg + deltas))
+    if len(good) == 0:
+        return None
+    delta = deltas[good[0]]
+    inner = turn_deg + delta + math.copysign(WRIST_TURN_MARGIN_DEG, delta)
+    return (float(inner) if delta and ok([inner])[0]
+            else float(turn_deg + delta))
 
 
 def fix_goal_wrist(robot, robot_arm, human_arm, arm, palm_pos, palm_rot,
-                   gaze_point, turn_deg):
+                   gaze_point, turn_deg, aim_head=True):
     """移動先の姿勢 (``robot`` の今の姿勢、握りの向き ``turn_deg``) で人の
     手首が目安を超えていれば、収まる握りの向き (``wrist_ok_turn``) に固定して
-    解き直す。``(握りの向き, 問題の説明 or None)`` を返す (直せなければ
-    姿勢は元のまま)。"""
+    解き直す (``aim_head`` なら首だけで ``gaze_point`` へ向け直す)。
+    ``(握りの向き, 問題の説明 or None)`` を返す (直せなければ姿勢は元の
+    まま)。"""
     if HUMAN_WRIST_CHECK == 'off':
         return turn_deg, None
     _, problem = wrist_problem(human_arm, robot, arm, 1.0, turn_deg)
@@ -1271,7 +1332,7 @@ def fix_goal_wrist(robot, robot_arm, human_arm, arm, palm_pos, palm_rot,
     palm = palm_from_frame(palm_pos, palm_rot)
     if _press_ik(robot, robot_arm, press_target(palm, turn, robot_arm),
                  gaze_point):
-        if gaze_point is not None:
+        if gaze_point is not None and aim_head:
             _aim_head(robot, gaze_point)
         turn = grip_turn_deg(robot, robot_arm, palm)
         if wrist_problem(human_arm, robot, arm, 1.0, turn)[1] is None:
@@ -1449,15 +1510,24 @@ def warmup_batch_ik(robot, robot_arm, hand, seed_av, collision_pairs,
                     attempts_per_pose=GOAL_ATTEMPTS_PER_POSE):
     """移動先のバッチ IK (``_batch_ik``) を、実際の呼び出しと同じ形で 1 回
     解いて、JAX のトレース・コンパイルを前倒しで済ませる。``GOAL_FREE_TURN``
-    が False なら何もしない。``seed_av`` は解ける目標を作るための姿勢。"""
+    が False なら何もしない。``seed_av`` は解ける目標を作るための姿勢。
+    初期値の数が違うと別にコンパイルされるので、まとめて解くとき
+    (``GOAL_BUNDLE_ATTEMPTS_PER_POSE``・``APPROACH_SINGLE_BATCH_ATTEMPTS``) の
+    数でも解く。"""
     if not GOAL_FREE_TURN:
         return
-    _place(robot, seed_av, (0.0, 0.0, 0.0))
-    end = getattr(robot, '{}arm_end_coords'.format(robot_arm))
-    target = Coordinates(pos=end.worldpos().copy(), rot=end.worldrot().copy())
-    _batch_ik(robot, robot_arm, hand, [target] * LOWERED_TARGET_COUNT,
-              seed_av, {}, collision_pairs, base_limits, attempts_per_pose,
-              free_turn=True)
+    counts = [GOAL_BUNDLE_ATTEMPTS_PER_POSE if GOAL_BUNDLE_FACINGS
+              else attempts_per_pose,
+              APPROACH_SINGLE_BATCH_ATTEMPTS if APPROACH_SINGLE_BATCH
+              else attempts_per_pose]
+    for attempts in sorted(set(counts)):
+        _place(robot, seed_av, (0.0, 0.0, 0.0))
+        end = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+        target = Coordinates(pos=end.worldpos().copy(),
+                             rot=end.worldrot().copy())
+        _batch_ik(robot, robot_arm, hand, [target] * LOWERED_TARGET_COUNT,
+                  seed_av, {}, collision_pairs, base_limits, attempts,
+                  free_turn=True)
 
 
 class _rotation_about(object):
@@ -1514,12 +1584,15 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           branch_range_deg=GOAL_BRANCH_JOINT_RANGE_DEG,
                           free_turn=False, lowered_arms=(),
                           max_waist_z=None, y_window=None,
-                          yaw_margin_deg=None, lowered_forearms=()):
+                          yaw_margin_deg=None, lowered_forearms=(),
+                          per_target=False):
     """下ろした手の候補 ``goal_palms`` (腕の低い順の 3 つの ``(位置,
     回転行列)``) への押し込み目標を、握りの向き ``turn_degs`` ごとに 1 回の
     バッチ IK で解き、移動先の台車・姿勢の候補 (前後は人の立ち位置
     ±``GOAL_X_MARGIN``) を、腕の低い目標から、同じ目標ではコストの安い順に
-    返す。
+    返す。``per_target`` なら腰の高さ・指先の向きによる絞り込みを目標ごとに
+    行う (目標ごとに別の下ろし方をまとめて解くとき。目標の添字 -> 組の
+    リストなら組ごと)。
 
     ``max_waist_z`` (押し込み終了時の腰の高さ [m]) を与え、``GOAL_LEG_RISE``
     が 'off' でなければ、腰がそれより ``GOAL_LEG_RISE_TOLERANCE`` を超えて
@@ -1636,16 +1709,23 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
             candidates.append((cost, av, base, turn_deg, palm_index))
             finger_zs.append(float(finger[2]))
             waist_zs.append(waist_height(robot))
-    if max_waist_z is not None and GOAL_LEG_RISE != 'off':
-        keep = [i for i, z in enumerate(waist_zs)
-                if z <= max_waist_z + GOAL_LEG_RISE_TOLERANCE]
-        if keep or GOAL_LEG_RISE == 'strict':
-            candidates = [candidates[i] for i in keep]
-            finger_zs = [finger_zs[i] for i in keep]
-    down = [c for c, z in zip(candidates, finger_zs)
-            if z <= GOAL_FINGER_DOWN_MAX_Z]
-    if down:
-        candidates = down
+    # 腰の高さ・指先の向きの絞り込みは、per_target なら目標ごと (リストなら
+    # 目標の添字 -> 組)、そうでなければ全体で行う。
+    groups = {}
+    for i, c in enumerate(candidates):
+        group = (c[4] if per_target is True
+                 else per_target[c[4]] if per_target else 0)
+        groups.setdefault(group, []).append(i)
+    kept = []
+    for indices in groups.values():
+        if max_waist_z is not None and GOAL_LEG_RISE != 'off':
+            keep = [i for i in indices
+                    if waist_zs[i] <= max_waist_z + GOAL_LEG_RISE_TOLERANCE]
+            if keep or GOAL_LEG_RISE == 'strict':
+                indices = keep
+        down = [i for i in indices if finger_zs[i] <= GOAL_FINGER_DOWN_MAX_Z]
+        kept += down or indices
+    candidates = [candidates[i] for i in sorted(kept)]
     if candidates:
         candidates.sort(key=lambda c: (c[4], c[0]))
         return candidates, GOAL_X_MARGIN
@@ -1849,6 +1929,36 @@ def plan_transition(*args, **kwargs):
     return _with_press_seed(post, _plan_transition, *args, **kwargs)
 
 
+# 人ごとのキャッシュ (_person_cache) を残す人数。
+PERSON_CACHE_SIZE = 4
+_PERSON_CACHES = collections.OrderedDict()
+_PERSON_CACHES_LOCK = threading.Lock()
+
+
+def _person_cache(post, turn_deg, collision_joints, base_limits):
+    """押し込み姿勢 ``post``・握りの向き・骨格・台車の可動域が同じ計画で共有
+    する dict (移動先のバッチ IK の候補と、下ろし方ごとの結果)。実機ノードの
+    動く前の計画と裏の計画 (別スレッド) が同じものを使う。"""
+    key = zlib.crc32(np.round(np.asarray(
+        post['joint_angle_vector'], dtype=np.float64), 6).tobytes())
+    key = zlib.crc32(np.round(np.asarray(
+        list(post['base_position'][:2]) + [post['base_yaw'], turn_deg]
+        + [v for limit in base_limits for v in limit],
+        dtype=np.float64), 6).tobytes(), key)
+    for name in sorted(collision_joints):
+        key = zlib.crc32(name.encode(), key)
+        key = zlib.crc32(np.round(np.asarray(
+            collision_joints[name], dtype=np.float64), 6).tobytes(), key)
+    with _PERSON_CACHES_LOCK:
+        cache = _PERSON_CACHES.pop(key, None)
+        if cache is None:
+            cache = {}
+        _PERSON_CACHES[key] = cache
+        while len(_PERSON_CACHES) > PERSON_CACHE_SIZE:
+            _PERSON_CACHES.popitem(last=False)
+    return cache
+
+
 def _with_press_seed(post, function, *args, **kwargs):
     """``function`` を、乱数を押し込み姿勢 ``post`` から決めたシードにして
     呼び、呼び出し元の乱数の状態は戻す。"""
@@ -1908,8 +2018,12 @@ def _refine_transition(robot, robot_arm, hand, post, turn_deg,
             return first
     rest = [name for name in PALM_FACING_ORDER if name != found]
     if rest:
+        secured_z = _lowered_palm_z(secured) if secured else None
         results.append(_plan_transition(
-            *common, attempts_per_pose=attempts_per_pose, facings=rest))
+            *common, attempts_per_pose=attempts_per_pose, facings=rest,
+            max_palm_z=(secured_z + LOWERED_HEIGHT_TOLERANCE
+                        if PRUNE_HIGH_LOWERINGS and secured_z is not None
+                        else None)))
     if secured:
         # 確保済みより腕を上げる計画は採らない。
         results.append(secured)
@@ -1968,7 +2082,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                  collision_pairs, base_limits,
                  attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
                  use_facing_variants=True, facings=None,
-                 yaw_margin_deg=None, deadline=None):
+                 yaw_margin_deg=None, deadline=None, cache=None,
+                 bundle_facings=None, max_palm_z=None, bundle_first=True):
     """押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict、向き
     ``turn_deg``) から、つないだ手を人の体の横へ下ろしながら、ロボットも
     人と横並びになる位置・姿勢へ移る waypoint を計画する (段階 1)。
@@ -1980,6 +2095,14 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     ``LOWERED_FACING_ORDER``)、``yaw_margin_deg`` は移動先の台車の向きの範囲。
     ``deadline`` (``time.time()`` の値) を過ぎたら探索をやめ、それまでの一番
     良い経路を返す (``timed_out`` が True)。
+
+    ``cache`` (``_person_cache``) を与えると、移動先のバッチ IK を
+    ``bundle_facings`` (既定 ``PALM_FACING_ORDER``) の掌の向きでまとめて解き
+    (``GOAL_BUNDLE_FACINGS``)、下ろし方ごとの結果を再利用する
+    (``GOAL_REUSE_OUTCOMES``)。``bundle_first`` が False なら、最初に解く
+    下ろし方はまとめずに解く (最初の下ろし方で横並びまで進むことが多い、
+    寄せを解かない計画用)。``max_palm_z`` [m] を与えると、下ろしきった掌が
+    それより高い下ろし方は試さない。
 
     Returns
     -------
@@ -2045,26 +2168,138 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             reasons.append('探索の時間の上限に達した')
         return True
 
+    yaw_key = (GOAL_YAW_MARGIN_DEG if yaw_margin_deg is None
+               else yaw_margin_deg)
+    # 移動先のバッチ IK をまとめて解く相手 (lowering_key -> 下ろし方のリスト、
+    # 下の per_angle のループで作る)。
+    bundles = {}
+    # いま試している下ろし方の一番良い経路 (GOAL_REUSE_OUTCOMES 用)。
+    current = [None]
+    # この呼び出しで移動先のバッチ IK を解いた回数。
+    n_solved = [0]
+
+    def lowering_key(lowering):
+        return (yaw_key, float(lowering['arm_deg']),
+                float(lowering['abduction_deg']), lowering['palm_facing'])
+
+    def solve_lowerings(lowerings, turn_degs, per_target=False,
+                        attempts=None):
+        return solve_goal_candidates(
+            robot, robot_arm, hand, [lw['palm'] for lw in lowerings],
+            start_av, translated_joints, collision_joints, collision_pairs,
+            base_limits, turn_degs=turn_degs,
+            attempts_per_pose=attempts or attempts_per_pose,
+            free_turn=free_turn,
+            lowered_arms=[(human_arm.shoulder,
+                           human_arm.lowering_pose(lw, 1.0)[0])
+                          for lw in lowerings],
+            max_waist_z=start_waist_z, yaw_margin_deg=yaw_margin_deg,
+            lowered_forearms=[human_arm.lowering_pose(lw, 1.0)
+                              for lw in lowerings],
+            per_target=per_target)
+
+    def wrist_feasible(lowering):
+        """下ろした掌 ``lowering`` で、人の手首が目安に収まる握りの向きが
+        あるか (``GOAL_PRECHECK_WRIST``)。無ければどの移動先も
+        ``fix_goal_wrist`` で捨てられる (ロボットの姿勢に依らない)。"""
+        if not GOAL_PRECHECK_WRIST or HUMAN_WRIST_CHECK == 'off':
+            return True
+        key = ('wrist',) + lowering_key(lowering)[1:]
+        if cache is not None and key in cache:
+            return cache[key]
+        goal_arm = human_arm.pose(
+            *lowering['palm'], elbow=human_arm.lowering_pose(lowering, 1.0)[0])
+        ok = wrist_ok_turn(human_arm, goal_arm, *lowering['palm'],
+                           0.0) is not None
+        if cache is not None:
+            cache[key] = ok
+        return ok
+
+    def cached_candidates(lowering):
+        """下ろし方 ``lowering`` (目標 3 つとも同じ) の移動先の候補。まとめる
+        相手 (``bundles``) と 1 回のバッチ IK で解き、``cache`` に置く。"""
+        key = ('goal',) + lowering_key(lowering)
+        if key not in cache:
+            bundle = GOAL_BUNDLE_FACINGS and (bundle_first or n_solved[0] > 0)
+            n_solved[0] += 1
+            members = [lowering] + ([
+                lw for lw in bundles.get(lowering_key(lowering)[1:], ())
+                if ('goal',) + lowering_key(lw) not in cache
+                and (max_palm_z is None or lw['palm'][0][2] <= max_palm_z)
+                and wrist_feasible(lw)
+            ][:LOWERED_TARGET_COUNT - 1] if bundle else [])
+            # 足りない目標は最後の下ろし方で埋め、同じ下ろし方として扱う。
+            slots = [min(k, len(members) - 1)
+                     for k in range(LOWERED_TARGET_COUNT)]
+            # まとめないときも初期値の数を揃える (バッチ IK の形を 1 つにして
+            # warmup のコンパイルを増やさない)。
+            candidates, _ = solve_lowerings(
+                [members[k] for k in slots], (0.0,), per_target=slots,
+                attempts=(GOAL_BUNDLE_ATTEMPTS_PER_POSE
+                          if GOAL_BUNDLE_FACINGS else None))
+            for k, member in enumerate(members):
+                own = sorted([c[:4] + (0,) for c in candidates
+                              if slots[c[4]] == k], key=lambda c: c[0])
+                cache[('goal',) + lowering_key(member)] = (
+                    own, GOAL_X_MARGIN if own else None)
+        candidates, x_margin = cache[key]
+        return list(candidates), x_margin
+
+    def record_path(waypoints, fraction, lowering, x_margin):
+        if current[0] is None or fraction > current[0][1]:
+            current[0] = (waypoints, fraction, lowering['arm_deg'],
+                          lowering['abduction_deg'], lowering['palm_facing'],
+                          x_margin)
+        if best[0] is None or fraction > best[0][1]:
+            best[0] = (waypoints, fraction)
+            result.setdefault('fraction_times', []).append(
+                (time.time(), float(fraction)))
+            result.update(arm_deg=lowering['arm_deg'],
+                          abduction_deg=lowering['abduction_deg'],
+                          palm_facing=lowering['palm_facing'],
+                          x_margin=x_margin)
+
     def try_lowerings(lowerings):
         """腕の下ろし方 ``lowerings`` (3 つ) を移動先にして経路を作る。
-        横並びまで (100%) 進めたか、時間の上限を過ぎたら True。"""
-        goal_palms = [lowering['palm'] for lowering in lowerings]
-        lowered_arms = [(human_arm.shoulder,
-                         human_arm.lowering_pose(lowering, 1.0)[0])
-                        for lowering in lowerings]
-        lowered_forearms = [human_arm.lowering_pose(lowering, 1.0)
-                            for lowering in lowerings]
+        横並びまで (100%) 進めたか、時間の上限を過ぎたら True。
+        ``GOAL_REUSE_OUTCOMES`` なら、同じ人で試し終えた下ろし方は結果を
+        再利用する。"""
+        single = all(lw is lowerings[0] for lw in lowerings)
+        key = (('outcome',) + lowering_key(lowerings[0])
+               if cache is not None and GOAL_REUSE_OUTCOMES and single
+               else None)
+        if key is not None and key in cache:
+            path, why = cache[key]
+            reasons.extend(why)
+            if path is not None:
+                waypoints, fraction, arm_deg, abduction_deg, facing, \
+                    x_margin = copy.deepcopy(path)
+                record_path(waypoints, fraction,
+                            dict(arm_deg=arm_deg, abduction_deg=abduction_deg,
+                                 palm_facing=facing), x_margin)
+                if fraction >= 1.0:
+                    return True
+            return False
+        mark = len(reasons)
+        current[0] = None
+        done = _try_lowerings(lowerings)
+        if key is not None and not result['timed_out']:
+            # 時間切れで途中までしか試していない結果は残さない。
+            cache[key] = (copy.deepcopy(current[0]), list(reasons[mark:]))
+        return done
+
+    def _try_lowerings(lowerings):
+        single = all(lw is lowerings[0] for lw in lowerings)
+        if single and not wrist_feasible(lowerings[0]):
+            reasons.append('移動先で人の手首が収まる握りの向きが無い')
+            return False
         for turn_degs in turn_groups:
             if out_of_time():
                 return True
-            candidates, x_margin = solve_goal_candidates(
-                robot, robot_arm, hand, goal_palms, start_av,
-                translated_joints, collision_joints, collision_pairs,
-                base_limits, turn_degs=turn_degs,
-                attempts_per_pose=attempts_per_pose, free_turn=free_turn,
-                lowered_arms=lowered_arms, max_waist_z=start_waist_z,
-                yaw_margin_deg=yaw_margin_deg,
-                lowered_forearms=lowered_forearms)
+            if cache is not None and single and free_turn:
+                candidates, x_margin = cached_candidates(lowerings[0])
+            else:
+                candidates, x_margin = solve_lowerings(lowerings, turn_degs)
             if not candidates:
                 reasons.append('移動先の IK が解けない (腕 {} 度、握りの向き '
                                '{})'.format(
@@ -2126,17 +2361,18 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                                       gaze_forward)
                             or finger_z(robot, robot_arm) >= before_z):
                         robot.angle_vector(before)
-                # 腕と同時の視線 IK は首が大きく回せず解けないことがあるので、首だけで
-                # 前へ向け直す (経路の首はここへ補間する)。
-                _aim_head(robot, gaze_forward)
                 if free_turn:
                     goal_turn = grip_turn_deg(robot, robot_arm,
                                               palm_from_frame(*goal_palm))
                 # 人の手首が目安を超えるなら、収まる握りの向きで解き直す。
                 goal_turn, problem = fix_goal_wrist(
                     robot, robot_arm, human_arm, goal_arm, *goal_palm,
-                    gaze_forward, goal_turn)
+                    gaze_forward, goal_turn, aim_head=False)
                 if problem is None:
+                    # 腕と同時の視線 IK は首が大きく回せず解けないことがあるので、
+                    # 首だけで前へ向け直す (経路の首はここへ補間する)。首は手首に
+                    # 関係しないので、手首の判定に通ったものだけ。
+                    _aim_head(robot, gaze_forward)
                     problem = checker.check(robot, goal_skeleton, goal_arm)
                 if problem is not None:
                     reasons.append('移動先で{}'.format(problem.split(' ')[0]))
@@ -2156,14 +2392,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 path_fractions.append(round(float(fraction), 3))
                 if why is not None:
                     reasons.append('経路の{}'.format(why))
-                if best[0] is None or fraction > best[0][1]:
-                    best[0] = (waypoints, fraction)
-                    result.setdefault('fraction_times', []).append(
-                        (time.time(), float(fraction)))
-                    result.update(arm_deg=lowering['arm_deg'],
-                                  abduction_deg=lowering['abduction_deg'],
-                                  palm_facing=lowering['palm_facing'],
-                                  x_margin=x_margin)
+                record_path(waypoints, fraction, lowering, x_margin)
                 if fraction >= 1.0:
                     n_paths_full[0] = n_paths[0]
                     return True
@@ -2172,9 +2401,10 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             return False
         return False
 
-    def facing_variants(arm_degs, abduction_deg):
+    def facing_variants(arm_degs, abduction_deg, order=None):
         """組 ``arm_degs`` の掌の向きごとの下ろし方 (3 つとも同じ向き) の
-        ``[(向きの順位, 下ろし方)]``。向きは ``LOWERED_FACING_ORDER`` の順で、
+        ``[(向きの順位, 下ろし方)]``。向きは ``order`` (既定は ``facings``、
+        それも None なら ``LOWERED_FACING_ORDER``) の順で、
         使えない向き・前腕のひねりが ``LOWERED_TWIST_MAX_DEG`` を超える向きは
         除く。``use_facing_variants`` が False なら前腕のひねりが一番少ない
         向き (上腕の角度ごとに違ってよい) の 1 つだけ。掌が押し込み時より
@@ -2194,7 +2424,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             return [] if lowerings is None else [(0, lowerings)]
         variants = []
         palm_up = float(human_arm.palm_rot0[2, 1]) >= PALM_UP_NORMAL_Z
-        facing_order = (facings if facings is not None
+        facing_order = (order if order is not None
+                        else facings if facings is not None
                         else LOWERED_FACING_ORDER_PALM_UP if palm_up
                         else LOWERED_FACING_ORDER)
         for rank, facing in enumerate(facing_order):
@@ -2237,7 +2468,30 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 for _, lowerings in ordered:
                     if id(lowerings[j]) not in seen:
                         seen.add(id(lowerings[j]))
+                        if (max_palm_z is not None
+                                and lowerings[j]['palm'][0][2] > max_palm_z):
+                            # 選ばれない高さ (PRUNE_HIGH_LOWERINGS)
+                            continue
                         batches.append([lowerings[j]] * len(lowerings))
+            if cache is not None and GOAL_BUNDLE_FACINGS and free_turn:
+                # 同じ上腕の角度・脇の開きの下ろし方を、掌の向きの順
+                # (bundle_facings) で次のものからまとめる相手にする。
+                order = tuple(bundle_facings or facings or ())
+                for abduction_deg in abductions:
+                    bundle_key = ('bundles', tuple(arm_degs), abduction_deg,
+                                  order)
+                    if bundle_key not in cache:
+                        variants = facing_variants(arm_degs, abduction_deg,
+                                                   order=order or None)
+                        table = {}
+                        for j, deg in enumerate(arm_degs):
+                            same = [lws[j] for _, lws in variants
+                                    if lws[j]['arm_deg'] == deg]
+                            for i, lw in enumerate(same):
+                                table[lowering_key(lw)[1:]] = \
+                                    same[i + 1:] + same[:i]
+                        cache[bundle_key] = table
+                    bundles.update(cache[bundle_key])
         else:
             batches = [lowerings for _, lowerings in ordered]
         if any(try_lowerings(lowerings) for lowerings in batches):
@@ -2377,19 +2631,36 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     reasons = []
     best = None
     window = None
+    # 試す窓 (近い方から、寄せが APPROACH_MIN_GAIN に満たない窓の手前まで)。
+    usable = []
     for lo, hi in windows:
         if hi > lat0 - APPROACH_MIN_GAIN:
             break
-        candidates, _ = solve_goal_candidates(
+        usable.append((lo, hi))
+
+    def solve_window(y_window, attempts):
+        return solve_goal_candidates(
             robot, robot_arm, hand, [(static.palm_pos, static.palm_rot)] * 3,
             start_av, translated_joints, collision_joints, collision_pairs,
             base_limits, turn_degs=(0.0,), free_turn=GOAL_FREE_TURN,
             lowered_arms=[(real.shoulder, static.elbow)] * 3,
             max_waist_z=start_waist_z, branch_range_deg=100.0,
-            y_window=(lo, hi), yaw_margin_deg=yaw_margin_deg,
-            attempts_per_pose=attempts_per_pose,
+            y_window=y_window, yaw_margin_deg=yaw_margin_deg,
+            attempts_per_pose=attempts,
             lowered_forearms=[(static.elbow, arm_pose['wrist'],
-                               static.palm_pos, static.palm_rot)] * 3)
+                               static.palm_pos, static.palm_rot)] * 3)[0]
+
+    union = None
+    if APPROACH_SINGLE_BATCH and usable:
+        union = solve_window((min(lo for lo, _ in usable),
+                              max(hi for _, hi in usable)),
+                             APPROACH_SINGLE_BATCH_ATTEMPTS)
+    for lo, hi in usable:
+        if union is None:
+            candidates = solve_window((lo, hi), attempts_per_pose)
+        else:
+            candidates = [c for c in union if lo <= human_lateral(
+                translated_joints, c[2], hand) <= hi]
         if not candidates:
             reasons.append('窓 {}-{} m の移動先の IK が解けない'.format(lo, hi))
             continue
@@ -2564,7 +2835,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                      use_facing_variants=True, approach=True, facings=None,
                      stop_lateral=APPROACH_STOP_LATERAL,
                      approach_kwargs=None,
-                     time_limit=TRANSITION_TIME_LIMIT):
+                     time_limit=TRANSITION_TIME_LIMIT, max_palm_z=None):
     """押し込み姿勢 ``post`` から、つないだ手を人の体の横へ下ろしながら
     ロボットも人と横並びになる位置・姿勢へ移り (段階 1、``_plan_stage1``)、
     さらに台車を人の方へ寄せる (段階 2、``plan_approach``) waypoint を計画する。
@@ -2584,9 +2855,12 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     ``yaw_margin`` を持ち、``waypoints`` は寄せまでを含む。``approach`` が
     False なら段階 2 は解かず、横並びまで進んだ最初の解で止める。
     ``time_limit`` [秒] (None なら無制限) を過ぎたら探索をやめ、それまでの
-    一番良い解を返す (``timed_out`` が True)。
+    一番良い解を返す (``timed_out`` が True)。``max_palm_z`` [m] を与えると、
+    下ろしきった掌がそれより高い下ろし方は試さない (呼び出し元に、それより
+    LOWERED_HEIGHT_TOLERANCE 低い計画があるとき)。
     """
     t0 = time.time()
+    cache = _person_cache(post, turn_deg, collision_joints, base_limits)
     deadline = None if time_limit is None else t0 + time_limit
     standing = spik.human_standing_xy(translated_joints)
     facing = spik.human_facing_direction(translated_joints)
@@ -2624,12 +2898,22 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                 if results and out_of_time():
                     done = True
                     break
+                palm_limit = max_palm_z
+                heights = [z for z in map(_lowered_palm_z, results)
+                           if z is not None]
+                if PRUNE_HIGH_LOWERINGS and heights:
+                    # これより高い下ろし方は _low_arm_results で外れる。
+                    limit = min(heights) + LOWERED_HEIGHT_TOLERANCE
+                    palm_limit = (limit if palm_limit is None
+                                  else min(palm_limit, limit))
                 result = _plan_stage1(
                     robot, robot_arm, hand, post, turn_deg,
                     translated_joints, collision_joints, verification_pairs,
                     collision_pairs, base_limits,
                     attempts_per_pose=attempts_per_pose,
-                    facings=group, yaw_margin_deg=margin, deadline=deadline)
+                    facings=group, yaw_margin_deg=margin, deadline=deadline,
+                    cache=cache, bundle_facings=PALM_FACING_ORDER,
+                    max_palm_z=palm_limit, bundle_first=approach)
                 result.update(yaw_margin=margin, approach=None)
                 if approach and result['verified'] \
                         and result['fraction'] >= 1.0 and not out_of_time():
