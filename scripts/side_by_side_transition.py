@@ -2668,6 +2668,16 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                  for ft, fraction in r.get('fraction_times', ())
                  if fraction >= threshold]
         best[key] = min(times) if times else None
+    # 採った解が、最初に見つかった解 (MIN_FRACTION 以上進めた解) か (表示用)。
+    best['chosen_try'] = next(
+        i for i, r in enumerate(results) if r is best) + 1
+    best['first_verified_try'] = next(
+        (i + 1 for i, r in enumerate(results)
+         if any(f >= MIN_FRACTION for _, f in r.get('fraction_times', ()))),
+        None)
+    chosen_times = [ft - t0 for ft, fraction in best.get('fraction_times', ())
+                    if fraction >= MIN_FRACTION]
+    best['chosen_time'] = min(chosen_times) if chosen_times else None
     best['timed_out'] = out_of_time()
     best['compute_time'] = time.time() - t0
     return best

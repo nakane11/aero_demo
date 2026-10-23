@@ -35,9 +35,9 @@ import rospy
 import message_filters
 import tf2_ros
 import trajectory_msgs.msg
-from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from sensor_msgs.msg import CameraInfo, Image, JointState, LaserScan
 from std_msgs.msg import String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger, TriggerResponse
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_DIR = os.path.dirname(_THIS_DIR)
@@ -57,7 +57,15 @@ os.environ.setdefault(
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS', '0')
 os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 
+from aero_demo import execution_timing  # noqa: E402
 from aero_demo import hand_offer_advice  # noqa: E402
+from aero_demo.handshake_stages import (  # noqa: E402
+    BACKGROUND_TRANSITION_REFINE, STAGE_ARMED, STAGE_ARMED_RETRY,
+    STAGE_BASE_CORRECTION, STAGE_DONE, STAGE_ERROR, STAGE_GRASP,
+    STAGE_HOVER_SETTLE, STAGE_IDLE, STAGE_INITIAL_POSE, STAGE_LEAD_IN,
+    STAGE_NOD_WAIT, STAGE_PLAN_APPROACH, STAGE_PLAN_IK, STAGE_PLAN_TRANSITION,
+    STAGE_PRESS_IN, STAGE_PRESS_REFINE, STAGE_RESULT, STAGE_SPIRAL,
+    STAGE_STARTING, STAGE_TRANSITION, STAGE_TRANSITION_WAIT, numbered_title)
 from aero_demo import in_motion_correction  # noqa: E402
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
@@ -145,8 +153,10 @@ HEAD_TRACK_MAX_DZ = 0.15  # [m]
 HEAD_TRACK_MAX_DXY = 0.30  # [m]
 ODOM_FRAME = 'odom'
 
-# 実機再生時の waypoint 間の所要時間の下限 [秒] (腕の制御周期 15Hz の 1 周期)。
-MIN_SEGMENT_TIME = 1.0 / 15.0
+# 実機再生時の区間の時間・速度上限 (表示ツールのシミュレーション表示と共有)。
+MIN_SEGMENT_TIME = execution_timing.MIN_SEGMENT_TIME
+BASE_MAX_VEL = execution_timing.BASE_MAX_VEL
+VEL_LIMIT_RATIO = execution_timing.VEL_LIMIT_RATIO
 
 # 干渉 NG の waypoint が全て接近区間のこの割合より後ろなら手の出し方が原因とみなす。
 FAILURE_NEAR_HAND_FRACTION = 0.7
@@ -169,17 +179,6 @@ SPEECH_FALLBACK_PER_CHAR = 0.2
 # 取り違えているとみなして裏返す。実機の差し出し 206 件 (bag のフレームを含む) では
 # 正しい掌は -0.25 以上、-0.8 未満はすべて裏返った推定だった (2026-10-21)。
 OUTWARD_PALM_MAX_MEDIAL = -0.5
-
-# 台車の速度上限。実機の aero_base_link.yaml の max_velocity と一致させること。
-BASE_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
-BASE_MAX_ANGVEL = 1.0  # [rad/s] 実機の base_link_pan の max_velocity
-
-# 指令で使う速度上限の割合。3 次スプライン瞬間速度の最大がこの割合になるよう
-# 区間の時間を決める (_limited_time_list)。
-VEL_LIMIT_RATIO = 0.9
-# 上限速度 (× VEL_LIMIT_RATIO) まで加速するのにかける時間 [秒]。
-ACCEL_TIME = 0.4
-TIME_LIMIT_MAX_ITERATIONS = 100
 
 # 接近終盤の台車の最終位置のずらし (_correct_base_tail)。到着 IN_MOTION_LEAD〜
 # IN_MOTION_LEAD_MIN 秒前に、台車停止 (odom 速度が MAX_YAW_RATE・MAX_SPEED 以下)
@@ -257,6 +256,13 @@ HAND_FOLLOW_MIN_SCORE = PRESS_IN_REFINE_MIN_HAND_SCORE
 SKELETON_HOLD_TIMEOUT = 1.0
 # 骨格の再描画周期 [秒] (状態変化は即座に反映)。
 SKELETON_REDRAW_INTERVAL = 0.5
+
+# 状態パネルのカメラ画像の幅 [px] (初期値・スライダーの範囲) と JPEG 品質。
+VIEWER_CAMERA_WIDTH = 400
+VIEWER_CAMERA_WIDTH_RANGE = (240, 1280)
+VIEWER_CAMERA_JPEG_QUALITY = 70
+# 状態パネルの幅のうち画像以外 (余白) [px]。
+VIEWER_PANEL_MARGIN = 40
 
 
 def collision_pairs_text(colliding):
@@ -541,6 +547,8 @@ class HandshakePlanner(object):
 
     def __init__(self, args):
         self.args = args
+        # plan の各計算の開始時に説明文で呼ぶ (画面の状態表示用) or None。
+        self.on_stage = None
         if hasattr(args, 'press_in_forearm_clearance'):
             spik.apply_press_in_forearm_argument(args)
         self.robot, self.verification_pairs = self._build_robot_and_pairs()
@@ -732,6 +740,10 @@ class HandshakePlanner(object):
             '軌道最適化の準備は別プロセスで続けています。'
             if self._optimizer_process is not None else ''))
 
+    def _stage(self, text):
+        if self.on_stage is not None:
+            self.on_stage(text)
+
     def plan(self, joint_positions, palms, offered_hand, attempt):
         """差し出された掌 ``palms[offered_hand]`` に対して IK -> 軌道計画 ->
         横並び移動を計画する (``attempt`` はログ用)。
@@ -791,6 +803,7 @@ class HandshakePlanner(object):
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
+        self._stage(STAGE_PLAN_IK)
         (picked, collision_ik_time, candidate_selection_time,
          person_base_limits, x_margin) = \
             spik.solve_person_ik_side_by_side(
@@ -840,6 +853,7 @@ class HandshakePlanner(object):
             motion_args.collision_verify_tolerance = \
                 args.motion_collision_verify_tolerance
             initial_base_pose = np.array([offset[0], offset[1], 0.0])
+            self._stage(STAGE_PLAN_APPROACH)
             motion = phm.plan_person_motion(
                 self.robot, robot_arm, result, collision_joints, human_xy,
                 motion_args, self.motion_verification_pairs, self.solver,
@@ -858,6 +872,7 @@ class HandshakePlanner(object):
                     and motion_verified(motion)):
                 # background/off は寄せを解かず最初の解で止める (background は
                 # 移動中に refine_transition で解く)。
+                self._stage(STAGE_PLAN_TRANSITION)
                 transition = sbs.plan_transition(
                     self.robot, robot_arm, offered_hand,
                     result['post_process'], result['turn_deg'],
@@ -1081,6 +1096,22 @@ class HandshakePipelineNode(object):
         self._displayed_joint_positions = None
         self._last_skeleton_redraw_time = 0.0
         self._attempt_count = 0  # 試行番号 (ログ用)
+        # 状態パネルの今の動作 ((見出し, 補足), 開始時刻)・裏の計算の説明 or None。
+        self._activity = (STAGE_STARTING, time.time())
+        self._background_activity = None
+        self.planner.on_stage = self._set_activity
+        # 状態パネル用の最新のカメラ画像 (BGR): 生画像と骨格を重ねた画像 (無ければ None)。
+        self._viewer_camera_raw = None
+        self._viewer_camera_overlay = None
+        self._viewer_camera_image = None  # 画面の画像 (_setup_activity_panel で作る)
+        # 画面のロボットを実機の姿勢で出す用: 最新の /joint_states ({関節名: 角度})
+        # と、画面の原点にする odom <- base_link (差し出し手が決まった時点。
+        # それまでは None で、今の台車を原点にする)。
+        self._real_joint_angles = None
+        self._real_pose_ref = None
+        self._viewer_camera_sent = None   # 最後に送った画像 (同じなら送らない)
+        self._viewer_camera_time = 0.0
+        self._activity_panel_content = None
 
         self.planner.warmup(
             background_optimizer=args.background_optimizer_warmup)
@@ -1144,11 +1175,25 @@ class HandshakePipelineNode(object):
 
         self.skeleton_image_pub = rospy.Publisher(
             '~skeleton_image', Image, queue_size=1)
+        # 表示ツール (scripts/handshake_viewer.py) 向けの状態・計画・骨格 (JSON 文字列)
+        # と ARM/RESET のサービス。
+        self.status_pub = rospy.Publisher(
+            '~status', String, queue_size=1, latch=True)
+        self.plan_pub = rospy.Publisher(
+            '~plan', String, queue_size=1, latch=True)
+        self.skeleton_pub = rospy.Publisher('~skeleton', String, queue_size=1)
         # 画像を残さない試行 (知らない人) でも後から解析できるよう、処理した
         # フレームごとの検出結果 (骨格・手・掌・差し出し判定) を JSON で出す
         # (購読者がいるときだけ。record_camera_pipeline.launch が録る)。
         self.detections_pub = rospy.Publisher(
             '~detections', String, queue_size=10)
+        self._last_status = None
+        self._last_status_time = 0.0
+        self._last_skeleton_publish_time = 0.0
+        self.arm_service = rospy.Service(
+            '~arm', Trigger, self._on_arm_service)
+        self.reset_service = rospy.Service(
+            '~reset', Trigger, self._on_reset_service)
 
         # camera_info は同期に含めず最新 1 つだけ持つ (画像が遅れると組ができない)。
         self._latest_camera_info = None
@@ -1160,13 +1205,26 @@ class HandshakePipelineNode(object):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub], queue_size=5, slop=0.1)
         self.sync.registerCallback(self._on_frame)
+        self.joint_states_sub = rospy.Subscriber(
+            args.joint_states_topic, JointState, self._on_joint_states,
+            queue_size=1)
         self._latest_scan = None
         if args.base_correction == 'scan':
             self.scan_sub = rospy.Subscriber(
                 args.scan_topic, LaserScan, self._on_scan, queue_size=1)
 
-        self._setup_viewer(args)
+        # 画面 (viser) は --no-viewer なら作らない (表示は scripts/handshake_viewer.py
+        # --ros が ~status・~plan から行う)。
+        self.viewer = None
+        self._skeleton_links = []
+        self._current_obstacle_links = []
+        if args.no_viewer:
+            print('[viewer] --no-viewer のため画面を作りません。表示は '
+                  'scripts/handshake_viewer.py --ros で行ってください。')
+        else:
+            self._setup_viewer(args)
 
+        self._set_activity(STAGE_IDLE)
         if args.auto_arm:
             self._arm('--auto-arm', move_to_initial_pose=False)
 
@@ -1195,13 +1253,10 @@ class HandshakePipelineNode(object):
 
         @self.reset_button.on_click
         def _on_reset(_):  # noqa: ANN001
-            self._reset_view()
-            self.state = 'idle'
-            self._retry_reference = None
-            self._latest_offer_selection = None
-            print('[RESET] 骨格表示とロボットの姿勢を初期状態に戻しました。')
+            self._reset('RESET ボタン')
 
         self._status_text = self.viewer._server.gui.add_markdown('')
+        self._setup_activity_panel(args)
         self.waypoint_slider = self.viewer._server.gui.add_slider(
             'waypoint', min=0, max=0, step=1, initial_value=0)
         self.play_checkbox = self.viewer._server.gui.add_checkbox(
@@ -1219,6 +1274,14 @@ class HandshakePipelineNode(object):
                 self.waypoint_slider.value = 0
 
         threading.Thread(target=self._play_loop, daemon=True).start()
+
+        self.show_real_pose_checkbox = self.viewer._server.gui.add_checkbox(
+            '実機の姿勢を表示 (オフで計画の waypoint)', initial_value=True)
+
+        @self.show_real_pose_checkbox.on_update
+        def _on_toggle_real_pose(_):  # noqa: ANN001
+            if not self.show_real_pose_checkbox.value:
+                self._apply_current_waypoint()
 
         self.show_collision_models_checkbox = (
             self.viewer._server.gui.add_checkbox(
@@ -1247,6 +1310,85 @@ class HandshakePipelineNode(object):
         self.viewer.show(open_browser=not args.no_open_browser)
         if not args.no_wait_for_client:
             viewer_nav.wait_for_client(self.viewer, args.client_wait_timeout)
+
+    def _setup_activity_panel(self, args):
+        """3D の画角によらない状態パネル (今の動作とロボットのカメラ画像) を
+        左上に浮かせて作る。"""
+        gui = self.viewer._server.gui
+        self._activity_panel = gui.add_panel()
+        self._viewer_camera_width = VIEWER_CAMERA_WIDTH
+        with self._activity_panel.add_tab('ロボットの状態'):
+            self._activity_text = gui.add_markdown('')
+            self._viewer_camera_image = None
+            if args.viewer_camera_fps > 0:
+                # 骨格を重ねた画像 (計算中は骨格を推定しないので生画像)。
+                self._viewer_camera_image = gui.add_image(
+                    np.zeros((VIEWER_CAMERA_WIDTH * 3 // 4,
+                              VIEWER_CAMERA_WIDTH, 3), dtype=np.uint8),
+                    format='jpeg', jpeg_quality=VIEWER_CAMERA_JPEG_QUALITY)
+                width_slider = gui.add_slider(
+                    '画像の幅 [px]', min=VIEWER_CAMERA_WIDTH_RANGE[0],
+                    max=VIEWER_CAMERA_WIDTH_RANGE[1], step=40,
+                    initial_value=VIEWER_CAMERA_WIDTH)
+
+                @width_slider.on_update
+                def _on_width(_):  # noqa: ANN001
+                    self._viewer_camera_width = int(width_slider.value)
+                    self._viewer_camera_sent = None  # 新しい幅ですぐ送り直す
+                    self._activity_panel.set_width(
+                        self._viewer_camera_width + VIEWER_PANEL_MARGIN)
+        self._activity_panel.float(
+            x=15, y=15, width=VIEWER_CAMERA_WIDTH + VIEWER_PANEL_MARGIN)
+
+    def _set_activity(self, stage):
+        """状態パネルの今の動作を ``stage`` ((見出し, 補足)) にし、``~status`` も
+        すぐ出す (短い段階を取りこぼさないため)。"""
+        with self._lock:
+            self._activity = (stage, time.time())
+        if getattr(self, 'status_pub', None) is not None:
+            self._publish_status(force=True)
+
+    def _set_background_activity(self, text):
+        with self._lock:
+            self._background_activity = text
+
+    def _update_activity_panel(self):
+        """状態パネルの文字とカメラ画像を更新する (変化したときだけ送る)。"""
+        now = time.time()
+        with self._lock:
+            (title, detail), started = self._activity
+            background = self._background_activity
+            raw = self._viewer_camera_raw
+            overlay = self._viewer_camera_overlay
+        content = '### {}\n\n'.format(numbered_title(title))
+        if detail:
+            content += '{}\n\n'.format(detail)
+        content += '経過 {:.0f} 秒'.format(now - started)
+        if background:
+            content += '\n\n({})'.format(background)
+        if content != self._activity_panel_content:
+            self._activity_text.content = content
+            self._activity_panel_content = content
+
+        if self._viewer_camera_image is None or (
+                now - self._viewer_camera_time
+                < 1.0 / self.args.viewer_camera_fps):
+            return
+        # 計算中は骨格を推定しないので、重ねた画像が無ければ生画像を出す。
+        image = overlay if overlay is not None else raw
+        if image is None or image is self._viewer_camera_sent:
+            return
+        # 元の解像度より大きくはしない (ブラウザが拡大する)。
+        width = self._viewer_camera_width
+        if width < image.shape[1]:
+            height = int(round(image.shape[0] * width / float(image.shape[1])))
+            image_to_send = cv2.resize(image, (width, height),
+                                       interpolation=cv2.INTER_AREA)
+        else:
+            image_to_send = image
+        self._viewer_camera_image.image = image_to_send[:, :, ::-1]
+        self._viewer_camera_sent = image
+        self._viewer_camera_time = now
 
     def _set_link_visible(self, link, visible):
         common_set_link_visible(self.viewer, link, visible)
@@ -1320,8 +1462,25 @@ class HandshakePipelineNode(object):
     def _on_camera_info(self, msg):
         self._latest_camera_info = msg
 
+    def _on_joint_states(self, msg):
+        angles = dict(zip(msg.name, msg.position))
+        with self._lock:
+            if self._real_joint_angles is None:
+                self._real_joint_angles = angles
+            else:
+                # 一部の関節だけのメッセージでも他の関節を消さない。
+                self._real_joint_angles.update(angles)
+
     def _on_frame(self, color_msg, depth_msg):
         if self._busy:
+            # 計算中も画像は流す (骨格は推定しないので生画像)。
+            if self.skeleton_image_pub.get_num_connections() > 0:
+                self.skeleton_image_pub.publish(color_msg)
+            if self._viewer_camera_image is not None:
+                color = imgmsg_to_ndarray(color_msg, desired_encoding='bgr8')
+                with self._lock:
+                    self._viewer_camera_raw = color
+                    self._viewer_camera_overlay = None
             return
         info_msg = self._latest_camera_info
         if info_msg is None:
@@ -1343,11 +1502,16 @@ class HandshakePipelineNode(object):
         people, joints_2d = self.pose_estimator.estimate_3d(
             color, depth_m, intrinsics, output_transform=camera_to_base)
 
-        if self.skeleton_image_pub.get_num_connections() > 0:
+        publish_overlay = self.skeleton_image_pub.get_num_connections() > 0
+        if publish_overlay or self._viewer_camera_image is not None:
             overlay = (skeleton_drawing.draw_skeleton_overlay(color, joints_2d[0])
                       if joints_2d else color)
-            self.skeleton_image_pub.publish(
-                ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
+            if publish_overlay:
+                self.skeleton_image_pub.publish(
+                    ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
+            with self._lock:
+                self._viewer_camera_raw = color
+                self._viewer_camera_overlay = overlay
         is_base_frame = camera_to_base is not None
         raw_joint_positions = people[0] if people else None
         preview_joint_positions = (
@@ -1357,6 +1521,7 @@ class HandshakePipelineNode(object):
                 frame_key=is_base_frame))
         armed_joint_positions = (
             preview_joint_positions if is_base_frame else None)
+        self._publish_skeleton(preview_joint_positions, is_base_frame)
         torso_points = [
             armed_joint_positions[name] for name in HEAD_TRACK_TARGET_JOINTS
             if armed_joint_positions and name in armed_joint_positions]
@@ -1442,6 +1607,19 @@ class HandshakePipelineNode(object):
             return
         self.detections_pub.publish(String(data=text))
 
+    def _publish_skeleton(self, joint_positions, is_base_frame):
+        """表示ツール向けに今の骨格 (検出なしは None) を ``~skeleton`` に出す
+        (最大 10Hz、購読者がいるときだけ)。"""
+        now = time.time()
+        if (self.skeleton_pub.get_num_connections() == 0
+                or now - self._last_skeleton_publish_time < 0.1):
+            return
+        self._last_skeleton_publish_time = now
+        self.skeleton_pub.publish(String(data=to_json(dict(
+            joint_positions=(None if joint_positions is None else {
+                k: list(v) for k, v in joint_positions.items()}),
+            frame=('base_link' if is_base_frame else 'camera')))))
+
     def _arm(self, reason, move_to_initial_pose=True, wait_offer_change=False):
         """ARMED にする (差し出し手を時間制限なく待つ)。
 
@@ -1463,13 +1641,16 @@ class HandshakePipelineNode(object):
         self._last_failure = None
         with self._lock:
             self._handshake_total_time = None
-        self.arm_button.visible = False
-        self.reset_button.visible = True
+        self._show_arm_button(False)
         if move_to_initial_pose and self.ri is not None:
             # 首の追従は初期姿勢に戻ってから始める (全身のゴールを打ち切らない)。
             self._initial_pose_done.clear()
             self._head_tracking_yaw = None
         self.state = 'armed'
+        if move_to_initial_pose and self.ri is not None:
+            self._set_activity(STAGE_INITIAL_POSE)
+        else:
+            self._set_armed_activity()
         if move_to_initial_pose and self.ri is not None:
             threading.Thread(
                 target=self._move_to_initial_pose, daemon=True).start()
@@ -1477,10 +1658,35 @@ class HandshakePipelineNode(object):
             reason, ' (今の手を動かすか向きを変えてから)'
             if wait_offer_change else ''))
 
+    def _reset(self, reason):
+        """IDLE に戻す (計画の表示も消す)。"""
+        self._reset_view()
+        self.state = 'idle'
+        self._set_activity(STAGE_IDLE)
+        self._retry_reference = None
+        self._latest_offer_selection = None
+        print('[RESET] 骨格表示とロボットの姿勢を初期状態に戻しました ({})。'
+              .format(reason))
+
+    def _on_arm_service(self, _req):
+        if self.state in ('solving',):
+            return TriggerResponse(success=False,
+                                   message='IK・軌道計画の計算中です')
+        self._arm('ARM サービス')
+        return TriggerResponse(success=True, message='ARMED')
+
+    def _on_reset_service(self, _req):
+        if self.state in ('solving',):
+            return TriggerResponse(success=False,
+                                   message='IK・軌道計画の計算中です')
+        self._reset('RESET サービス')
+        return TriggerResponse(success=True, message='IDLE')
+
     def _reset_view(self):
         """IK・軌道の結果表示を消して画面を初期位置に戻す (状態は変えない)。"""
         with self._lock:
             self._frozen_joint_positions = None
+            self._real_pose_ref = None
             self._current_result = None
             self._current_motion = None
             self._display_waypoints = None
@@ -1488,15 +1694,78 @@ class HandshakePipelineNode(object):
             self._display_n_approach = 0
             self._display_n_transition = 0
             self._handshake_total_time = None
+        self._publish_plan()
+        if self.viewer is None:
+            return
         self.play_checkbox.value = False
         self._set_waypoint_slider_range(0)
-        self.reset_button.visible = False
-        self.arm_button.visible = True
+        self._show_arm_button(True)
         with self._viewer_lock:
             for obstacle_link in self._current_obstacle_links:
                 self.viewer.delete(obstacle_link)
             self._current_obstacle_links = []
             self.viewer.redraw()
+
+    def _show_arm_button(self, show):
+        """画面の ARM ボタンを出す (RESET ボタンは隠す)。``show`` が False なら逆。"""
+        if self.viewer is None:
+            return
+        self.arm_button.visible = show
+        self.reset_button.visible = not show
+
+    def _publish_plan(self):
+        """表示ツール向けに今の計画 (無ければ ``attempt`` が None) を ``~plan`` に出す。
+
+        座標はすべて差し出し手が決まった時点の base_link 系。``real_pose_ref`` は
+        その時点の odom <- base_link (実機の姿勢を同じ系に置くため)。
+        """
+        with self._lock:
+            frozen = self._frozen_joint_positions
+            waypoints = self._display_waypoints
+            payload = dict(
+                attempt=(self._attempt_count if frozen is not None else None),
+                skeleton=(None if frozen is None
+                          else {k: list(v) for k, v in frozen.items()}),
+                palm=self._current_palm,
+                result=self._current_result,
+                motion=self._current_motion,
+                display_waypoints=waypoints,
+                n_prepend=self._display_n_prepend,
+                n_approach=self._display_n_approach,
+                n_transition=self._display_n_transition,
+                real_pose_ref=self._real_pose_ref,
+                torso_surface_offset=self.args.torso_surface_offset)
+            try:
+                text = to_json(payload)
+            except (TypeError, ValueError) as e:
+                print('[plan-topic] 計画を JSON にできませんでした: {!r}'.format(e))
+                return
+        self.plan_pub.publish(String(data=text))
+
+    def _publish_status(self, force=False):
+        """表示ツール向けに今の状態を ``~status`` に出す (変化したときと 1 秒ごと)。"""
+        now = time.time()
+        with self._lock:
+            (title, detail), started = self._activity
+            background = self._background_activity
+            selection = self._latest_offer_selection
+            total_time = self._handshake_total_time
+        status = dict(
+            state=self.state, stage=title, detail=detail,
+            background=background, attempt=self._attempt_count,
+            retry=self._retry_reference is not None,
+            offer_scores=(epp.format_offer_scores(
+                selection, self.offered_hand_selector.score_min)
+                if self.state == 'armed' and selection is not None else None),
+            plan_time=total_time)
+        if (not force and status == self._last_status
+                and now - self._last_status_time < 1.0):
+            return
+        self._last_status = status
+        self._last_status_time = now
+        # 経過時間はノードの時計で測って入れる (表示側と時計がずれていてもよい)。
+        self.status_pub.publish(String(data=to_json(
+            dict(status, elapsed=now - started))))
 
     def _offer_changed(self, palms, stamp):
         """失敗した計画の掌 (反対の手は最初に見えた掌) を基準に、どちらかの手が
@@ -1574,6 +1843,7 @@ class HandshakePipelineNode(object):
             if not self._offer_changed(palms, stamp):
                 return
             self._retry_reference = None
+            self._set_armed_activity()
         offered_hand = palms['offered_hand']
         if offered_hand is None:
             return
@@ -1588,11 +1858,13 @@ class HandshakePipelineNode(object):
                 self._nod_done.clear()
         if self.ri is not None:
             threading.Thread(target=self._nod_head, daemon=True).start()
+        # 以降は骨格・計画とも今の base_link 系なので、実機の姿勢もここを原点に出す。
+        real_pose_ref = self._lookup_odom_from_base(rospy.Time.from_sec(stamp))
         with self._lock:
             self._frozen_joint_positions = joint_positions
+            self._real_pose_ref = real_pose_ref
         self.state = 'solving'
-        self.arm_button.visible = False
-        self.reset_button.visible = True
+        self._show_arm_button(False)
         outcome = None
         try:
             outcome = self._solve_handshake(joint_positions, palms,
@@ -1605,7 +1877,9 @@ class HandshakePipelineNode(object):
         if outcome == 'execute':
             threading.Thread(
                 target=self._execute_on_robot, daemon=True).start()
-        elif outcome == 'failed':
+        elif outcome != 'failed':
+            self._set_activity(STAGE_RESULT)
+        if outcome == 'failed':
             self._reset_view()
             self._arm('失敗', move_to_initial_pose=False,
                       wait_offer_change=True)
@@ -1729,6 +2003,7 @@ class HandshakePipelineNode(object):
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
             self._display_n_transition = n_transition
+        self._publish_plan()
         has_post_process = result.get('post_process') is not None
         executable = (
             args.auto_execute and self.ri is not None and result['solved']
@@ -1839,6 +2114,7 @@ class HandshakePipelineNode(object):
         def run():
             with self._refine_lock:
                 t0 = time.time()
+                self._set_background_activity(BACKGROUND_TRANSITION_REFINE)
                 try:
                     transition = self.planner.refine_transition(job)
                 except Exception as e:  # noqa: BLE001 (確保済みの解で動ける)
@@ -1846,6 +2122,8 @@ class HandshakePipelineNode(object):
                           ' ({}: {})。確保済みの横並び移動を使います。'.format(
                               job['attempt'], type(e).__name__, e))
                     return
+                finally:
+                    self._set_background_activity(None)
             with self._lock:
                 motion['transition_refined'] = transition
             # 計画の直後に保存した JSON に、裏の計画も書き足す。
@@ -1906,7 +2184,12 @@ class HandshakePipelineNode(object):
 
     def _resave_motion(self, motion):
         """``_save_attempt`` で保存した ``motion`` の JSON を、今の内容で
-        書き直す (保存していなければ何もしない)。失敗しても試行は続ける。"""
+        書き直す (保存していなければ何もしない)。失敗しても試行は続ける。
+        表示ツール向けの ``~plan`` も出し直す。"""
+        with self._lock:
+            current = motion is self._current_motion
+        if current:
+            self._publish_plan()
         path = self._motion_paths.get(id(motion))
         if path is None:
             return
@@ -1968,13 +2251,17 @@ class HandshakePipelineNode(object):
 
     def _set_waypoint_slider_range(self, max_index):
         """スライダーの範囲を ``[0, max_index]`` にし、waypoint 0 を表示する。"""
+        if self.viewer is None:
+            return
         self.waypoint_slider.max = max_index
         self.waypoint_slider.value = 0
         self._apply_current_waypoint()
 
     def _apply_current_waypoint(self):
         """スライダーの現在値の姿勢 (軌道が無ければ IK 結果か初期位置) を
-        ``self.display_robot`` に反映する。"""
+        ``self.display_robot`` に反映する (実機の姿勢を表示中なら何もしない)。"""
+        if self.viewer is None or self._real_pose_active():
+            return
         with self._lock:
             result = self._current_result
             motion = self._current_motion
@@ -2000,6 +2287,36 @@ class HandshakePipelineNode(object):
             self.viewer.redraw()
         self._refresh_collision_pairs_text()
 
+    def _real_pose_active(self):
+        """画面のロボットを実機の姿勢 (/joint_states・odom) で出しているか。"""
+        checkbox = getattr(self, 'show_real_pose_checkbox', None)
+        with self._lock:
+            received = self._real_joint_angles is not None
+        return checkbox is not None and checkbox.value and received
+
+    def _update_real_pose(self):
+        """``self.display_robot`` を実機の関節角と台車位置にする。台車は差し出し手が
+        決まった時点の台車 (それまでは今の台車) を原点にした位置に置く。"""
+        if not self._real_pose_active():
+            return
+        with self._lock:
+            angles = dict(self._real_joint_angles)
+            ref = self._real_pose_ref
+        world_from_base = self._initial_base_coords.T()
+        if ref is not None:
+            odom_from_base = self._lookup_odom_from_base()
+            if odom_from_base is not None:
+                world_from_base = (world_from_base @ np.linalg.inv(ref)
+                                   @ odom_from_base)
+        with self._viewer_lock:
+            for joint in self.display_robot.joint_list:
+                if joint.name in angles:
+                    joint.joint_angle(angles[joint.name])
+            self.display_robot.base_link.newcoords(Coordinates(
+                pos=world_from_base[:3, 3], rot=world_from_base[:3, :3]))
+            sync_robot_collision_overlay(
+                self.robot_collision_overlay, self.display_robot)
+
     def _refresh_collision_pairs_text(self):
         """表示中の姿勢で指ありの事後検証をやり直し、表示用文字列を更新する
         (人体は画面の Cylinder を使う)。"""
@@ -2020,6 +2337,12 @@ class HandshakePipelineNode(object):
             self._move_to_initial_pose_body()
         finally:
             self._initial_pose_done.set()
+            if self.state == 'armed':
+                self._set_armed_activity()
+
+    def _set_armed_activity(self):
+        self._set_activity(STAGE_ARMED if self._retry_reference is None
+                           else STAGE_ARMED_RETRY)
 
     def _move_to_initial_pose_body(self):
         try:
@@ -2428,6 +2751,10 @@ class HandshakePipelineNode(object):
                 None if seen is None else self._seen_target_odom(seen))
         try:
             self._execute_on_robot_body()
+            self._set_activity(STAGE_DONE)
+        except Exception:
+            self._set_activity(STAGE_ERROR)
+            raise
         finally:
             self._head_person_ref = None
             # 握った場合は試行終了時 (失敗時も) に開く。
@@ -2514,6 +2841,7 @@ class HandshakePipelineNode(object):
                   'ません。')
             return
 
+        self._set_activity(STAGE_NOD_WAIT)
         if not self._nod_done.wait(timeout=10.0):
             print('[execute] うなずきが 10 秒以内に終わらなかったため、'
                   '待たずに実行します。')
@@ -2558,6 +2886,13 @@ class HandshakePipelineNode(object):
 
         def on_approach_sent():
             self._set_face_tracking(True)
+            # 状態パネルを螺旋の開始で切り替える。
+            timer = threading.Timer(
+                float(sum(self._segment_time_list[:n_prepend + 1])),
+                self._set_activity, args=(STAGE_SPIRAL,))
+            timer.daemon = True
+            follow_timers.append(timer)
+            timer.start()
             if follow_target is None:
                 return
             delay = float(sum(self._segment_time_list[:n_prepend + 1]))
@@ -2583,6 +2918,7 @@ class HandshakePipelineNode(object):
 
         self._tail_correction = None
         tail_stop = threading.Event()
+        self._set_activity(STAGE_LEAD_IN)
         start_odom_coords, final_traj_point = self._execute_waypoint_segment(
             display_waypoints[:reach_boundary], joint_names,
             on_sent=on_approach_sent)
@@ -2613,6 +2949,7 @@ class HandshakePipelineNode(object):
         if self.args.base_correction != 'none':
             # 終盤のずらし後に残ったスリップを直す (目標は掌を計画どおり見る位置
             # なので終盤のずらしは戻さない)。
+            self._set_activity(STAGE_BASE_CORRECTION)
             self._correct_base_residual(
                 start_odom_coords, final_traj_point, ref_scan=ref_scan,
                 exclude_centers=exclude_centers, palm_anchor=palm_anchor)
@@ -2625,6 +2962,7 @@ class HandshakePipelineNode(object):
                           math.degrees(drift[1])))
 
         robot_arm = result['robot_arm']
+        self._set_activity(STAGE_HOVER_SETTLE)
         self._wait_joint_settle(
             'hover', display_waypoints[reach_boundary - 1], joint_names,
             robot_arm)
@@ -2635,6 +2973,7 @@ class HandshakePipelineNode(object):
         if reach_boundary < len(display_waypoints):
             press_waypoints = display_waypoints[reach_boundary - 1:]
             if self.args.press_in_refine:
+                self._set_activity(STAGE_PRESS_REFINE)
                 refined = self._refine_press_in(
                     press_waypoints[0], joint_names, result)
                 if refined is not None:
@@ -2643,12 +2982,14 @@ class HandshakePipelineNode(object):
                 press_waypoints = self._hold_neck(
                     press_waypoints, joint_names)
             self._set_hand_tracking(False)
+            self._set_activity(STAGE_PRESS_IN)
             self._execute_waypoint_segment(press_waypoints, joint_names)
             self._wait_joint_settle(
                 '押し込み終了', press_waypoints[-1], joint_names,
                 robot_arm)
 
         if reach_boundary < len(display_waypoints):
+            self._set_activity(STAGE_GRASP)
             self._set_hand_grasp(True)
         self._say(self.args.speech_done_text)
         press_end_time = time.time()
@@ -2664,6 +3005,7 @@ class HandshakePipelineNode(object):
                 press_waypoints[-1], joint_names, result, duration)
 
         if do_transition:
+            self._set_activity(STAGE_TRANSITION_WAIT)
             wait = press_end_time + self.args.side_by_side_delay - time.time()
             if wait > 0:
                 rospy.sleep(wait)
@@ -2694,6 +3036,7 @@ class HandshakePipelineNode(object):
                 + delta])
             for wp in waypoints]
         self._say(self.args.speech_transition_text)
+        self._set_activity(STAGE_TRANSITION)
         print('[execute] 手を下ろしながら横並びの位置へ移動します '
               '(waypoint {} 個)。'.format(len(waypoints)))
         self._execute_waypoint_segment(
@@ -3538,29 +3881,16 @@ class HandshakePipelineNode(object):
         最終 waypoint の先頭基準 ``[dx, dy, dyaw]``、台車移動なしなら None)。
         """
         arm_angle_vectors = []
-        # 先頭 waypoint からの累積移動量 (move_trajectory_sequence は各要素を
-        # 開始時の odom から独立に適用する)。
-        base_trajectory_points = []
-        first_base = None  # (x, y, yaw) この区間の先頭 waypoint の台車位置姿勢 (world 系)
         for wp in waypoints:
             name_to_angle = dict(zip(joint_names, wp['joint_angle_vector']))
             for joint in self.real_robot.joint_list:
                 if joint.name in name_to_angle:
                     joint.joint_angle(name_to_angle[joint.name])
             arm_angle_vectors.append(self.real_robot.angle_vector())
-
-            bx, by, byaw = (wp['base_position'][0], wp['base_position'][1],
-                           wp['base_yaw'])
-            if first_base is None:
-                first_base = (bx, by, byaw)
-            x0, y0, yaw0 = first_base
-            dx_world = bx - x0
-            dy_world = by - y0
-            dyaw = byaw - yaw0
-            cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
-            dx = cos_yaw * dx_world + sin_yaw * dy_world
-            dy = -sin_yaw * dx_world + cos_yaw * dy_world
-            base_trajectory_points.append([dx, dy, dyaw])
+        # 先頭 waypoint からの累積移動量 (move_trajectory_sequence は各要素を
+        # 開始時の odom から独立に適用する)。
+        base_trajectory_points = execution_timing.base_trajectory_points(
+            waypoints)
 
         # それぞれ 1 ゴールで送る (非ブロッキング)。台車と腕に同じ time_list を渡して揃える。
         time_list = self._limited_time_list(
@@ -3686,121 +4016,23 @@ class HandshakePipelineNode(object):
         None/空なら判定から外す。コントローラが 3 次エルミートで補間するので、
         その最大値で判定する。
         """
-        axis_names = []
-        arm_deltas = None
-        base_deltas = None
+        arm_deltas = arm_max_vel = None
         if arm_angle_vectors:
             ri = self.ri
             controller_joint_names = {
                 name for param in ri.controller_param_table[ri.controller_type]
                 for name in param['joint_names']}
             # コントローラで動かさない関節は判定から外す (inf)。
-            arm_max_vel = np.array([
-                joint.max_joint_velocity * VEL_LIMIT_RATIO
-                if (joint.name in controller_joint_names
-                    and joint.max_joint_velocity > 0)
-                else np.inf
-                for joint in self.real_robot.joint_list])
+            arm_max_vel = execution_timing.joint_max_velocities(
+                self.real_robot.joint_list, controller_joint_names)
             avs = [ri.angle_vector()] + list(arm_angle_vectors)
             arm_deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
                                    for i in range(len(arm_angle_vectors))])
-            axis_names += [joint.name for joint in self.real_robot.joint_list]
-        if base_trajectory_points:
-            points = np.vstack([np.zeros(3),
-                                np.asarray(base_trajectory_points, dtype=np.float64)])
-            base_deltas = np.diff(points, axis=0)
-            axis_names += ['base_xy', 'base_yaw']
-        if not axis_names:
-            return [float(t) for t in time_list]
+        return execution_timing.limited_time_list(
+            arm_deltas, arm_max_vel, base_trajectory_points, time_list,
+            log=log_debug)
 
-        def peak_ratios(times):
-            # 区間・軸ごとの 速度/上限 と sqrt(加速度/上限)。
-            vel_ratios = []
-            acc_ratios = []
-            if arm_deltas is not None:
-                point_vel = self._point_velocities(arm_deltas, times)
-                vel, acc = self._hermite_peaks(arm_deltas, times, point_vel)
-                vel_ratios.append(vel / arm_max_vel)
-                acc_ratios.append(acc / (arm_max_vel / ACCEL_TIME))
-            if base_deltas is not None:
-                point_vel = self._point_velocities(base_deltas, times)
-                # 並進は向きによらず超えないようベクトルの大きさで判定する。
-                vel_xy, acc_xy = self._hermite_peaks(
-                    base_deltas[:, :2], times, point_vel[:, :2], norm=True)
-                vel_yaw, acc_yaw = self._hermite_peaks(
-                    base_deltas[:, 2:], times, point_vel[:, 2:])
-                vel_limit = np.array([BASE_MAX_VEL, BASE_MAX_ANGVEL]) \
-                    * VEL_LIMIT_RATIO
-                vel_ratios.append(
-                    np.stack([vel_xy, vel_yaw[:, 0]], axis=1) / vel_limit)
-                acc_ratios.append(
-                    np.stack([acc_xy, acc_yaw[:, 0]], axis=1)
-                    / (vel_limit / ACCEL_TIME))
-            return np.concatenate(
-                vel_ratios + [np.sqrt(r) for r in acc_ratios], axis=1)
-
-        min_times = np.array(time_list, dtype=np.float64)
-        times = min_times.copy()
-        for _ in range(TIME_LIMIT_MAX_ITERATIONS):
-            # ratio 倍そのままだと振動するので平方根で半分だけ動かす。
-            ratio = np.max(peak_ratios(times), axis=1)
-            new_times = np.maximum(min_times, times * np.sqrt(ratio))
-            if np.allclose(new_times, times, rtol=1e-4, atol=0.0):
-                times = new_times
-                break
-            times = new_times
-        # 残った超過は全区間を一律に延ばして必ず上限内にする。
-        worst = float(np.max(peak_ratios(times)))
-        if worst > 1.0:
-            if worst > 1.01:
-                log_debug('[debug][segment] 速度上限の反復で収まらなかったため '
-                      '全区間を {:.3f} 倍に延ばします。'.format(worst))
-            times *= worst
-        return [float(t) for t in times]
-
-    @staticmethod
-    def _point_velocities(deltas, times):
-        """各点の速度 ``(区間数 + 1, 軸数)``。skrobot の
-        ``angle_vector_sequence`` と同じ規則 (途中は前後区間の平均速度の
-        平均、符号が逆の軸と始点・終点は 0)。"""
-        n_segments = len(times)
-        seg_vel = deltas / times[:, None]
-        point_vel = np.zeros((n_segments + 1, deltas.shape[1]))
-        if n_segments > 1:
-            same_sign = deltas[:-1] * deltas[1:] >= 0.0
-            point_vel[1:n_segments] = np.where(
-                same_sign, 0.5 * (seg_vel[:-1] + seg_vel[1:]), 0.0)
-        return point_vel
-
-    @staticmethod
-    def _hermite_peaks(deltas, times, point_vel, norm=False, n_samples=101):
-        """各区間を点の速度 ``point_vel`` の 3 次エルミート補間で動かした
-        ときの速度と加速度の最大値 (絶対値) を返す。形状は ``deltas`` と
-        同じ、``norm=True`` ならベクトルの大きさで ``(区間数,)``
-        (このときの速度は ``n_samples`` 点で評価する)。"""
-        seg_times = times[:, None]
-        v0 = point_vel[:-1]
-        v1 = point_vel[1:]
-        a = (v0 + v1) / seg_times ** 2 - 2.0 * deltas / seg_times ** 3
-        b = 3.0 * deltas / seg_times ** 2 - (2.0 * v0 + v1) / seg_times
-        acc0 = 2.0 * b
-        acc1 = 6.0 * a * seg_times + 2.0 * b
-        if norm:
-            # t: (区間数, n_samples, 1)、速度: (区間数, n_samples, 軸数)
-            t = (np.linspace(0.0, 1.0, n_samples)[None, :]
-                 * seg_times)[:, :, None]
-            vel = (3.0 * a[:, None] * t ** 2 + 2.0 * b[:, None] * t
-                   + v0[:, None])
-            return (np.max(np.linalg.norm(vel, axis=2), axis=1),
-                    np.maximum(np.linalg.norm(acc0, axis=1),
-                               np.linalg.norm(acc1, axis=1)))
-        peak = np.maximum(np.abs(v0), np.abs(v1))
-        with np.errstate(divide='ignore', invalid='ignore'):
-            t_star = -b / (3.0 * a)
-            v_star = v0 - b ** 2 / (3.0 * a)
-        inside = (a != 0.0) & (t_star > 0.0) & (t_star < seg_times)
-        return (np.where(inside, np.maximum(peak, np.abs(v_star)), peak),
-                np.maximum(np.abs(acc0), np.abs(acc1)))
+    _point_velocities = staticmethod(execution_timing.point_velocities)
 
     def _wait_odom_settle(self, timeout=ODOM_SETTLE_TIMEOUT):
         """odom が止まるまで最大 ``timeout`` 秒待つ。
@@ -4001,6 +4233,8 @@ class HandshakePipelineNode(object):
     def _update_skeleton_view(self, joint_positions):
         """骨格の線と人体の干渉回避ジオメトリ (IK と同じ Cylinder) を作り直す
         (``joint_positions`` が None なら消す)。"""
+        if self.viewer is None:
+            return
         with self._viewer_lock:
             for link in self._skeleton_links:
                 self.viewer.delete(link)
@@ -4109,8 +4343,9 @@ class HandshakePipelineNode(object):
 
     def spin(self):
         """viser 画面の骨格・状態表示を更新するメインループ。"""
-        print('viser のブラウザ画面で骨格の確認と ARM ボタンの操作を '
-              '行ってください (URL は起動時に表示されます)。')
+        if self.viewer is not None:
+            print('viser のブラウザ画面で骨格の確認と ARM ボタンの操作を '
+                  '行ってください (URL は起動時に表示されます)。')
 
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
@@ -4143,15 +4378,21 @@ class HandshakePipelineNode(object):
                 self._update_skeleton_view(display_joint_positions)
                 self._displayed_joint_positions = display_joint_positions
                 self._last_skeleton_redraw_time = now
-            self._update_status_text(joint_positions, is_base_frame, is_frozen)
-            with self._viewer_lock:
-                self.viewer.redraw()
+            self._publish_status()
+            if self.viewer is not None:
+                self._update_status_text(
+                    joint_positions, is_base_frame, is_frozen)
+                self._update_activity_panel()
+                self._update_real_pose()
+                with self._viewer_lock:
+                    self.viewer.redraw()
             try:
                 rate.sleep()
             except rospy.exceptions.ROSTimeMovedBackwardsException:
                 pass
         self.pose_estimator.close()
-        self.viewer.close()
+        if self.viewer is not None:
+            self.viewer.close()
 
 
 def build_arg_parser():
@@ -4163,6 +4404,18 @@ def build_arg_parser():
                         default='/camera/depth/image_raw/decompressed')
     parser.add_argument('--camera-info-topic', type=str,
                         default='/camera/color/camera_info')
+    parser.add_argument(
+        '--no-viewer', action='store_true',
+        help='このノードの画面 (viser) を作らない。表示は '
+             'scripts/handshake_viewer.py --ros で行う (ARM/RESET もそちらのボタン)。')
+    parser.add_argument(
+        '--viewer-camera-fps', type=float, default=5.0,
+        help='viser の状態パネルに出すカメラ画像 (--color-topic に骨格を重ねた'
+             'もの) の更新頻度 [Hz]。0 で画像を出さない。')
+    parser.add_argument(
+        '--joint-states-topic', type=str, default='/joint_states',
+        help='画面のロボットを実機の姿勢で表示するときの関節角のトピック '
+             '(台車の位置は odom の TF)。')
     parser.add_argument('--base-frame', type=str, default='base_link')
     parser.add_argument(
         '--camera-optical-frame', type=str,

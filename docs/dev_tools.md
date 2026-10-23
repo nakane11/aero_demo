@@ -18,6 +18,7 @@ aero_demo/
                     plan_handshake_motion.py/side_by_side_transition.py/
                     view_handshake_poses.py/
                     view_handshake_motion.py/handshake_viewer_common.py/
+                    handshake_viewer.py (表示ツール)/
                     collision_pairs.json、ROS ノードは scripts/ros/ 以下)
     tools/         開発・デバッグ用 (このページの対象)
     tools/ros/     開発・デバッグ用のうち ROS (rospy 等) に依存するもの
@@ -383,6 +384,8 @@ python3 scripts/ros/run_camera_pipeline_test.py \
   接続まで無期限に待つため、無人テストでは必須)。表示自体を見たいときは外して、普段どおり
   viser の URL をブラウザで開けばよい。
 - `--no-robot-interface`: 実機 (`AeroROSRobotInterface`) に接続しない。
+- `--no-viewer`: このノードの viser 画面を作らない。表示は下の
+  [表示ツール](#表示ツール-scriptshandshake_viewerpy) で行う (ARM/RESET もそのボタンから)。
 - `--force-optimize` (既定 False): 候補が検証に通っていても必ず jaxls の軌道最適化まで
   実行させる (`plan_handshake_motion.py` の同名オプションと同じ、計算時間の計測用。
   [`jax_compilation_cache.md`](jax_compilation_cache.md) 11 節)。通常運用では付けない。
@@ -391,10 +394,76 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 このテストに実ロボットは不要 (`--bag` のクリップに `tf`/`tf_static` も含めている
 ため、実ロボットの TF 配信も不要)。
 
+### 表示ツール (`scripts/handshake_viewer.py`)
+
+握手の計画と実行を viser で表示する。表示は 2 つある。
+
+- **シミュレーション**: 計画した軌道 (lead-in・接近・押し込み・横並び移動) を、実機と同じ
+  速度上限・同じ補間 (`execution_timing`) で時間どおりに動かす。時刻スライダー・Play・
+  再生の速さで操作する。実機で長さの決まらない状態 (うなずき、hover での補正、手を握る・
+  横並び移動の開始待ち) は `handshake_stages.SIMULATED_DURATIONS` の固定値で近似する。
+  **ROS は不要** (`source` しなくてよい)。計画の経路は、今通っている区間だけ台車を緑・
+  手先を赤で太く、ほかを灰で細く描く。
+- **実機**: `/joint_states` と odom の TF で実機の姿勢、実機ノードの `~status` で状態、
+  `~skeleton_image` でカメラ画像 (骨格を重ねたもの、幅は「画像の幅」で変える) を出す。
+  台車は差し出し手が決まった時点の台車を原点に置くので、計画と同じ座標で重なる。計画の
+  経路は灰で細く描き、実機が実際に通った台車 (緑)・手先 (赤) の軌跡を重ねる (hover 以降は
+  押し込み直前の補正や裏の計画で計画からずれる)。`--ros` のときだけ使え、画面の「表示」で
+  シミュレーションと切り替える。
+
+画面左上の状態パネルには、ロボットの状態 (`handshake_stages.STATE_GROUPS`: 1 待機中・
+2 掌検出中・3 計算中・4 接近中・5 hover で補正中・6 押し込み中・7 手を握って待機中・
+8 横並び移動中・9 終了・10 エラー) を縦に並べ、今の状態だけ大きく出す。今の細かい処理
+(「3. 計算中: 接近軌道の計画」など) と、計算の順の結果・計算時間 (横並び移動は最初の解を
+採ったかも) は右のパネルに出す。目印の球は接近開始・hover・押し込み・横並びの台車の位置で、
+次の目標だけ大きくラベルを付ける。
+
+```bash
+# 合成骨格 (run_pipeline_test.py の作業ディレクトリ)・保存した試行 (ROS 不要)
+python3 scripts/handshake_viewer.py --work-dir /tmp/aero_demo_pipeline_xxxx
+python3 scripts/handshake_viewer.py --work-dir data/real/2026-10-21/trial3_side_by_side
+
+# 実機・rosbag (実機ノードと同じ ROS マスター)
+python3 scripts/ros/run_camera_pipeline_test.py --no-viewer ...
+python3 scripts/handshake_viewer.py --ros
+```
+
+実機ノードは表示ツール向けに次を出す (JSON 文字列は `std_msgs/String`)。
+
+| 名前 | 内容 |
+|---|---|
+| `~status` | 状態・段階 (見出し・補足)・経過秒・裏の計算・差し出しスコア。段階が変わったときと 1 秒ごと |
+| `~plan` (latched) | 固定した骨格・掌・IK 結果・軌道・表示用 waypoint (lead-in 込み)・その時点の odom <- base_link。RESET で `attempt` が null |
+| `~skeleton` | 計画前のライブの骨格 (base_link 系、最大 10 Hz) |
+| `~skeleton_image` | 骨格を重ねた画像 (購読者がいるときだけ) |
+| `~arm`・`~reset` (`std_srvs/Trigger`) | 画面の ARM/RESET と同じ |
+
+実機表示では、計画を受け取ってからの実機の姿勢・状態・カメラ画像 (縮小) を ROS の
+時刻で記録し、「記録の時刻」スライダー・「Play (記録)」で何度でも再生できる (「ライブ
+表示」で戻る。Play が記録の終わりに追いつくとライブ表示に戻る)。次の試行の計画が届くと
+記録し直す。
+
+`~status` を記録していない bag (2026-10-23 より前) では、実機ノードを実機なしで動かすと
+状態が計算の後で止まる。`--log <bag と一緒に保存した person_NN.log>` を付けると、ログの
+出来事 (`[execute] 実機で waypoint を…` など、`src/aero_demo/node_log_stages.py`) から
+当時の状態の切り替わりを復元して出す。ログの時刻 (時:分:秒) は bag の時刻の日付と
+この PC の地方時で読む (違う時差の PC で書いたログは `--log-utc-offset`)。ログに出ない
+切り替わり (関節の到着待ちの始まりなど) は前の状態のまま。今後の bag は `~status`・
+`~plan` も記録しておけば `--log` は要らない。
+
+```bash
+python3 scripts/handshake_viewer.py --ros \
+    --log data/real/2026-10-21/trial3_side_by_side/person_02.log
+```
+
+既知の制限: 計算中はノードの画像の処理が止まるのでカメラ画像も止まる。指は `/joint_states`
+とモデルで関節名の体系が違うため実機表示では動かない。
+
 ### `--auto-execute`: 実機での実行速度とログ
 
 `--auto-execute` で実機を動かすとき、waypoint 間の所要時間は固定の刻み幅ではなく、
-区間ごとに `run_camera_pipeline_test.py` 冒頭の定数から決める (`_limited_time_list`)。
+区間ごとに `src/aero_demo/execution_timing.py` の定数から決める (`limited_time_list`。
+表示ツールのシミュレーション表示も同じ計算で動かす)。
 軌道計画の `dt` (`plan_handshake_motion.DEFAULT_DT`) は最適化のコスト正規化に使うだけで、
 実行速度には関係しない。
 

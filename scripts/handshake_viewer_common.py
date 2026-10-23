@@ -202,6 +202,21 @@ def apply_waypoint_pose(robot, joint_names, waypoints, index):
         pos=wp['base_position'], rot=rpy_matrix(wp['base_yaw'], 0.0, 0.0)))
 
 
+def apply_pose(robot, joint_names, angles, base):
+    """関節角 ``angles`` (``joint_names`` の順) と台車 ``base`` (x, y, yaw) を
+    ``robot`` に反映する (指は初期姿勢)。補間で可動域をわずかに超えた角度は
+    端に収める (超えると skrobot が毎回警告を出すため)。"""
+    robot.reset_pose()
+    name_to_angle = dict(zip(joint_names, angles))
+    for joint in robot.joint_list:
+        if joint.name in name_to_angle:
+            joint.joint_angle(float(np.clip(name_to_angle[joint.name],
+                                            joint.min_angle,
+                                            joint.max_angle)))
+    robot.base_link.newcoords(Coordinates(
+        pos=[base[0], base[1], 0.0], rot=rpy_matrix(base[2], 0.0, 0.0)))
+
+
 def build_display_waypoints(motion, result):
     """接近経路の後ろに押し込み・横並び移動の waypoint を足す。
 
