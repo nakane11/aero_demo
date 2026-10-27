@@ -95,9 +95,10 @@ LOWERED_NATURAL_MAX_OUTWARD = 0.3
 LOWERED_NATURAL_MAX_VERTICAL = 0.5
 
 # 掌の向きは LOWERED_FACING_ORDER の順に試す (``plan_transition`` の
-# ``facing_variants``)。前腕のひねりがこの角度 [度] を超える向きは試さない
-# (握手の姿勢から前腕をひねれる範囲は約 ±80〜90 度)。
-LOWERED_TWIST_MAX_DEG = 80.0
+# ``facing_variants``)。押し込み時からの前腕のひねりがこの角度 [度] を超える
+# 向きは試さない。None なら見ない (既定。前腕のひねりは HUMAN_ARM_LIMITS_DEG の
+# 絶対的な回内・回外 (LUBA) で判定する。2026-10-27 まで 80 度)。
+LOWERED_TWIST_MAX_DEG = None
 
 # 腕を下ろしきったときに押し込み時の手首の曲げを戻す割合 (0: 戻さず
 # 剛体、1: 指先が前腕の向き)。下ろす間に線形に戻す。
@@ -268,9 +269,40 @@ PLANNED_JOINT_STEP = math.radians(20.0)
 MIN_FRACTION = 0.3
 
 # 人の腕の目安 (表示・ログ用、超えても止めない。reach <= 1 だけ止める)。
-HUMAN_ELBOW_FLEX_MAX_DEG = 145.0
-HUMAN_WRIST_BEND_MAX_DEG = 70.0
-HUMAN_TWIST_CHANGE_MAX_DEG = 90.0
+# 肘は LUBA の最後の段階の始まり。手首の曲げ (合成) と押し込み時からの
+# ひねりは LUBA に対応する値が無いので印を付けない (None)。
+HUMAN_ELBOW_FLEX_MAX_DEG = 120.0
+HUMAN_WRIST_BEND_MAX_DEG = None
+HUMAN_TWIST_CHANGE_MAX_DEG = None
+
+# --- LUBA (Kee & Karwowski 2001) の立位の不快度スコア --------------------------
+# 人の腕・手首の制約 (上限) はこの表だけから決める
+# (docs/human_joint_angle_references.md)。成分ごとに (正の側, 負の側) の段階
+# ((段階の終わりの角度 [度], スコア), ...)。正負は ``human_arm_joint_angles``・
+# ``human_wrist_angles`` と同じ。None は段階が無い側 (正の側の表で数える)。
+_INF = float('inf')
+LUBA_STANDING_SCORES = collections.OrderedDict([
+    ('shoulder_flexion', (((45, 1), (90, 3), (150, 6), (_INF, 11)),   # 屈曲
+                          ((20, 1), (45, 3), (60, 6), (_INF, 10)))),  # 伸展
+    ('shoulder_abduction', (((30, 1), (90, 3), (_INF, 7)),            # 外転
+                            ((10, 1), (30, 2), (_INF, 8)))),          # 内転
+    ('shoulder_rotation', (((10, 1), (30, 2), (_INF, 5)),             # 外旋
+                           ((30, 1), (90, 2), (_INF, 5)))),           # 内旋
+    ('elbow_flexion', (((45, 1), (120, 3), (_INF, 5)), None)),
+    ('pronation', (((70, 2), (_INF, 7)),                              # 回内
+                   ((90, 2), (_INF, 7)))),                            # 回外
+    ('wrist_flexion', (((20, 1), (60, 2), (_INF, 5)),                 # 掌屈
+                       ((20, 1), (45, 2), (_INF, 7)))),               # 背屈
+    ('wrist_deviation', (((10, 1), (30, 3), (_INF, 7)),               # 撓屈
+                         ((10, 1), (20, 3), (_INF, 6)))),             # 尺屈
+])
+
+
+def luba_limit(key, positive):
+    """成分 ``key`` の ``positive`` (正/負) の側の上限 [度]: LUBA の最後の
+    段階 (可動域の端を含む段階) の始まり。段階が無い側は None。"""
+    stages = LUBA_STANDING_SCORES[key][0 if positive else 1]
+    return None if stages is None else float(stages[-2][0])
 
 # --- 人の手首 (人の手をロボットの手に固定したモデル) -----------------------
 # 人の手はロボットの手について回るとみなし、人の手の向きをロボットの手先の
@@ -282,15 +314,49 @@ HUMAN_TWIST_CHANGE_MAX_DEG = 90.0
 # HUMAN_TURN_CAP_DEG を超えるものを同じく扱う (簡易版)。'off' は見ない。
 HUMAN_WRIST_CHECKS = ('hand_fixed', 'turn_cap', 'off')
 HUMAN_WRIST_CHECK = 'hand_fixed'
-HUMAN_WRIST_RADIAL_MAX_DEG = 20.0
-HUMAN_WRIST_ULNAR_MAX_DEG = 30.0
-HUMAN_WRIST_FLEX_MAX_DEG = 60.0
+# 手首の目安も LUBA の最後の段階の始まり (撓屈 30・尺屈 20・掌屈 60・背屈 45)。
+HUMAN_WRIST_RADIAL_MAX_DEG = luba_limit('wrist_deviation', True)
+HUMAN_WRIST_ULNAR_MAX_DEG = luba_limit('wrist_deviation', False)
+HUMAN_WRIST_FLEX_MAX_DEG = luba_limit('wrist_flexion', True)
 HUMAN_WRIST_TWIST_MAX_DEG = LOWERED_TWIST_MAX_DEG
 HUMAN_TURN_CAP_DEG = 20.0
 # 押し込み時にすでにこれ以上曲がっている成分は、押し込み時の値 + この余裕
 # [度] までを許す (骨格・掌の推定の手首の曲げは誤差が大きく、押し込み直後で
 # 止まらないように)。
 HUMAN_WRIST_PRESS_SLACK_DEG = 5.0
+# 背屈の目安 [度] (None なら掌屈と同じ HUMAN_WRIST_FLEX_MAX_DEG)。
+HUMAN_WRIST_EXT_MAX_DEG = luba_limit('wrist_flexion', False)
+
+# --- 人の肩・肘・前腕 (腕を下ろす動き HumanArm.lowering) --------------------
+# 肩の屈曲 (前へ上げる)・伸展 (後ろへ引く)・外転・内転・外旋・内旋、肘の屈曲、
+# 前腕の回内・回外 (``human_arm_joint_angles``)。人の肩・肘・掌の向きは下ろし方
+# (``HumanArm.lowering_pose``) だけで決まり、ロボットの姿勢に依らない (ロボット
+# の握りの向きは掌の法線まわりなので前腕のひねりも変えない) ので、
+# HUMAN_ARM_CHECK が 'on' なら、腕を下ろす途中 (HUMAN_ARM_CHECK_SAMPLES 点) で
+# 目安を超える下ろし方をバッチ IK の前に外す。押し込み時にすでに超えている
+# 成分は、手首と同じく押し込み時の値 + HUMAN_ARM_PRESS_SLACK_DEG までを、腕を
+# 下ろす割合 s に比例して減らしながら許す。目安は LUBA (Kee & Karwowski 2001)
+# で可動域の端を含む最後の段階の始まり (可動域のおよそ 3/4、不快度の増え方が
+# 一番大きい境目。docs/human_joint_angle_references.md)。
+HUMAN_ARM_CHECKS = ('on', 'off')
+HUMAN_ARM_CHECK = 'on'
+HUMAN_ARM_CHECK_SAMPLES = 10
+HUMAN_ARM_PRESS_SLACK_DEG = 5.0
+# (成分, (負の側の目安, 正の側の目安))。None は見ない。肩 伸展 60 / 屈曲 150、
+# 内転 30 / 外転 90、内旋 90 / 外旋 30、肘 120、回外 90 / 回内 70。
+HUMAN_ARM_LIMITS_DEG = collections.OrderedDict(
+    (key, (luba_limit(key, False), luba_limit(key, True)))
+    for key in ('shoulder_flexion', 'shoulder_abduction', 'shoulder_rotation',
+                'elbow_flexion', 'pronation'))
+_HUMAN_ARM_LABELS = dict(
+    shoulder_flexion=('肩の屈曲', '肩の伸展'),
+    shoulder_abduction=('肩の外転', '肩の内転'),
+    shoulder_rotation=('肩の外旋', '肩の内旋'),
+    elbow_flexion=('肘の屈曲', '肘の伸展'),
+    pronation=('前腕の回内', '前腕の回外'))
+# 肘の曲げがこの角度 [度] 未満なら、上腕の回旋と前腕の回内・回外を見分け
+# られない (肩の回旋は None、回内・回外は上腕の回旋を含めた値) とする。
+HUMAN_ARM_ROTATION_MIN_ELBOW_DEG = 20.0
 
 # --- 人の前腕・手の甲を障害物にする ----------------------------------------
 # 移動先のバッチ IK と検証で、人の前腕と手の甲側 (``spik.forearm_obstacles``、
@@ -414,14 +480,19 @@ def wrist_limits(press_angles, s=1.0):
     def bounds(value, lower, upper):
         return (-lower - keep * max(0.0, -lower - (value - slack)),
                 upper + keep * max(0.0, value + slack - upper))
-    return dict(
-        flexion=bounds(press_angles['flexion_deg'], HUMAN_WRIST_FLEX_MAX_DEG,
+    extension = (HUMAN_WRIST_FLEX_MAX_DEG if HUMAN_WRIST_EXT_MAX_DEG is None
+                 else HUMAN_WRIST_EXT_MAX_DEG)
+    limits = dict(
+        flexion=bounds(press_angles['flexion_deg'], extension,
                        HUMAN_WRIST_FLEX_MAX_DEG),
         deviation=bounds(press_angles['deviation_deg'],
                          HUMAN_WRIST_ULNAR_MAX_DEG,
-                         HUMAN_WRIST_RADIAL_MAX_DEG),
-        twist=bounds(press_angles['twist_deg'], HUMAN_WRIST_TWIST_MAX_DEG,
-                     HUMAN_WRIST_TWIST_MAX_DEG))
+                         HUMAN_WRIST_RADIAL_MAX_DEG))
+    if HUMAN_WRIST_TWIST_MAX_DEG is not None:
+        limits['twist'] = bounds(press_angles['twist_deg'],
+                                 HUMAN_WRIST_TWIST_MAX_DEG,
+                                 HUMAN_WRIST_TWIST_MAX_DEG)
+    return limits
 
 
 def wrist_violation(angles, limits):
@@ -434,6 +505,114 @@ def wrist_violation(angles, limits):
         if value > hi or value < lo:
             return '人の手首の{} {:.0f} 度'.format(
                 labels[key][0 if value > 0 else 1], abs(value))
+    return None
+
+
+def _signed_angle(a, b, axis):
+    """``axis`` まわりに ``a`` から ``b`` へ回る角度 [度] (どちらも ``axis``
+    に垂直な成分で測る)。"""
+    axis = _unit(axis)
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = a - np.dot(a, axis) * axis
+    b = b - np.dot(b, axis) * axis
+    return math.degrees(math.atan2(float(np.dot(np.cross(a, b), axis)),
+                                   float(np.dot(a, b))))
+
+
+def human_arm_joint_angles(shoulder, elbow, wrist, normal, forward, outward):
+    """人の腕 (肩 ``shoulder``・肘 ``elbow``・手首 ``wrist``、掌の法線
+    ``normal``) の関節角度 [度] の dict。``forward``/``outward`` は人の正面と
+    差し出した腕の側の外向き (水平)。
+
+    - ``shoulder_flexion``: 上腕を前後の面に投影した真下からの角度 (前へ上げる
+      屈曲が正、後ろへ引く伸展が負)。上腕が前後の面からほぼ外れる (外転 78 度
+      超) ときは 0。
+    - ``shoulder_abduction``: 上腕の前後の面からの角度 (外へ開く外転が正、体の
+      前を内へ横切る内転が負)。
+    - ``shoulder_rotation``: 上腕の回旋 (外旋が正)。基準は、腕を真下に下ろし
+      肘を曲げた前腕が前を向く向きを、真下から上腕へ最短で回したもの。肘の
+      曲げが ``HUMAN_ARM_ROTATION_MIN_ELBOW_DEG`` 未満なら None。
+    - ``elbow_flexion``: 肘の曲げ (伸ばしきりが 0)。
+    - ``pronation``: 前腕の回内 (掌を下へ向ける側が正、回外が負)。基準は肘を
+      曲げて親指を上にした向き (掌が体の内側を向く)。肘の曲げが小さいときは、
+      上腕の回旋を含めた (上の肩の回旋の基準からの) 値。
+    """
+    shoulder, elbow, wrist = (np.asarray(v, dtype=np.float64)
+                              for v in (shoulder, elbow, wrist))
+    up = np.array([0.0, 0.0, 1.0])
+    f = _unit([forward[0], forward[1], 0.0])
+    o = np.asarray(outward, dtype=np.float64)
+    o = _unit(o - np.dot(o, f) * f - np.dot(o, up) * up)
+    ua = _unit(elbow - shoulder)
+    fa = _unit(wrist - elbow)
+    sagittal = math.hypot(float(np.dot(ua, f)), float(np.dot(ua, up)))
+    flexion = (math.degrees(math.atan2(float(np.dot(ua, f)),
+                                       -float(np.dot(ua, up))))
+               if sagittal > 0.2 else 0.0)
+    abduction = math.degrees(math.asin(float(np.clip(np.dot(ua, o),
+                                                     -1.0, 1.0))))
+    elbow_flex = _angle_between(ua, fa)
+    # 真下から上腕へ最短で回す回転で、腕を下ろしたときの基準を運ぶ。
+    carry = _rotation_between(_DOWN, ua)
+    neutral_fore = carry @ f
+    # 外旋 (前腕が外へ回る) の向き: 腕を下ろした基準で f から o へ回る向き。
+    ext_sign = 1.0 if float(np.dot(np.cross(f, o), _DOWN)) > 0.0 else -1.0
+    # 親指を上にした掌の法線は体の内側 (-o) を向く: 肘を曲げた腕の面の法線
+    # cross(前腕, 上腕) の内側向きの符号。
+    medial = 1.0 if float(np.dot(np.cross(f, _DOWN), -o)) > 0.0 else -1.0
+    normal = np.asarray(normal, dtype=np.float64)
+    rotation = None
+    if elbow_flex >= HUMAN_ARM_ROTATION_MIN_ELBOW_DEG:
+        rotation = ext_sign * _signed_angle(neutral_fore, fa, ua)
+        ref = medial * np.cross(fa, ua)
+    else:
+        # 上腕の回旋の基準のまま肘を伸ばした向きで、親指を上にした法線。
+        ref = _rotation_between(ua, fa) @ (medial * np.cross(neutral_fore,
+                                                             ua))
+    # 回内は、前腕の向きまわりに法線が親指を上にした向きから掌を下へ向ける
+    # 側へ回る角度 (右腕・前を向いた前腕では -x まわり)。
+    pronation = -medial * _signed_angle(ref, normal, fa)
+    return collections.OrderedDict([
+        ('shoulder_flexion', flexion), ('shoulder_abduction', abduction),
+        ('shoulder_rotation', rotation), ('elbow_flexion', elbow_flex),
+        ('pronation', pronation)])
+
+
+def arm_limits(press_angles, s=1.0):
+    """押し込み時の腕の関節角度 ``press_angles`` から、腕を下ろす動きの割合
+    ``s`` で許す範囲の dict (成分ごとの (下限, 上限) [度]、見ない側は
+    ``None``)。押し込み時にすでに目安を超えている側は、押し込み時の値 +
+    ``HUMAN_ARM_PRESS_SLACK_DEG`` までの超過を ``s`` に比例して減らしながら
+    許す (``wrist_limits`` と同じ)。"""
+    slack = HUMAN_ARM_PRESS_SLACK_DEG
+    keep = 1.0 - min(1.0, max(0.0, s))
+    limits = {}
+    for key, (negative, positive) in HUMAN_ARM_LIMITS_DEG.items():
+        value = press_angles.get(key)
+        lo = hi = None
+        if negative is not None:
+            lo = -negative
+            if value is not None:
+                lo -= keep * max(0.0, -negative - (value - slack))
+        if positive is not None:
+            hi = positive
+            if value is not None:
+                hi += keep * max(0.0, value + slack - positive)
+        limits[key] = (lo, hi)
+    return limits
+
+
+def arm_violation(angles, limits):
+    """腕の関節角度 ``angles`` が範囲 ``limits`` を超えていればその説明、
+    超えていなければ None。"""
+    for key, (lo, hi) in limits.items():
+        value = angles.get(key)
+        if value is None:
+            continue
+        if (hi is not None and value > hi) or (lo is not None and value < lo):
+            return '人の{} {:.0f} 度'.format(
+                _HUMAN_ARM_LABELS[key][0 if value > 0 else 1], abs(value))
     return None
 
 
@@ -492,6 +671,29 @@ class HumanArm(object):
         self.press_wrist = human_wrist_angles(
             press_elbow, self.wrist0, self.palm_rot0, hand,
             self.press_forearm, self.palm_rot0[:, 1])
+        self.press_joints = self.joint_angles(press_elbow, self.wrist0,
+                                              self.palm_rot0)
+
+    def joint_angles(self, elbow, wrist, palm_rot):
+        """肘 ``elbow``・手首 ``wrist``・掌 ``palm_rot`` の腕の関節角度
+        (``human_arm_joint_angles``)。"""
+        return human_arm_joint_angles(self.shoulder, elbow, wrist,
+                                      np.asarray(palm_rot)[:, 1],
+                                      self.forward, self.outward)
+
+    def lowering_problem(self, lowering, samples=None):
+        """下ろし方 ``lowering`` の途中 (``samples`` 点、既定
+        ``HUMAN_ARM_CHECK_SAMPLES``) で腕の関節角度が目安 (``arm_limits``) を
+        超えればその説明、超えなければ None。"""
+        samples = samples or HUMAN_ARM_CHECK_SAMPLES
+        for k in range(1, samples + 1):
+            s = k / float(samples)
+            elbow, wrist, _, rot = self.lowering_pose(lowering, s)
+            problem = arm_violation(self.joint_angles(elbow, wrist, rot),
+                                    arm_limits(self.press_joints, s))
+            if problem is not None:
+                return problem
+        return None
 
     def arm_fraction(self, s):
         """経路の割合 ``s`` のときの腕を下ろす動きの割合。"""
@@ -552,7 +754,8 @@ class HumanArm(object):
             elbow_flex_deg=180.0 - _angle_between(
                 self.shoulder - elbow, wrist - elbow),
             wrist_bend_deg=_angle_between(wrist - elbow, hand_vec),
-            twist_change_deg=twist)
+            twist_change_deg=twist,
+            joints=dict(self.joint_angles(elbow, wrist, palm_rot)))
 
     def skeleton(self, arm):
         """骨格の差し出した腕 (肘・手首・手の landmark) を ``arm``
@@ -1268,6 +1471,40 @@ def wrist_problem(human_arm, robot, arm, s, turn_deg):
 WRIST_TURN_MARGIN_DEG = 5.0
 
 
+def wrist_angles_for_turns(human_arm, arm, palm, turns):
+    """掌 ``palm`` に合わせたまま握りの向きを ``turns`` (配列 [度]) に
+    したときの、腕 ``arm`` の人の手首の角度の dict (``flexion``/
+    ``deviation``/``twist`` の配列 [度])。"""
+    turns = np.asarray(turns, dtype=np.float64)
+    # 握りの向きは掌の法線まわりの回転なので、法線と前腕のひねりは
+    # 変わらず、指先 (と指先 x 法線) が 2 つの向きの cos・sin の和になる。
+    rot0, rot90 = [hand_on_robot(
+        spik.palm_target_rot(palm, base, human_arm.robot_arm),
+        human_arm.press_turn, human_arm.robot_arm)
+        for base in (turns[0], turns[0] + 90.0)]
+    angles = human_arm.hand_wrist(arm, rot0)
+    d = np.radians(turns - turns[0])[:, None]
+    fingers = np.cos(d) * rot0[:, 0] + np.sin(d) * rot90[:, 0]
+    side = np.cos(d) * rot0[:, 2] + np.sin(d) * rot90[:, 2]
+    radial = side if human_arm.hand == 'R' else -side
+    a = _unit(np.asarray(arm['wrist'], dtype=np.float64)
+              - np.asarray(arm['elbow'], dtype=np.float64))
+    along = fingers @ a
+    return dict(
+        flexion=np.degrees(np.arctan2(-float(np.dot(a, rot0[:, 1])), along)),
+        deviation=np.degrees(np.arctan2(-(radial @ a), along)),
+        twist=np.full(len(turns), angles['twist_deg']))
+
+
+def _wrist_within(values, limits):
+    """``wrist_angles_for_turns`` の角度 ``values`` が範囲 ``limits`` に
+    収まるか (配列)。"""
+    good = np.ones(len(values['flexion']), dtype=bool)
+    for key, (lo, hi) in limits.items():
+        good &= (values[key] >= lo) & (values[key] <= hi)
+    return good
+
+
 def wrist_ok_turn(human_arm, arm, palm_pos, palm_rot, turn_deg, s=1.0):
     """掌 ``palm_pos``/``palm_rot`` に合わせたまま、人の手首が目安に収まる
     握りの向きのうち ``turn_deg`` に一番近いもの (収まる範囲の端から
@@ -1281,29 +1518,8 @@ def wrist_ok_turn(human_arm, arm, palm_pos, palm_rot, turn_deg, s=1.0):
         if HUMAN_WRIST_CHECK == 'turn_cap':
             change = (turns - human_arm.press_turn + 180.0) % 360.0 - 180.0
             return np.abs(change) <= HUMAN_TURN_CAP_DEG
-        # 握りの向きは掌の法線まわりの回転なので、法線と前腕のひねりは
-        # 変わらず、指先 (と指先 x 法線) が 2 つの向きの cos・sin の和になる。
-        rot0, rot90 = [hand_on_robot(
-            spik.palm_target_rot(palm, base, human_arm.robot_arm),
-            human_arm.press_turn, human_arm.robot_arm)
-            for base in (turns[0], turns[0] + 90.0)]
-        angles = human_arm.hand_wrist(arm, rot0)
-        d = np.radians(turns - turns[0])[:, None]
-        fingers = np.cos(d) * rot0[:, 0] + np.sin(d) * rot90[:, 0]
-        side = np.cos(d) * rot0[:, 2] + np.sin(d) * rot90[:, 2]
-        radial = side if human_arm.hand == 'R' else -side
-        a = _unit(np.asarray(arm['wrist'], dtype=np.float64)
-                  - np.asarray(arm['elbow'], dtype=np.float64))
-        along = fingers @ a
-        values = dict(
-            flexion=np.degrees(np.arctan2(-float(np.dot(a, rot0[:, 1])),
-                                          along)),
-            deviation=np.degrees(np.arctan2(-(radial @ a), along)),
-            twist=np.full(len(turns), angles['twist_deg']))
-        good = np.ones(len(turns), dtype=bool)
-        for key, (lo, hi) in limits.items():
-            good &= (values[key] >= lo) & (values[key] <= hi)
-        return good
+        return _wrist_within(wrist_angles_for_turns(human_arm, arm, palm,
+                                                    turns), limits)
 
     deltas = np.array(sorted(range(-180, 181), key=abs), dtype=np.float64)
     good = np.flatnonzero(ok(turn_deg + deltas))
@@ -2226,6 +2442,22 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                               for lw in lowerings],
             per_target=per_target)
 
+    arm_problems = {}
+
+    def arm_ok(lowering):
+        """下ろし方 ``lowering`` の途中で人の肩・肘・前腕が目安に収まるか
+        (``HUMAN_ARM_CHECK``)。収まらなければ理由を ``reasons`` に足す。"""
+        if HUMAN_ARM_CHECK == 'off':
+            return True
+        key = ('arm',) + lowering_key(lowering)[1:]
+        store = cache if cache is not None else arm_problems
+        if key not in store:
+            store[key] = human_arm.lowering_problem(lowering)
+        problem = store[key]
+        if problem is not None:
+            reasons.append('下ろし方で{}'.format(problem.split(' ')[0]))
+        return problem is None
+
     def wrist_feasible(lowering):
         """下ろした掌 ``lowering`` で、人の手首が目安に収まる握りの向きが
         あるか (``GOAL_PRECHECK_WRIST``)。無ければどの移動先も
@@ -2433,14 +2665,14 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         """組 ``arm_degs`` の掌の向きごとの下ろし方 (3 つとも同じ向き) の
         ``[(向きの順位, 下ろし方)]``。向きは ``order`` (既定は ``facings``、
         それも None なら ``LOWERED_FACING_ORDER``) の順で、
-        使えない向き・前腕のひねりが ``LOWERED_TWIST_MAX_DEG`` を超える向きは
+        使えない向き・前腕のひねりが ``LOWERED_TWIST_MAX_DEG`` (None でなければ) を超える向きは
         除く。``use_facing_variants`` が False なら前腕のひねりが一番少ない
         向き (上腕の角度ごとに違ってよい) の 1 つだけ。掌が押し込み時より
         ``LOWERED_MIN_DROP`` 下がらない下ろし方は、下がる下ろし方で置き換え
         (バッチ IK の目標の数を変えないため)、1 つも無ければその組を除く。"""
         def lowered_enough(lowerings):
             ok = [lw['palm'][0][2] <= press_palm_z - LOWERED_MIN_DROP
-                  for lw in lowerings]
+                  and arm_ok(lw) for lw in lowerings]
             if not any(ok):
                 return None
             low = lowerings[ok.index(True)]
@@ -2462,7 +2694,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             if any(lw is None for lw in lowerings):
                 continue
             twist = max(abs(math.degrees(lw['twist'])) for lw in lowerings)
-            if twist > LOWERED_TWIST_MAX_DEG:
+            if (LOWERED_TWIST_MAX_DEG is not None
+                    and twist > LOWERED_TWIST_MAX_DEG):
                 continue
             lowerings = lowered_enough(lowerings)
             if lowerings is None:
@@ -2572,6 +2805,15 @@ def human_arm_max(waypoints):
             radial_deg=max(0.0, max(w['deviation_deg'] for w in wrists)),
             ulnar_deg=max(0.0, -min(w['deviation_deg'] for w in wrists)),
             hand_twist_deg=max(abs(w['twist_deg']) for w in wrists))
+    joints = [a['joints'] for a in arms if 'joints' in a]
+    if joints:
+        # 肩・肘・前腕の関節角度の (最小, 最大) [度]。
+        ranges = {}
+        for key in HUMAN_ARM_LIMITS_DEG:
+            values = [j[key] for j in joints if j.get(key) is not None]
+            if values:
+                ranges[key] = [min(values), max(values)]
+        out['joints'] = ranges
     return out
 
 
@@ -3018,6 +3260,21 @@ def add_human_arm_arguments(parser):
                  HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG,
                  HUMAN_WRIST_FLEX_MAX_DEG))
     parser.add_argument(
+        '--transition-wrist-ext-limit', type=float, default=None,
+        help='hand_fixed の背屈の目安 [度] (既定 {})。'.format(
+            '掌屈と同じ' if HUMAN_WRIST_EXT_MAX_DEG is None
+            else '{:.0f}'.format(HUMAN_WRIST_EXT_MAX_DEG)))
+    parser.add_argument(
+        '--transition-twist-limit', type=float, default=None,
+        help='押し込み時からの前腕のひねりの目安 [度] (掌の向きの候補と '
+             'hand_fixed の両方、既定は見ない = 絶対的な回内・回外だけで'
+             '判定)。')
+    parser.add_argument(
+        '--transition-human-arm', choices=HUMAN_ARM_CHECKS,
+        default=HUMAN_ARM_CHECK,
+        help='横並び移動で、腕を下ろす途中の人の肩・肘・前腕が目安を超える'
+             '下ろし方を外すか (既定 {})。'.format(HUMAN_ARM_CHECK))
+    parser.add_argument(
         '--transition-lowering-batch', choices=LOWERED_ARM_BATCHES,
         default=LOWERED_ARM_BATCH,
         help='移動先のバッチ IK の目標の作り方 (既定 {})。'.format(
@@ -3043,6 +3300,14 @@ def apply_human_arm_arguments(args):
     global HUMAN_WRIST_RADIAL_MAX_DEG, HUMAN_WRIST_ULNAR_MAX_DEG
     global HUMAN_WRIST_FLEX_MAX_DEG, LOWERED_ARM_BATCH, GOAL_LATERAL_WEIGHT
     global MERGE_APPROACH, FOREARM_PRESS_ALLOWANCE
+    global HUMAN_WRIST_EXT_MAX_DEG, HUMAN_ARM_CHECK
+    global LOWERED_TWIST_MAX_DEG, HUMAN_WRIST_TWIST_MAX_DEG
+    if args.transition_twist_limit is not None:
+        LOWERED_TWIST_MAX_DEG = HUMAN_WRIST_TWIST_MAX_DEG = (
+            args.transition_twist_limit)
+    if args.transition_wrist_ext_limit is not None:
+        HUMAN_WRIST_EXT_MAX_DEG = args.transition_wrist_ext_limit
+    HUMAN_ARM_CHECK = args.transition_human_arm
     MERGE_APPROACH = args.transition_merge_approach == 'on'
     FOREARM_PRESS_ALLOWANCE = args.transition_forearm_press_allowance == 'on'
     HUMAN_FOREARM_OBSTACLE = args.transition_forearm_obstacle == 'on'
@@ -3057,7 +3322,8 @@ def apply_human_arm_arguments(args):
 def human_arm_text(arm):
     """人の腕の目安の 1 行の説明 (目安を超えたものに印を付ける)。"""
     def mark(value, limit):
-        return '{:.0f}{}'.format(value, ' (!)' if value > limit else '')
+        return '{:.0f}{}'.format(
+            value, ' (!)' if limit is not None and value > limit else '')
     down = arm.get('arm_down_deg')
     return ('{}到達率 {:.2f}{}、肘の曲げ {} 度、手首の曲げ {} 度、前腕のひねり '
             '{} 度'.format(
@@ -3078,11 +3344,14 @@ def robot_hand_wrist_text(arm):
         return ''
 
     def mark(value, limit):
-        return '{:.0f}{}'.format(value, ' (!)' if value > limit else '')
+        return '{:.0f}{}'.format(
+            value, ' (!)' if limit is not None and value > limit else '')
     return ('、手首 (ロボットの手に固定) 掌屈 {}・背屈 {}・撓屈 {}・尺屈 {}・'
             'ひねり {} 度'.format(
                 mark(arm['flexion_deg'], HUMAN_WRIST_FLEX_MAX_DEG),
-                mark(arm['extension_deg'], HUMAN_WRIST_FLEX_MAX_DEG),
+                mark(arm['extension_deg'],
+                     HUMAN_WRIST_FLEX_MAX_DEG if HUMAN_WRIST_EXT_MAX_DEG
+                     is None else HUMAN_WRIST_EXT_MAX_DEG),
                 mark(arm['radial_deg'], HUMAN_WRIST_RADIAL_MAX_DEG),
                 mark(arm['ulnar_deg'], HUMAN_WRIST_ULNAR_MAX_DEG),
                 mark(arm['hand_twist_deg'], HUMAN_WRIST_TWIST_MAX_DEG)))

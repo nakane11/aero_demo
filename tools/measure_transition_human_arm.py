@@ -109,13 +109,19 @@ def measure(robot, checkers, motion):
         hand_rot = sbs.hand_on_robot(end.worldrot(), turn_before, robot_arm)
         wrist = sbs.human_wrist_angles(arm['elbow'], arm['wrist'], hand_rot,
                                        hand, press_forearm, press_normal)
+        joints = arm.get('joints')
+        arm_violation = None
+        if joints is not None and press.get('joints') is not None:
+            arm_violation = sbs.arm_violation(
+                joints, sbs.arm_limits(press['joints'], s))
         rows.append(dict(
             line_forearm=fore, line_hand=hand_d, forearm_angle=angle,
             clear_forearm=clear[0], clear_hand=clear[1],
             turn_change=abs(math.degrees(sbs._wrap(math.radians(
                 wp['turn_deg'] - turn_before)))),
             violation=sbs.wrist_violation(
-                wrist, sbs.wrist_limits(press_angles, s)), **wrist))
+                wrist, sbs.wrist_limits(press_angles, s)),
+            joints=joints, arm_violation=arm_violation, **wrist))
     palm_z = [wp['human_arm']['palm_position'][2]
               for wp in transition['waypoints']]
     laterals = transition.get('laterals') or []
@@ -126,7 +132,20 @@ def measure(robot, checkers, motion):
                        lateral_max=max(laterals), lateral_after=laterals[-1],
                        lateral_overshoot=max(laterals) - laterals[-1])
     press_clear = transition.get('press_forearm_clearance')
+    # 肩・肘・前腕の関節角度の waypoint での (最小, 最大) [度]。
+    joint_ranges = {}
+    for key in sbs.HUMAN_ARM_LIMITS_DEG:
+        values = [r['joints'][key] for r in rows
+                  if r['joints'] is not None and r['joints'].get(key)
+                  is not None]
+        if values:
+            joint_ranges[key] = [min(values), max(values)]
+    arm_problems = [r['arm_violation'] for r in rows
+                    if r['arm_violation'] is not None]
     return dict(
+        press_joints=press.get('joints'), joint_ranges=joint_ranges,
+        n_arm_violations=len(arm_problems),
+        arm_violation=arm_problems[0] if arm_problems else None,
         press_clear=(min(press_clear) if press_clear else None),
         palm_z_press=press['palm_position'][2], palm_z_after=palm_z[-1],
         palm_drop=press['palm_position'][2] - palm_z[-1],
@@ -231,6 +250,35 @@ def main():
                     label, np.median(values), values.max()))
         print('[summary] 手首の目安を超える waypoint がある人: {}/{}'.format(
             sum(r['n_violations'] > 0 for r in measured), len(measured)))
+        with_joints = [r for r in measured if r.get('joint_ranges')]
+        if with_joints:
+            for key in sbs.HUMAN_ARM_LIMITS_DEG:
+                press = np.array([r['press_joints'][key] for r in with_joints
+                                  if r['press_joints']
+                                  and r['press_joints'].get(key) is not None])
+                lows = np.array([r['joint_ranges'][key][0]
+                                 for r in with_joints
+                                 if key in r['joint_ranges']])
+                highs = np.array([r['joint_ranges'][key][1]
+                                  for r in with_joints
+                                  if key in r['joint_ranges']])
+                if len(highs) == 0:
+                    continue
+                print('[summary] {}: 押し込み時 中央値 {:.0f} ({:.0f}〜{:.0f})'
+                      '、経路の最小 中央値 {:.0f} (最小 {:.0f})、経路の最大 '
+                      '中央値 {:.0f} (最大 {:.0f}) [度]'.format(
+                          key, np.median(press) if len(press) else math.nan,
+                          press.min() if len(press) else math.nan,
+                          press.max() if len(press) else math.nan,
+                          np.median(lows), lows.min(), np.median(highs),
+                          highs.max()))
+            print('[summary] 肩・肘・前腕の目安を超える waypoint がある人: '
+                  '{}/{} ({})'.format(
+                      sum(r['n_arm_violations'] > 0 for r in with_joints),
+                      len(with_joints),
+                      ', '.join(sorted(set(
+                          r['arm_violation'].split(' ')[0]
+                          for r in with_joints if r['arm_violation'])))))
         times = [r['compute_time'] for r in measured if r.get('compute_time')]
         if times:
             print('[summary] 計画時間 [秒]: 平均 {:.2f} / 最大 {:.2f}'.format(
