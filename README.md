@@ -33,7 +33,7 @@ MediaPipe 形式の骨格・掌の
 4.5. **`scripts/plan_handshake_motion.py`**
    手順 4 の握手姿勢 (hover) を目標として、そこへ至る接近の軌道 (waypoints) を
    干渉回避付きで生成し JSON として保存する。台車は人の手を中心に公転+自転して
-   人の横に並び、腕は pre-touch 姿勢を経由して寄る。幾何的に作った軌道で干渉が
+   人の横に並び、腕は関節の線形補間で hover 姿勢へ上げる。幾何的に作った軌道で干渉が
    残ったときだけ jaxls で最適化し、全 waypoint を事後検証して `verified` に入れる
    (初期位置から接近開始位置までの直進は `lead_in_verified`)。
    `--initial-base-pose X Y YAW` で初期台車位置を変えて試せる
@@ -69,7 +69,7 @@ estimate_palm_poses.py  (既定の入力先: random_human_poses/, 出力先: ran
 solve_palm_ik.py  (既定の入力先: random_palm_poses/, skeleton: random_human_poses/, 出力先: random_handshake_poses/)
         │  (IK 後の台車位置/全関節角/手先姿勢)
         ├──▶ plan_handshake_motion.py  (既定の入力先: random_handshake_poses/, skeleton: random_human_poses/, 出力先: random_motion_poses/)
-        │        (接近開始姿勢 -> pre-touch -> 握手姿勢 の waypoint 列 + verified)
+        │        (接近開始姿勢 -> 握手姿勢 の waypoint 列 + verified)
         ▼
 view_handshake_poses.py  (骨格: random_human_poses/, IK 結果: random_handshake_poses/)
          (SMPL メッシュ + ロボットモデルを viserで表示)

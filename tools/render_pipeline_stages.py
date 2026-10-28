@@ -1174,15 +1174,14 @@ class StageBuilder(object):
             r = self.shortfall(p.collision_joints, approach_thresholds)
             if r is not None and r[2] < closest[0]:
                 closest = (r[2], k, r[0], r[1])
-        kinds = {'pretouch': 'pre-touch 経由', 'linear': '線形補間',
-                 'optimized': 'jaxls 最適化'}
+        kinds = {'linear': '線形補間', 'optimized': 'jaxls 最適化'}
         stage = Stage(
             '05_approach', '5. 接近軌道 (初期位置 → lead-in → 螺旋で hover へ)',
             ['lead-in: その場回転 → 直進。接近開始位置は手を中心とする'
              '半径 (手〜最終台車位置 + 0.3 m) の円上で、lead-in が螺旋の接線に'
              'なる位置。通らなければ ±30° 刻みで ±120° まで回した候補を試す。',
              '接近: 20 waypoint、両腕を下ろした姿勢 → hover。'
-             'pre-touch 経由 → 線形補間 → jaxls 最適化 の順に作り最初に通ったものを'
+             '線形補間 → jaxls 最適化 の順に作り最初に通ったものを'
              '採る (この人: {}、角度 {:.0f}°)。台車の経路の範囲は制限しない。'.format(
                  kinds.get(motion['kind'], motion['kind']),
                  math.degrees(motion.get('approach_angle') or 0.0)),
@@ -1224,7 +1223,7 @@ class StageBuilder(object):
             pts = [wp['base_position'][:2] for wp in lead_in + waypoints[:1]]
             s.add(tube([[x, y, z] for x, y in pts], 0.015), LEAD_IN_COLOR)
         s.layer('path', '接近の台車の経路 (螺旋)',
-                '手を中心に公転 + 自転。pre-touch 経由 → 線形補間 → jaxls '
+                '手を中心に公転 + 自転。線形補間 → jaxls '
                 '最適化の順に作り、最初に検証を通ったもの')
         pts = [wp['base_position'][:2] for wp in waypoints]
         s.add(tube([[x, y, z] for x, y in pts], 0.018), PATH_COLOR)

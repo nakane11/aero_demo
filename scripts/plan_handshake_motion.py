@@ -4,8 +4,8 @@
 """``solve_palm_ik.py`` の握手姿勢 (hover 目標) へ至る接近軌道を干渉回避
 付きで計画し、JSON に保存する。
 
-台車は人の手を中心に公転+自転して最終位置へ寄り、最後は pre-touch 姿勢
-から直進する。まず最適化なしの軌道を厳密形状で検証し、通らないときだけ
+台車は人の手を中心に公転+自転して最終位置へ寄り、腕は関節の線形補間で
+hover 姿勢へ上げる。まず最適化なしの軌道を厳密形状で検証し、通らないときだけ
 jaxls (別途 pip install が必要) で最適化する。押し込み (``post_process``)
 は計画・検証しない。
 
@@ -103,17 +103,6 @@ LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 # lead-in の waypoint 間隔 (並進 / 回頭)。
 LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
-
-# pre-touch 姿勢を hover から台車の方へ水平に引き戻す距離 [m]。
-DEFAULT_PRETOUCH_STANDOFF = 0.25  # [m]
-
-# 軌道のうち pre-touch 姿勢までに使う割合。
-DEFAULT_PRETOUCH_SPLIT = 0.75
-
-# pre-touch 姿勢の IK (干渉回避なし) の収束条件。
-DEFAULT_PRETOUCH_IK_STOP = 50
-DEFAULT_PRETOUCH_IK_THRE = 0.01  # [m]
-DEFAULT_PRETOUCH_IK_RTHRE = math.radians(5.0)  # [rad]
 
 # 自己干渉の許容貫通量 [m]。
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
@@ -598,68 +587,9 @@ def build_initial_trajectory(q_start, base_start, q_goal, base_goal,
 
 # 結果 JSON の ``kind`` の表示名。
 KIND_LABELS = {
-    'pretouch': 'pre-touch 経由 (最適化なし)',
     'linear': '線形補間のみ (最適化なし)',
     'optimized': '軌道最適化',
 }
-
-
-def pretouch_direction(handshake, base_goal):
-    """pre-touch 姿勢へ引き戻す向き: hover 目標から終点の台車へ向かう水平の
-    単位ベクトル (求まらなければ ``None``)。"""
-    direction = np.zeros(3)
-    direction[:2] = (np.asarray(base_goal[:2], dtype=np.float64)
-                     - np.asarray(handshake['target_position'][:2]))
-    norm = float(np.linalg.norm(direction))
-    return None if norm < 1e-6 else direction / norm
-
-
-def solve_pretouch_pose(robot, robot_arm, link_list, joint_list, handshake,
-                        q_goal, base_goal, direction, standoff):
-    """終点の手先を ``direction`` へ ``standoff`` [m] 引き戻した pre-touch
-    姿勢を台車固定・干渉回避なしの IK で解き、``joint_list`` 順の関節角を返す
-    (失敗時 ``None``)。
-
-    脚 (足首・膝) は終点の角度のまま腕と腰だけで解く (しゃがみ込み防止)。"""
-    target_position = (np.asarray(handshake['target_position'])
-                       + direction * standoff)
-    robot.newcoords(Coordinates(
-        pos=[float(base_goal[0]), float(base_goal[1]), 0.0],
-        rot=rpy_matrix(float(base_goal[2]), 0.0, 0.0)))
-    for joint, angle in zip(joint_list, q_goal):
-        joint.joint_angle(float(angle))
-    whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
-    leg_joints = (robot.ankle_joint, robot.knee_joint)
-    upper_link_list = [
-        link for link in link_list
-        if not any(link.joint is joint
-                   or link.joint.name.startswith(joint.name)
-                   for joint in leg_joints)]
-    result = robot.inverse_kinematics(
-        target_coords=Coordinates(
-            pos=target_position.tolist(),
-            rot=np.asarray(handshake['target_rot'], dtype=np.float64)),
-        move_target=whole_body.end_coords, link_list=upper_link_list,
-        stop=DEFAULT_PRETOUCH_IK_STOP, thre=DEFAULT_PRETOUCH_IK_THRE,
-        rthre=DEFAULT_PRETOUCH_IK_RTHRE, revert_if_fail=True)
-    if result is False:
-        return None
-    return np.array([joint.joint_angle() for joint in joint_list])
-
-
-def build_pretouch_trajectory(q_start, base_start, q_pre, q_goal, base_goal,
-                              n_waypoints, split_ratio, orbit=None):
-    """始点 → pre-touch 姿勢 → 終点 の 2 区間の軌道。後半は台車を動かさない。"""
-    n_joints = len(q_start)
-    split = max(2, min(n_waypoints - 1, int(n_waypoints * split_ratio)))
-    traj = np.zeros((n_waypoints, n_joints + 3))
-    traj[:split, :n_joints] = interpolate_trajectory(q_start, q_pre, split)
-    traj[split - 1:, :n_joints] = interpolate_trajectory(
-        q_pre, q_goal, n_waypoints - split + 1)
-    traj[:split, n_joints:] = base_interpolation(
-        base_start, base_goal, split, orbit=orbit)
-    traj[split:, n_joints:] = base_goal
-    return traj
 
 
 def trajectory_waypoints(robot, joint_list, trajectory):
@@ -959,15 +889,13 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
     def out_of_time():
         return deadline is not None and time.time() >= deadline
 
-    pretouch_cache = {}
     zero,others = candidates[0], candidates[1:]
     zero_lead_in = check_lead_in(zero[1])
     zero_motion = None
     if zero_lead_in[-1]:
         zero_motion = _plan_from_start(
             robot, robot_arm, handshake, joint_positions, zero[1], args,
-            verification_pairs, solver, obstacle_cache, orbit=orbit,
-            pretouch_cache=pretouch_cache)
+            verification_pairs, solver, obstacle_cache, orbit=orbit)
     best = None
     n_tried = 1
     if zero_motion is not None and zero_motion['verified']:
@@ -987,7 +915,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
             motion = _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
                 args, verification_pairs, solver, obstacle_cache,
-                optimize=False, orbit=orbit, pretouch_cache=pretouch_cache)
+                optimize=False, orbit=orbit)
             if motion['verified']:
                 best = (candidate, lead_in_check, motion)
                 break
@@ -997,16 +925,14 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
             candidate, lead_in_check = first_lead_in_ok
             best = (candidate, lead_in_check, _plan_from_start(
                 robot, robot_arm, handshake, joint_positions, candidate[1],
-                args, verification_pairs, solver, obstacle_cache, orbit=orbit,
-                pretouch_cache=pretouch_cache))
+                args, verification_pairs, solver, obstacle_cache, orbit=orbit))
         if best is None:
             # どれも通らなければ角度 0 の結果を返す (最適化なし)。
             if zero_motion is None:
                 zero_motion = _plan_from_start(
                     robot, robot_arm, handshake, joint_positions, zero[1],
                     args, verification_pairs, solver, obstacle_cache,
-                    optimize=False, orbit=orbit,
-                    pretouch_cache=pretouch_cache)
+                    optimize=False, orbit=orbit)
             best = (zero, zero_lead_in, zero_motion)
 
     ((angle, _), (lead_in, lead_in_distances, lead_in_clearances,
@@ -1063,14 +989,12 @@ def blend_head_to_post_process(robot, motion, handshake):
 
 def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
                      args, verification_pairs, solver, obstacle_cache, orbit,
-                     optimize=True, pretouch_cache=None):
+                     optimize=True):
     """台車の始点 ``base_start`` から 1 人分の軌道を計画する。
 
-    pre-touch 経由 → 線形補間の順に検証し、通ればそれを返す。通らなければ
-    jaxls で最適化する (検証に通らなければ最も余裕の大きい候補を
-    ``verified: false`` で返す)。``optimize`` が偽なら
-    最適化しない。``pretouch_cache`` (dict) は pre-touch 姿勢の IK を同じ
-    ``handshake`` 内で使い回す。
+    線形補間を検証し、通ればそれを返す。通らなければ jaxls で最適化する
+    (検証に通らなければ余裕の大きい方を ``verified: false`` で返す)。
+    ``optimize`` が偽なら最適化しない。
     """
     link_list, joint_list, q_start, base_start, q_goal, base_goal = \
         build_start_and_goal(robot, robot_arm, handshake, base_start,
@@ -1118,48 +1042,17 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             human_clearance_margin=float(min(margins)),
             human_clearance_waypoint=int(np.argmin(margins))))
         candidate['candidates_tried'] = tried
-        candidate['pretouch_status'] = pretouch_status
         return candidate
 
     initial_traj = build_initial_trajectory(
         q_start, base_start, q_goal, base_goal, args.n_waypoints,
         orbit=orbit)
-    candidates = []
-    direction = pretouch_direction(handshake, base_goal)
-    pretouch_status = 'no_direction'
-    if direction is not None:
-        if pretouch_cache is not None and 'q_pre' in pretouch_cache:
-            q_pre = pretouch_cache['q_pre']
-        else:
-            q_pre = solve_pretouch_pose(
-                robot, robot_arm, link_list, joint_list, handshake, q_goal,
-                base_goal, direction, DEFAULT_PRETOUCH_STANDOFF)
-            if pretouch_cache is not None:
-                pretouch_cache['q_pre'] = q_pre
-        pretouch_status = 'ik_failed'
-        if q_pre is not None:
-            pretouch_status = 'built'
-            candidates.append(('pretouch', build_pretouch_trajectory(
-                q_start, base_start, q_pre, q_goal, base_goal,
-                args.n_waypoints, DEFAULT_PRETOUCH_SPLIT, orbit=orbit)))
-    candidates.append(('linear', initial_traj))
-
-    force_optimize = getattr(args, 'force_optimize', False)
-    best = None
-    best_trajectory = None
-    for kind, trajectory in candidates:
-        candidate = record(make_candidate(trajectory, kind))
-        if candidate['verified'] and not force_optimize:
-            return candidate
-        if best is None or motion_margin(candidate) > motion_margin(best):
-            best = candidate
-            best_trajectory = trajectory
-        if candidate['verified']:
-            break
-    if not optimize:
+    best = record(make_candidate(initial_traj, 'linear'))
+    if (best['verified'] and not getattr(args, 'force_optimize', False)) \
+            or not optimize:
         return best
 
-    # solve_pretouch_pose が台車を動かすので、台車を原点・腕を始点に戻す。
+    # 検証で台車・腕が動いたので、台車を原点・腕を始点に戻す。
     robot.newcoords(Coordinates())
     robot.base_link.newcoords(Coordinates())
     for joint, angle in zip(joint_list, q_start):
@@ -1180,7 +1073,7 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         collision_weight=100.0,
         self_collision_weight=100.0)
     solve_start = time.time()
-    result = solver.solve(problem, best_trajectory)
+    result = solver.solve(problem, initial_traj)
     candidate = record(make_candidate(
         result.trajectory, 'optimized', 0, float(result.cost),
         time.time() - solve_start))

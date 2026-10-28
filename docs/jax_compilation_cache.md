@@ -62,7 +62,7 @@ scikit-robot 側の `JaxlsSolver` はコンパイル済み問題を腕ごと
   x64 を有効にするので、warmup が先だと float32 でコンパイルされ、本番の
   float64 の solve で各腕の初回に約 9 秒の再コンパイルが起きる。
 
-通常運用では pre-touch/線形補間だけで事後検証に通ることが多く、その場合は
+通常運用では線形補間だけで事後検証に通ることが多く、その場合は
 jaxls 自体が呼ばれない(`plan_handshake_motion.py` の `--force-optimize` を
 付けると常に jaxls まで実行させられる、ベンチマーク用オプション)。
 
@@ -218,12 +218,12 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 ## 11. `--force-optimize` の意味
 
 `plan_handshake_motion.py`(`run_pipeline_test.py` 経由でも指定可)の
-`--force-optimize` は、pre-touch/線形補間が事後検証に通っても jaxls の
+`--force-optimize` は、線形補間が事後検証に通っても jaxls の
 軌道最適化を 1 回実行させる、**軌道最適化そのものの計算時間を測るための
 ベンチマーク用オプション**(通常運用では指定しない)。付けると平均計算時間は
 約 2 倍以上になる。
 
-一方、pre-touch も線形補間も検証を通らない人は `--force-optimize` が無くても
+一方、線形補間が検証を通らない人は `--force-optimize` が無くても
 jaxls の最適化まで進む。そのため「1 人あたりの最大計算時間」はこの検証失敗
 ケースの最適化コストで決まり、`--force-optimize` の有無ではほぼ変わらない。
 

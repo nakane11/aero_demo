@@ -73,7 +73,6 @@ DEFAULT_PLAYBACK_FPS = 40.0
 
 # plan_handshake_motion.KIND_LABELS の複製 (import が重いため)。
 KIND_LABELS = {
-    'pretouch': 'pre-touch 経由 (最適化なし)',
     'linear': '線形補間のみ (最適化なし)',
     'optimized': '軌道最適化',
 }

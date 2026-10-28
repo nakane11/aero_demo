@@ -7,7 +7,7 @@
 
 既定は OFAT (ベースラインから 1 軸ずつ振る)、``--mode full`` で総当たり。
 各グリッド点はウォームアップ (JIT コンパイル) と本計測の 2 回実行する。
-``--force-optimize`` は pre-touch/線形補間での早期採用をせず全員を最適化する
+``--force-optimize`` は線形補間での早期採用をせず全員を最適化する
 (成功率はパイプライン全体ではなく最適化そのものの収束率になる)。
 データセットは既存ファイルがあれば再生成しない。
 
@@ -107,8 +107,6 @@ def make_baseline_args(seed):
     """``plan_person_motion`` に渡す ``args`` のベースライン。"""
     return argparse.Namespace(
         approach_distance=phm.DEFAULT_APPROACH_DISTANCE,
-        pretouch_standoff=phm.DEFAULT_PRETOUCH_STANDOFF,
-        pretouch_split=phm.DEFAULT_PRETOUCH_SPLIT,
         n_waypoints=phm.DEFAULT_N_WAYPOINTS,
         dt=phm.DEFAULT_DT,
         max_iterations=phm.DEFAULT_MAX_ITERATIONS,
@@ -155,10 +153,8 @@ def build_combos(baseline, axis_values, mode):
 
 def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
                                  human_xy, args, verification_pairs, solver):
-    """``plan_person_motion`` と同じ入出力で、早期採用せず必ず jaxls 最適化する。
-
-    pre-touch 姿勢が解ければ warm start に使う。
-    """
+    """``plan_person_motion`` と同じ入出力で、早期採用せず必ず jaxls 最適化する
+    (warm start は線形補間)。"""
     start_time = time.time()
     base_goal = phm.handshake_base_goal(handshake)
     # 始点は角度 0 の orbit 候補 (初期位置による縮小はしない)。
@@ -190,18 +186,8 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
 
     initial_traj = phm.build_initial_trajectory(
         q_start, base_start, q_goal, base_goal, args.n_waypoints)
-    warm_start_traj = initial_traj
-    direction = phm.pretouch_direction(handshake, base_goal)
-    if direction is not None:
-        q_pre = phm.solve_pretouch_pose(
-            robot, robot_arm, link_list, joint_list, handshake, q_goal,
-            base_goal, direction, args.pretouch_standoff)
-        if q_pre is not None:
-            warm_start_traj = phm.build_pretouch_trajectory(
-                q_start, base_start, q_pre, q_goal, base_goal,
-                args.n_waypoints, args.pretouch_split)
 
-    # solve_pretouch_pose が動かした台車・腕を始点に戻す。
+    # 台車を原点・腕を始点に戻す。
     robot.newcoords(phm.Coordinates())
     robot.base_link.newcoords(phm.Coordinates())
     for joint, angle in zip(joint_list, q_start):
@@ -219,7 +205,7 @@ def force_optimize_person_motion(robot, robot_arm, handshake, joint_positions,
         self_collision_weight=args.self_collision_weight)
 
     solve_start = time.time()
-    result = solver.solve(problem, warm_start_traj)
+    result = solver.solve(problem, initial_traj)
     best = make_candidate(
         result.trajectory, 0, float(result.cost), time.time() - solve_start)
     best['compute_time'] = time.time() - start_time
@@ -270,7 +256,6 @@ def aggregate(results, combo, wall_elapsed, n_failed=0):
         compute_time_median=(
             float(np.median(compute_times)) if n else float('nan')),
         compute_time_max=float(compute_times.max()) if n else float('nan'),
-        n_pretouch=kind_counts.get('pretouch', 0),
         n_linear=kind_counts.get('linear', 0),
         n_optimized=kind_counts.get('optimized', 0),
         optimized_verified_rate=optimized_verified_rate,
@@ -284,10 +269,10 @@ def print_row(row):
          '| 計算時間: 平均={compute_time_mean:.3f}s 中央値='
          '{compute_time_median:.3f}s 最大={compute_time_max:.3f}s '
          '(合計 {wall_elapsed:.1f}s)'.format(**row))
-    print('    内訳(kind): pretouch={n_pretouch} linear={n_linear} '
+    print('    内訳(kind): linear={n_linear} '
          'optimized={n_optimized} '
          '(optimized のうち verified={optimized_verified_rate})'.format(
-             n_pretouch=row['n_pretouch'], n_linear=row['n_linear'],
+             n_linear=row['n_linear'],
              n_optimized=row['n_optimized'],
              optimized_verified_rate=(
                  'n/a' if row['optimized_verified_rate'] != row[
@@ -325,7 +310,7 @@ def print_ranking(rows):
 CSV_FIELDS = [
     'label', 'n_waypoints', 'max_iterations', 'n_target', 'n_failed', 'success_rate',
     'compute_time_mean', 'compute_time_median', 'compute_time_max',
-    'n_pretouch', 'n_linear', 'n_optimized', 'optimized_verified_rate',
+    'n_linear', 'n_optimized', 'optimized_verified_rate',
     'wall_elapsed',
 ]
 
