@@ -150,3 +150,82 @@ def icp_2d(ref_points, cur_points, initial_pose, exclude_centers=None,
                 rms=float(np.sqrt(np.mean(residuals ** 2))),
                 inlier_ratio=float(len(residuals) / n_cur),
                 n_inliers=int(len(residuals)), iterations=iterations)
+
+
+class ScanOdometry(object):
+    """スキャンを順につないで、基準スキャンの台車系から見た今の台車の姿勢を求める.
+
+    基準スキャンだけと照合すると、接近で大きく回った後は重なりが減って照合の品質
+    が足りなくなる (180 度回ると半分以上の試行で失敗した)。そこでキーフレーム
+    (直近に照合が通ったスキャン) と照合し、``key_yaw``・``key_distance`` 以上
+    動いたら今のスキャンを新しいキーフレームにする。照合の品質が足りないスキャンは
+    直前の推定に odom の増分を足した予測で埋める。
+
+    ``update`` に渡す ``odom_delta`` は、基準スキャンの時刻の odom から見た
+    そのスキャンの時刻の odom (区間先頭基準の ``[dx, dy, dyaw]``)。
+    ``exclude_centers`` は基準の台車系の人の関節 (xy)。
+    """
+
+    def __init__(self, ref_points, ref_stamp, exclude_centers=None,
+                 exclude_radius=0.0, min_inlier_ratio=0.3, min_inliers=100,
+                 max_rms=0.03, key_yaw=math.radians(10.0),
+                 key_distance=0.25, history=400):
+        self._key_points = np.asarray(ref_points, dtype=np.float64)
+        self._key_pose = np.zeros(3)
+        self._exclude = (None if exclude_centers is None
+                         else np.asarray(exclude_centers, dtype=np.float64))
+        self._exclude_radius = exclude_radius
+        self._quality = (min_inlier_ratio, min_inliers, max_rms)
+        self._key_yaw = key_yaw
+        self._key_distance = key_distance
+        self._history_size = history
+        # (時刻, 推定した姿勢, その時刻の odom_delta, 照合が通ったか)
+        self.history = [(float(ref_stamp), np.zeros(3), np.zeros(3), True)]
+        self.n_fallback = 0
+
+    def update(self, points, stamp, odom_delta):
+        """時刻 ``stamp`` のスキャン ``points`` (台車系) で推定を進め、
+        ``(姿勢, 照合が通ったか, icp の結果)`` を返す。"""
+        odom_delta = np.asarray(odom_delta, dtype=np.float64)
+        _, prev_pose, prev_odom, _ = self.history[-1]
+        predicted = compose(prev_pose, relative(prev_odom, odom_delta))
+        exclude = None
+        if self._exclude is not None and len(self._exclude):
+            exclude = transform_points(self._exclude, inverse(self._key_pose))
+        match = icp_2d(self._key_points, points,
+                       relative(self._key_pose, predicted),
+                       exclude_centers=exclude,
+                       exclude_radius=self._exclude_radius)
+        min_ratio, min_inliers, max_rms = self._quality
+        ok = (match['inlier_ratio'] >= min_ratio
+              and match['n_inliers'] >= min_inliers
+              and match['rms'] <= max_rms)
+        if ok:
+            pose = compose(self._key_pose, np.asarray(match['pose']))
+            moved = relative(self._key_pose, pose)
+            if (abs(moved[2]) > self._key_yaw
+                    or math.hypot(moved[0], moved[1]) > self._key_distance):
+                self._key_pose = pose
+                self._key_points = np.asarray(points, dtype=np.float64)
+        else:
+            pose = predicted
+            self.n_fallback += 1
+        self.history.append((float(stamp), pose, odom_delta, ok))
+        if len(self.history) > self._history_size:
+            del self.history[0]
+        return pose, ok, match
+
+    def latest(self):
+        """最後に処理したスキャンの ``(時刻, 姿勢, 照合が通ったか, odom_delta)``。"""
+        stamp, pose, odom_delta, ok = self.history[-1]
+        return stamp, pose.copy(), ok, odom_delta.copy()
+
+    def pose_at(self, stamp, odom_delta):
+        """時刻 ``stamp`` (その時刻の odom_delta) の姿勢を、時刻が最も近い
+        スキャンの推定に odom の増分を足して返す (``(姿勢, そのスキャンとの
+        時刻の差 [s])``)。"""
+        times = np.array([h[0] for h in self.history])
+        i = int(np.argmin(np.abs(times - float(stamp))))
+        t, pose, odom_then, _ = self.history[i]
+        step = relative(odom_then, np.asarray(odom_delta, dtype=np.float64))
+        return compose(pose, step), float(stamp) - t

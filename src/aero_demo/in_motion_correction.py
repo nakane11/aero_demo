@@ -184,6 +184,59 @@ def build_tail_points(cum_times, positions, velocities, yaws, yaw_rates,
     return points
 
 
+def blended_offset(t, shifts, t_end):
+    """``shifts`` の各 ``(shift, t_start)`` を、``t_start`` から ``t_end`` まで
+    ``smoothstep`` で 0 -> 1 に効かせた合計のずれと、その速度を返す。"""
+    offset = np.zeros(2)
+    rate = np.zeros(2)
+    for shift, t_start in shifts:
+        duration = t_end - t_start
+        if duration <= 0.0:
+            continue
+        tau = (t - t_start) / duration
+        offset += np.asarray(shift, dtype=np.float64) * smoothstep(tau)
+        rate += (np.asarray(shift, dtype=np.float64)
+                 * smoothstep_rate(tau) / duration)
+    return offset, rate
+
+
+def build_retarget_points(cum_times, positions, velocities, yaws, yaw_rates,
+                          elapsed, current_position, current_velocity,
+                          current_yaw, current_yaw_rate, shifts,
+                          min_gap=MIN_POINT_GAP):
+    """接近中の再照準で、元の台車軌道の ``elapsed`` 秒以降を ``shifts``
+    (``[(ずれ (2), 効かせ始める時刻 [s, 元の軌道の先頭基準]), ...]``) を
+    ``blended_offset`` で足して作り直した点列を返す (形は ``build_tail_points``
+    と同じ、時刻は今が 0)。
+
+    何度ずらしても、前のずらしの途中から続けられる (各ずらしは自分の開始時刻から
+    終点まで滑らかに効く)。``yaws`` は折り返さない連続の値で、残りの回転が
+    180 度を超えても向きを保つ。残りが ``min_gap`` 未満なら None。
+    """
+    cum_times = np.asarray(cum_times, dtype=np.float64)
+    positions = np.asarray(positions, dtype=np.float64)
+    velocities = np.asarray(velocities, dtype=np.float64)
+    yaws = np.asarray(yaws, dtype=np.float64)
+    t_end = float(cum_times[-1])
+    if t_end - elapsed < min_gap:
+        return None
+    # 今の時刻の計画の向きを今の向きの近くで表し、以降は計画の増分を足す。
+    planned_now = float(np.interp(elapsed, cum_times, yaws))
+    yaw_base = float(current_yaw) + wrap_angle(planned_now - current_yaw)
+    points = [(0.0, np.asarray(current_position, dtype=np.float64),
+               np.asarray(current_velocity, dtype=np.float64),
+               float(current_yaw), float(current_yaw_rate))]
+    for k in range(len(cum_times)):
+        t = float(cum_times[k]) - elapsed
+        if t < min_gap:
+            continue
+        offset, rate = blended_offset(float(cum_times[k]), shifts, t_end)
+        points.append((
+            t, positions[k] + offset, velocities[k] + rate,
+            yaw_base + float(yaws[k]) - planned_now, float(yaw_rates[k])))
+    return points
+
+
 def hermite_velocity_along(points, direction, n_samples=21):
     """点列 (``build_tail_points`` の形) を 3 次エルミート補間したときの、
     ``direction`` 方向の速度の最小値 [m/s]。"""
