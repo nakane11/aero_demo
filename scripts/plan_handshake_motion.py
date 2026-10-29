@@ -108,6 +108,12 @@ LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
     spik.DEFAULT_COLLISION_VERIFY_TOLERANCE)  # [m]
 
+# 軌道最適化の人体との干渉の組 (``approach_problem_options``)。pairs は hover の
+# IK と同じ collision_pairs.json の 8 組 + 手先 × 差し出した前腕の 4 組。全リンク
+# (all) と比べ合成 100 人で最適化の成否は全員同じ、時間は約 1 割短い (2026-10-29)。
+DEFAULT_APPROACH_COLLISION_PAIRS = 'pairs'
+DEFAULT_COLLISION_PAIRS_PATH = os.path.join(_THIS_DIR, 'collision_pairs.json')
+
 # 押し込み前 (lead-in・接近軌道) の検証での人体との距離 [m]。
 # 横並び移動 (TRANSITION_HUMAN_CLEARANCE) と揃える。
 DEFAULT_HUMAN_CLEARANCE = 0.05  # [m]
@@ -532,13 +538,50 @@ def build_start_and_goal(robot, robot_arm, handshake, base_start, orbit):
     return link_list, joint_list, q_start, base_start, q_goal, base_goal
 
 
+def approach_obstacle_pairs(robot, robot_arm, collision_link_list,
+                            collision_pairs):
+    """軌道最適化の人体との干渉を ``collision_pairs`` (hover の IK と同じ
+    ``collision_pairs.json`` の組) に限るときの ``obstacle_pairs``
+    (``(collision_link_list の添字, 人体の障害物の添字)``)。hover の IK と
+    同じく、手先側のリンク (``OFFERED_HAND_PENALTY_LINKS``) × 差し出された
+    前腕の組を足す (差し出す手は ``robot_arm`` で決まる)。"""
+    index = {link: i for i, link in enumerate(collision_link_list)}
+    pairs = [(index[link], other) for link, other in collision_pairs
+             if isinstance(other, int) and link in index]
+    hand = {arm: h for h, arm in spik.DEFAULT_ROBOT_ARM.items()}[robot_arm]
+    forearm = spik.human_obstacle_names().index(
+        '{0}Elbow-{0}Wrist'.format(hand))
+    by_name = {link.name: i for i, link in enumerate(collision_link_list)}
+    pairs += [(by_name[name.format(robot_arm)], forearm)
+              for name in spik.OFFERED_HAND_PENALTY_LINKS
+              if name.format(robot_arm) in by_name]
+    return pairs
+
+
+def approach_problem_options(robot, robot_arm, collision_link_list, args):
+    """``args`` の ``approach_collision_pairs`` (``all``/``pairs``) と
+    ``approach_self_collision`` から ``build_problem`` の引数を作る。"""
+    options = dict(self_collision=getattr(args, 'approach_self_collision',
+                                          True))
+    if getattr(args, 'approach_collision_pairs',
+               DEFAULT_APPROACH_COLLISION_PAIRS) == 'pairs':
+        options['obstacle_pairs'] = approach_obstacle_pairs(
+            robot, robot_arm, collision_link_list,
+            spik.load_collision_pairs(
+                getattr(args, 'collision_pairs', DEFAULT_COLLISION_PAIRS_PATH),
+                robot))
+    return options
+
+
 def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
                   world_obstacles, collision_link_list,
                   collision_activation_distance,
                   self_collision_activation_distance,
                   smoothness_weight, acceleration_weight,
-                  collision_weight=100.0, self_collision_weight=100.0):
-    """``TrajectoryProblem`` を組み立てる。
+                  collision_weight=100.0, self_collision_weight=100.0,
+                  obstacle_pairs=None, self_collision=True):
+    """``TrajectoryProblem`` を組み立てる。``obstacle_pairs`` が None なら
+    人体との干渉は全リンク × 全障害物。
 
     干渉コストは近似なので、経路は必ず ``verify_waypoints`` で検証すること。"""
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -553,11 +596,12 @@ def build_problem(robot, robot_arm, link_list, n_waypoints, dt,
         collision_link_list, world_obstacles,
         weight=collision_weight,
         activation_distance=collision_activation_distance,
-        as_constraint=True)
-    problem.add_self_collision_cost(
-        weight=self_collision_weight,
-        activation_distance=self_collision_activation_distance,
-        as_constraint=True)
+        as_constraint=True, obstacle_pairs=obstacle_pairs)
+    if self_collision:
+        problem.add_self_collision_cost(
+            weight=self_collision_weight,
+            activation_distance=self_collision_activation_distance,
+            as_constraint=True)
     problem.set_fixed_endpoints(start=True, end=True)
     return problem
 
@@ -1071,7 +1115,9 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
         DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
         DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
         collision_weight=100.0,
-        self_collision_weight=100.0)
+        self_collision_weight=100.0,
+        **approach_problem_options(robot, robot_arm, collision_link_list,
+                                   args))
     solve_start = time.time()
     result = solver.solve(problem, initial_traj)
     candidate = record(make_candidate(
@@ -1105,7 +1151,9 @@ def _warmup_solver(robot, solver, args):
                     DEFAULT_COLLISION_ACTIVATION_DISTANCE),
             DEFAULT_SELF_COLLISION_ACTIVATION_DISTANCE,
             DEFAULT_SMOOTHNESS_WEIGHT, DEFAULT_ACCELERATION_WEIGHT,
-            collision_weight=100.0, self_collision_weight=100.0)
+            collision_weight=100.0, self_collision_weight=100.0,
+            **approach_problem_options(robot, robot_arm, collision_link_list,
+                                       args))
         initial_traj = build_initial_trajectory(
             q_start, base_start, q_goal, base_goal, args.n_waypoints)
         solver.solve(problem, initial_traj)
@@ -1180,6 +1228,16 @@ def main():
         '--force-optimize', action='store_true',
         help='最適化なしの軌道が通っても必ず jaxls で最適化する (計測用)。')
     parser.add_argument(
+        '--approach-collision-pairs', choices=('all', 'pairs'),
+        default=DEFAULT_APPROACH_COLLISION_PAIRS,
+        help='軌道最適化の人体との干渉の組 (all: 全リンク × 人体、pairs: '
+             'hover の IK と同じ --collision-pairs の組 + 手先 × 差し出した'
+             '前腕、既定 {})。'.format(DEFAULT_APPROACH_COLLISION_PAIRS))
+    parser.add_argument(
+        '--no-approach-self-collision', dest='approach_self_collision',
+        action='store_false',
+        help='軌道最適化で自己干渉のコストを入れない (計測用)。')
+    parser.add_argument(
         '--collision-verify-model', choices=spik.COLLISION_VERIFY_MODELS,
         default=spik.DEFAULT_COLLISION_VERIFY_MODEL,
         help='事後検証のモデル (solve_palm_ik.py と同じ意味)。')
@@ -1211,8 +1269,9 @@ def main():
              '上限なし。'.format(spik.PLAN_TIME_LIMIT))
     parser.add_argument(
         '--collision-pairs', type=str,
-        default=os.path.join(_THIS_DIR, 'collision_pairs.json'),
-        help='横並び移動のバッチ IK で使う干渉ペア。')
+        default=DEFAULT_COLLISION_PAIRS_PATH,
+        help='横並び移動のバッチ IK と軌道最適化 (--approach-collision-pairs '
+             'pairs) で使う干渉ペア。')
     parser.add_argument(
         '--goal-leg-rise', choices=sbs.GOAL_LEG_RISE_MODES,
         default=sbs.GOAL_LEG_RISE,

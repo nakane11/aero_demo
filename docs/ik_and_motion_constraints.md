@@ -172,7 +172,7 @@
 | 第1段バッチ IK の最適化 | `scripts/collision_pairs.json` の 8 組 (台車・胴体・肩・上腕 × 人の脛・体幹、下の「最適化で使う干渉ペアの選び方」) と、ロボットの手・親指の箱・手首 (`hand_yaw_link`)・前腕 (`OFFERED_HAND_PENALTY_LINKS`) × 差し出された前腕 1 本の 4 組 (前腕の円柱は半径・長さを (6 cm − 2 cm) 細らせ、2 cm で効くようにする。掌・指は組に入れず、hover の事後検証で 2 cm を見る)。自己干渉の組は無い。**JSON が無いと干渉回避と事後検証の両方を無効にして解く** (0 組の JSON なら干渉回避だけを無効にし、事後検証は行う) |
 | 自己干渉の事後検証 (IK・軌道共通) | 指なし + 手の箱の全リンク同士 (35 本、472 組) から `self_collision_ignored` の組を除いたもの。除くのは、干渉ジオメトリを持つリンクだけでたどった関節のつながりが 3 段以内の組、既定の姿勢で既に貫通している組、`SELF_COLLISION_IGNORE_PAIRS` (前腕 × 指ありモデルの親指の付け根。手首の角度によって近似形状が 1 mm 未満で触れるだけで、実機では当たらない) |
 | 人体との距離の事後検証 (IK・軌道共通) | 指ありモデルの全リンク × 人体 28 本 (2380 組、`VerificationPairs.clearance_pairs`) |
-| 軌道最適化 (jaxls) | 指なし + 手の箱の全リンク (`collision_link_list_for_arm`) × 人体 28 本、および自己干渉 (リスト上で隣り合わない全組。`collision_pairs.json` は使わない)。人体のうち差し出された手まわりは、掌・指を遠くのダミーに置き換え、前腕は効き始めで 2 cm になるよう細らせる (`human_body_cylinder_obstacles(hand=)`) |
+| 軌道最適化 (jaxls) | 人体とは第1段バッチ IK と同じ 12 組 (`collision_pairs.json` の 8 組 + 手先 4 リンク × 差し出された前腕、`approach_obstacle_pairs`)、および自己干渉 (指なし + 手の箱の全リンク `collision_link_list_for_arm` のうちリスト上で隣り合わない全組)。前腕は効き始めで 2 cm になるよう細らせる (`human_body_cylinder_obstacles(hand=)`)。`--approach-collision-pairs all` で従来の全リンク × 人体 28 本 (掌・指はダミー) に戻せる。合成 seed0 の 67 人・seed1 の 400 人で、最適化を全員に強制しても成否は全員同じ、最適化 1 回は 0.65 → 0.58 秒 (2026-10-29)。時間の大半は自己干渉のコスト (外すと 0.10 秒) |
 
 `--collision-verify-model` (`solve_palm_ik.py`・`plan_handshake_motion.py`・実機ノード共通) で
 事後検証のモデルを選べる: `mixed` (既定、上表)、`nohand` (人体との距離も手の箱で測る)、
