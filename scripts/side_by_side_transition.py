@@ -356,8 +356,9 @@ HUMAN_ARM_ROTATION_MIN_ELBOW_DEG = 20.0
 
 # --- 人の前腕・手の甲を障害物にする ----------------------------------------
 # 移動先のバッチ IK と検証で、人の前腕と手の甲側 (``spik.forearm_obstacles``、
-# 掌の接触面は含まない) を、ロボットの差し出す腕の肘・前腕・手首
-# (``spik.FOREARM_CHECK_LINKS``) から OFFERED_HAND_CLEARANCE 離す。
+# 掌の接触面は含まない) を、ロボットの差し出す腕から OFFERED_HAND_CLEARANCE 離す。
+# 検証は肘・前腕・手首 (``spik.FOREARM_CHECK_LINKS``)、バッチ IK は前腕・手首
+# (``TRANSITION_FOREARM_LINKS``、precontact の最適化と同じく肘は入れない)。
 # FOREARM_PRESS_ALLOWANCE なら、押し込み時にすでにそれより近い分は、腕を下ろす
 # 割合 s に比例して減らしながら許す (s=1 で OFFERED_HAND_CLEARANCE)。
 HUMAN_FOREARM_OBSTACLE = True
@@ -366,7 +367,7 @@ FOREARM_PRESS_ALLOWANCE = True
 # 時よりわずかに近づいても止めないように)。
 FOREARM_PRESS_SLACK = 0.005
 HUMAN_FINGER_LENGTH = spik.HUMAN_FINGER_LENGTH
-TRANSITION_FOREARM_LINKS = spik.FOREARM_CHECK_LINKS
+TRANSITION_FOREARM_LINKS = ('{}_forearm_link', '{}_hand_yaw_link')
 
 
 def _wrap(angle):
