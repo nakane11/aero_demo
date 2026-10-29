@@ -115,7 +115,8 @@ DEFAULT_COLLISION_IK_STOP = 80
 DEFAULT_COLLISION_IK_THRE = 0.03  # [m]
 DEFAULT_COLLISION_IK_RTHRE = math.radians(8.0)  # [rad]
 
-# 人体との干渉ペナルティの重みとマージン [m] (マージンは事後検証・軌道計画と同じ)。
+# 人体との干渉ペナルティの重みとマージン [m] (マージンは軌道最適化の効き始めと同じ。
+# 事後検証の距離は DEFAULT_HOVER_HUMAN_CLEARANCE)。
 DEFAULT_COLLISION_WEIGHT = 10.0
 DEFAULT_COLLISION_MARGIN = 0.06
 
@@ -149,8 +150,10 @@ PRESS_IN_LEG_RISE_MODES = ('off', 'strict', 'fallback')
 LEG_RISE_ALLOW = 0.20  # [m]
 LEG_RISE_PIN_TOLERANCE = 2.0 * LEG_RISE_ALLOW
 
-# hover 姿勢でロボットと人体 (全身) の間に空ける距離 [m]。
-DEFAULT_HOVER_HUMAN_CLEARANCE = DEFAULT_COLLISION_MARGIN  # [m]
+# hover 姿勢の事後検証でロボットと人体 (全身) の間に空ける距離 [m]。
+# 接近・押し込み区間・横並び移動の検証と揃える (IK のペナルティは
+# DEFAULT_COLLISION_MARGIN のまま)。
+DEFAULT_HOVER_HUMAN_CLEARANCE = 0.05  # [m]
 
 # 差し出した手 (掌・指) と同じ側の前腕だけに空ける距離 [m] (hover・接近)。
 OFFERED_HAND_CLEARANCE = 0.02  # [m]

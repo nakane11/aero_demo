@@ -14,7 +14,7 @@
   └ 台車 x の窓ごと (±0.15 m → ±0.3 m → 無制限, solve_person_ik_side_by_side)
       ├ 第1段: 干渉回避付きバッチ IK (向き 3 × 初期値 512 を 1 バッチ、目標は hover)
       └ 候補選択 (pick_verified_candidate): コスト昇順に
-          ├ hover の事後検証 (自己干渉の貫通 + 人体から 6 cm、差し出した手まわりだけ 2 cm)
+          ├ hover の事後検証 (自己干渉の貫通 + 人体から 5 cm、差し出した手まわりだけ 2 cm)
           ├ 第2段: 押し込み区間 (solve_press_in): 曲線上 8 点の IK、最後の点が後処理 IK (掌 + 視線)
           └ 押し込み区間の事後検証 (自己干渉 + 手まわり以外の人体から 5 cm)
 軌道計画 (plan_person_motion)
@@ -35,8 +35,8 @@
 
 | 項目 | 値 | どこで使うか |
 |---|---|---|
-| 人体から離す距離 (全身) | **6 cm** (`spik.DEFAULT_COLLISION_MARGIN` = `DEFAULT_HOVER_HUMAN_CLEARANCE` = `phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE`) | hover の IK のペナルティの効き始め、hover 姿勢の事後検証、軌道最適化の効き始め |
-| 人体から離す距離 (経路・押し込み区間) | **5 cm** (`phm.DEFAULT_HUMAN_CLEARANCE`、`sbs.TRANSITION_HUMAN_CLEARANCE`、`spik.PRESS_IN_HUMAN_CLEARANCE`) | 接近軌道 (lead-in・全 waypoint)、押し込み区間 (手まわり以外)、横並び移動の事後検証 |
+| 人体から離す距離 (最適化) | **6 cm** (`spik.DEFAULT_COLLISION_MARGIN` = `phm.DEFAULT_COLLISION_ACTIVATION_DISTANCE`) | hover の IK のペナルティの効き始め、軌道最適化の効き始め |
+| 人体から離す距離 (検証) | **5 cm** (`spik.DEFAULT_HOVER_HUMAN_CLEARANCE`、`phm.DEFAULT_HUMAN_CLEARANCE`、`sbs.TRANSITION_HUMAN_CLEARANCE`、`spik.PRESS_IN_HUMAN_CLEARANCE`) | hover 姿勢の事後検証、接近軌道 (lead-in・全 waypoint)、押し込み区間 (手まわり以外)、横並び移動の事後検証 |
 | 差し出された手まわりから離す距離 | **2 cm** (`spik.OFFERED_HAND_CLEARANCE`) | hover の事後検証と接近軌道。押し込み区間では見ない、横並び移動では 5 cm (ロボットの肘から先だけ除外) |
 | 自己干渉の許容貫通 | **0 mm** (`DEFAULT_COLLISION_VERIFY_TOLERANCE` = `phm.DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE`) | IK・軌道の事後検証 |
 | ロボットの形状 | 指なしモデル + 手の箱 2 個 (下の「干渉ジオメトリ」) | IK・軌道最適化・自己干渉の事後検証 |
@@ -55,7 +55,8 @@
 
 | 段階 | 全身 | 手まわり |
 |---|---|---|
-| hover の IK (ペナルティ)・hover の事後検証 | 6 cm | 2 cm (IK では前腕を細らせて 2 cm 相当、掌・指はペナルティに入れない) |
+| hover の IK (ペナルティ) | 6 cm | 2 cm (前腕を細らせて 2 cm 相当、掌・指はペナルティに入れない) |
+| hover の事後検証 | 5 cm | 2 cm |
 | 押し込み区間 (途中の 7 点 + 最終の 1 点) | 5 cm | 見ない (掌に触れる) |
 | 接近軌道・lead-in | 5 cm | 2 cm |
 | 横並び移動 | 5 cm | 5 cm (ただしロボットの肘から先 × 人の差し出した手・前腕は見ない) |
@@ -362,7 +363,7 @@ cost = Σ w_j · q_j²                                (関節の曲げ量, 単�
 
 1. 差し出さない腕に関わらない組で、hover 姿勢を検証する:
    - 自己干渉の組の貫通 (`collision_pairs_min_distance`、許容 0 mm)。
-   - 人体 (全身) から **6 cm** 以上、差し出された手まわりだけ **2 cm** 以上離れているか
+   - 人体 (全身) から **5 cm** 以上、差し出された手まわりだけ **2 cm** 以上離れているか
      (`human_obstacle_clearances`・`human_clearance_thresholds`、指ありモデル、
      `--hover-human-clearance`。負の値で無効にすると、代わりに人体との組も貫通で見る)。
    ここで落ちれば押し込み区間を解く前に棄却する。
@@ -567,7 +568,7 @@ jaxls の軌道最適化 (`build_problem`):
     距離 (`other_hand_base_clearance`) も含める。
   - 人体 (全身) から **5 cm** 以上 (指ありモデル、`verify_human_clearance`、
     `phm.DEFAULT_HUMAN_CLEARANCE`)。ただし差し出された手まわりだけ **2 cm**。hover の IK の
-    6 cm より 1 cm 緩い (下の「接近の検証を 5 cm に」)。
+    6 cm より 1 cm 緩い (下の「接近の検証を 5 cm に」)。hover の事後検証も同じ 5 cm。
 - **`verified` の条件: 上の 2 つを全 waypoint で満たす** (`motion_passes`)。結果の
   `waypoint_min_distances` は自己干渉の最小距離、`waypoint_human_clearance_margins`/
   `lead_in_human_clearance_margins` は人体との距離から基準 (5 cm、手まわりは 2 cm) を引いた
@@ -578,12 +579,20 @@ jaxls の軌道最適化 (`build_problem`):
 hover の IK は人体から 6 cm で解くので、hover は 6 cm ちょうど付近に来る。接近の検証も
 6 cm だと、経路が差し出した掌・前腕へ数 mm 入るだけで落ちていた (実機 2026-10-13 の試行
 1・2・9 は 1〜8 mm 不足)。経路の検証だけ 5 cm に緩めた (hover の IK・軌道最適化の効き始め・
-IK 段階の hover の事後検証は 6 cm のまま。軌道計画で差し出さない腕を差し替えた後の再検証
+IK 段階の hover の事後検証はこの時点では 6 cm のまま (10/29 に 5 cm、下)。軌道計画で差し出さない腕を差し替えた後の再検証
 (`handshake_with_other_arm_posture`) は `phm.DEFAULT_HUMAN_CLEARANCE` を使うので 5 cm)。
 保存した実機 10/13 の 13 試行を
 解き直すと、6 cm で 8/13、5 cm で 11/13 が通った。5 cm でも残る 2 試行は距離と関係ない
 (試行 11 は自己干渉 -6 mm、試行 12 は接近の途中で差し出した手まで 1.1 cm)。
 差し出された手まわりを 2 cm にしたのはその後の hover の変更 (hover が掌から約 2 cm になった) による。
+
+2026-10-29 に IK 段階の hover の事後検証 (`DEFAULT_HOVER_HUMAN_CLEARANCE`) も 5 cm にして、
+検証の距離を全段階で揃えた (hover の IK のペナルティと軌道最適化の効き始めは 6 cm のまま)。
+合成 400 人 (seed 0) は後処理まで 60・軌道 60 で変わらず、選ばれた hover の関節角も 60 人とも
+同じ。横並びは 59 → 58/60 だが、減った human_232 は hover 姿勢が同じで探索の時間の上限による
+揺れ。保存した実機 37 試行 (10/13・10/15・10/22) は横並びまで 11 で同じ、1 試行
+(10/22 16:20:35) が ik_fail → no_press に進んだだけ。IK の時間は合成で 0.476 → 0.471 秒/人、
+実機の解き直しは平均 1.76 → 1.68 秒/試行 (差は横並びの計画時間の揺れ)。
 
 - 軌道が通らず、その原因に指先と台車の干渉が含まれるときは、差し出さない腕を
   `OTHER_ARM_POSTURES_DEG` の 1 段曲げた姿勢に差し替えて計画し直す
