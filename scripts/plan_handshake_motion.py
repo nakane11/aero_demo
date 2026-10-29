@@ -467,7 +467,8 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
 
 
 def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
-                   joint_positions, human_xy, obstacle_cache, hand=None):
+                   joint_positions, human_xy, obstacle_cache, hand=None,
+                   robot_arm=None):
     """人から ``LEAD_IN_CHECK_RADIUS`` 以内の lead-in waypoint を検証し、
     (最小距離のリスト, 人体距離の余裕のリスト) を返す (未検証は ``None``)。"""
     near = [i for i, wp in enumerate(lead_in)
@@ -484,7 +485,7 @@ def verify_lead_in(robot, joint_names, lead_in, verification_pairs,
             obstacle_cache=obstacle_cache)
         checked_clearances = verify_human_clearance(
             robot, joint_names, near_waypoints, verification_pairs,
-            obstacle_cache, hand=hand)
+            obstacle_cache, hand=hand, robot_arm=robot_arm)
         for i, d, c in zip(near, checked, checked_clearances):
             distances[i] = float(d)
             clearances[i] = float(c)
@@ -724,23 +725,22 @@ def _apply_waypoint(robot, joint_names, wp):
 
 
 def verify_human_clearance(robot, joint_names, waypoints, verification_pairs,
-                           obstacle_cache, hand=None):
-    """各 waypoint の人体との最短距離から ``DEFAULT_HUMAN_CLEARANCE`` (差し
-    出した手 ``hand`` の手まわりは ``OFFERED_HAND_CLEARANCE``) を引いた余裕
-    [m] のリスト (0 以上で通過、障害物が無ければ ``inf``)。"""
+                           obstacle_cache, hand=None, robot_arm=None):
+    """各 waypoint の人体との最短距離から ``DEFAULT_HUMAN_CLEARANCE`` (ロボットの
+    差し出す腕 ``robot_arm`` の肘から先と差し出した手 ``hand`` の手まわりの組は
+    ``OFFERED_HAND_CLEARANCE``) を引いた余裕 [m] のリスト (0 以上で通過、障害物が
+    無ければ ``inf``)。"""
     obstacle_links = obstacle_cache[0]
     if not obstacle_links or not waypoints:
         return [float('inf')] * len(waypoints)
-    verification_pairs = spik.human_clearance_pairs(verification_pairs)
-    thresholds = spik.human_clearance_thresholds(
-        hand, DEFAULT_HUMAN_CLEARANCE)
+    groups = spik.offered_hand_clearance_groups(
+        spik.human_clearance_pairs(verification_pairs), hand, robot_arm,
+        DEFAULT_HUMAN_CLEARANCE, cache=True)
     margins = []
     for wp in waypoints:
         _apply_waypoint(robot, joint_names, wp)
-        per_obstacle = spik.human_obstacle_clearances(
-            robot, verification_pairs, obstacle_links,
-            cull_distance=DEFAULT_HUMAN_CLEARANCE)
-        margins.append(spik.clearance_shortfall(per_obstacle, thresholds)[1])
+        margins.append(spik.grouped_clearance_shortfall(
+            robot, groups, obstacle_links)[1])
     return margins
 
 
@@ -798,35 +798,47 @@ def handshake_with_other_arm_posture(robot, robot_arm, handshake, posture,
         result['joint_angle_vector'] = [float(v)
                                         for v in robot.angle_vector()]
 
+    hand = handshake.get('offered_hand')
+    obstacles = (spik.human_body_obstacles(joint_positions)
+                 if joint_positions else None)
+    clearance_source = spik.human_clearance_pairs(verification_pairs)
+    # hover はロボットの肘から先 x 手まわりを OFFERED_HAND_CLEARANCE、押し込みは
+    # その組を見ない。それ以外の組は手まわりも含めて 5cm。
+    hover_groups = spik.offered_hand_clearance_groups(
+        clearance_source, hand, robot_arm, DEFAULT_HUMAN_CLEARANCE,
+        cache=True)
+    press_groups = spik.offered_hand_clearance_groups(
+        clearance_source, hand, robot_arm, spik.PRESS_IN_HUMAN_CLEARANCE,
+        hand_clearance=None, cache=True)
+
+    def rejected(groups):
+        if spik.collision_pairs_min_distance(
+                robot, self_pairs, joint_positions) < -tolerance:
+            return True
+        return bool(obstacles) and spik.grouped_clearance_shortfall(
+            robot, groups, obstacles)[1] < 0.0
+
     apply(new)
-    if spik.collision_pairs_min_distance(
-            robot, self_pairs, joint_positions) < -tolerance:
+    if rejected(hover_groups):
         return None
-    if joint_positions:
-        clearances = spik.human_obstacle_clearances(
-            robot, spik.human_clearance_pairs(verification_pairs),
-            spik.human_body_obstacles(joint_positions),
-            cull_distance=DEFAULT_HUMAN_CLEARANCE)
-        thresholds = spik.human_clearance_thresholds(
-            handshake.get('offered_hand'), DEFAULT_HUMAN_CLEARANCE)
-        if spik.clearance_shortfall(clearances, thresholds)[1] < 0.0:
-            return None
     post = new.get('post_process')
     if post is not None:
-        # 押し込み途中の姿勢も差し替える (検証は自己干渉のみ)。
+        # 押し込み途中の姿勢も差し替える。台車は押し込み区間の台車の経路。
         path = []
-        for angle_vector in post.get('press_in_path', []):
+        bases = post.get('press_in_base_path') or []
+        for k, angle_vector in enumerate(post.get('press_in_path', [])):
             step = dict(post, joint_angle_vector=angle_vector)
+            if k < len(bases):
+                step.update(base_position=[bases[k][0], bases[k][1], 0.0],
+                            base_yaw=bases[k][2])
             apply(step)
-            if spik.collision_pairs_min_distance(
-                    robot, self_pairs, joint_positions) < -tolerance:
+            if rejected(press_groups):
                 return None
             path.append(step['joint_angle_vector'])
         if 'press_in_path' in post:
             post['press_in_path'] = path
         apply(post)
-        if spik.collision_pairs_min_distance(
-                robot, self_pairs, joint_positions) < -tolerance:
+        if rejected(press_groups):
             return None
         post['other_arm_posture'] = list(spik.OTHER_ARM_POSTURES_DEG[posture])
     return new
@@ -926,7 +938,7 @@ def _plan_person_motion_once(robot, robot_arm, handshake, joint_positions,
         distances, clearances = verify_lead_in(
             robot, joint_names, lead_in, verification_pairs,
             joint_positions, human_xy, obstacle_cache,
-            hand=handshake.get('offered_hand'))
+            hand=handshake.get('offered_hand'), robot_arm=robot_arm)
         verified = motion_passes(distances, clearances)
         return lead_in, distances, clearances, verified
 
@@ -1054,7 +1066,8 @@ def _plan_from_start(robot, robot_arm, handshake, joint_positions, base_start,
             robot_arm=robot_arm)
         clearances = verify_human_clearance(
             robot, joint_names, waypoints, verification_pairs,
-            obstacle_cache, hand=handshake.get('offered_hand'))
+            obstacle_cache, hand=handshake.get('offered_hand'),
+            robot_arm=robot_arm)
         return dict(
             planned=True,
             kind=kind,

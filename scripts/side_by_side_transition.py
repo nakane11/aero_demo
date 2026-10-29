@@ -1291,17 +1291,6 @@ def _aim_head(robot, gaze_point):
     return best[0]
 
 
-def _below_elbow(link, robot_arm):
-    """``link`` が ``robot_arm`` の腕の肘から先 (手・指を含む) か。"""
-    elbow = '{}_elbow_joint'.format(robot_arm)
-    while link is not None:
-        joint = getattr(link, 'joint', None)
-        if joint is not None and joint.name == elbow:
-            return True
-        link = getattr(link, 'parent_link', None)
-    return False
-
-
 # 横並び移動の検証で人体 (車輪と脚・足を含む) から空ける距離 [m]。
 TRANSITION_HUMAN_CLEARANCE = 0.05
 
@@ -1322,12 +1311,8 @@ class TransitionChecker(object):
         source = spik.human_clearance_pairs(verification_pairs)
         self.clearance_pairs = None
         if source is not None:
-            pairs = [pair for pair in source
-                     if not (isinstance(pair[1], int) and pair[1] in offered
-                             and _below_elbow(pair[0], robot_arm))]
-            self.clearance_pairs = (
-                source.with_pairs(pairs)
-                if isinstance(source, spik.VerificationPairs) else pairs)
+            self.clearance_pairs = spik.split_offered_hand_pairs(
+                source, hand, robot_arm)[1]
         # 台車の経路 (``check_base_path``) で見る、車輪と人の脚・足などの組
         # (人の腕は経路の途中で動くので除く)。各姿勢の車輪は clearance_pairs
         # で見る。

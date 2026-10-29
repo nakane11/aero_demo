@@ -1165,6 +1165,83 @@ def human_clearance_thresholds(hand, clearance,
     return thresholds
 
 
+def below_elbow(link, robot_arm):
+    """``link`` が ``robot_arm`` の腕の肘から先 (肘・手・指を含む) か。"""
+    elbow = '{}_elbow_joint'.format(robot_arm)
+    while link is not None:
+        joint = getattr(link, 'joint', None)
+        if joint is not None and joint.name == elbow:
+            return True
+        link = getattr(link, 'parent_link', None)
+    return False
+
+
+def split_offered_hand_pairs(source, hand, robot_arm):
+    """人体との距離の組 ``source`` を、ロボットの差し出す腕 ``robot_arm`` の肘から先
+    (``below_elbow``) x 差し出した手まわり (``offered_hand_obstacle_indices``) の組と、
+    それ以外の組に分けて ``(肘から先, それ以外)`` を返す。"""
+    offered = offered_hand_obstacle_indices(hand)
+    near, rest = [], []
+    for pair in source:
+        if (isinstance(pair[1], int) and pair[1] in offered
+                and below_elbow(pair[0], robot_arm)):
+            near.append(pair)
+        else:
+            rest.append(pair)
+    if isinstance(source, VerificationPairs):
+        return source.with_pairs(near), source.with_pairs(rest)
+    return near, rest
+
+
+# (id(source), hand, robot_arm) -> (source, 肘から先, それ以外)。分けた組は距離計算の
+# 段取り (_pair_plan) を持つので、同じ組を何度も測る呼び出し元で使い回す。
+_OFFERED_HAND_SPLIT_CACHE = {}
+
+
+def offered_hand_clearance_groups(source, hand, robot_arm, clearance,
+                                  hand_clearance=OFFERED_HAND_CLEARANCE,
+                                  cache=False):
+    """人体との距離の事後検証で測る ``[(組, 障害物ごとの閾値, 説明), ...]``。
+
+    ロボットの差し出す腕 ``robot_arm`` の肘から先 x 差し出した手 ``hand`` の手まわり
+    は ``hand_clearance`` (None なら見ない)、それ以外の組は手まわりも含めて
+    ``clearance``。``robot_arm`` が None なら分けずに、手まわりを全リンク
+    ``hand_clearance`` にする (``human_clearance_thresholds``)。``cache`` なら分けた組を
+    ``source`` ごとに覚えて使い回す (``source`` を長く使う呼び出し元向け)。"""
+    if source is None:
+        return []
+    if hand is None or robot_arm is None:
+        return [(source, human_clearance_thresholds(
+            hand, clearance, hand_clearance=hand_clearance), '')]
+    key = (id(source), hand, robot_arm)
+    cached = _OFFERED_HAND_SPLIT_CACHE.get(key) if cache else None
+    if cached is None or cached[0] is not source:
+        cached = (source,) + split_offered_hand_pairs(source, hand, robot_arm)
+        if cache:
+            _OFFERED_HAND_SPLIT_CACHE[key] = cached
+    _, near, rest = cached
+    n = len(human_obstacle_names())
+    groups = [(rest, np.full(n, float(clearance)), '')]
+    if hand_clearance is not None and len(near):
+        groups.append((near, np.full(n, float(min(hand_clearance, clearance))),
+                       'ロボットの肘から先'))
+    return groups
+
+
+def grouped_clearance_shortfall(robot, groups, obstacle_links):
+    """``offered_hand_clearance_groups`` の組ごとに人体との距離を測り、閾値を引いた
+    余裕が最小の ``(添字, 余裕, 距離, 説明)`` (無ければ ``(None, inf, inf, '')``)。"""
+    best = (None, float('inf'), float('inf'), '')
+    for pairs, thresholds, label in groups:
+        clearances = human_obstacle_clearances(
+            robot, pairs, obstacle_links,
+            cull_distance=float(np.max(thresholds)))
+        index, margin = clearance_shortfall(clearances, thresholds)
+        if index is not None and margin < best[1]:
+            best = (index, margin, clearances[index], label)
+    return best
+
+
 def clearance_shortfall(clearances, thresholds):
     """``human_obstacle_clearances`` の結果 ``{添字: 距離}`` で、距離から ``thresholds`` を
     引いた余裕が最小の ``(添字, 余裕)`` (無ければ ``(None, inf)``)。"""
@@ -2818,9 +2895,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
                             placement_joint_positions=None):
     """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
-    (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、差し出した手まわりだけ
-    ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が解け、自己干渉と手まわり以外の
-    人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) をすべて通る候補をコストの低い順に探す。
+    (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、ロボットの差し出す腕の肘から先と
+    差し出した手まわりの組だけ ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が
+    解け、自己干渉と、肘から先 x 手まわり以外の人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) を
+    すべて通る候補をコストの低い順に探す。
 
     コストは関節の曲げ量に、台車の正面方向のずれ x ``front_offset_weight`` と向きのずれ x
     ``facing_yaw_weight`` を足したもの。後処理だけ失敗した場合は、事後検証を通った最小コストの候補を
@@ -2926,12 +3004,18 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     early_clearance_pairs = _subset(
         lambda pair: not _involves_other_arm(pair), clearance_source)
     other_arm_clearance_pairs = _subset(_involves_other_arm, clearance_source)
-    # hover は差し出した手まわりだけ OFFERED_HAND_CLEARANCE、押し込み区間は
-    # 手まわりを見ずにそれ以外を PRESS_IN_HUMAN_CLEARANCE。
-    hover_thresholds = None if hover_human_clearance is None else \
-        human_clearance_thresholds(hand, hover_human_clearance)
-    press_thresholds = human_clearance_thresholds(
-        hand, PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
+    # ロボットの差し出す腕の肘から先 x 差し出した手まわりは、hover は
+    # OFFERED_HAND_CLEARANCE、押し込み区間は見ない。それ以外の組は手まわりも含めて
+    # hover は hover_human_clearance、押し込み区間は PRESS_IN_HUMAN_CLEARANCE。
+    early_hover_groups = other_arm_hover_groups = None
+    if hover_human_clearance is not None:
+        early_hover_groups = offered_hand_clearance_groups(
+            early_clearance_pairs, hand, robot_arm, hover_human_clearance)
+        other_arm_hover_groups = offered_hand_clearance_groups(
+            other_arm_clearance_pairs, hand, robot_arm, hover_human_clearance)
+    press_groups = offered_hand_clearance_groups(
+        clearance_source, hand, robot_arm, PRESS_IN_HUMAN_CLEARANCE,
+        hand_clearance=None)
     # 押し込み区間で、ロボットの前腕まわりを人の前腕・手の甲から離す。
     press_forearm_pairs = press_forearm_obstacles = None
     if (PRESS_IN_FOREARM_CLEARANCE is not None and joint_positions
@@ -2958,25 +3042,23 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                 return True
         return False
 
-    def _too_close_to_human(pairs, label, thresholds=hover_thresholds,
-                            what='hover-clearance'):
-        if thresholds is None or not obstacle_links or pairs is None:
+    def _too_close_to_human(groups, label, what='hover-clearance'):
+        if not groups or not obstacle_links:
             return False
-        clearances = human_obstacle_clearances(
-            robot, pairs, obstacle_links,
-            cull_distance=float(np.max(thresholds)))
-        index, margin = clearance_shortfall(clearances, thresholds)
+        index, margin, distance, part = grouped_clearance_shortfall(
+            robot, groups, obstacle_links)
         if index is None or margin >= 0.0:
             return False
-        print('  [{}] {} の候補は人体 ({}) まで {:.3f} m しか離れていない'
+        print('  [{}] {} の候補は{}人体 ({}) まで {:.3f} m しか離れていない'
               'ため棄却します。'.format(
-                  what, label, human_obstacle_names()[index],
-                  clearances[index]))
+                  what, label, part + 'から' if part else '',
+                  human_obstacle_names()[index], distance))
         return True
 
     def _press_in_path_rejected(path, bases, posture, label):
         # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの、台車は bases の [x, y, yaw]) を
-        # 自己干渉と手まわり以外の人体距離で検証し、差し替えた関節角のリストを返す (通らなければ None)。
+        # 自己干渉と、肘から先 x 手まわり以外の人体距離で検証し、差し替えた関節角のリストを返す
+        # (通らなければ None)。
         replaced = []
         for k, (angle_vector, base) in enumerate(zip(path, bases)):
             robot.newcoords(Coordinates(
@@ -2994,8 +3076,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                       'で {:.4f} m 自己干渉していたため、後処理判定を失敗扱い'
                       'にします。'.format(label, k + 1, dist))
                 return None
-            if _too_close_to_human(clearance_source, label, press_thresholds,
-                                   'press-in-clearance'):
+            if _too_close_to_human(press_groups, label, 'press-in-clearance'):
                 return None
             if _forearm_too_close(label, k):
                 return None
@@ -3027,7 +3108,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                   '棄却します。'.format(label, min_dist,
                                        *collision_pair_name(pair)))
             continue
-        if _too_close_to_human(early_clearance_pairs, label):
+        if _too_close_to_human(early_hover_groups, label):
             continue
         # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決め、hover・押し込みの両方に差し替える。
         post_result = solve_press_in(
@@ -3057,13 +3138,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                   '姿勢で {:.4f} m 貫通 ({} x {}) していたため棄却します。'
                   .format(label, min_dist, *collision_pair_name(pair)))
             continue
-        if _too_close_to_human(other_arm_clearance_pairs, label):
+        if _too_close_to_human(other_arm_hover_groups, label):
             continue
         if fallback is None:
             fallback = (turn_index, hover_av, base_poses[candidate_index],
                         cost)
         if post_result is not None:
-            # 押し込み区間は差し出した手まわりに触れるので、自己干渉と手まわり以外の人体距離だけを検証する。
+            # 押し込み区間はロボットの肘から先が差し出した手まわりに触れるので、その組は見ない。
             replaced = _press_in_path_rejected(
                 post_result['press_in_path']
                 + [post_result['joint_angle_vector']],

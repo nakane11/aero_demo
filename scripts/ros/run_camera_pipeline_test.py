@@ -3725,7 +3725,8 @@ class HandshakePipelineNode(object):
             self.robot, joint_names, [waypoint],
             self.motion_verification_pairs,
             phm.build_obstacle_cache(collision_joints),
-            hand=offered_hand)[0])
+            hand=offered_hand,
+            robot_arm=spik.DEFAULT_ROBOT_ARM[offered_hand])[0])
 
     def _send_tail_goal(self, points):
         """``in_motion_correction.build_tail_points`` の点列を台車の新しいゴールとして
