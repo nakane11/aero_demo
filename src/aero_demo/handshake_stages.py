@@ -31,6 +31,7 @@ STAGE_GRASP = ('手を握っています', '')
 STAGE_TRANSITION_WAIT = ('横並び移動の開始待ち', '')
 STAGE_TRANSITION = ('横並び移動',
                     'つないだ手を体の横へ下ろしながら横並びへ (首は顔を追う)')
+STAGE_WALK_FORWARD = ('手をつないで前進', '台車だけ前へ進む (首は正面)')
 STAGE_DONE = ('実行を終了しました', 'RESET で最初から')
 STAGE_ERROR = ('実行中にエラーが起きました', '端末のログを確認してください')
 # 裏の計算 (状態の補足に出す)。
@@ -47,7 +48,7 @@ STATE_GROUPS = (
                      STAGE_PRESS_REFINE)),
     ('押し込み中', (STAGE_PRESS_IN,)),
     ('手を握って待機中', (STAGE_GRASP, STAGE_TRANSITION_WAIT)),
-    ('横並び移動中', (STAGE_TRANSITION,)),
+    ('横並び移動中', (STAGE_TRANSITION, STAGE_WALK_FORWARD)),
     ('終了', (STAGE_DONE,)),
     ('エラー', (STAGE_ERROR,)),
 )

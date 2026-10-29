@@ -65,7 +65,8 @@ from aero_demo.handshake_stages import (  # noqa: E402
     STAGE_HOVER_SETTLE, STAGE_IDLE, STAGE_INITIAL_POSE, STAGE_LEAD_IN,
     STAGE_NOD_WAIT, STAGE_PLAN_APPROACH, STAGE_PLAN_IK, STAGE_PLAN_TRANSITION,
     STAGE_PRESS_IN, STAGE_PRESS_REFINE, STAGE_RESULT, STAGE_SPIRAL,
-    STAGE_STARTING, STAGE_TRANSITION, STAGE_TRANSITION_WAIT, numbered_title)
+    STAGE_STARTING, STAGE_TRANSITION, STAGE_TRANSITION_WAIT,
+    STAGE_WALK_FORWARD, numbered_title)
 from aero_demo import in_motion_correction  # noqa: E402
 from aero_demo import json_io  # noqa: E402
 from aero_demo import palm_plane_view  # noqa: E402
@@ -175,6 +176,11 @@ SPEECH_SERVER_TIMEOUT = 1.0  # [s]
 SPEECH_RESULT_TIMEOUT = 60.0  # [s]
 SPEECH_FALLBACK_BASE = 3.0
 SPEECH_FALLBACK_PER_CHAR = 0.2
+# 横並びの後、手をつないだまま台車を前へ進める距離と、それにかける最短時間
+# (人が付いて歩ける速さにするため)、進む前の発話。
+WALK_FORWARD_DISTANCE = 0.5  # [m]
+WALK_FORWARD_MIN_TIME = 4.0  # [s]
+SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
 # 取り違えているとみなして裏返す。実機の差し出し 206 件 (bag のフレームを含む) では
 # 正しい掌は -0.25 以上、-0.8 未満はすべて裏返った推定だった (2026-10-21)。
@@ -2810,6 +2816,23 @@ class HandshakePipelineNode(object):
         self.ri.angle_vector_sequence(
             [target_av], time_list, controller_type='head_controller')
 
+    def _send_head_forward(self):
+        """首を正面 (neck の y・p・r を 0) へ向かわせる (待たない)。"""
+        joint_list = self.real_robot.joint_list
+        current_av = np.asarray(self.ri.angle_vector(), dtype=np.float64)
+        target_av = current_av.copy()
+        for joint in (self.real_robot.neck_y_joint,
+                      self.real_robot.neck_p_joint,
+                      self.real_robot.neck_r_joint):
+            target_av[joint_list.index(joint)] = 0.0
+        delta = float(np.max(np.abs(target_av - current_av)))
+        time_list = self._limited_time_list(
+            [target_av], None,
+            [max(HEAD_TRACK_MIN_MOVE_TIME,
+                 delta / np.deg2rad(HEAD_FACE_TRACK_SPEED_DEG))])
+        self.ri.angle_vector_sequence(
+            [target_av], time_list, controller_type='head_controller')
+
     def _execute_on_robot(self):
         """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
         途中で例外になっても顔追従・手の追跡は止める。"""
@@ -3123,8 +3146,33 @@ class HandshakePipelineNode(object):
                 press_waypoints[-1], display_waypoints[-1],
                 transition_waypoints_, joint_names, robot_arm,
                 hold_neck=hand_followed)
+            self._walk_forward(WALK_FORWARD_DISTANCE)
 
         print('[execute] 実行を終了しました。')
+
+    def _walk_forward(self, distance):
+        """横並びの後、手をつないだまま台車だけを ``distance`` [m] 前 (台車の
+        +x) へ進める。腕・脚には指令を送らず横並びの姿勢のまま、進む前に
+        ``SPEECH_WALK_FORWARD_TEXT`` を発話し終わるまで待つ。首は顔を追わず
+        正面 (首の関節を全て 0) へ向ける。"""
+        self._set_activity(STAGE_WALK_FORWARD)
+        spoken = self._say(SPEECH_WALK_FORWARD_TEXT, wait=True)
+        spoken.wait(SPEECH_RESULT_TIMEOUT)
+        point = [float(distance), 0.0, 0.0]
+        sec, = self._limited_time_list(
+            None, [point], [WALK_FORWARD_MIN_TIME])
+        print('[execute] 手をつないだまま {:.2f}m 前進します ({:.1f} 秒)。'
+              .format(distance, sec))
+        self._send_head_forward()
+        before = self._odom_pose(self.ri.odom)
+        self._send_base_trajectory([point], [sec], wait=True)
+        settle_time, _ = self._wait_odom_settle()
+        self.ri.wait_interpolation(controller_type='head_controller')
+        moved = scan_matching.relative(before, self._odom_pose(self.ri.odom))
+        log_debug('[execute][walk] 前進後の odom の移動 ({:+.3f}m, {:+.3f}m, '
+                  '{:+.1f}deg)、止まるまで {:.2f}s'.format(
+                      moved[0], moved[1], math.degrees(moved[2]),
+                      settle_time))
 
     def _execute_transition(self, press_wp, planned_press_wp, waypoints,
                             joint_names, robot_arm, hold_neck=False):
