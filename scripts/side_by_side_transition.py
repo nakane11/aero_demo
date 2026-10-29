@@ -215,10 +215,6 @@ GOAL_YAW_MARGIN_DEG = 20.0
 GOAL_YAW_FALLBACK_DEG = 30.0
 APPROACH_FALLBACK_LATERAL = 0.85
 
-# 台車 (車輪の箱) と人の脚などの距離 [m] (ほかの組は
-# TRANSITION_HUMAN_CLEARANCE)。人の脚は円柱で足先が入っていないので余裕を見る。
-TRANSITION_BASE_CLEARANCE = 0.10
-
 # 人の掌の向きの候補 (``HumanArm.lowering`` の facing): 腕を下ろしきった
 # ときの掌の法線を後ろ向き (0 度) から人側 (90 度) へ回した角度 [度] の
 # 'phi<角度>'、続けて 'natural' と 'forward'。
@@ -1306,7 +1302,7 @@ def _below_elbow(link, robot_arm):
     return False
 
 
-# 横並び移動の検証で人体 (車輪と脚を含む) から空ける距離 [m]。
+# 横並び移動の検証で人体 (車輪と脚・足を含む) から空ける距離 [m]。
 TRANSITION_HUMAN_CLEARANCE = 0.05
 
 
@@ -1318,10 +1314,8 @@ class TransitionChecker(object):
 
     def __init__(self, robot_arm, hand, verification_pairs,
                  clearance=TRANSITION_HUMAN_CLEARANCE,
-                 tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE,
-                 base_clearance=TRANSITION_BASE_CLEARANCE):
+                 tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
         self.clearance = clearance
-        self.base_clearance = max(base_clearance, clearance)
         self.tolerance = tolerance
         self.self_pairs = spik.self_collision_pairs(verification_pairs)
         offered = spik.offered_hand_obstacle_indices(hand)
@@ -1334,7 +1328,9 @@ class TransitionChecker(object):
             self.clearance_pairs = (
                 source.with_pairs(pairs)
                 if isinstance(source, spik.VerificationPairs) else pairs)
-        # 台車の車輪と人の脚などの組 (人の腕は動くので除く)。
+        # 台車の経路 (``check_base_path``) で見る、車輪と人の脚・足などの組
+        # (人の腕は経路の途中で動くので除く)。各姿勢の車輪は clearance_pairs
+        # で見る。
         self.base_pairs = None
         if source is not None:
             arm = offered | set(_lowered_arm_slots(hand))
@@ -1397,11 +1393,11 @@ class TransitionChecker(object):
             _place(robot, av, base_path.at(k / float(n)))
             clearances = spik.human_obstacle_clearances(
                 robot, self.base_pairs, obstacles,
-                cull_distance=self.base_clearance)
+                cull_distance=self.clearance)
             if not clearances:
                 continue
             index = min(clearances, key=clearances.get)
-            if clearances[index] < self.base_clearance:
+            if clearances[index] < self.clearance:
                 return '経路の車輪が人体 ({}) まで {:.3f} m'.format(
                     names[index], clearances[index])
         return None
@@ -1436,17 +1432,6 @@ class TransitionChecker(object):
             if clearances[index] < self.clearance:
                 return '人体 ({}) まで {:.3f} m'.format(
                     spik.human_obstacle_names()[index], clearances[index])
-        if self.base_pairs and self.base_clearance > self.clearance:
-            clearances = spik.human_obstacle_clearances(
-                robot, self.base_pairs,
-                spik.human_body_obstacles(joint_positions),
-                cull_distance=self.base_clearance)
-            if clearances:
-                index = min(clearances, key=clearances.get)
-                if clearances[index] < self.base_clearance:
-                    return '台車が人体 ({}) まで {:.3f} m'.format(
-                        spik.human_obstacle_names()[index],
-                        clearances[index])
         return None
 
 

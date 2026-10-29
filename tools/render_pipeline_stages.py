@@ -86,6 +86,7 @@ ROBOT_GHOST_COLOR = (150, 170, 200, 70)
 SKIN_COLOR = (205, 165, 140, 255)
 SKIN_FADED_COLOR = (205, 165, 140, 110)
 HUMAN_CYL_COLOR = (80, 140, 220, 70)
+HUMAN_CYL_LABEL = '人体の干渉円柱 ({} 本)'.format(len(spik.human_obstacle_names()))
 HUMAN_SHELL_COLOR = (80, 170, 240, 28)
 HAND_SHELL_COLOR = (60, 200, 170, 45)     # 差し出した手まわりの膜 (2 cm)
 PRESS_CURVE_COLOR = (230, 40, 40, 255)
@@ -825,7 +826,7 @@ class StageBuilder(object):
         s.add(robot_visual_mesh(self.visual), ROBOT_COLOR)
         s.layer('smpl', '人 (SMPL)')
         s.add(p.smpl_mesh(p.palm), SKIN_COLOR)
-        s.layer('cyl', '人体の干渉円柱 (26 本)',
+        s.layer('cyl', HUMAN_CYL_LABEL,
                 '骨格から作る円柱。以降の段階の干渉判定はすべてこれで行う',
                 default=False, colors=[HUMAN_CYL_COLOR])
         add_human_cylinders(s, p.collision_joints)
@@ -853,7 +854,7 @@ class StageBuilder(object):
         stage.top_limits = self.top_limits_around(
             [[0.0, 0.0], p.standing, p.palm], margin=1.0)
         stage.legend = [
-            legend_handle(HUMAN_CYL_COLOR, '人体の干渉円柱 (26 本)'),
+            legend_handle(HUMAN_CYL_COLOR, HUMAN_CYL_LABEL),
             legend_handle((230, 150, 80, 110), 'ロボットの干渉形状'),
             legend_handle(TARGET_HOVER_COLOR, 'hover 目標', 'marker')]
         return stage
@@ -971,11 +972,12 @@ class StageBuilder(object):
             '03_hover_verify', '3. 事後検証: hover 姿勢 (人体から 6 cm・手まわり 2 cm、自己干渉 0 mm)',
             ['収束した候補をコスト (関節の曲げ量 + 30 × 前方ずれ + 30 × 向きのずれ) '
              'の安い順に検証し、通った最初の候補で第 2 段 (押し込み) を解く。',
-             '人体との距離: 指ありモデル (表示しているロボット) の表面から全身 26 本'
+             '人体との距離: 指ありモデル (表示しているロボット) の表面から全身 {} 本'
              'の円柱まで {:.0f} cm 以上。ただし差し出した手まわり (掌・指・同じ側の'
              '前腕) は hover が掌から約 2 cm なので {:.0f} cm。この段階で初めて'
              '全身を見る。この人の余裕が最小の部位: {}。'.format(
-                 100 * clearance, 100 * hand_clearance, closest_text),
+                 len(spik.human_obstacle_names()), 100 * clearance,
+                 100 * hand_clearance, closest_text),
              '自己干渉: 指なし + 手の箱 2 個のモデルで貫通が 0 mm を超えないこと '
              '(この人の最小距離 {:+.1f} mm: {} × {})。差し出さない腕は台車の箱から 2 cm 離す姿勢に'
              '差し替えて再検証する。'.format(1000.0 * self_dist, *self_pair)])
@@ -990,7 +992,7 @@ class StageBuilder(object):
         add_robot_collision(s, self.ik)
         s.layer('closest', '余裕が最小の人体の部位', closest_text,
                 colors=[CLOSEST_COLOR])
-        s.layer('cyl', '人体の干渉円柱 (26 本)', colors=[HUMAN_CYL_COLOR])
+        s.layer('cyl', HUMAN_CYL_LABEL, colors=[HUMAN_CYL_COLOR])
         s.layer('shell', '人体 + 6 cm (近づけない範囲)',
                 '円柱を 6 cm 膨らませた形。ロボットの表面がこの中に入ると棄却',
                 colors=[HUMAN_SHELL_COLOR])
@@ -1204,7 +1206,7 @@ class StageBuilder(object):
         self.pose(waypoints[-1])
         s.layer('visual', 'ロボット: 終点 (hover)')
         s.add(robot_visual_mesh(self.visual), ROBOT_COLOR)
-        s.layer('cyl', '人体の干渉円柱 (26 本)', colors=[HUMAN_CYL_COLOR])
+        s.layer('cyl', HUMAN_CYL_LABEL, colors=[HUMAN_CYL_COLOR])
         s.layer('shell', '人体 + 5 cm (経路が入ってはいけない範囲)',
                 'hover の IK は 6 cm、経路の検証は 1 cm 緩い 5 cm',
                 colors=[HUMAN_SHELL_COLOR])
@@ -1524,7 +1526,7 @@ class StageBuilder(object):
         s.layer('smpl', '人 (SMPL)')
         self.pose(hover_wp(p))
         s.add(p.smpl_mesh(self.end_coords().worldpos()), SKIN_COLOR)
-        s.layer('cyl', '人体の干渉円柱 (26 本)', default=False,
+        s.layer('cyl', HUMAN_CYL_LABEL, default=False,
                 colors=[HUMAN_CYL_COLOR])
         add_human_cylinders(s, p.collision_joints)
         # 人のまわりに集まるロボットを横から、初期位置も入る向きで見る。

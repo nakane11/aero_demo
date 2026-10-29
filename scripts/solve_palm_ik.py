@@ -277,6 +277,20 @@ HUMAN_COLLISION_SEGMENTS = (
     ('LHip', 'LKnee', 0.09),
     ('LKnee', 'LAnkle', 0.06),
 )
+
+# 人の足 (靴を含む) の円柱。骨格に足先・かかとの点は無いので、足首から腰の
+# 正面方向 (``human_foot_segments``) を FOOT_TOE_OUT_DEG だけ外へ開いた向きに、
+# かかと側 FOOT_HEEL_LENGTH・つま先側 FOOT_TOE_LENGTH の軸を床から半径の高さに
+# 置く。寸法は合成 67 人の SMPL の足 (裸足) の頂点で、足首から前 0.11〜0.20 m
+# (中央 0.15)・後ろ 0.05〜0.08 m・外向き中央 15°・幅 ±0.05 m だったのに、靴の
+# 約 2 cm を足した値 (2026-10-29)。床は z = 0。
+FOOT_TOE_LENGTH = 0.20
+FOOT_HEEL_LENGTH = 0.09
+FOOT_TOE_OUT_DEG = 15.0
+FOOT_RADIUS = 0.05
+# 人の向きが求まらないときは、足首の真下に向きによらず足を覆う鉛直の円柱を置く。
+FOOT_FALLBACK_RADIUS = FOOT_TOE_LENGTH
+HUMAN_FOOT_SIDES = ('R', 'L')
 # 胴体の 3 本の円柱の半径を決める幅の関節。半径は前後の厚みで、肩幅・腰幅から概算する。
 _TORSO_SEGMENT_WIDTH_JOINTS = {
     ('RShoulder', 'RHip'): ('RShoulder', 'LShoulder'),
@@ -976,8 +990,42 @@ def _dummy_cylinder(radius):
                     pos=[DUMMY_OBSTACLE_DISTANCE] * 3)
 
 
+def human_foot_segments(joint_positions):
+    """左右の足の円柱の ``(p0, p1, 半径)`` のリスト (``HUMAN_FOOT_SIDES`` の順、
+    足首が無ければ None)。``joint_positions`` は ``_fill_missing_joints_straight_down``
+    後のもの。実カメラの骨格では足首を表面から奥へずらした後の点から置く。
+    足の向きは腰 (右腰 -> 左腰) の正面 (肩は体幹のひねりの分ずれるため)、
+    腰が無ければ ``human_facing_direction``。"""
+    forward = human_facing_direction(
+        {name: joint_positions[name] for name in ('RHip', 'LHip')
+         if name in joint_positions})
+    if forward is None:
+        forward = human_facing_direction(joint_positions)
+    segments = []
+    for side in HUMAN_FOOT_SIDES:
+        ankle = joint_positions.get('{}Ankle'.format(side))
+        if ankle is None:
+            segments.append(None)
+            continue
+        ankle = np.asarray(ankle, dtype=np.float64)
+        if forward is None:
+            p0 = np.array([ankle[0], ankle[1], 0.0])
+            p1 = np.array([ankle[0], ankle[1], 2.0 * FOOT_RADIUS])
+            segments.append((p0, p1, FOOT_FALLBACK_RADIUS))
+            continue
+        # 右足は右 (上から見て時計回り)、左足は左へ開く。
+        angle = math.radians(FOOT_TOE_OUT_DEG) * (-1.0 if side == 'R' else 1.0)
+        c, s = math.cos(angle), math.sin(angle)
+        direction = np.array([c * forward[0] - s * forward[1],
+                              s * forward[0] + c * forward[1], 0.0])
+        base = np.array([ankle[0], ankle[1], FOOT_RADIUS])
+        segments.append((base - FOOT_HEEL_LENGTH * direction,
+                         base + FOOT_TOE_LENGTH * direction, FOOT_RADIUS))
+    return segments
+
+
 def human_body_obstacles(joint_positions):
-    """骨格の関節位置から全身 (差し出した手を含む) の障害物 ``Cylinder`` のリストを作る。
+    """骨格の関節位置から全身 (差し出した手・足を含む) の障害物 ``Cylinder`` のリストを作る。
     個数・順序は常に一定 (``human_obstacle_names``) で、欠けた部位はダミーで埋める。"""
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     obstacles = []
@@ -1010,6 +1058,10 @@ def human_body_obstacles(joint_positions):
                     HAND_FINGER_RADIUS))
             else:
                 obstacles.append(_dummy_cylinder(HAND_FINGER_RADIUS))
+    # 足は既存の添字を変えないよう末尾に置く。
+    for segment in human_foot_segments(joint_positions):
+        obstacles.append(_dummy_cylinder(FOOT_RADIUS) if segment is None
+                         else _cylinder_between(*segment))
     return obstacles
 
 
@@ -1143,6 +1195,7 @@ def human_obstacle_names():
         names.append('{}_palm'.format(side))
         for label in HAND_FINGER_LABELS:
             names.append('{}_{}'.format(side, label))
+    names += ['{}Foot'.format(side) for side in HUMAN_FOOT_SIDES]
     return names
 
 
@@ -1199,6 +1252,11 @@ def human_capsules(joint_positions):
                 p0 = p1 = dummy
             caps.append((p0, p1, HAND_FINGER_RADIUS))
             names.append('{}_{}'.format(side, label))
+    for side, segment in zip(HUMAN_FOOT_SIDES,
+                             human_foot_segments(joint_positions)):
+        caps.append((dummy, dummy, FOOT_RADIUS) if segment is None
+                    else segment)
+        names.append('{}Foot'.format(side))
     return caps, names
 
 
