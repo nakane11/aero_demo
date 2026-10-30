@@ -4252,6 +4252,7 @@ class HandshakePipelineNode(object):
         要求から再生開始 (最初の feedback) と完了までの時間をログに出す。action
         サーバが無ければ topic で送り、文字数から見積もった時間だけ待つ。
         """
+        from actionlib_msgs.msg import GoalStatus
         from sound_play.msg import SoundRequest, SoundRequestGoal
         t_request = time.time()
         first_feedback = []
@@ -4278,13 +4279,25 @@ class HandshakePipelineNode(object):
             finished = client.wait_for_result(
                 rospy.Duration(SPEECH_RESULT_TIMEOUT))
             t_done = time.time()
+            # wait_for_result は ABORTED でも True を返すので state で判定する
+            # (音声合成に失敗すると sound_play は再生せず即 abort する)。
+            state = client.get_state()
             started = ('{:.2f} 秒後に再生開始、'.format(
                 first_feedback[0] - t_request) if first_feedback else '')
+            if not finished:
+                outcome = '打ち切り (時間切れ)'
+            elif state == GoalStatus.SUCCEEDED:
+                outcome = '完了'
+            else:
+                state_names = {v: k for k, v in vars(GoalStatus).items()
+                               if k.isupper() and isinstance(v, int)}
+                outcome = '失敗 ({}、再生されていません)'.format(
+                    state_names.get(state, state))
             print('[speech] 発話 ({} 文字) は要求から {}{:.2f} 秒で{}。'.format(
-                len(text), started, t_done - t_request,
-                '完了' if finished else '打ち切り (時間切れ)'))
+                len(text), started, t_done - t_request, outcome))
             log_debug_event(dict(
                 event='speech', n_chars=len(text), finished=bool(finished),
+                state=int(state),
                 start_delay=(first_feedback[0] - t_request
                              if first_feedback else None),
                 total=t_done - t_request))
