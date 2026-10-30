@@ -15,6 +15,7 @@ Usage
 """
 
 import argparse
+import base64
 import collections
 import copy
 import json
@@ -5293,22 +5294,68 @@ def build_arg_parser():
     parser.add_argument(
         '--no-head-tracking', dest='head_tracking', action='store_false',
         help='ARMED 中に首を人の方へ向けたり、見渡して人を探したりしない。')
+    parser.add_argument(
+        '--no-clock-sync', dest='clock_sync', action='store_false',
+        help='起動時にロボットとの時計ずれを見つけても Windows のタスク '
+             '(tools/sync_robot_clock.ps1) で合わせず、警告だけして起動する。')
     spik.add_press_in_forearm_argument(parser)
     return parser
 
 
 CLOCK_OFFSET_WARN_SEC = 0.1  # [秒] ロボットとの時計ずれがこれを超えたら警告
+# カーネルの tick [us] の標準値と、これ以上外れていたら警告する幅。WSL では
+# Windows との差が数秒 (10/30 実測で 3 秒は放置・6 秒は補正) を超えると時計を
+# Windows へ合わせ直し、WSL が先行していると tick を下げて追いつかせる (実測で
+# 9167、約 0.09 秒/秒)。普段の揺れは 9995〜10035 程度。
+KERNEL_TICK_NOMINAL = 10000  # [us]
+KERNEL_TICK_WARN = 100  # [us]
+SYNC_CLOCK_ADVICE = (
+    '  Windows の PowerShell で tools\\sync_robot_clock.ps1 を実行して、Windows を'
+    '先に直してください (WSL の時計は Windows との差が数秒を超えると Windows へ'
+    '引き戻されるので、Windows がずれたまま WSL だけ ntpdate すると実行中に'
+    '元のずれへ戻っていきます)。')
 
 
-def check_robot_clock_offset():
-    """ROS master (ロボット) との時計ずれを ntpdate -q で測り、大きければ警告する。
+def read_kernel_tick():
+    """adjtimex で今のカーネルの tick [us] を読む (読むだけなので root 不要)。
+    読めなければ None。"""
+    import ctypes
+    import ctypes.util
 
-    PC が遅れているとゴールの開始時刻が過去扱いになり、ARM で腕が下がらない・
-    短い台車ゴールが暴れる等が起きる。測れなくても起動は止めない。
-    """
-    host = urlparse(os.environ.get('ROS_MASTER_URI', '')).hostname
-    if host in (None, 'localhost', '127.0.0.1'):
-        return
+    class Timex(ctypes.Structure):
+        _fields_ = [
+            ('modes', ctypes.c_uint), ('offset', ctypes.c_long),
+            ('freq', ctypes.c_long), ('maxerror', ctypes.c_long),
+            ('esterror', ctypes.c_long), ('status', ctypes.c_int),
+            ('constant', ctypes.c_long), ('precision', ctypes.c_long),
+            ('tolerance', ctypes.c_long), ('time_sec', ctypes.c_long),
+            ('time_usec', ctypes.c_long), ('tick', ctypes.c_long),
+            ('rest', ctypes.c_byte * 256)]  # 以降の欄は使わない (余裕を持たせる)
+
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+        tx = Timex()
+        if libc.adjtimex(ctypes.byref(tx)) < 0:
+            return None
+        return int(tx.tick)
+    except (OSError, AttributeError):
+        return None
+
+
+def measure_robot_clock(host):
+    """ロボット (``host``) との時計ずれを ntpdate -q で測り、tick と合わせて
+    表示する。ずれ・引き戻しがあれば True、無ければ False、測れなければ None。"""
+    bad = False
+    tick = read_kernel_tick()
+    if tick is not None and abs(tick - KERNEL_TICK_NOMINAL) > KERNEL_TICK_WARN:
+        print('\033[1;31m[clock][WARN] カーネルの時計の進みが {:+.1f}% 変えられて'
+              'います (tick={})。WSL と Windows の時計が食い違っていて、WSL が'
+              'Windows の時計へ引き戻されている最中です。ロボットとの今のずれが'
+              '小さくても、実行中に 1 秒あたり約 {:.2f} 秒ずつ変わっていきます。'
+              '\033[0m'.format(
+                  (tick - KERNEL_TICK_NOMINAL) / KERNEL_TICK_NOMINAL * 100.0,
+                  tick, abs(tick - KERNEL_TICK_NOMINAL) / float(tick)))
+        bad = True
     ntpdate = shutil.which('ntpdate') or '/usr/sbin/ntpdate'
     try:
         out = subprocess.run(
@@ -5319,14 +5366,100 @@ def check_robot_clock_offset():
     except (OSError, subprocess.SubprocessError, IndexError, ValueError):
         print('[clock][WARN] {} との時計ずれを測れませんでした '
               '(ntpdate -q {})。'.format(host, host))
-        return
+        return True if bad else None
     if abs(offset) <= CLOCK_OFFSET_WARN_SEC:
         print('[clock] {} との時計ずれ {:+.3f} 秒 (OK)。'.format(host, offset))
-        return
+        return bad
     print('\033[1;31m[clock][WARN] PC の時計が {} より {:.3f} 秒{}います。'
-          'このままだと ARM で腕が動かない・台車が暴れる等が起きます。\n'
-          '  sudo ntpdate -u {} で合わせてください。\033[0m'.format(
-              host, abs(offset), '遅れて' if offset > 0 else '進んで', host))
+          'このままだと ARM で腕が動かない・台車が暴れる等が起きます。'
+          '\033[0m'.format(host, abs(offset),
+                           '遅れて' if offset > 0 else '進んで'))
+    return True
+
+
+SYNC_CLOCK_TASK = 'SyncRobotClock'  # sync_robot_clock.ps1 -Install で登録するタスク
+SYNC_CLOCK_TIMEOUT_SEC = 480  # ps1 は WSL の引き戻しが終わるまで最大 300 秒待つ
+
+
+def run_sync_clock_task():
+    """Windows のタスク ``SYNC_CLOCK_TASK`` (sync_robot_clock.ps1、最上位の特権で
+    登録済みなので UAC なしで Windows の時計も直せる) を起動し、終わるまで待つ。
+    タスクの終了コード (0 = OK) を返す。起動できなければ None。"""
+    powershell = shutil.which('powershell.exe')
+    if powershell is None:
+        default = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+        powershell = default if os.path.exists(default) else None
+    if powershell is None:
+        print('[clock][WARN] powershell.exe が見つからないので {} を起動できません '
+              '(WSL 以外で動かしている?)。'.format(SYNC_CLOCK_TASK))
+        return None
+    script = '\n'.join([
+        # 出力をパイプにすると進捗が CLIXML (スクリプトの本文を含む) で混ざるので止める
+        "$ProgressPreference = 'SilentlyContinue'",
+        "$t = '{}'".format(SYNC_CLOCK_TASK),
+        'if (-not (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue))'
+        " { 'NOTASK'; exit }",
+        # 定期実行で既に動いていれば、Start は何もせず終わるのを待つだけになる
+        'Start-ScheduledTask -TaskName $t',
+        'Start-Sleep -Seconds 2',
+        '$deadline = (Get-Date).AddSeconds({})'.format(SYNC_CLOCK_TIMEOUT_SEC),
+        "while ((Get-ScheduledTask -TaskName $t).State -eq 'Running' -and"
+        ' (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }',
+        "'RESULT ' + (Get-ScheduledTaskInfo -TaskName $t).LastTaskResult",
+    ])
+    # 引用符をネイティブ exe の引数に通すと壊れるので -EncodedCommand で渡す
+    encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+    print('[clock] Windows のタスク {} (tools/sync_robot_clock.ps1) で時計を合わせ'
+          'ます (WSL の引き戻しが終わるまで待つので最大数分)...'.format(
+              SYNC_CLOCK_TASK))
+    try:
+        out = subprocess.run(
+            [powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand',
+             encoded], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=SYNC_CLOCK_TIMEOUT_SEC + 30).stdout.decode('utf-8', 'replace')
+    except (OSError, subprocess.SubprocessError) as e:
+        print('[clock][WARN] {} を起動できませんでした: {}'.format(
+            SYNC_CLOCK_TASK, e))
+        return None
+    if re.search(r'^NOTASK\s*$', out, re.MULTILINE):
+        print('[clock][WARN] タスク {} が登録されていません (Windows の PowerShell'
+              'で tools\\sync_robot_clock.ps1 -Install で登録できます)。'.format(
+                  SYNC_CLOCK_TASK))
+        return None
+    m = re.search(r'^RESULT (-?\d+)\s*$', out, re.MULTILINE)
+    if m is None:
+        print('[clock][WARN] {} の結果を読めませんでした: {}'.format(
+            SYNC_CLOCK_TASK, out.strip()[-300:]))
+        return None
+    # 詳細は Windows 側の %LOCALAPPDATA%\sync_robot_clock.log に残る
+    print('[clock] {} の終了コード {} (0=OK, 1=直らなかった, 2=ロボットに'
+          '届かない)。'.format(SYNC_CLOCK_TASK, m.group(1)))
+    return int(m.group(1))
+
+
+def check_robot_clock_offset(auto_sync=True):
+    """ROS master (ロボット) との時計ずれを測り、ずれていれば合わせる。
+
+    PC が遅れているとゴールの開始時刻が過去扱いになり、ARM で腕が下がらない・
+    短い台車ゴールが暴れる等が起きる。WSL の時計が Windows の時計へ引き戻されて
+    いる最中 (tick が標準から外れている) なら、今のずれが小さくても実行中に
+    ずれていくので同じく扱う。``auto_sync`` なら Windows のタスク
+    (sync_robot_clock.ps1) で合わせて測り直し、それでも直らなければ起動を止める。
+    測れないだけのときは起動は止めない。
+    """
+    host = urlparse(os.environ.get('ROS_MASTER_URI', '')).hostname
+    if host in (None, 'localhost', '127.0.0.1'):
+        return
+    if not measure_robot_clock(host):
+        return
+    if not auto_sync:
+        print('\033[1;31m{}\033[0m'.format(SYNC_CLOCK_ADVICE))
+        return
+    run_sync_clock_task()
+    if measure_robot_clock(host):
+        sys.exit('ロボットとの時計ずれを直せなかったので起動を止めます。\n{}\n'
+                 '(承知の上で起動するには --no-clock-sync)'.format(
+                     SYNC_CLOCK_ADVICE))
 
 
 def main():
@@ -5352,7 +5485,7 @@ def main():
         rospy.set_param('/use_sim_time', True)
     elif not rospy.get_param('/use_sim_time', False):
         # rosbag を別に再生しているとき (use_sim_time) は測らない
-        check_robot_clock_offset()
+        check_robot_clock_offset(auto_sync=args.clock_sync)
 
     rospy.init_node('run_camera_pipeline_test')
     node = HandshakePipelineNode(args)
