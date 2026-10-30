@@ -21,11 +21,13 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -5295,6 +5297,38 @@ def build_arg_parser():
     return parser
 
 
+CLOCK_OFFSET_WARN_SEC = 0.1  # [秒] ロボットとの時計ずれがこれを超えたら警告
+
+
+def check_robot_clock_offset():
+    """ROS master (ロボット) との時計ずれを ntpdate -q で測り、大きければ警告する。
+
+    PC が遅れているとゴールの開始時刻が過去扱いになり、ARM で腕が下がらない・
+    短い台車ゴールが暴れる等が起きる。測れなくても起動は止めない。
+    """
+    host = urlparse(os.environ.get('ROS_MASTER_URI', '')).hostname
+    if host in (None, 'localhost', '127.0.0.1'):
+        return
+    ntpdate = shutil.which('ntpdate') or '/usr/sbin/ntpdate'
+    try:
+        out = subprocess.run(
+            [ntpdate, '-q', host], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, universal_newlines=True,
+            timeout=10).stdout
+        offset = float(re.findall(r'offset\s+(-?\d+\.\d+)', out)[-1])
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        print('[clock][WARN] {} との時計ずれを測れませんでした '
+              '(ntpdate -q {})。'.format(host, host))
+        return
+    if abs(offset) <= CLOCK_OFFSET_WARN_SEC:
+        print('[clock] {} との時計ずれ {:+.3f} 秒 (OK)。'.format(host, offset))
+        return
+    print('\033[1;31m[clock][WARN] PC の時計が {} より {:.3f} 秒{}います。'
+          'このままだと ARM で腕が動かない・台車が暴れる等が起きます。\n'
+          '  sudo ntpdate -u {} で合わせてください。\033[0m'.format(
+              host, abs(offset), '遅れて' if offset > 0 else '進んで', host))
+
+
 def main():
     parser = build_arg_parser()
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
@@ -5316,6 +5350,9 @@ def main():
             sys.exit('--bag で指定したファイルが見つかりません: {}'.format(
                 args.bag))
         rospy.set_param('/use_sim_time', True)
+    elif not rospy.get_param('/use_sim_time', False):
+        # rosbag を別に再生しているとき (use_sim_time) は測らない
+        check_robot_clock_offset()
 
     rospy.init_node('run_camera_pipeline_test')
     node = HandshakePipelineNode(args)
