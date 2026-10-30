@@ -368,6 +368,14 @@ FOREARM_PRESS_ALLOWANCE = True
 FOREARM_PRESS_SLACK = 0.005
 HUMAN_FINGER_LENGTH = spik.HUMAN_FINGER_LENGTH
 TRANSITION_FOREARM_LINKS = ('{}_forearm_link', '{}_hand_yaw_link')
+# バッチ IK で前腕・手の甲との距離を OFFERED_HAND_CLEARANCE にする方法。
+# 'shrink': 障害物を共通の判定距離 (DEFAULT_COLLISION_MARGIN) との差だけ細らせる
+# (手の甲は半径 2cm で削る量 4cm より細く点になるので、側面は約 4cm で効く)。
+# 'pair': 細らせず、TRANSITION_FOREARM_LINKS とのペアだけ判定距離を
+# FOREARM_PAIR_MARGIN にする (skrobot の collision_pair_margins)。
+FOREARM_MARGIN_MODES = ('shrink', 'pair')
+FOREARM_MARGIN_MODE = 'pair'
+FOREARM_PAIR_MARGIN = spik.OFFERED_HAND_CLEARANCE
 
 
 def _wrap(angle):
@@ -1585,7 +1593,8 @@ def _transition_pairs(robot, robot_arm, hand):
 def _forearm_obstacle_slots(obstacles, lowered_forearms):
     """``HUMAN_FOREARM_OBSTACLE`` なら、障害物 ``obstacles`` の後ろに人の
     前腕・手の甲 (目標ごとに 2 本、``forearm_obstacles``) を足し、足した添字の
-    リストを返す。距離が ``OFFERED_HAND_CLEARANCE`` になるよう細らせ、無い
+    リストを返す。``FOREARM_MARGIN_MODE`` が 'shrink' なら距離が
+    ``OFFERED_HAND_CLEARANCE`` になるよう細らせる ('pair' ならそのまま)。無い
     目標の分はダミーで埋める (個数は常に ``2 * LOWERED_TARGET_COUNT``)。"""
     if not HUMAN_FOREARM_OBSTACLE:
         return []
@@ -1595,6 +1604,7 @@ def _forearm_obstacle_slots(obstacles, lowered_forearms):
             obstacles += [
                 spik.offered_hand_penalty_obstacle(
                     o, spik.DEFAULT_COLLISION_MARGIN)
+                if FOREARM_MARGIN_MODE == 'shrink' else o
                 for o in forearm_obstacles(*lowered_forearms[k])]
         else:
             obstacles += [spik._dummy_cylinder(spik.HUMAN_FOREARM_RADIUS),
@@ -1631,6 +1641,7 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
     # 手首に避けさせる。
     forearm_slots = _forearm_obstacle_slots(obstacles, lowered_forearms)
     pairs = None
+    pair_margins = None
     if collision_pairs:
         links_by_name = {link.name: link for link in
                          list(robot.link_list)
@@ -1642,10 +1653,17 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
             if name.format(robot_arm) in links_by_name for i in offered
             if i not in _lowered_arm_slots(hand)]
         pairs += _transition_pairs(robot, robot_arm, hand)
-        pairs += [(links_by_name[name.format(robot_arm)], i)
-                  for name in TRANSITION_FOREARM_LINKS
-                  if name.format(robot_arm) in links_by_name
-                  for i in forearm_slots]
+        forearm_pairs = [(links_by_name[name.format(robot_arm)], i)
+                         for name in TRANSITION_FOREARM_LINKS
+                         if name.format(robot_arm) in links_by_name
+                         for i in forearm_slots]
+        if FOREARM_MARGIN_MODE == 'pair':
+            # 前腕・手の甲とのペアだけ判定距離を変える (他は共通の
+            # DEFAULT_COLLISION_MARGIN)。値は jit の引数なので再コンパイル
+            # しない。
+            pair_margins = ([None] * len(pairs)
+                            + [FOREARM_PAIR_MARGIN] * len(forearm_pairs))
+        pairs += forearm_pairs
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     # バッチ IK は台車をワールド原点から動かす (base_limits もその前提の
     # 絶対座標)。
@@ -1677,7 +1695,8 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
                 self_collision=pairs is not None,
                 collision_pairs=pairs,
                 self_collision_margin=spik.DEFAULT_SELF_COLLISION_MARGIN,
-                collision_geometry=spik.DEFAULT_IK_COLLISION_GEOMETRY)
+                collision_geometry=spik.DEFAULT_IK_COLLISION_GEOMETRY,
+                collision_pair_margins=pair_margins)
     finally:
         restore()
     solutions = []
@@ -3218,6 +3237,18 @@ def add_human_arm_arguments(parser):
         default='on' if HUMAN_FOREARM_OBSTACLE else 'off',
         help='横並び移動で人の前腕・手の甲をロボットの前腕の障害物にするか。')
     parser.add_argument(
+        '--transition-forearm-margin', choices=FOREARM_MARGIN_MODES,
+        default=FOREARM_MARGIN_MODE,
+        help='移動先のバッチ IK で前腕・手の甲との距離をどう効かせるか '
+             '(shrink: 障害物を細らせる、pair: 細らせずペアの判定距離を '
+             '--transition-forearm-pair-margin にする。既定 {})。'.format(
+                 FOREARM_MARGIN_MODE))
+    parser.add_argument(
+        '--transition-forearm-pair-margin', type=float,
+        default=FOREARM_PAIR_MARGIN,
+        help='pair のときの判定距離 [m] (既定 {})。'.format(
+            FOREARM_PAIR_MARGIN))
+    parser.add_argument(
         '--transition-human-wrist', choices=HUMAN_WRIST_CHECKS,
         default=HUMAN_WRIST_CHECK,
         help='横並び移動で人の手首をどう評価するか (hand_fixed: 人の手を'
@@ -3273,6 +3304,9 @@ def apply_human_arm_arguments(args):
     global MERGE_APPROACH, FOREARM_PRESS_ALLOWANCE
     global HUMAN_WRIST_EXT_MAX_DEG, HUMAN_ARM_CHECK
     global LOWERED_TWIST_MAX_DEG, HUMAN_WRIST_TWIST_MAX_DEG
+    global FOREARM_MARGIN_MODE, FOREARM_PAIR_MARGIN
+    FOREARM_MARGIN_MODE = args.transition_forearm_margin
+    FOREARM_PAIR_MARGIN = args.transition_forearm_pair_margin
     if args.transition_twist_limit is not None:
         LOWERED_TWIST_MAX_DEG = HUMAN_WRIST_TWIST_MAX_DEG = (
             args.transition_twist_limit)
