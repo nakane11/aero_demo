@@ -103,6 +103,10 @@ if ($FixWindowsLog -ne '') {
     exit 0
 }
 
+# 定期実行は画面に出ないので、毎回の結果をログに追記する
+$LogPath = Join-Path $env:LOCALAPPDATA 'sync_robot_clock.log'
+if (-not $CheckOnly) { Start-Transcript -Path $LogPath -Append | Out-Null }
+
 Write-Host "robot = $Robot, threshold = $Threshold s"
 $win = Get-WindowsOffset
 $wsl = Get-WslOffset
