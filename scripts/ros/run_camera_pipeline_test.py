@@ -179,6 +179,10 @@ SPEECH_SERVER_TIMEOUT = 1.0  # [s]
 SPEECH_RESULT_TIMEOUT = 60.0  # [s]
 SPEECH_FALLBACK_BASE = 3.0
 SPEECH_FALLBACK_PER_CHAR = 0.2
+# 実機の sound_play (robotsound_jp) が音声合成に使う VOICEVOX エンジン。実機側の
+# 環境変数 VOICEVOX_TEXTTOSPEECH_URL/PORT と同じ (エンジンはこの PC で動かす)。
+VOICEVOX_ENGINE_URL = 'http://192.168.97.180:50021'
+VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
 # 横並びの後、手をつないだまま台車を前へ進める距離と、それにかける最短時間
 # (人が付いて歩ける速さにするため)、進む前の発話。
 WALK_FORWARD_DISTANCE = 0.5  # [m]
@@ -1209,6 +1213,8 @@ class HandshakePipelineNode(object):
             except Exception as exc:  # noqa: BLE001
                 print('[speech] SoundClient の初期化に失敗したため発話し '
                       'ません ({})。'.format(exc))
+            if self.sound_client is not None:
+                _check_voicevox_engine(args.voicevox_url)
         self.offer_advisor = None
         if args.speech_advice:
             try:
@@ -5275,6 +5281,9 @@ def build_arg_parser():
     parser.add_argument(
         '--speech-voice', type=str, default='四国めたん-ノーマル',
         help='発話に使う声 (sound_play の voice)。')
+    parser.add_argument(
+        '--voicevox-url', type=str, default=VOICEVOX_ENGINE_URL,
+        help='起動時に応答を確かめる VOICEVOX エンジンの URL (空で確かめない)。')
     # --- rosbag での実カメラ無しテスト ---
     parser.add_argument(
         '--bag', type=str, default=None,
@@ -5460,6 +5469,27 @@ def check_robot_clock_offset(auto_sync=True):
         sys.exit('ロボットとの時計ずれを直せなかったので起動を止めます。\n{}\n'
                  '(承知の上で起動するには --no-clock-sync)'.format(
                      SYNC_CLOCK_ADVICE))
+
+
+def _check_voicevox_engine(url):
+    """VOICEVOX エンジンが応答しなければ警告する (起動は止めない)。
+
+    エンジンが無いと実機の sound_play は音声合成に失敗して即 abort し、何も
+    言わずに次の動作へ進んでしまう。
+    """
+    if not url:
+        return
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/version',
+                                    timeout=VOICEVOX_CHECK_TIMEOUT) as res:
+            print('[speech] VOICEVOX エンジン {} (version {})'.format(
+                url, res.read().decode().strip('"')))
+    except Exception as exc:  # noqa: BLE001
+        print('\033[1;31m[speech] VOICEVOX エンジン {} が応答しません ({})。'
+              'エンジンを起動しないと発話されません:\n'
+              '  roslaunch voicevox voicevox_texttospeech.launch '
+              'docker_only:=true\033[0m'.format(url, exc))
 
 
 def main():
