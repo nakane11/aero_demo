@@ -3330,14 +3330,29 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  collision_obstacles, base_limits,
                                  standing_x,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
-                                 deadline=None, **kwargs):
+                                 deadline=None, hover_solver='batch',
+                                 **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に狭い順に絞って ``solve_person_ik`` を解き、
     後処理まで解けた最初の結果を返す。肩ヨーがねじれた解なら、次の有限の窓でねじれずに解ければそちらを返す。
     ``deadline`` (``time.time()`` の値) を過ぎたら次の窓を解かない。
 
+    ``hover_solver='jaxls'`` なら窓を使わず、台車の置き方を最適化の中の目標の誤差項にした
+    ``hover_goal_ik.solve_person_ik_goal`` を 1 回だけ解く (``base_limits`` はそのまま
+    ハードな可動域になるので、呼び出し側で yaw の窓を掛けないこと。``x_margin`` は None)。
+
     ``(picked, collision_ik_time, candidate_selection_time, base_limits, x_margin)`` を返す
     (時間は合計、窓は採った解のもの)。
     """
+    if hover_solver == 'jaxls':
+        picked, collision_ik_time, candidate_selection_time = \
+            _import_hover_goal_ik().solve_person_ik_goal(
+                robot, palm, hand, robot_arm, collision_obstacles,
+                base_limits, **kwargs)
+        return (picked, collision_ik_time, candidate_selection_time,
+                base_limits, None)
+    if hover_solver != 'batch':
+        raise ValueError('hover_solver は batch か jaxls です: {}'.format(
+            hover_solver))
     if standing_x is None or not x_margins:
         x_margins = (-1.0,)
     collision_ik_time = candidate_selection_time = 0.0
@@ -3482,6 +3497,19 @@ _WARMUP_PALM = dict(
     x_axis=[1.0, 0.0, 0.0],
     y_axis=[0.0, 1.0, 0.0],
 )
+
+
+# hover 姿勢の解き方 (``solve_person_ik_side_by_side`` の ``hover_solver``)。
+HOVER_SOLVERS = ('batch', 'jaxls')
+
+def _import_hover_goal_ik():
+    """``hover_goal_ik`` を import する。このファイルを直接実行したとき (``__main__``) は、
+    ``hover_goal_ik`` の ``import solve_palm_ik`` が別の複製を読み込まないよう (isinstance の
+    判定や main で書き換えた定数がずれる)、このモジュールを ``solve_palm_ik`` として登録する。"""
+    if __name__ == '__main__':
+        sys.modules.setdefault('solve_palm_ik', sys.modules[__name__])
+    import hover_goal_ik
+    return hover_goal_ik
 
 
 def _warmup_batch_ik(robot, base_limits, ik_kwargs):
@@ -3632,6 +3660,32 @@ def main():
         default=DEFAULT_HOVER_HUMAN_CLEARANCE,
         help='hover 姿勢でロボットと人体の間に空ける距離 [m] (既定 {}、'
             '負で無効)。'.format(DEFAULT_HOVER_HUMAN_CLEARANCE))
+    parser.add_argument(
+        '--hover-solver', choices=HOVER_SOLVERS, default='batch',
+        help='hover 姿勢の解き方。batch (既定) は skrobot のバッチ IK を台車の x の'
+            '窓・yaw の窓で解き、台車の置き方を候補の並べ替えで決める。jaxls は台車の'
+            '置き方を最適化の中の目標の誤差項にして 1 回で解く (hover_goal_ik.py)。')
+    parser.add_argument(
+        '--hover-goal-attempts-per-turn', type=int, default=None,
+        help='--hover-solver jaxls の 1 つの向きあたりの初期値の数 (既定 '
+            'hover_goal_ik.DEFAULT_HOVER_GOAL_ATTEMPTS_PER_TURN)。')
+    parser.add_argument(
+        '--hover-goal-max-iterations', type=int, default=None,
+        help='--hover-solver jaxls の反復回数の上限 (既定 '
+            'hover_goal_ik.DEFAULT_HOVER_GOAL_MAX_ITERATIONS)。')
+    parser.add_argument(
+        '--hover-goal-upper-arm-pairs', choices=('none', 'offered', 'both'),
+        default=None,
+        help='--hover-solver jaxls で人の上腕とロボットの差し出す腕 (肘〜手) の距離を'
+            '制約にする側 (既定 hover_goal_ik.DEFAULT_UPPER_ARM_PAIRS)。')
+    parser.add_argument(
+        '--hover-base-front-tol', type=float, default=None,
+        help='--hover-solver jaxls の台車の前方ずれ (押し込み後) の許容幅 [m]。誤差項の'
+            '正規化と成否の判定に使う (既定 hover_goal_ik.HOVER_GOAL_FRONT_EPS)。')
+    parser.add_argument(
+        '--hover-base-yaw-tol-deg', type=float, default=None,
+        help='--hover-solver jaxls の台車の向きのずれの許容幅 [deg] (既定 '
+            'hover_goal_ik.HOVER_GOAL_YAW_EPS)。')
     add_press_in_forearm_argument(parser)
     parser.add_argument(
         '--press-in-slide', type=float, default=PRESS_IN_SLIDE,
@@ -3766,7 +3820,25 @@ def main():
     has_target = any(
         load_palm_json(path).get('offered_hand') in ('L', 'R')
         for path in files)
-    if has_target:
+    if args.hover_solver == 'jaxls':
+        hover_goal_ik = _import_hover_goal_ik()
+        if collision_pairs is None:
+            parser.error('--hover-solver jaxls は干渉の組 (--collision-pairs) が'
+                         '必要です。')
+        if args.hover_goal_attempts_per_turn is not None:
+            ik_kwargs['attempts_per_turn'] = args.hover_goal_attempts_per_turn
+        if args.hover_goal_max_iterations is not None:
+            ik_kwargs['max_iterations'] = args.hover_goal_max_iterations
+        if args.hover_goal_upper_arm_pairs is not None:
+            ik_kwargs['upper_arm_pairs'] = args.hover_goal_upper_arm_pairs
+        if args.hover_base_front_tol is not None:
+            ik_kwargs['front_eps'] = args.hover_base_front_tol
+        if args.hover_base_yaw_tol_deg is not None:
+            ik_kwargs['yaw_eps'] = math.radians(args.hover_base_yaw_tol_deg)
+        ik_kwargs['verbose'] = True
+    if has_target and args.hover_solver == 'jaxls':
+        hover_goal_ik.warmup_hover_goal_ik(robot, base_limits, **ik_kwargs)
+    elif has_target:
         _warmup_batch_ik(robot, base_limits, ik_kwargs)
 
     n_solved = 0
@@ -3823,7 +3895,8 @@ def main():
                     base_limits[1], side_sign),
                 base_limits[2]]
 
-        if joint_positions is not None:
+        # jaxls は台車の向きを目標の誤差項で決めるので yaw の窓を掛けない。
+        if joint_positions is not None and args.hover_solver == 'batch':
             human_yaw = human_facing_yaw(joint_positions)
             if human_yaw is not None:
                 person_base_limits = [
@@ -3851,7 +3924,7 @@ def main():
             facing_yaw_weight=args.facing_yaw_weight,
             joint_positions=collision_joints,
             placement_joint_positions=joint_positions, deadline=deadline,
-            **ik_kwargs)
+            hover_solver=args.hover_solver, **ik_kwargs)
         if picked is None:
             result = unsolved_result(
                 robot, robot_arm, rots[-1], person_base_limits,
@@ -3877,6 +3950,8 @@ def main():
         result['offered_hand'] = human_hand
         result['robot_arm'] = robot_arm
         result['base_x_standing_margin'] = x_margin
+        if args.hover_solver == 'jaxls':
+            result['hover_goal'] = dict(hover_goal_ik.LAST_STATS)
         n_total += 1
         n_solved += int(result['solved'])
         save_json(result, out_path)
