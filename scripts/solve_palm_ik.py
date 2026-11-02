@@ -3679,6 +3679,10 @@ def main():
         help='--hover-solver jaxls で人の上腕とロボットの差し出す腕 (肘〜手) の距離を'
             '制約にする側 (既定 hover_goal_ik.DEFAULT_UPPER_ARM_PAIRS)。')
     parser.add_argument(
+        '--hover-goal-finger-pairs', action='store_true',
+        help='--hover-solver jaxls でロボットの肘から先と人の差し出した手の掌・指の'
+            '距離 (OFFERED_HAND_CLEARANCE) も制約にする。')
+    parser.add_argument(
         '--hover-base-front-tol', type=float, default=None,
         help='--hover-solver jaxls の台車の前方ずれ (押し込み後) の許容幅 [m]。誤差項の'
             '正規化と成否の判定に使う (既定 hover_goal_ik.HOVER_GOAL_FRONT_EPS)。')
@@ -3686,6 +3690,14 @@ def main():
         '--hover-base-yaw-tol-deg', type=float, default=None,
         help='--hover-solver jaxls の台車の向きのずれの許容幅 [deg] (既定 '
             'hover_goal_ik.HOVER_GOAL_YAW_EPS)。')
+    parser.add_argument(
+        '--hover-pose-weight', type=float, default=None,
+        help='--hover-solver jaxls の手先の誤差項 (位置/閾値・姿勢/閾値) の重み (他の目的は重み 1、'
+            '既定 hover_goal_ik.HOVER_GOAL_POSE_WEIGHT)。')
+    parser.add_argument(
+        '--hover-normal-tol', type=float, default=None,
+        help='--hover-solver jaxls の手先の掌の法線方向の位置の許容幅 [m] (それ以外の方向は'
+            '--collision-ik-thre。既定 hover_goal_ik.HOVER_GOAL_NORMAL_EPS)。')
     add_press_in_forearm_argument(parser)
     parser.add_argument(
         '--press-in-slide', type=float, default=PRESS_IN_SLIDE,
@@ -3831,10 +3843,16 @@ def main():
             ik_kwargs['max_iterations'] = args.hover_goal_max_iterations
         if args.hover_goal_upper_arm_pairs is not None:
             ik_kwargs['upper_arm_pairs'] = args.hover_goal_upper_arm_pairs
+        if args.hover_goal_finger_pairs:
+            ik_kwargs['finger_pairs'] = True
         if args.hover_base_front_tol is not None:
             ik_kwargs['front_eps'] = args.hover_base_front_tol
         if args.hover_base_yaw_tol_deg is not None:
             ik_kwargs['yaw_eps'] = math.radians(args.hover_base_yaw_tol_deg)
+        if args.hover_pose_weight is not None:
+            ik_kwargs['pose_weight'] = args.hover_pose_weight
+        if args.hover_normal_tol is not None:
+            ik_kwargs['normal_eps'] = args.hover_normal_tol
         ik_kwargs['verbose'] = True
     if has_target and args.hover_solver == 'jaxls':
         hover_goal_ik.warmup_hover_goal_ik(robot, base_limits, **ik_kwargs)

@@ -12,7 +12,8 @@
   人体との距離 (バッチ IK と同じ組・差し出した前腕の細らせ・人の上腕、
   ``DEFAULT_COLLISION_MARGIN`` 以上)。台車 (x, y, yaw) の範囲は制約にしない
   (初期値の x, y の範囲にだけ使う。置き方は下の誤差項で決める)。
-- 手先の目標 (hover 目標) は重み ``POSE_WEIGHT`` の二乗誤差 (等式制約より収束が良かった)。
+- 手先の目標 (hover 目標) は誤差項: 掌の法線方向の位置 / ``HOVER_GOAL_NORMAL_EPS``、それ以外の
+  位置 / 位置の閾値、姿勢 / 姿勢の閾値 (成功判定と同じ値) に重み ``HOVER_GOAL_POSE_WEIGHT`` を掛ける。
 - 目標の誤差項 (重み付き二乗和を最小化): 台車の前方ずれ (押し込み後の台車、
   ``pick_verified_candidate`` と同じ定義) と向きのずれ。どちらも許容幅 eps で正規化した
   ``e / eps``。IK の手先の収束閾値と同じく、``|e| <= eps`` を満たさない解は収束していない
@@ -41,8 +42,13 @@ HOVER_GOAL_FRONT_WEIGHT = 1.0
 HOVER_GOAL_YAW_EPS = math.radians(15.0)
 HOVER_GOAL_YAW_WEIGHT = 1.0
 
-# 手先の hover 目標の二乗誤差の重み ([m]・[rad] の誤差に掛かる)。
-POSE_WEIGHT = 1.0e6
+# 手先の hover 目標の誤差項 (位置 / eps_pos、姿勢 / eps_rot) の重み。eps は成功判定の
+# 閾値 (collision_ik_thre / collision_ik_rthre) と同じ値を使う。他の目的 (前方ずれ・向き)
+# の重み 1 と同じ尺度。
+HOVER_GOAL_POSE_WEIGHT = 3.0
+# 掌の法線方向 (手先の Y 軸) の位置誤差の許容幅 [m]。握手では掌が人の掌に触れるので、
+# 法線方向だけ位置の閾値 (3 cm) より厳しくする。それ以外の方向は collision_ik_thre。
+HOVER_GOAL_NORMAL_EPS = 0.01
 
 # hover の jaxls の関節可動域の余裕 (全域幅に対する比率)。0 = 可動域そのものが制約。
 HOVER_GOAL_JOINT_LIMIT_MARGIN_RATIO = 0.0
@@ -79,10 +85,12 @@ UPPER_ARM_PAIR_LINKS = ('{}_elbow_link', '{}_forearm_link', '{}_hand_yaw_link',
 # 上腕の制約を掛ける人の側: 'none'、'offered' (差し出した側)、'both'。
 UPPER_ARM_PAIR_SIDES = ('none', 'offered', 'both')
 DEFAULT_UPPER_ARM_PAIRS = 'offered'
+# 肘から先 x 差し出した手の掌・指の組を、判定距離 OFFERED_HAND_CLEARANCE の別の制約で足すか。
+DEFAULT_FINGER_PAIRS = False
 
 # PersonVar の並び: 立ち位置 xy, 正面方向 xy, 台車の下限 xyz, 上限 xyz,
-# eps_front, eps_yaw, sqrt(w_front), sqrt(w_yaw)
-_PERSON_DIM = 14
+# eps_front, eps_yaw, sqrt(w_front), sqrt(w_yaw), sqrt(w_pose), eps_pos, eps_rot, eps_normal
+_PERSON_DIM = 18
 # TargetVar の並び: 目標位置 3, 目標回転 9, 押し込みでの台車のずれ 3
 _TARGET_DIM = 15
 
@@ -123,8 +131,8 @@ class HoverGoalSolver(object):
                  joint_limit_margin_ratio=(
                      spik.DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
                  max_iterations=DEFAULT_HOVER_GOAL_MAX_ITERATIONS,
-                 pose_weight=POSE_WEIGHT,
-                 upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS):
+                 upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
+                 finger_pairs=DEFAULT_FINGER_PAIRS):
         import jax
         jax.config.update('jax_enable_x64', True)
         import jax.numpy as jnp
@@ -203,6 +211,22 @@ class HoverGoalSolver(object):
             activation_distance=collision_margin, as_constraint=True,
             obstacle_pairs=obstacle_pairs)
         collision_spec = problem.residuals[-1]
+        # 肘から先 x 差し出した手の掌・指は、事後検証と同じ OFFERED_HAND_CLEARANCE。
+        # 指は細く半径を縮められないので、同じ障害物の別の spec (判定距離だけ 2 cm) にする。
+        finger_spec = None
+        if finger_pairs:
+            offered = spik.offered_hand_obstacle_indices(hand) - {self.forearm}
+            finger_obstacle_pairs = [
+                (collision_links.index(links_by_name[name.format(robot_arm)]),
+                 index)
+                for name in spik.OFFERED_HAND_PENALTY_LINKS
+                if name.format(robot_arm) in links_by_name
+                for index in sorted(offered)]
+            problem.add_collision_cost(
+                collision_links, _obstacle_dicts(dummy_obstacles), weight=1.0,
+                activation_distance=spik.OFFERED_HAND_CLEARANCE,
+                as_constraint=True, obstacle_pairs=finger_obstacle_pairs)
+            finger_spec = problem.residuals[-1]
 
         fk_data = js._quantize_fk_constants(prepare_fk_data(problem, jnp), jnp)
         root_pos_np, root_rot_np = js._root_link_world_pose(problem)
@@ -273,14 +297,29 @@ class HoverGoalSolver(object):
             return pose_error_log(ee_pos, ee_rot, target[:3],
                                   target[3:12].reshape(3, 3))
 
-        sqrt_pose_weight = math.sqrt(pose_weight)
         zero = jnp.array([0])
         costs = []
 
         @jaxls.Cost.factory(name='hover_pose')
-        def pose_cost(vals, var, target):
-            return sqrt_pose_weight * ee_pose_error(vals[var], vals[target])
-        costs.append(pose_cost(PoseVar(zero), TargetVar(zero)))
+        def pose_cost(vals, var, target, person):
+            # 位置 (m) / eps_pos と姿勢 (rad) / eps_rot。pose_error_log の並びは
+            # [0:3] = 並進 (SE(3) の log)、[3:6] = 回転 (軸角)。
+            # 位置は世界座標の誤差を、掌の法線方向 (手先の Y 軸) / eps_normal と、
+            # それ以外の方向 / eps_pos に分ける。姿勢は pose_error_log の [3:6] / eps_rot。
+            p = vals[person]
+            tgt = vals[target]
+            err = ee_pose_error(vals[var], tgt)
+            normal = tgt[3:12].reshape(3, 3)[:, 1]
+            base_pos, base_rot = base_pose(vals[var])
+            ee_pos, _ = ee_fk(vals[var][:nj], base_pos, base_rot)
+            d = ee_pos - tgt[:3]
+            d_normal = jnp.dot(d, normal)
+            d_tangent = d - d_normal * normal
+            return p[14] * jnp.concatenate([
+                jnp.array([d_normal / p[17]]), d_tangent / p[15],
+                err[3:] / p[16]])
+        costs.append(pose_cost(PoseVar(zero), TargetVar(zero),
+                               PersonVar(zero)))
 
         @jaxls.Cost.factory(kind='constraint_geq_zero', name='limits')
         def limit_cost(vals, var, person):
@@ -302,6 +341,21 @@ class HoverGoalSolver(object):
         costs.append(jaxls.Cost(
             compute_residual=negated_collision, args=soft_collision.args,
             kind='constraint_geq_zero', name='human_collision'))
+        if finger_spec is not None:
+            soft_finger = js.JaxlsSolver._make_world_collision_cost(
+                None, problem, PoseVar, SphereObs, CylGeom, CylRot, fk_data,
+                finger_spec, prim_state)
+            finger_residual = soft_finger.compute_residual
+
+            def negated_finger(*args, _residual=finger_residual):
+                return -_residual(*args)
+            costs.append(jaxls.Cost(
+                compute_residual=negated_finger, args=soft_finger.args,
+                kind='constraint_geq_zero', name='finger_collision'))
+            main_residual = collision_residual
+
+            def collision_residual(*args, _a=main_residual, _b=finger_residual):
+                return jnp.concatenate([_a(*args), _b(*args)])
 
         def placement_errors(q, target, person):
             # 押し込み後の台車の前方ずれと、台車の +x の正面方向からのずれ。
@@ -352,7 +406,10 @@ class HoverGoalSolver(object):
             def one(q, target):
                 base_pos, base_rot = base_pose(q)
                 ee_pos, ee_rot = ee_fk(q[:nj], base_pos, base_rot)
-                position_error = jnp.linalg.norm(ee_pos - target[:3])
+                d = ee_pos - target[:3]
+                normal = target[3:12].reshape(3, 3)[:, 1]
+                normal_error = jnp.abs(jnp.dot(d, normal))
+                position_error = jnp.linalg.norm(d - jnp.dot(d, normal) * normal)
                 relative = ee_rot.T @ target[3:12].reshape(3, 3)
                 rotation_error = jnp.arccos(jnp.clip(
                     (jnp.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
@@ -364,7 +421,8 @@ class HoverGoalSolver(object):
                     vals, (PoseVar(0), CylGeom(0), CylRot(0), PrimPose(0)),
                     {})
                 front, dyaw = placement_errors(q, target, person)
-                return (position_error, rotation_error, jnp.max(shortfall),
+                return (position_error, normal_error, rotation_error,
+                        jnp.max(shortfall),
                         front, dyaw)
             return jax.vmap(one)(q_all, targets)
 
@@ -394,6 +452,10 @@ class HoverGoalSolver(object):
                       front_weight=HOVER_GOAL_FRONT_WEIGHT,
                       yaw_eps=HOVER_GOAL_YAW_EPS,
                       yaw_weight=HOVER_GOAL_YAW_WEIGHT,
+                      pose_weight=HOVER_GOAL_POSE_WEIGHT,
+                      pose_eps=(spik.DEFAULT_COLLISION_IK_THRE,
+                                spik.DEFAULT_COLLISION_IK_RTHRE,
+                                HOVER_GOAL_NORMAL_EPS),
                       random_state=np.random):
         """1 人分の入力 (初期値・目標・人物の値・障害物) を作る。
 
@@ -429,7 +491,9 @@ class HoverGoalSolver(object):
             standing, facing, lower, upper,
             [front_eps, yaw_eps,
              math.sqrt(front_weight) if has_placement else 0.0,
-             math.sqrt(yaw_weight) if has_placement else 0.0]])
+             math.sqrt(yaw_weight) if has_placement else 0.0,
+             math.sqrt(pose_weight), pose_eps[0], pose_eps[1],
+             pose_eps[2]]])
 
         if collision_obstacles:
             obstacles = list(collision_obstacles)
@@ -511,7 +575,8 @@ class HoverGoalSolver(object):
               rthre=spik.DEFAULT_COLLISION_IK_RTHRE):
         """制約を満たした解の bool 配列と、各解の誤差の dict を返す。"""
         _, targets, person, cyl_geom, cyl_rot, prim = inputs
-        position_error, rotation_error, shortfall, front, dyaw = (
+        (position_error, normal_error, rotation_error, shortfall, front,
+         dyaw) = (
             np.asarray(v) for v in self._evaluate(
                 q, targets, person, cyl_geom, cyl_rot, prim))
         q = np.asarray(q)
@@ -519,11 +584,14 @@ class HoverGoalSolver(object):
         q_joints = q[:, :self.nj]
         limit_excess = np.maximum(self.joint_lower - q_joints,
                                   q_joints - self.joint_upper).max(axis=1)
-        feasible = ((position_error < thre) & (rotation_error < rthre)
+        feasible = ((position_error < thre) & (normal_error < p[17])
+                    & (rotation_error < rthre)
                     & (limit_excess < LIMIT_TOLERANCE)
                     & (shortfall < COLLISION_TOLERANCE))
         # 目標の誤差 (重み 0 = 立ち位置が無いときは見ない) も許容幅内で成功。
-        goal = np.zeros_like(front)
+        goal = (p[14] ** 2 * ((position_error / p[15]) ** 2
+                              + (normal_error / p[17]) ** 2
+                              + (rotation_error / p[16]) ** 2))
         within = np.ones(len(front), dtype=bool)
         if p[12] > 0.0:
             goal += (front / p[10]) ** 2 * p[12] ** 2
@@ -533,6 +601,7 @@ class HoverGoalSolver(object):
             within &= np.abs(dyaw) <= p[11]
         ok = feasible & within
         return ok, dict(feasible=feasible, position_error=position_error,
+                        normal_error=normal_error,
                         rotation_error=rotation_error,
                         limit_excess=limit_excess, collision_shortfall=shortfall,
                         front=front, yaw=dyaw, goal=goal)
@@ -571,18 +640,20 @@ def get_solver(robot, robot_arm, collision_pairs, n_instances,
                joint_limit_margin_ratio=(
                    spik.DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
                max_iterations=DEFAULT_HOVER_GOAL_MAX_ITERATIONS,
-               upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS):
+               upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
+               finger_pairs=DEFAULT_FINGER_PAIRS):
     """ソルバーを作るか、同じ構造のものを使い回す (jit のキャッシュのため)。"""
     key = (id(robot), robot_arm, n_instances, len(collision_pairs),
            collision_margin, joint_limit_margin_ratio, max_iterations,
-           upper_arm_pairs)
+           upper_arm_pairs, finger_pairs)
     solver = _SOLVERS.get(key)
     if solver is None:
         solver = HoverGoalSolver(
             robot, robot_arm, collision_pairs, n_instances,
             collision_margin=collision_margin,
             joint_limit_margin_ratio=joint_limit_margin_ratio,
-            max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs)
+            max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs,
+            finger_pairs=finger_pairs)
         _SOLVERS[key] = solver
     return solver
 
@@ -613,8 +684,11 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
                          front_weight=HOVER_GOAL_FRONT_WEIGHT,
                          yaw_eps=HOVER_GOAL_YAW_EPS,
                          yaw_weight=HOVER_GOAL_YAW_WEIGHT,
+                         pose_weight=HOVER_GOAL_POSE_WEIGHT,
+                         normal_eps=HOVER_GOAL_NORMAL_EPS,
                          prefer_untwisted=True,
                          upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
+                         finger_pairs=DEFAULT_FINGER_PAIRS,
                          verbose=False, **_ignored):
     """``solve_person_ik`` の jaxls 版。全ての向き x 初期値を 1 回で解き、
     ``pick_verified_candidate`` (台車の front/yaw の重みは 0、曲げ・沈み込み・前傾の
@@ -639,7 +713,8 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
         robot, robot_arm, collision_pairs, attempts_per_turn * len(rots),
         collision_margin=collision_margin,
         joint_limit_margin_ratio=HOVER_GOAL_JOINT_LIMIT_MARGIN_RATIO,
-        max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs)
+        max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs,
+        finger_pairs=finger_pairs)
     if placement_joint_positions is None:
         placement_joint_positions = joint_positions
     standing_xy = facing = None
@@ -649,7 +724,9 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
     inputs = solver.person_inputs(
         palm, hand, rots, base_limits, standing_xy=standing_xy, facing=facing,
         collision_obstacles=collision_obstacles, front_eps=front_eps,
-        front_weight=front_weight, yaw_eps=yaw_eps, yaw_weight=yaw_weight)
+        front_weight=front_weight, yaw_eps=yaw_eps, yaw_weight=yaw_weight,
+        pose_weight=pose_weight,
+        pose_eps=(collision_ik_thre, collision_ik_rthre, normal_eps))
     q = solver.solve(inputs)
     success_flags, errors = solver.check(q, inputs, thre=collision_ik_thre,
                                          rthre=collision_ik_rthre)
@@ -664,6 +741,13 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
         n_instances=int(len(feasible)), n_feasible=int(feasible.sum()),
         n_success=int(success_flags.sum()), front_eps=float(front_eps),
         yaw_eps_deg=math.degrees(yaw_eps),
+        pose_weight=float(pose_weight),
+        best_normal_err_mm=None if best is None
+        else 1e3 * float(errors['normal_error'][best]),
+        best_pos_err_mm=None if best is None
+        else 1e3 * float(errors['position_error'][best]),
+        best_rot_err_deg=None if best is None
+        else math.degrees(float(errors['rotation_error'][best])),
         best_front=None if best is None else float(errors['front'][best]),
         best_yaw_deg=None if best is None
         else math.degrees(float(errors['yaw'][best])))
