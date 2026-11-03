@@ -2893,7 +2893,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             facing_yaw_weight=DEFAULT_FACING_YAW_WEIGHT,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
-                            placement_joint_positions=None):
+                            placement_joint_positions=None,
+                            candidate_costs=None):
     """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
     (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、ロボットの差し出す腕の肘から先と
     差し出した手まわりの組だけ ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が
@@ -2902,7 +2903,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
 
     コストは関節の曲げ量に、台車の正面方向のずれ x ``front_offset_weight`` と向きのずれ x
     ``facing_yaw_weight`` を足したもの。後処理だけ失敗した場合は、事後検証を通った最小コストの候補を
-    ``post_process_result=None`` で採用する。
+    ``post_process_result=None`` で採用する。``candidate_costs`` (候補ごとのコストの配列) を
+    渡すと、上のコストの代わりにそれで並べる (jaxls の hover は最適化の目的関数の値を渡す)。
 
     ``(turn_index, angle_vector, base_pose, post_process_result)`` または None を返す。
     ``robot`` は最後に調べた候補の姿勢のままになる。
@@ -2934,6 +2936,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         return max(0.0, CROUCH_REFERENCE_WAIST_Z - waist_z_cache[key])
 
     def candidate_cost(candidate_index):
+        if candidate_costs is not None:
+            return float(candidate_costs[candidate_index])
         cost = _joint_bend_cost_from_vector(
             angle_vectors[candidate_index], bend_cost_indices)
         if CROUCH_WEIGHT > 0.0:
@@ -3695,6 +3699,26 @@ def main():
         help='--hover-solver jaxls の手先の誤差項 (位置/閾値・姿勢/閾値) の重み (他の目的は重み 1、'
             '既定 hover_goal_ik.HOVER_GOAL_POSE_WEIGHT)。')
     parser.add_argument(
+        '--hover-crouch-eps', type=float, default=None,
+        help='--hover-solver jaxls の腰の沈み込みの許容幅 [m] (既定 '
+            'hover_goal_ik.HOVER_GOAL_CROUCH_EPS)。')
+    parser.add_argument(
+        '--hover-crouch-weight', type=float, default=None,
+        help='--hover-solver jaxls の腰の沈み込みの重み (既定 '
+            'hover_goal_ik.HOVER_GOAL_CROUCH_WEIGHT)。0 で入れない。')
+    parser.add_argument(
+        '--hover-bow-eps-deg', type=float, default=None,
+        help='--hover-solver jaxls の腰の前傾の許容幅 [deg] (既定 '
+            'hover_goal_ik.HOVER_GOAL_BOW_EPS)。')
+    parser.add_argument(
+        '--hover-bow-weight', type=float, default=None,
+        help='--hover-solver jaxls の腰の前傾の重み (既定 '
+            'hover_goal_ik.HOVER_GOAL_BOW_WEIGHT)。0 で入れない。')
+    parser.add_argument(
+        '--hover-bend-weight', type=float, default=None,
+        help='--hover-solver jaxls の差し出す腕の関節の曲げ量 (JOINT_BEND_COST_JOINTS) の重みの'
+            '倍率 (既定 hover_goal_ik.HOVER_GOAL_BEND_WEIGHT)。0 で入れない。')
+    parser.add_argument(
         '--hover-normal-tol', type=float, default=None,
         help='--hover-solver jaxls の手先の掌の法線方向の位置の許容幅 [m] (それ以外の方向は'
             '--collision-ik-thre。既定 hover_goal_ik.HOVER_GOAL_NORMAL_EPS)。')
@@ -3853,6 +3877,16 @@ def main():
             ik_kwargs['pose_weight'] = args.hover_pose_weight
         if args.hover_normal_tol is not None:
             ik_kwargs['normal_eps'] = args.hover_normal_tol
+        if args.hover_bend_weight is not None:
+            ik_kwargs['bend_weight'] = args.hover_bend_weight
+        if args.hover_crouch_eps is not None:
+            ik_kwargs['crouch_eps'] = args.hover_crouch_eps
+        if args.hover_crouch_weight is not None:
+            ik_kwargs['crouch_weight'] = args.hover_crouch_weight
+        if args.hover_bow_eps_deg is not None:
+            ik_kwargs['bow_eps'] = math.radians(args.hover_bow_eps_deg)
+        if args.hover_bow_weight is not None:
+            ik_kwargs['bow_weight'] = args.hover_bow_weight
         ik_kwargs['verbose'] = True
     if has_target and args.hover_solver == 'jaxls':
         hover_goal_ik.warmup_hover_goal_ik(robot, base_limits, **ik_kwargs)

@@ -23,8 +23,9 @@
 (目標・立ち位置・正面方向・台車の可動域・障害物・eps・重み) は凍結した ParamVar
 なので、人物が変わっても再コンパイルしない。
 
-関節の曲げ・腰の沈み込み・前傾は、今の段階では最適化に入れず
-``pick_verified_candidate`` の並べ替えのまま (front/yaw の重みだけ 0 にする)。
+腰の沈み込み・前傾も同じく ``e / eps`` の誤差項 (``posture_goal``)。候補の並べ替えは
+この誤差項の重み付き和 (``pick_verified_candidate`` の ``candidate_costs``) で、関節の曲げ量
+コストは使わない。
 """
 
 import math
@@ -41,6 +42,33 @@ HOVER_GOAL_FRONT_WEIGHT = 1.0
 # 台車の向きのずれ (人の正面方向から) の許容幅 [rad] と重み。
 HOVER_GOAL_YAW_EPS = math.radians(15.0)
 HOVER_GOAL_YAW_WEIGHT = 1.0
+
+# 腰の沈み込み (CROUCH_REFERENCE_WAIST_Z からの腰の高さの下がり量 [m]) と前傾
+# (waist_p が正の側 [rad]) の許容幅と重み。誤差は e / eps (不感帯なし)。姿勢の好みなので
+# 手先・置き方より弱く、許容幅は合成 67 人で必要だった最大 (沈み込み 20.6 cm・前傾は
+# 可動域上限 32.5°) を含む値にして成否の判定ではほぼ落とさない。重みは eps 5 cm・10° で
+# w=0.1 を eps の二乗比で換算した値。沈み込みだけ、ユーザー指示 (2026-11-03、沈み込み優先)
+# で重みを 15 に上げた (合成 67 人、後処理まで通った解の平均で沈み込み 5.7→2.6 cm、前傾
+# 15.4→10.9°、後処理成功 59→56、横並び 52→55。重み 7.5 は 3.8 cm・55、30 は 1.8 cm だが
+# 成功が 52 に減る)。
+HOVER_GOAL_CROUCH_EPS = 0.25
+HOVER_GOAL_CROUCH_WEIGHT = 15.0
+HOVER_GOAL_BOW_EPS = math.radians(35.0)
+HOVER_GOAL_BOW_WEIGHT = 1.225
+# 差し出す腕の関節の曲げ量 (spik.JOINT_BEND_COST_JOINTS の関節、関節角 [rad]) の誤差項。
+# 誤差は e / eps (eps = pi、可動域より広いので成否の判定には効かない)、重みは
+# 関節ごとの重み (JOINT_BEND_COST_JOINTS) x HOVER_GOAL_BEND_WEIGHT x eps^2 で、
+# 現行の並べ替えのコスト (重み付き二乗和) の HOVER_GOAL_BEND_WEIGHT 倍と同じ。曲げ量は
+# 押し込みが解ける姿勢を選ぶ働きもあり (0 だと押し込み IK が解けない候補が 2 倍に増え、
+# 後処理判定が 2 倍遅い)、1 倍だと押し込みはほぼ解けるが沈み込みが深くなる (平均 9.3 cm)。
+# 0.3 倍が成功数と時間の折り合い (2026-11-03)。
+HOVER_GOAL_BEND_EPS = math.pi
+HOVER_GOAL_BEND_WEIGHT = 0.3
+# 腰の高さ (台車の床面から) = z0 + L1 cos(ankle) + L2 cos(knee)。脚の FK と一致することを
+# ソルバーの作成時に確かめる (2026-11-02: 最大誤差 2e-8)。
+LEG_WAIST_Z0 = 0.42
+LEG_WAIST_L1 = 0.25
+LEG_WAIST_L2 = 0.25
 
 # 手先の hover 目標の誤差項 (位置 / eps_pos、姿勢 / eps_rot) の重み。eps は成功判定の
 # 閾値 (collision_ik_thre / collision_ik_rthre) と同じ値を使う。他の目的 (前方ずれ・向き)
@@ -89,8 +117,9 @@ DEFAULT_UPPER_ARM_PAIRS = 'offered'
 DEFAULT_FINGER_PAIRS = False
 
 # PersonVar の並び: 立ち位置 xy, 正面方向 xy, 台車の下限 xyz, 上限 xyz,
-# eps_front, eps_yaw, sqrt(w_front), sqrt(w_yaw), sqrt(w_pose), eps_pos, eps_rot, eps_normal
-_PERSON_DIM = 18
+# eps_front, eps_yaw, sqrt(w_front), sqrt(w_yaw), sqrt(w_pose), eps_pos, eps_rot, eps_normal,
+# eps_crouch, eps_bow, sqrt(w_crouch), sqrt(w_bow), sqrt(w_bend) x 曲げ量の関節 5 つ
+_PERSON_DIM = 27
 # TargetVar の並び: 目標位置 3, 目標回転 9, 押し込みでの台車のずれ 3
 _TARGET_DIM = 15
 
@@ -376,6 +405,41 @@ class HoverGoalSolver(object):
         costs.append(placement_cost(PoseVar(zero), TargetVar(zero),
                                     PersonVar(zero)))
 
+        chain_joint_names = [link.joint.name for link in self.link_list]
+        col_ankle = chain_joint_names.index('ankle_joint')
+        col_knee = chain_joint_names.index('knee_joint')
+        col_waist_p = chain_joint_names.index('waist_p_joint')
+        self.leg_columns = (col_ankle, col_knee, col_waist_p)
+        self._check_leg_waist_height(robot)
+
+        def posture_errors(q):
+            # 腰の沈み込み (基準より下がった分) と前傾 (waist_p が正の側)。
+            waist_z = (LEG_WAIST_Z0 + LEG_WAIST_L1 * jnp.cos(q[col_ankle])
+                       + LEG_WAIST_L2 * jnp.cos(q[col_knee]))
+            return (jnp.maximum(0.0, spik.CROUCH_REFERENCE_WAIST_Z - waist_z),
+                    jnp.maximum(0.0, q[col_waist_p]))
+
+        @jaxls.Cost.factory(name='posture_goal')
+        def posture_cost(vals, var, person):
+            p = vals[person]
+            drop, bow = posture_errors(vals[var])
+            return jnp.stack([p[20] * drop / p[18], p[21] * bow / p[19]])
+        costs.append(posture_cost(PoseVar(zero), PersonVar(zero)))
+
+        # 差し出す腕の曲げ量 (関節ごとの重み付き e / eps)。
+        self.bend_columns = [
+            chain_joint_names.index('{}_{}_joint'.format(robot_arm, suffix))
+            for suffix in spik.JOINT_BEND_COST_JOINTS]
+        self.bend_joint_weights = np.array(
+            list(spik.JOINT_BEND_COST_JOINTS.values()))
+        bend_columns = jnp.asarray(self.bend_columns)
+
+        @jaxls.Cost.factory(name='bend_goal')
+        def bend_cost(vals, var, person):
+            p = vals[person]
+            return p[22:27] * vals[var][bend_columns] / HOVER_GOAL_BEND_EPS
+        costs.append(bend_cost(PoseVar(zero), PersonVar(zero)))
+
         js._pin_cost_group_order(costs)
         variables = [PoseVar(zero), TargetVar(zero), PersonVar(zero),
                      CylGeom(zero), CylRot(zero), PrimPose(zero)]
@@ -442,6 +506,31 @@ class HoverGoalSolver(object):
             link.joint.name for link in self.link_list].index(
                 '{}_shoulder_y_joint'.format(robot_arm))
 
+    @staticmethod
+    def _check_leg_waist_height(robot):
+        """腰の高さの式 (LEG_WAIST_*) が脚の FK と合っているか確かめる (違えば ValueError)。"""
+        joints = {joint.name: i for i, joint in enumerate(robot.joint_list)}
+        saved = robot.angle_vector().copy()
+        try:
+            for ankle, knee in ((0.5, -0.8), (1.0, -0.2), (0.1, -1.3)):
+                angle_vector = saved.copy()
+                angle_vector[joints['ankle_joint']] = ankle
+                angle_vector[joints['knee_joint']] = knee
+                robot.angle_vector(angle_vector)
+                # 脚の可動域制限で指定角度がクリップされるので、実際の角度で比べる。
+                ankle = float(robot.joint_list[joints['ankle_joint']].joint_angle())
+                knee = float(robot.joint_list[joints['knee_joint']].joint_angle())
+                actual = (float(robot.waist_link.worldpos()[2])
+                          - float(robot.base_link.worldpos()[2]))
+                expected = (LEG_WAIST_Z0 + LEG_WAIST_L1 * math.cos(ankle)
+                            + LEG_WAIST_L2 * math.cos(knee))
+                if abs(actual - expected) > 1e-4:
+                    raise ValueError(
+                        '腰の高さの式が脚の FK と合いません (ankle {} knee {}: {} 対 {})。'
+                        .format(ankle, knee, expected, actual))
+        finally:
+            robot.angle_vector(saved)
+
     def compile_count(self):
         """``_solve`` のコンパイル済みの数 (人物で増えないことの確認用)。"""
         return self._solve._cache_size()
@@ -456,6 +545,11 @@ class HoverGoalSolver(object):
                       pose_eps=(spik.DEFAULT_COLLISION_IK_THRE,
                                 spik.DEFAULT_COLLISION_IK_RTHRE,
                                 HOVER_GOAL_NORMAL_EPS),
+                      crouch_eps=HOVER_GOAL_CROUCH_EPS,
+                      crouch_weight=HOVER_GOAL_CROUCH_WEIGHT,
+                      bow_eps=HOVER_GOAL_BOW_EPS,
+                      bow_weight=HOVER_GOAL_BOW_WEIGHT,
+                      bend_weight=HOVER_GOAL_BEND_WEIGHT,
                       random_state=np.random):
         """1 人分の入力 (初期値・目標・人物の値・障害物) を作る。
 
@@ -493,7 +587,10 @@ class HoverGoalSolver(object):
              math.sqrt(front_weight) if has_placement else 0.0,
              math.sqrt(yaw_weight) if has_placement else 0.0,
              math.sqrt(pose_weight), pose_eps[0], pose_eps[1],
-             pose_eps[2]]])
+             pose_eps[2], crouch_eps, bow_eps,
+             math.sqrt(crouch_weight), math.sqrt(bow_weight)],
+            np.sqrt(self.bend_joint_weights * bend_weight)
+            * HOVER_GOAL_BEND_EPS])
 
         if collision_obstacles:
             obstacles = list(collision_obstacles)
@@ -599,8 +696,23 @@ class HoverGoalSolver(object):
         if p[13] > 0.0:
             goal += (dyaw / p[11]) ** 2 * p[13] ** 2
             within &= np.abs(dyaw) <= p[11]
+        # 姿勢の好み (沈み込み・前傾) も同じ e / eps の重み付き和に入れ、許容幅内で成功。
+        col_ankle, col_knee, col_waist_p = self.leg_columns
+        waist_z = (LEG_WAIST_Z0 + LEG_WAIST_L1 * np.cos(q[:, col_ankle])
+                   + LEG_WAIST_L2 * np.cos(q[:, col_knee]))
+        waist_drop = np.maximum(0.0, spik.CROUCH_REFERENCE_WAIST_Z - waist_z)
+        waist_bow = np.maximum(0.0, q[:, col_waist_p])
+        goal += ((waist_drop / p[18]) ** 2 * p[20] ** 2
+                 + (waist_bow / p[19]) ** 2 * p[21] ** 2)
+        goal += ((p[22:27] * q[:, self.bend_columns] / HOVER_GOAL_BEND_EPS)
+                 ** 2).sum(axis=1)
+        if p[20] > 0.0:
+            within &= waist_drop <= p[18]
+        if p[21] > 0.0:
+            within &= waist_bow <= p[19]
         ok = feasible & within
-        return ok, dict(feasible=feasible, position_error=position_error,
+        return ok, dict(feasible=feasible, waist_drop=waist_drop,
+                        waist_bow=waist_bow, position_error=position_error,
                         normal_error=normal_error,
                         rotation_error=rotation_error,
                         limit_excess=limit_excess, collision_shortfall=shortfall,
@@ -686,13 +798,19 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
                          yaw_weight=HOVER_GOAL_YAW_WEIGHT,
                          pose_weight=HOVER_GOAL_POSE_WEIGHT,
                          normal_eps=HOVER_GOAL_NORMAL_EPS,
+                         crouch_eps=HOVER_GOAL_CROUCH_EPS,
+                         crouch_weight=HOVER_GOAL_CROUCH_WEIGHT,
+                         bow_eps=HOVER_GOAL_BOW_EPS,
+                         bow_weight=HOVER_GOAL_BOW_WEIGHT,
+                         bend_weight=HOVER_GOAL_BEND_WEIGHT,
                          prefer_untwisted=True,
                          upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
                          finger_pairs=DEFAULT_FINGER_PAIRS,
                          verbose=False, **_ignored):
     """``solve_person_ik`` の jaxls 版。全ての向き x 初期値を 1 回で解き、
-    ``pick_verified_candidate`` (台車の front/yaw の重みは 0、曲げ・沈み込み・前傾の
-    並べ替えはそのまま) で 1 つ選ぶ。
+    ``pick_verified_candidate`` で 1 つ選ぶ。並べ替えのコストは最適化の目的関数
+    (誤差項の重み付き和、手先・置き方・沈み込み・前傾) そのもので、関節の曲げ量・
+    沈み込み・前傾の並べ替えコストは使わない。
 
     ``base_limits`` は台車の可動域の上下限 (x の窓・yaw の窓は掛けない)。
     台車の置き方は ``placement_joint_positions`` (無ければ ``joint_positions``) の
@@ -726,7 +844,9 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
         collision_obstacles=collision_obstacles, front_eps=front_eps,
         front_weight=front_weight, yaw_eps=yaw_eps, yaw_weight=yaw_weight,
         pose_weight=pose_weight,
-        pose_eps=(collision_ik_thre, collision_ik_rthre, normal_eps))
+        pose_eps=(collision_ik_thre, collision_ik_rthre, normal_eps),
+        crouch_eps=crouch_eps, crouch_weight=crouch_weight,
+        bow_eps=bow_eps, bow_weight=bow_weight, bend_weight=bend_weight)
     q = solver.solve(inputs)
     success_flags, errors = solver.check(q, inputs, thre=collision_ik_thre,
                                          rthre=collision_ik_rthre)
@@ -748,6 +868,10 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
         else 1e3 * float(errors['position_error'][best]),
         best_rot_err_deg=None if best is None
         else math.degrees(float(errors['rotation_error'][best])),
+        best_waist_drop_cm=None if best is None
+        else 100.0 * float(errors['waist_drop'][best]),
+        best_waist_bow_deg=None if best is None
+        else math.degrees(float(errors['waist_bow'][best])),
         best_front=None if best is None else float(errors['front'][best]),
         best_yaw_deg=None if best is None
         else math.degrees(float(errors['yaw'][best])))
@@ -778,7 +902,8 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
             post_process_max_candidates=post_process_max_candidates,
             front_offset_weight=0.0, facing_yaw_weight=0.0,
             hover_human_clearance=hover_human_clearance,
-            placement_joint_positions=placement_joint_positions)
+            placement_joint_positions=placement_joint_positions,
+            candidate_costs=errors['goal'])
 
     # 肩ヨーがねじれた枝 (solve_person_ik_side_by_side と同じ判定) は、ねじれていない解で
     # 後処理まで通らないときだけ使う (後処理まで通った解 > ねじれた解 > 後処理前の解)。
