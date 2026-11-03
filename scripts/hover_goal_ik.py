@@ -56,13 +56,13 @@ HOVER_GOAL_CROUCH_WEIGHT = 15.0
 HOVER_GOAL_BOW_EPS = math.radians(35.0)
 HOVER_GOAL_BOW_WEIGHT = 1.225
 # 差し出す腕の関節の曲げ量 (spik.JOINT_BEND_COST_JOINTS の関節、関節角 [rad]) の誤差項。
-# 誤差は e / eps (eps = pi、可動域より広いので成否の判定には効かない)、重みは
+# 誤差は e / eps (eps は重みの尺度で、成否の判定には使わない。関節ごとのロボットの可動域の
+# 上限 = ソルバーの ``bend_eps``)、重みは
 # 関節ごとの重み (JOINT_BEND_COST_JOINTS) x HOVER_GOAL_BEND_WEIGHT x eps^2 で、
 # 現行の並べ替えのコスト (重み付き二乗和) の HOVER_GOAL_BEND_WEIGHT 倍と同じ。曲げ量は
 # 押し込みが解ける姿勢を選ぶ働きもあり (0 だと押し込み IK が解けない候補が 2 倍に増え、
 # 後処理判定が 2 倍遅い)、1 倍だと押し込みはほぼ解けるが沈み込みが深くなる (平均 9.3 cm)。
 # 0.3 倍が成功数と時間の折り合い (2026-11-03)。
-HOVER_GOAL_BEND_EPS = math.pi
 HOVER_GOAL_BEND_WEIGHT = 0.3
 # 腰の高さ (台車の床面から) = z0 + L1 cos(ankle) + L2 cos(knee)。脚の FK と一致することを
 # ソルバーの作成時に確かめる (2026-11-02: 最大誤差 2e-8)。
@@ -433,11 +433,16 @@ class HoverGoalSolver(object):
         self.bend_joint_weights = np.array(
             list(spik.JOINT_BEND_COST_JOINTS.values()))
         bend_columns = jnp.asarray(self.bend_columns)
+        # eps は関節ごとのロボットの可動域の上限 (|下限|・|上限| の大きいほう)。成否の判定には使わない。
+        self.bend_eps = np.maximum(
+            np.maximum(np.abs(lower[self.bend_columns]),
+                       np.abs(upper[self.bend_columns])), 1e-3)
+        bend_eps = jnp.asarray(self.bend_eps)
 
         @jaxls.Cost.factory(name='bend_goal')
         def bend_cost(vals, var, person):
             p = vals[person]
-            return p[22:27] * vals[var][bend_columns] / HOVER_GOAL_BEND_EPS
+            return p[22:27] * vals[var][bend_columns] / bend_eps
         costs.append(bend_cost(PoseVar(zero), PersonVar(zero)))
 
         js._pin_cost_group_order(costs)
@@ -590,7 +595,7 @@ class HoverGoalSolver(object):
              pose_eps[2], crouch_eps, bow_eps,
              math.sqrt(crouch_weight), math.sqrt(bow_weight)],
             np.sqrt(self.bend_joint_weights * bend_weight)
-            * HOVER_GOAL_BEND_EPS])
+            * self.bend_eps])
 
         if collision_obstacles:
             obstacles = list(collision_obstacles)
@@ -704,7 +709,7 @@ class HoverGoalSolver(object):
         waist_bow = np.maximum(0.0, q[:, col_waist_p])
         goal += ((waist_drop / p[18]) ** 2 * p[20] ** 2
                  + (waist_bow / p[19]) ** 2 * p[21] ** 2)
-        goal += ((p[22:27] * q[:, self.bend_columns] / HOVER_GOAL_BEND_EPS)
+        goal += ((p[22:27] * q[:, self.bend_columns] / self.bend_eps)
                  ** 2).sum(axis=1)
         if p[20] > 0.0:
             within &= waist_drop <= p[18]
