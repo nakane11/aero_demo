@@ -145,6 +145,13 @@ PRESS_IN_PATH_POINTS = 8
 # (解けなければ失敗)、'fallback' は解けないときだけ制限なし、'off' は制限なし。
 PRESS_IN_LEG_RISE = 'strict'
 PRESS_IN_LEG_RISE_MODES = ('off', 'strict', 'fallback')
+# 押し込み後の姿勢 (``solve_post_process``) の解き方: 'ik' は skrobot のヤコビアン IK、
+# 'jaxls' は hover の jaxls と同じ手先の誤差項の最小化 (``press_goal_ik``。視線は腕を解いた後に
+# 首だけで向け直す)。
+PRESS_SOLVER = 'ik'
+PRESS_SOLVERS = ('ik', 'jaxls')
+# 'jaxls' の、初期姿勢からの関節角の変化の誤差項の重み (None なら ``press_goal_ik`` の既定)。
+PRESS_GOAL_REDUNDANCY_WEIGHT = None
 # 押し込みで腰が上がってよい量 [m]。LEG_RISE_PIN_TOLERANCE は脚の関節を直前の
 # 角度に合わせるときの許容 [rad] (その 2 倍)。
 LEG_RISE_ALLOW = 0.20  # [m]
@@ -2470,6 +2477,36 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
     head_move_target = gaze_coords(robot, GAZE_FINAL_RATIO)
     head_target = _gaze_target(head_move_target, position)
 
+    hand_error = None
+    if PRESS_SOLVER == 'jaxls':
+        # 手先は jaxls の誤差項で解き (台車は動かさない)、視線は首だけで向け直す。
+        try:
+            hand_error = _import_press_goal_ik().solve_press_goal(
+                robot, robot_arm, target_pos, target_rot, fix_legs=fix_legs,
+                **({} if PRESS_GOAL_REDUNDANCY_WEIGHT is None else dict(
+                    redundancy_weight=PRESS_GOAL_REDUNDANCY_WEIGHT)))
+        except Exception as e:
+            print('  [post-process] 押し込みの jaxls で例外が発生したため '
+                  '棄却します: {}'.format(e))
+            robot.angle_vector(initial_angle_vector)
+            return None
+        if hand_error is None:
+            return None
+        if gaze:
+            _reaim_gaze(robot, head_move_target, position,
+                        gaze_ik_stop, gaze_ik_rthre)
+            gaze_error = _gaze_error(head_move_target, position)
+            if gaze_error >= POST_PROCESS_ARM_ONLY_GAZE_TOLERANCE:
+                robot.angle_vector(initial_angle_vector)
+                return None
+            arm_only = gaze_error >= gaze_ik_rthre
+        else:
+            arm_only = False
+        return _post_process_result(
+            robot, move_target, position, target_pos, target_rot, gaze,
+            gaze_ik_stop, gaze_ik_rthre, arm_only, start_time,
+            hand_error=hand_error)
+
     def solve_arm_only():
         return robot.inverse_kinematics(
             target_coords, move_target=move_target,
@@ -2515,13 +2552,23 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
             robot.angle_vector(initial_angle_vector)
             return None
 
+    return _post_process_result(
+        robot, move_target, position, target_pos, target_rot, gaze,
+        gaze_ik_stop, gaze_ik_rthre, arm_only, start_time)
+
+
+def _post_process_result(robot, move_target, position, target_pos, target_rot,
+                         gaze, gaze_ik_stop, gaze_ik_rthre, arm_only,
+                         start_time, hand_error=None):
+    """``solve_post_process`` が解いた後の姿勢の ``robot`` から結果 dict を作る。
+    ``hand_error`` (jaxls で解いたときの手先の誤差) があれば足す。"""
     hover_head = None
     if gaze:
         hover_head = _hover_head_angles(robot, position, gaze_ik_stop,
                                         gaze_ik_rthre)
 
     yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
-    return dict(
+    result = dict(
         hover_head=hover_head,
         target_position=[float(v) for v in target_pos],
         target_rot=[[float(v) for v in row] for row in target_rot],
@@ -2534,6 +2581,9 @@ def solve_post_process(robot, robot_arm, palm, target_rot,
         arm_only=arm_only,
         compute_time=time.time() - start_time,
     )
+    if hand_error is not None:
+        result['hand_error'] = dict(hand_error)
+    return result
 
 
 def _pin_leg_floor(robot, limits):
@@ -3516,6 +3566,14 @@ def _import_hover_goal_ik():
     return hover_goal_ik
 
 
+def _import_press_goal_ik():
+    """``press_goal_ik`` を import する (``_import_hover_goal_ik`` と同じ理由で登録してから)。"""
+    if __name__ == '__main__':
+        sys.modules.setdefault('solve_palm_ik', sys.modules[__name__])
+    import press_goal_ik
+    return press_goal_ik
+
+
 def _warmup_batch_ik(robot, base_limits, ik_kwargs):
     """人物ループの前にダミー目標で ``solve_person_ik`` を解き、jax のコンパイルを済ませる (結果は捨てる)。
     ``ik_kwargs`` は人物ループと同じものを渡すこと (違うと別のコンパイル)。"""
@@ -3533,7 +3591,7 @@ def main():
     global PRESS_IN_SLIDE, PRESS_IN_ADVANCE, PRESS_IN_LIFT, \
         PRESS_IN_CURVE_EXPONENT, PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, \
         BOW_WEIGHT, PRESS_IN_LEG_RISE, LEG_RISE_PIN_TOLERANCE, \
-        LEG_LOW_SIDE_MARGIN_RATIO
+        LEG_LOW_SIDE_MARGIN_RATIO, PRESS_SOLVER, PRESS_GOAL_REDUNDANCY_WEIGHT
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -3746,6 +3804,19 @@ def main():
             'なる側へ動かさない、fallback: 解けないときだけ制限なし、'
             '既定 {})。'.format(PRESS_IN_LEG_RISE))
     parser.add_argument(
+        '--press-solver', choices=PRESS_SOLVERS, default=PRESS_SOLVER,
+        help='押し込み後の姿勢の解き方 (ik: skrobot のヤコビアン IK、jaxls: hover と同じ手先の'
+            '誤差項の最小化 + 視線は首だけで向け直す、既定 {})。'.format(
+                PRESS_SOLVER))
+    parser.add_argument(
+        '--seed-offset', type=int, default=0,
+        help='人物ごとの乱数シード (ファイル名の crc32) に足す値。同じ入力の結果の揺れの幅を'
+            '見るのに使う (既定 0 = 従来どおり)。')
+    parser.add_argument(
+        '--press-redundancy-weight', type=float, default=None,
+        help='--press-solver jaxls の、初期姿勢からの関節角の変化の誤差項の重み '
+            '(手先の誤差の重みは hover と同じ 3)。')
+    parser.add_argument(
         '--leg-low-margin', type=float, default=None,
         help='足首の上限・膝の下限 (腰が低くなる側) を全域幅のこの割合だけ'
             '狭める (既定 {})。'.format(LEG_LOW_SIDE_MARGIN_RATIO))
@@ -3777,6 +3848,8 @@ def main():
     CROUCH_WEIGHT = args.crouch_weight
     BOW_WEIGHT = args.bow_weight
     PRESS_IN_LEG_RISE = args.press_in_leg_rise
+    PRESS_SOLVER = args.press_solver
+    PRESS_GOAL_REDUNDANCY_WEIGHT = args.press_redundancy_weight
     if args.leg_rise_allow is not None:
         LEG_RISE_PIN_TOLERANCE = 2.0 * args.leg_rise_allow
     if args.leg_low_margin is not None:
@@ -3886,13 +3959,17 @@ def main():
         hover_goal_ik.warmup_hover_goal_ik(robot, base_limits, **ik_kwargs)
     elif has_target:
         _warmup_batch_ik(robot, base_limits, ik_kwargs)
+    if has_target and PRESS_SOLVER == 'jaxls':
+        _import_press_goal_ik().warmup_press_goal_ik(robot)
 
     n_solved = 0
     n_total = 0
     n_not_target = 0
     for i, path in enumerate(files):
         # 結果が処理順に依存しないよう、人物ごとにシードを決め直す。
-        np.random.seed(zlib.crc32(os.path.basename(path).encode()))
+        np.random.seed(
+            (zlib.crc32(os.path.basename(path).encode()) + args.seed_offset)
+            % (2 ** 32))
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         palms = load_palm_json(path)
         human_hand = palms.get('offered_hand')

@@ -133,6 +133,20 @@ def _param_var(default):
     return ParamVar
 
 
+def hand_error_residual(jnp, ee_pos, rot_error, target_pos, target_rot,
+                        weight, eps_pos, eps_rot, eps_normal):
+    """手先の目標の誤差項 (hover と押し込み後の姿勢で共有)。位置の誤差 (世界座標) を、掌の法線方向
+    (手先の Y 軸 = ``target_rot`` の 2 列目) / ``eps_normal`` と、それ以外の方向 / ``eps_pos`` に分け、
+    姿勢の誤差 ``rot_error`` (``pose_error_log`` の回転 3 成分) / ``eps_rot`` と並べて ``weight`` 倍する。"""
+    normal = target_rot[:, 1]
+    d = ee_pos - target_pos
+    d_normal = jnp.dot(d, normal)
+    d_tangent = d - d_normal * normal
+    return weight * jnp.concatenate([
+        jnp.array([d_normal / eps_normal]), d_tangent / eps_pos,
+        rot_error / eps_rot])
+
+
 def _obstacle_dicts(obstacles):
     """``Cylinder`` のリストを skrobot の軌道最適化の障害物 dict にする。"""
     out = []
@@ -319,15 +333,11 @@ class HoverGoalSolver(object):
             p = vals[person]
             tgt = vals[target]
             err = ee_pose_error(vals[var], tgt)
-            normal = tgt[3:12].reshape(3, 3)[:, 1]
             base_pos, base_rot = base_pose(vals[var])
             ee_pos, _ = ee_fk(vals[var][:nj], base_pos, base_rot)
-            d = ee_pos - tgt[:3]
-            d_normal = jnp.dot(d, normal)
-            d_tangent = d - d_normal * normal
-            return p[14] * jnp.concatenate([
-                jnp.array([d_normal / p[17]]), d_tangent / p[15],
-                err[3:] / p[16]])
+            return hand_error_residual(
+                jnp, ee_pos, err[3:], tgt[:3], tgt[3:12].reshape(3, 3),
+                p[14], p[15], p[16], p[17])
         costs.append(pose_cost(PoseVar(zero), TargetVar(zero),
                                PersonVar(zero)))
 
