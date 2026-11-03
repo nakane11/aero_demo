@@ -113,8 +113,6 @@ UPPER_ARM_PAIR_LINKS = ('{}_elbow_link', '{}_forearm_link', '{}_hand_yaw_link',
 # 上腕の制約を掛ける人の側: 'none'、'offered' (差し出した側)、'both'。
 UPPER_ARM_PAIR_SIDES = ('none', 'offered', 'both')
 DEFAULT_UPPER_ARM_PAIRS = 'offered'
-# 肘から先 x 差し出した手の掌・指の組を、判定距離 OFFERED_HAND_CLEARANCE の別の制約で足すか。
-DEFAULT_FINGER_PAIRS = False
 
 # PersonVar の並び: 立ち位置 xy, 正面方向 xy, 台車の下限 xyz, 上限 xyz,
 # eps_front, eps_yaw, sqrt(w_front), sqrt(w_yaw), sqrt(w_pose), eps_pos, eps_rot, eps_normal,
@@ -160,8 +158,7 @@ class HoverGoalSolver(object):
                  joint_limit_margin_ratio=(
                      spik.DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
                  max_iterations=DEFAULT_HOVER_GOAL_MAX_ITERATIONS,
-                 upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
-                 finger_pairs=DEFAULT_FINGER_PAIRS):
+                 upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS):
         import jax
         jax.config.update('jax_enable_x64', True)
         import jax.numpy as jnp
@@ -240,22 +237,6 @@ class HoverGoalSolver(object):
             activation_distance=collision_margin, as_constraint=True,
             obstacle_pairs=obstacle_pairs)
         collision_spec = problem.residuals[-1]
-        # 肘から先 x 差し出した手の掌・指は、事後検証と同じ OFFERED_HAND_CLEARANCE。
-        # 指は細く半径を縮められないので、同じ障害物の別の spec (判定距離だけ 2 cm) にする。
-        finger_spec = None
-        if finger_pairs:
-            offered = spik.offered_hand_obstacle_indices(hand) - {self.forearm}
-            finger_obstacle_pairs = [
-                (collision_links.index(links_by_name[name.format(robot_arm)]),
-                 index)
-                for name in spik.OFFERED_HAND_PENALTY_LINKS
-                if name.format(robot_arm) in links_by_name
-                for index in sorted(offered)]
-            problem.add_collision_cost(
-                collision_links, _obstacle_dicts(dummy_obstacles), weight=1.0,
-                activation_distance=spik.OFFERED_HAND_CLEARANCE,
-                as_constraint=True, obstacle_pairs=finger_obstacle_pairs)
-            finger_spec = problem.residuals[-1]
 
         fk_data = js._quantize_fk_constants(prepare_fk_data(problem, jnp), jnp)
         root_pos_np, root_rot_np = js._root_link_world_pose(problem)
@@ -370,21 +351,6 @@ class HoverGoalSolver(object):
         costs.append(jaxls.Cost(
             compute_residual=negated_collision, args=soft_collision.args,
             kind='constraint_geq_zero', name='human_collision'))
-        if finger_spec is not None:
-            soft_finger = js.JaxlsSolver._make_world_collision_cost(
-                None, problem, PoseVar, SphereObs, CylGeom, CylRot, fk_data,
-                finger_spec, prim_state)
-            finger_residual = soft_finger.compute_residual
-
-            def negated_finger(*args, _residual=finger_residual):
-                return -_residual(*args)
-            costs.append(jaxls.Cost(
-                compute_residual=negated_finger, args=soft_finger.args,
-                kind='constraint_geq_zero', name='finger_collision'))
-            main_residual = collision_residual
-
-            def collision_residual(*args, _a=main_residual, _b=finger_residual):
-                return jnp.concatenate([_a(*args), _b(*args)])
 
         def placement_errors(q, target, person):
             # 押し込み後の台車の前方ずれと、台車の +x の正面方向からのずれ。
@@ -757,20 +723,18 @@ def get_solver(robot, robot_arm, collision_pairs, n_instances,
                joint_limit_margin_ratio=(
                    spik.DEFAULT_COLLISION_IK_JOINT_LIMIT_MARGIN_RATIO),
                max_iterations=DEFAULT_HOVER_GOAL_MAX_ITERATIONS,
-               upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
-               finger_pairs=DEFAULT_FINGER_PAIRS):
+               upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS):
     """ソルバーを作るか、同じ構造のものを使い回す (jit のキャッシュのため)。"""
     key = (id(robot), robot_arm, n_instances, len(collision_pairs),
            collision_margin, joint_limit_margin_ratio, max_iterations,
-           upper_arm_pairs, finger_pairs)
+           upper_arm_pairs)
     solver = _SOLVERS.get(key)
     if solver is None:
         solver = HoverGoalSolver(
             robot, robot_arm, collision_pairs, n_instances,
             collision_margin=collision_margin,
             joint_limit_margin_ratio=joint_limit_margin_ratio,
-            max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs,
-            finger_pairs=finger_pairs)
+            max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs)
         _SOLVERS[key] = solver
     return solver
 
@@ -810,7 +774,6 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
                          bend_weight=HOVER_GOAL_BEND_WEIGHT,
                          prefer_untwisted=True,
                          upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS,
-                         finger_pairs=DEFAULT_FINGER_PAIRS,
                          verbose=False, **_ignored):
     """``solve_person_ik`` の jaxls 版。全ての向き x 初期値を 1 回で解き、
     ``pick_verified_candidate`` で 1 つ選ぶ。並べ替えのコストは最適化の目的関数
@@ -836,8 +799,7 @@ def solve_person_ik_goal(robot, palm, hand, robot_arm, collision_obstacles,
         robot, robot_arm, collision_pairs, attempts_per_turn * len(rots),
         collision_margin=collision_margin,
         joint_limit_margin_ratio=HOVER_GOAL_JOINT_LIMIT_MARGIN_RATIO,
-        max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs,
-        finger_pairs=finger_pairs)
+        max_iterations=max_iterations, upper_arm_pairs=upper_arm_pairs)
     if placement_joint_positions is None:
         placement_joint_positions = joint_positions
     standing_xy = facing = None
