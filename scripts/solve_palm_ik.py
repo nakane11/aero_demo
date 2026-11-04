@@ -3736,6 +3736,11 @@ def main():
         help='--hover-solver jaxls の反復回数の上限 (既定 '
             'hover_goal_ik.DEFAULT_HOVER_GOAL_MAX_ITERATIONS)。')
     parser.add_argument(
+        '--hover-goal-float64', action='store_true',
+        help='--hover-solver jaxls を倍精度 (jax_enable_x64) で解く (既定は単精度で、GPU で'
+            '約 2〜3 倍速い)。jax の設定はプロセス全体に効くので、--press-solver jaxls* の'
+            'ときは自動で倍精度になる。')
+    parser.add_argument(
         '--hover-goal-upper-arm-pairs', choices=('none', 'offered', 'both'),
         default=None,
         help='--hover-solver jaxls で人の上腕とロボットの差し出す腕 (肘〜手) の距離を'
@@ -3934,6 +3939,10 @@ def main():
             ik_kwargs['attempts_per_turn'] = args.hover_goal_attempts_per_turn
         if args.hover_goal_max_iterations is not None:
             ik_kwargs['max_iterations'] = args.hover_goal_max_iterations
+        # jax の x64 設定はプロセス共有で press_goal_ik は倍精度なので、押し込みが jaxls のときは
+        # hover も倍精度にそろえる (切り替わると型が変わって再コンパイルする)。
+        if args.hover_goal_float64 or PRESS_SOLVER in ('jaxls', 'jaxls-path'):
+            hover_goal_ik.HOVER_GOAL_X64 = True
         if args.hover_goal_upper_arm_pairs is not None:
             ik_kwargs['upper_arm_pairs'] = args.hover_goal_upper_arm_pairs
         if args.hover_base_front_tol is not None:

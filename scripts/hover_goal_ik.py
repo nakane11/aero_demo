@@ -83,8 +83,12 @@ HOVER_GOAL_JOINT_LIMIT_MARGIN_RATIO = 0.0
 
 # 1 つの向きあたりの初期値の数 (向き 3 つで 3 倍の問題を 1 回で解く)。
 DEFAULT_HOVER_GOAL_ATTEMPTS_PER_TURN = 128
-# jaxls の反復回数の上限。
-DEFAULT_HOVER_GOAL_MAX_ITERATIONS = 100
+# jaxls の反復回数の上限。50 で 100 反復の成功の約 95% に届く (2026-11-03 計測、
+# 時間は反復数にほぼ比例)。
+DEFAULT_HOVER_GOAL_MAX_ITERATIONS = 50
+# 倍精度 (jax_enable_x64) で解くか。単精度は GPU で約 2〜3 倍速く、合成 67 人で解けた人数は
+# 変わらない (2026-11-04)。jax の設定はプロセス全体に効く (press_goal_ik は倍精度)。
+HOVER_GOAL_X64 = False
 
 # 成功の判定: 手先 (バッチ IK と同じ)、関節・台車の可動域の超過 [rad/m]、
 # 人体との距離の不足 (DEFAULT_COLLISION_MARGIN からの) [m]。
@@ -174,7 +178,7 @@ class HoverGoalSolver(object):
                  max_iterations=DEFAULT_HOVER_GOAL_MAX_ITERATIONS,
                  upper_arm_pairs=DEFAULT_UPPER_ARM_PAIRS):
         import jax
-        jax.config.update('jax_enable_x64', True)
+        jax.config.update('jax_enable_x64', HOVER_GOAL_X64)
         import jax.numpy as jnp
         import jaxls
         from skrobot.planner.trajectory_optimization.fk_utils import \
