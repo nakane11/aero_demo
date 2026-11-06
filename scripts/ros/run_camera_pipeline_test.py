@@ -185,8 +185,11 @@ VOICEVOX_ENGINE_URL = 'http://192.168.97.180:50021'
 VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
 # 横並びの後、手をつないだまま台車を前へ進める距離と、それにかける最短時間
 # (人が付いて歩ける速さにするため)、進む前の発話。
-WALK_FORWARD_DISTANCE = 0.5  # [m]
-WALK_FORWARD_MIN_TIME = 4.0  # [s]
+WALK_FORWARD_DISTANCE = 1.5  # [m]
+WALK_FORWARD_MIN_TIME = 2.0  # [s]
+# 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。
+WALK_TURN_MIN_TIME = 3.0  # [s]
+WALK_TURN_TOLERANCE = math.radians(1.0)
 SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
 # 取り違えているとみなして裏返す。実機の差し出し 206 件 (bag のフレームを含む) では
@@ -2846,6 +2849,7 @@ class HandshakePipelineNode(object):
         """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
         途中で例外になっても顔追従・手の追跡は止める。"""
         self._hand_grasped = False
+        self._initial_base_yaw = None
         with self._lock:
             seen = self._head_person_seen
             self._head_person_ref = (
@@ -2962,6 +2966,8 @@ class HandshakePipelineNode(object):
                   len(display_waypoints) - reach_boundary, n_transition))
 
         self._say(self.args.speech_start_text)
+        # 動き出す前の台車の向き (前進は人と同じ向き = これの逆向きへ進む)。
+        self._initial_base_yaw = float(self._odom_pose(self.ri.odom)[2])
 
         ref_scan = None
         exclude_centers = None
@@ -3165,6 +3171,7 @@ class HandshakePipelineNode(object):
         ``SPEECH_WALK_FORWARD_TEXT`` を発話し終わるまで待つ。首は顔を追わず
         正面 (首の関節を全て 0) へ向ける。"""
         self._set_activity(STAGE_WALK_FORWARD)
+        self._turn_to_walk_heading()
         spoken = self._say(SPEECH_WALK_FORWARD_TEXT, wait=True)
         spoken.wait(SPEECH_RESULT_TIMEOUT)
         point = [float(distance), 0.0, 0.0]
@@ -3181,6 +3188,32 @@ class HandshakePipelineNode(object):
         log_debug('[execute][walk] 前進後の odom の移動 ({:+.3f}m, {:+.3f}m, '
                   '{:+.1f}deg)、止まるまで {:.2f}s'.format(
                       moved[0], moved[1], math.degrees(moved[2]),
+                      settle_time))
+
+    def _turn_to_walk_heading(self):
+        """前進の前に、台車をその場で回して実行開始時の向きの逆向き (開始時に
+        ロボットが -x を向いていたとすると +x) へ向ける。腕・脚には指令を
+        送らない。差が ``WALK_TURN_TOLERANCE`` 未満なら回さない。"""
+        initial_yaw = self._initial_base_yaw
+        if initial_yaw is None:
+            return
+        yaw = float(self._odom_pose(self.ri.odom)[2])
+        dyaw = (initial_yaw + math.pi - yaw + math.pi) % (2 * math.pi) - math.pi
+        if abs(dyaw) < WALK_TURN_TOLERANCE:
+            log_debug('[execute][walk] 前進の向きとの差 {:+.1f}deg のため回転'
+                      'しません'.format(math.degrees(dyaw)))
+            return
+        point = [0.0, 0.0, dyaw]
+        sec, = self._limited_time_list(None, [point], [WALK_TURN_MIN_TIME])
+        print('[execute] 前進の向きへその場で {:+.1f}deg 回転します ({:.1f} 秒)。'
+              .format(math.degrees(dyaw), sec))
+        self._send_base_trajectory([point], [sec], wait=True)
+        settle_time, _ = self._wait_odom_settle()
+        after = float(self._odom_pose(self.ri.odom)[2])
+        log_debug('[execute][walk] 回転後の向きの残り {:+.1f}deg、止まるまで '
+                  '{:.2f}s'.format(
+                      math.degrees((initial_yaw + math.pi - after + math.pi)
+                                   % (2 * math.pi) - math.pi),
                       settle_time))
 
     def _execute_transition(self, press_wp, planned_press_wp, waypoints,
