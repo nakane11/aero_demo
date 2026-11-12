@@ -1034,6 +1034,11 @@ class DemoViewer(object):
                       max(timeline.ik_errors)))
         try:
             timeline.save(path)
+            # 同じシーンの古い版 (コードが変わる前の計算結果) は消す。
+            prefix = os.path.basename(path).rsplit('_', 1)[0] + '_'
+            for name in os.listdir(CACHE_DIR):
+                if name.startswith(prefix) and name != os.path.basename(path):
+                    os.remove(os.path.join(CACHE_DIR, name))
         except OSError as e:
             print('[demo] 計算結果を保存できませんでした ({})'.format(e))
         return timeline
