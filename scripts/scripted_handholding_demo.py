@@ -32,6 +32,7 @@ import argparse
 import dataclasses
 import hashlib
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1159,6 +1160,10 @@ def add_track(scene, lane_center):
     return tape, broken
 
 
+# 動画の保存先。
+VIDEO_DIR = os.path.expanduser('~/aero_demo_videos')
+
+
 class DemoViewer(object):
     """シーンの選択・再生の GUI。タイムラインは裏のスレッドで、選ばれたシーンを
     優先して計算し、ディスクに保存する (2 回目からは読み込むだけ)。"""
@@ -1208,7 +1213,14 @@ class DemoViewer(object):
         # (カメラを動かすとブラウザでのズーム・回転を上書きしてしまうため)。
         self.follow = gui.add_checkbox('2 人を画面の中央に留める',
                                        initial_value=False)
+        self.record_button = gui.add_button('動画を保存 (今の画角)')
+        self.record_lock = threading.Lock()
         self.current = None
+
+        @self.record_button.on_click
+        def _(event):  # noqa: ANN001
+            threading.Thread(target=self.record, args=(event.client,),
+                             daemon=True).start()
 
         @self.scene_dropdown.on_update
         def _(_):  # noqa: ANN001
@@ -1383,6 +1395,54 @@ class DemoViewer(object):
                 handle.visible = crossed
             self.status.content = '**{}**  \n{:.2f} / {:.1f} 秒'.format(
                 tl.phase_at(tl.times[i]), tl.times[i], tl.times[-1])
+
+    def record(self, client):
+        """ボタンを押したブラウザの今のカメラで、シーンの最初から最後までを
+        描画して MP4 に保存し、そのブラウザにダウンロードとして送る。
+        画像は 3D の画面だけで、右上の GUI パネルは写らない。"""
+        if client is None or self.current is None:
+            return
+        if not self.record_lock.acquire(blocking=False):
+            return
+        try:
+            self.play.value = False
+            tl = self.current
+            width = int(client.camera.image_width) // 2 * 2 or 1280
+            height = int(client.camera.image_height) // 2 * 2 or 720
+            os.makedirs(VIDEO_DIR, exist_ok=True)
+            path = os.path.join(VIDEO_DIR, 'scene_{}_{}.mp4'.format(
+                tl.scene.key.replace("'", '2'),
+                time.strftime('%Y%m%d_%H%M%S')))
+            ffmpeg = subprocess.Popen(
+                ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo',
+                 '-pix_fmt', 'rgb24', '-s', '{}x{}'.format(width, height),
+                 '-r', str(FPS), '-i', '-', '-c:v', 'libx264',
+                 '-pix_fmt', 'yuv420p', '-crf', '18', path],
+                stdin=subprocess.PIPE)
+            n = len(tl.times)
+            for i, t in enumerate(tl.times):
+                self.render(t)
+                image = client.camera.get_render(
+                    height=height, width=width, transport_format='png')
+                ffmpeg.stdin.write(np.ascontiguousarray(
+                    image[:, :, :3], dtype=np.uint8).tobytes())
+                if i % 10 == 0:
+                    self.record_button.label = '録画中 {:.0f}%'.format(
+                        100.0 * (i + 1) / n)
+            ffmpeg.stdin.close()
+            ffmpeg.wait()
+            print('[demo] 動画を保存しました: {}'.format(path))
+            with open(path, 'rb') as f:
+                client.send_file_download(os.path.basename(path), f.read())
+            message = '動画を保存しました: `{}`'.format(path)
+        except Exception as e:  # 録画の失敗で表示を止めない
+            print('[demo] 動画を保存できませんでした: {}'.format(e))
+            message = '動画を保存できませんでした: {}'.format(e)
+        finally:
+            self.record_button.label = '動画を保存 (今の画角)'
+            self.time_slider.value = 0.0
+            self.record_lock.release()
+        self.status.content = message
 
     def _play_loop(self):
         last = time.time()
