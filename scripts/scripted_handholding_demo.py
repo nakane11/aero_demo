@@ -589,7 +589,7 @@ class SceneC(Scene):
             arms={'R': goal, 'L': left_goal}, human_gaze=self.human_gaze(t),
             spine_yaw=self.spine_yaw(t), kneel=kneel,
             waist_y=twist, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
-            # 走ってきながら大きく手を振り、止まる前に下ろす。
+            # 走ってきながら (人から遠い側の手を) 大きく振り、止まる前に下ろす。
             wave=ramp(t, 0.2, 0.8) - ramp(t, 2.6, 3.4),
             grip=grip, robot_gaze=self.robot_gaze(t))
 
@@ -850,7 +850,8 @@ class Timeline(object):
                                (ROBOT_HOLD_ARM, swing)):
                 angles = robot_swing_angles(arm, value, robot_run)
                 wave = plan.get('wave', 0.0)
-                if arm == ROBOT_HOLD_ARM and wave > 0.0:
+                # 手は人から遠い側 (空いた腕) で振る。
+                if arm == ROBOT_FREE_ARM and wave > 0.0:
                     waving = robot_wave_angles(arm, t)
                     angles = {name: lerp(angle, waving[name], wave)
                               for name, angle in angles.items()}
@@ -1009,6 +1010,7 @@ LINE_COLOR = (245, 245, 240)
 LANE_WIDTH = 1.22
 TRACK_X = (-30.0, 25.0)
 TRACK_Y = (-3.4, 4.0)
+FINISH_TAPE_Z = 1.1  # ゴールテープの高さ (胸のあたり) [m]
 FINISH_X = 6.0  # 2 度目の走りの途中 (15 秒ごろ) で越える
 FLAG_COLORS = [(220, 60, 60), (240, 200, 50), (60, 120, 220), (70, 170, 90),
                (250, 250, 250)]
@@ -1058,17 +1060,35 @@ def add_track(scene, lane_center):
         scene.add_box('/bg_track/{}_line'.format(name), color=LINE_COLOR,
                       dimensions=(0.1, y1 - y0, 0.005),
                       position=(x, 0.5 * (y0 + y1), 0.0015))
-    # ゴールの柱と横断幕。
-    for i, y in enumerate((y0 - 0.3, y1 + 0.3)):
+    # ゴールの柱とテープ (胸の高さ)。テープは 2 人が越えると切れて、両側の柱
+    # から垂れ下がる (handle を返して表示を切り替える)。
+    poles_y = (y0 - 0.3, y1 + 0.3)
+    for i, y in enumerate(poles_y):
         scene.add_box('/bg_track/finish_pole_{}'.format(i),
-                      color=(235, 235, 235), dimensions=(0.08, 0.08, 2.6),
-                      position=(FINISH_X, y, 1.3))
-    scene.add_box('/bg_track/finish_banner', color=(210, 50, 50),
-                  dimensions=(0.04, y1 - y0 + 0.6, 0.45),
-                  position=(FINISH_X, 0.5 * (y0 + y1), 2.35))
+                      color=(235, 235, 235), dimensions=(0.06, 0.06, 1.5),
+                      position=(FINISH_X, y, 0.75))
+        scene.add_box('/bg_track/finish_flag_{}'.format(i),
+                      color=(210, 50, 50), dimensions=(0.02, 0.4, 0.25),
+                      position=(FINISH_X, y, 1.38))
+    tape = scene.add_box(
+        '/bg_track/finish_tape', color=LINE_COLOR,
+        dimensions=(0.01, poles_y[1] - poles_y[0], 0.04),
+        position=(FINISH_X, 0.5 * (y0 + y1), FINISH_TAPE_Z))
+    broken = []
+    for i, (y, sign) in enumerate(((poles_y[0], 1.0), (poles_y[1], -1.0))):
+        # 柱から 0.9 m 垂れ下がる (鉛直から 20 度ほど内側へ)。x 軸まわりに
+        # 回して、箱の長手 (z) を下・内向きにする。
+        angle = np.deg2rad(20.0)
+        wxyz = (np.cos(0.5 * sign * angle), np.sin(0.5 * sign * angle),
+                0.0, 0.0)
+        broken.append(scene.add_box(
+            '/bg_track/finish_tape_broken_{}'.format(i), color=LINE_COLOR,
+            dimensions=(0.01, 0.04, 0.9), wxyz=wxyz,
+            position=(FINISH_X, y + sign * 0.45 * np.sin(angle),
+                      FINISH_TAPE_Z - 0.45 * np.cos(angle)), visible=False))
     scene.add_label('/bg_track/finish_label', 'GOAL',
-                    position=(FINISH_X - 0.05, 0.5 * (y0 + y1), 2.35),
-                    font_size_mode='scene', font_scene_height=0.35,
+                    position=(FINISH_X, poles_y[1], 1.75),
+                    font_size_mode='scene', font_scene_height=0.3,
                     anchor='center-center', depth_test=True)
     scene.add_label('/bg_track/start_label', 'START',
                     position=(SceneC.START_X, y0 - 0.6, 0.05),
@@ -1093,6 +1113,7 @@ def add_track(scene, lane_center):
             scene.add_mesh_simple('/bg_track/flags_{}_{}'.format(side, c),
                                   vertices=verts, faces=faces,
                                   color=FLAG_COLORS[c], side='double')
+    return tape, broken
 
 
 class DemoViewer(object):
@@ -1122,7 +1143,8 @@ class DemoViewer(object):
         self.grid = add_plain_ground(server.scene)
         self.bg_track = server.scene.add_frame('/bg_track', show_axes=False,
                                                visible=False)
-        add_track(server.scene, lane_center=0.5 * SIDE_DISTANCE)
+        self.tape, self.tape_broken = add_track(
+            server.scene, lane_center=0.5 * SIDE_DISTANCE)
         self.viewer.add(self.robot)
         remove_robot_gui(self.viewer)
         self.mesh = None
@@ -1309,6 +1331,13 @@ class DemoViewer(object):
             self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
                                   0.001)
             self.bg_track.position = (-offset[0], -offset[1], 0.0)
+            # 2 人の胸 (前の方) がゴールを越えたらテープを切る。
+            front = max(tl.robot_bases[i][0],
+                        float(np.max(tl.vertices[i][:, 0])))
+            crossed = front > FINISH_X
+            self.tape.visible = not crossed
+            for handle in self.tape_broken:
+                handle.visible = crossed
             self.status.content = '**{}**  \n{:.2f} / {:.1f} 秒'.format(
                 tl.phase_at(tl.times[i]), tl.times[i], tl.times[-1])
 
