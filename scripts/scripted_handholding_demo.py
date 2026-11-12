@@ -483,13 +483,12 @@ class SceneB(Scene):
 class SceneC(Scene):
     key = 'C'
     title = 'C: 後ろから走ってきて、手を繋いで一緒に走る (運動会、途中で転ぶ)'
-    duration = 18.5
     phases = [('0 手を振りながら走ってくる', 0.0, 3.2), ('1 見合う', 3.2, 4.2),
               ('2 手を出す', 4.2, 5.0), ('3 握る', 5.0, 5.5),
-              ('4 一緒に走る', 5.5, 9.0), ('5 転ぶ', 9.0, 9.6),
-              ('6 振り返って手を引き、起こす', 9.6, 11.6),
-              ('7 見合う', 11.6, 12.2), ('8 また走ってゴールへ', 12.2, 17.0),
-              ('9 ゴール', 17.0, 18.5)]
+              ('4 一緒に走る', 5.5, 9.0), ('5 転んで手が離れる', 9.0, 9.6),
+              ('6 振り返って手を差し出す', 9.6, 10.9),
+              ('7 手を取って起こす', 10.9, 12.8), ('8 見合う', 12.8, 13.4),
+              ('9 また走ってゴールへ', 13.4, 18.2), ('10 ゴール', 18.2, 19.7)]
     follow_camera = True
     background = 'track'
     SPEED = 3.2           # 一緒に走る速さ [m/s]
@@ -497,17 +496,25 @@ class SceneC(Scene):
     START_X = -8.0        # 人が待っている位置 (スタートライン)
     STOP_T = 3.2          # ロボットが人の横で止まる時刻
     FALL_T = 9.0          # 人がつまずく時刻
-    RESTART_T = 12.2      # また走り出す時刻
-    FALL_LEAD = 0.45      # 転んだとき、ロボットが行き過ぎて止まる距離 [m]
+    OFFER_T = 10.0        # ロボットが手を差し出し始める時刻
+    TAKE_T = 10.6         # 人が差し出された手へ手を伸ばし始める時刻
+    REGRIP_T = 11.2       # もう一度握る時刻
+    STAND_T = 11.6        # 引かれて立ち上がり始める時刻
+    RESTART_T = 13.4      # また走り出す時刻
+    duration = 19.7
+    FALL_LEAD = 0.9       # 転んだとき、ロボットが行き過ぎて止まる距離 [m]
+    BACK_LEAD = 0.45      # 人が立った後、ロボットが下がってくる位置 [m]
     TURN = 1.6            # 振り返るときの上半身のひねり [rad]
+    # 差し出す手の位置 (台車から見て後ろ・左、高さ) [m]。
+    OFFER_FROM_BASE = (-0.45, 0.22, 0.95)
 
     def __init__(self):
         v = self.SPEED
+        r = self.RESTART_T
         together = (lambda t: v * (ramp(t, 5.8, 7.8)
                                    - ramp(t, self.FALL_T, self.FALL_T + 0.5)
-                                   + ramp(t, self.RESTART_T,
-                                          self.RESTART_T + 2.0)
-                                   - ramp(t, 15.5, 17.0)))
+                                   + ramp(t, r, r + 2.0)
+                                   - ramp(t, r + 3.3, r + 4.8)))
         approach = (lambda t: self.APPROACH_SPEED
                     * (1.0 - ramp(t, 1.8, self.STOP_T)))
         self.human_track = SpeedTrack(self.START_X, SIDE_DISTANCE, together,
@@ -518,16 +525,19 @@ class SceneC(Scene):
         self.robot_track.shift(self.START_X + ROBOT_AHEAD
                                - self.robot_track(self.STOP_T)[0])
         # 走っている間、ロボットはときどき人の方を振り返り、人も見返す。
-        glances = [(7.9, 8.5), (14.4, 15.0)]
+        glances = [(7.9, 8.5), (r + 2.2, r + 2.8)]
         f = self.FALL_T
         robot_keys = [(0.0, 'face'), (4.3, 'hands'), (5.0, 'face'),
                       (5.7, 'forward'), (f + 0.15, 'face'),
-                      (10.4, 'hands'), (11.2, 'face'),
-                      (self.RESTART_T + 0.1, 'forward'), (17.0, 'face')]
+                      (self.TAKE_T + 0.2, 'hands'),
+                      (self.REGRIP_T + 0.3, 'face'), (r + 0.1, 'forward'),
+                      (r + 4.8, 'face')]
         human_keys = [(0.0, 'forward'), (1.0, 'face'), (4.2, 'hands'),
                       (5.0, 'face'), (5.6, 'forward'), (f, 'ground'),
-                      (9.9, 'face'), (self.RESTART_T + 0.1, 'forward'),
-                      (16.9, 'face')]
+                      (self.OFFER_T + 0.2, 'face'),
+                      (self.TAKE_T + 0.1, 'hands'),
+                      (self.REGRIP_T + 0.4, 'face'), (r + 0.1, 'forward'),
+                      (r + 4.7, 'face')]
         for t0, t1 in glances:
             robot_keys += [(t0, 'face'), (t1, 'forward')]
             human_keys += [(t0 + 0.15, 'face'), (t1 + 0.1, 'forward')]
@@ -538,13 +548,15 @@ class SceneC(Scene):
         # 走っているときはロボットが少し前に出て引っぱる (5〜15 cm 前で揺らぐ。
         # 前に出すぎると Aero の肩が後ろへ振れきり、繋いだ手が離れる)。
         # 人が転ぶとロボットは少し行き過ぎて止まり、走り出すと横へ戻る。
-        w = (ramp(t, 6.0, 7.5) - ramp(t, 15.5, 17.0))
+        r = self.RESTART_T
+        w = (ramp(t, 6.0, 7.5) - ramp(t, r + 3.3, r + 4.8))
         u = t - 6.0
         lead = w * (0.10 + 0.035 * np.sin(2.0 * np.pi * u / 3.3)
                     + 0.015 * np.sin(2.0 * np.pi * u / 1.9))
-        fall = self.FALL_LEAD * (ramp(t, self.FALL_T, self.FALL_T + 0.9)
-                                 - ramp(t, self.RESTART_T,
-                                        self.RESTART_T + 1.3))
+        # 立ち上がったら人の方へ下がってきて、走り出すと横に並ぶ。
+        fall = self.FALL_LEAD * ramp(t, self.FALL_T, self.FALL_T + 1.0) \
+            - (self.FALL_LEAD - self.BACK_LEAD) * ramp(t, 12.6, r) \
+            - self.BACK_LEAD * ramp(t, r, r + 1.3)
         return lead + fall
 
     def spine_yaw(self, t):
@@ -553,42 +565,66 @@ class SceneC(Scene):
 
     def kneel(self, t):
         """膝をつく量: つまずいて 0.5 秒で膝と手をつき、手を引かれて立つ。"""
-        return ramp(t, self.FALL_T, self.FALL_T + 0.5) - ramp(t, 10.4, 11.6)
+        return ramp(t, self.FALL_T, self.FALL_T + 0.5) \
+            - ramp(t, self.STAND_T, self.STAND_T + 1.2)
 
     def script(self, t, ctx):
         human, shoulders, yaw, run = ctx.human, ctx.shoulders, ctx.yaw, ctx.run
         fwd, left, up = body_axes(yaw)
+        f, r = self.FALL_T, self.RESTART_T
         swing = np.sin(ctx.phase) * ctx.walk
         rest = human_swing_goal(human, shoulders, 'R', yaw, swing, run)
-        grip = ramp(t, 5.0, 5.5)
+        # 握り: 最初に握る → 転んだ拍子に離す → 差し出された手をもう一度握る。
+        grip = ramp(t, 5.0, 5.5) - ramp(t, f, f + 0.25) \
+            + ramp(t, self.REGRIP_T, self.REGRIP_T + 0.4)
         hold = human_hold_goal(human, shoulders, yaw, swing, run, grip)
         goal = blend_goal(rest, hold, ramp(t, 4.2, 4.9))
         goal.grip = grip
         kneel = self.kneel(t)
-        # 転んだ間、繋いだ右手は前のロボットの方へ伸ばす (引かれる)。
-        reach_out = shm.ArmGoal(
+
+        def on_ground(side, out):
+            s = shoulders[side]
+            p = s + 0.32 * fwd + out * left
+            return shm.ArmGoal(wrist=np.array([p[0], p[1], 0.06]), bend=fwd)
+
+        # ロボットが振り返って差し出す手の位置 (台車の後ろ、人との間)。
+        rb = ctx.robot_base
+        offer_point = np.array([rb[0] + self.OFFER_FROM_BASE[0],
+                                rb[1] + self.OFFER_FROM_BASE[1],
+                                self.OFFER_FROM_BASE[2]])
+        # 差し出された手へ伸ばす右手 (掌は握手のように横向き)。
+        take = shm.ArmGoal(wrist=offer_point - 0.06 * fwd,
+                           bend=left + 0.3 * up, palm=left, grip=grip)
+        # 走り出すときは手を前に伸ばしたまま、ロボットに追いついたら横へ。
+        forward = shm.ArmGoal(
             wrist=shoulders['R'] + 0.46 * fwd - 0.10 * left - 0.04 * up,
-            # 腕はほぼ伸ばし、肘はわずかに外・下へ。掌は握手のように横向き。
-            bend=left + 0.3 * up, palm=left, grip=1.0)
-        # 走り出してロボットに追いつくまでは手を前に伸ばしたまま。
-        pulled = ramp(t, self.FALL_T, self.FALL_T + 0.6) \
-            - ramp(t, self.RESTART_T + 0.2, self.RESTART_T + 1.4)
-        goal = blend_goal(goal, reach_out, pulled)
-        # 左手は地面につく。
+            bend=left + 0.3 * up, palm=left, grip=grip)
+        # 右手: 繋いだ手 → (離して) 地面 → 差し出された手 → 前 → 横。
+        goal = blend_goal(goal, on_ground('R', -0.04),
+                          ramp(t, f, f + 0.45))
+        if t >= self.TAKE_T:
+            goal = blend_goal(on_ground('R', -0.04), take,
+                              ramp(t, self.TAKE_T, self.REGRIP_T))
+        if t >= 12.6:
+            goal = blend_goal(take, forward, ramp(t, 12.6, r))
+        if t >= r:
+            goal = blend_goal(forward, hold, ramp(t, r + 0.2, r + 1.4))
+        goal.grip = grip
+        # 左手は地面につき、立つときに離す。
         left_goal = human_swing_goal(human, shoulders, 'L', yaw, -swing, run)
-        ground = shm.ArmGoal(
-            wrist=np.array([*(shoulders['L'] + 0.32 * fwd + 0.06 * left)[:2],
-                            0.06]), bend=fwd)
-        left_goal = blend_goal(left_goal, ground, kneel)
-        # ひねりは人が追いついてから戻す (人が後ろにいるうちに戻すと、Aero の
-        # 肩は後ろへ 15 度しか振れないので繋いだ手に届かない)。
-        twist = self.TURN * (ramp(t, self.FALL_T + 0.4, self.FALL_T + 1.1)
-                             - ramp(t, self.RESTART_T + 0.3,
-                                    self.RESTART_T + 1.4))
+        left_goal = blend_goal(left_goal, on_ground('L', 0.06), kneel)
+        twist = self.TURN * (ramp(t, f + 0.4, f + 1.1)
+                             - ramp(t, r + 0.3, r + 1.4))
+        # ロボットの手: 離したら下ろし、振り返って差し出し、人の手を取る。
+        reach = ramp(t, 4.3, 5.0) - ramp(t, f, f + 0.6) \
+            + ramp(t, self.TAKE_T + 0.2, self.REGRIP_T)
+        offer = ramp(t, self.OFFER_T, self.OFFER_T + 0.7) \
+            - ramp(t, self.REGRIP_T, self.REGRIP_T + 0.2)
         return dict(
             arms={'R': goal, 'L': left_goal}, human_gaze=self.human_gaze(t),
             spine_yaw=self.spine_yaw(t), kneel=kneel,
-            waist_y=twist, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
+            waist_y=twist, waist_p=0.0, reach=reach,
+            offer=offer, offer_point=offer_point,
             # 走ってきながら (人から遠い側の手を) 大きく振り、止まる前に下ろす。
             wave=ramp(t, 0.2, 0.8) - ramp(t, 2.6, 3.4),
             grip=grip, robot_gaze=self.robot_gaze(t))
@@ -862,17 +898,24 @@ class Timeline(object):
 
             # つなぐ腕: 腕振りの姿勢 → 掌の手前 → 人の掌。手首は手を伸ばし
             # ながら台本の角度へ回す (掌を人の掌へ向ける)。
+            # 手を差し出す (``offer``): 腕を下ろした姿勢から ``offer_point`` へ
+            # 手を伸ばして待つ。そこから人の掌へ合わせて握るのが ``reach``。
             reach = plan['reach']
+            offer = plan.get('offer', 0.0)
             err = 0.0
-            if reach > 0.0:
+            if reach > 0.0 or offer > 0.0:
+                turn = max(ramp(reach, 0.0, 0.7), ramp(offer, 0.0, 0.7))
                 hold_wrist_y.joint_angle(
-                    plan.get('hold_wrist_y', -1.5) * ramp(reach, 0.0, 0.7))
+                    plan.get('hold_wrist_y', -1.5) * turn)
                 hold_shoulder_y.joint_angle(
-                    plan.get('hold_shoulder_y', 0.0) * ramp(reach, 0.0, 0.7))
-                neutral_pos = hold_end.worldpos().copy()
+                    plan.get('hold_shoulder_y', 0.0) * turn)
+                target_pos = hold_end.worldpos().copy()
+                if offer > 0.0:
+                    target_pos = lerp(target_pos, plan['offer_point'],
+                                      minjerk(offer))
                 pre = PREGRASP_OFFSET * (1.0 - ramp(reach, 0.6, 1.0))
                 target_pos = lerp(
-                    neutral_pos,
+                    target_pos,
                     robot_hold_position(*palm) + palm[1] * pre,
                     minjerk(min(1.0, reach / 0.8)))
                 if ik_seed is None:
@@ -1011,7 +1054,7 @@ LANE_WIDTH = 1.22
 TRACK_X = (-30.0, 25.0)
 TRACK_Y = (-3.4, 4.0)
 FINISH_TAPE_Z = 1.1  # ゴールテープの高さ (胸のあたり) [m]
-FINISH_X = 6.0  # 2 度目の走りの途中 (15 秒ごろ) で越える
+FINISH_X = 6.0  # 2 度目の走りの途中 (16 秒ごろ) で越える
 FLAG_COLORS = [(220, 60, 60), (240, 200, 50), (60, 120, 220), (70, 170, 90),
                (250, 250, 250)]
 
