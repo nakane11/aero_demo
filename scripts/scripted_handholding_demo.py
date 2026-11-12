@@ -93,6 +93,9 @@ ROBOT_AHEAD = 0.04
 # 手を取る直前に掌の法線方向へ浮かせる距離 [m]。
 PREGRASP_OFFSET = 0.08
 
+# ロボットが走るときの前傾 (waist_p) [rad]。
+ROBOT_RUN_LEAN = 0.12
+
 # 首振りの応答 (臨界減衰の固有振動数 [Hz])。人とロボットで少し変える。
 HUMAN_GAZE_FREQ = 2.4
 ROBOT_GAZE_FREQ = 2.0
@@ -146,6 +149,9 @@ class SpeedTrack(object):
             [[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * 0.001)])
         self.y = y
         self.yaw = yaw
+
+    def shift(self, dx):
+        self._x = self._x + dx
 
     def __call__(self, t):
         return np.array([np.interp(t, self._t, self._x), self.y, self.yaw])
@@ -251,12 +257,12 @@ def blend_goal(a, b, s):
 def robot_swing_angles(arm, swing, run):
     """ロボットの腕振りの関節角。``swing`` は前へ振れて正。"""
     mirror = 1.0 if arm == 'l' else -1.0
-    shoulder_p = -(0.25 * (1.0 - run) + 0.55 * run) * swing - 0.15 * run
+    shoulder_p = -(0.25 * (1.0 - run) + 0.45 * run) * swing - 0.05 * run
     return {
         '{}_shoulder_p_joint'.format(arm): shoulder_p,
         '{}_shoulder_r_joint'.format(arm): mirror * 0.08,
         '{}_shoulder_y_joint'.format(arm): 0.0,
-        '{}_elbow_joint'.format(arm): -0.2 - 1.3 * run,
+        '{}_elbow_joint'.format(arm): -0.2 - 0.9 * run,
         '{}_wrist_y_joint'.format(arm): 0.0,
         '{}_wrist_p_joint'.format(arm): 0.0,
         '{}_wrist_r_joint'.format(arm): 0.0,
@@ -279,7 +285,23 @@ class Scene(object):
         return self.human_track(t)
 
     def robot_pose(self, t):
-        return self.robot_track(t)
+        return self.robot_track(t) + np.array([self.drift(t), 0.0, 0.0])
+
+    def drift(self, t):
+        """並んで動くときのロボットの前後のずれ [m] (前が正)。"""
+        return 0.0
+
+
+def side_by_side_drift(t, t0, t1, amplitude):
+    """``t0``〜``t1`` の間、ロボットが人の真横から後ろへゆっくりずれたり戻ったり
+    する量 (0〜-``amplitude`` 程度、負が後ろ)。2 つの周期を重ねて単調さを消す。
+    Aero の肩は後ろへ 15 度しか振れず、前に出すぎると繋いだ手に届かないので
+    後ろ側にだけずらす。"""
+    w = ramp(t, t0, t0 + 1.0) - ramp(t, t1 - 1.5, t1)
+    u = t - t0
+    return -w * amplitude * (0.7 * 0.5 * (1.0 - np.cos(2.0 * np.pi * u / 3.3))
+                             + 0.3 * 0.5 * (1.0 - np.cos(2.0 * np.pi * u
+                                                         / 1.9)))
 
 
 class SceneA(Scene):
@@ -410,6 +432,7 @@ class SceneB(Scene):
                                       self.duration)
         self.robot_track = SpeedTrack(-4.0 + ROBOT_AHEAD, 0.0, speed,
                                       self.duration)
+
         # 「前を向いたまま」: 見合うのは最初だけで、手は見ずに取る。
         self.robot_gaze = GazeSchedule([
             (0.0, 'forward'), (1.7, 'face'), (2.5, 'forward'),
@@ -417,6 +440,9 @@ class SceneB(Scene):
         self.human_gaze = GazeSchedule([
             (0.0, 'forward'), (1.6, 'face'), (2.6, 'hands'), (3.8, 'face'),
             (4.9, 'forward')])
+
+    def drift(self, t):
+        return side_by_side_drift(t, 4.6, self.duration + 1.5, 0.12)
 
     def script(self, t, ctx):
         human, shoulders, yaw, run = ctx.human, ctx.shoulders, ctx.yaw, ctx.run
@@ -436,41 +462,57 @@ class SceneB(Scene):
 
 class SceneC(Scene):
     key = 'C'
-    title = 'C: 手を繋いで一緒に走る (運動会)'
-    duration = 11.0
-    phases = [('1 見合う', 0.3, 1.2), ('2 手を出す', 1.2, 2.0),
-              ('3 握る', 2.0, 2.5), ('4 一緒に走る', 2.5, 9.8),
-              ('5 ゴール', 9.8, 11.0)]
+    title = 'C: 後ろから走ってきて、手を繋いで一緒に走る (運動会)'
+    duration = 14.0
+    phases = [('0 後ろから走ってくる', 0.0, 3.2), ('1 見合う', 3.2, 4.2),
+              ('2 手を出す', 4.2, 5.0), ('3 握る', 5.0, 5.5),
+              ('4 一緒に走る', 5.5, 12.8), ('5 ゴール', 12.8, 14.0)]
     follow_camera = True
-    SPEED = 3.2
+    SPEED = 3.2           # 一緒に走る速さ [m/s]
+    APPROACH_SPEED = 3.0  # ロボットが走ってくる速さ [m/s]
+    START_X = -8.0        # 人が待っている位置 (スタートライン)
+    STOP_T = 3.2          # ロボットが人の横で止まる時刻
 
     def __init__(self):
-        speed = (lambda t: self.SPEED * (ramp(t, 2.8, 4.8)
-                                         - ramp(t, 8.3, 9.8)))
-        self.human_track = SpeedTrack(-8.0, SIDE_DISTANCE, speed,
+        together = (lambda t: self.SPEED * (ramp(t, 5.8, 7.8)
+                                            - ramp(t, 11.3, 12.8)))
+        approach = (lambda t: self.APPROACH_SPEED
+                    * (1.0 - ramp(t, 1.8, self.STOP_T)))
+        self.human_track = SpeedTrack(self.START_X, SIDE_DISTANCE, together,
                                       self.duration)
-        self.robot_track = SpeedTrack(-8.0 + ROBOT_AHEAD, 0.0, speed,
-                                      self.duration)
+        self.robot_track = SpeedTrack(
+            0.0, 0.0, lambda t: approach(t) + together(t), self.duration)
+        # 止まった位置が人の横 (ROBOT_AHEAD だけ前) になるよう平行移動する。
+        self.robot_track.shift(self.START_X + ROBOT_AHEAD
+                               - self.robot_track(self.STOP_T)[0])
         self.robot_gaze = GazeSchedule([
-            (0.0, 'forward'), (0.3, 'face'), (1.3, 'hands'), (2.0, 'face'),
-            (2.6, 'forward'), (9.9, 'face')])
+            (0.0, 'face'), (4.3, 'hands'), (5.0, 'face'),
+            (5.7, 'forward'), (12.9, 'face')])
         self.human_gaze = GazeSchedule([
-            (0.0, 'forward'), (0.4, 'face'), (1.2, 'hands'), (2.0, 'face'),
-            (2.6, 'forward'), (9.8, 'face')])
+            (0.0, 'forward'), (1.0, 'face'), (4.2, 'hands'), (5.0, 'face'),
+            (5.6, 'forward'), (12.8, 'face')])
+
+    def drift(self, t):
+        return side_by_side_drift(t, 6.6, 12.6, 0.25)
+
+    def spine_yaw(self, t):
+        # 足音に気づいて右後ろを振り返り、ロボットが横に来たら戻す。
+        return -0.45 * (ramp(t, 1.0, 1.8) - ramp(t, 2.6, 3.4))
 
     def script(self, t, ctx):
         human, shoulders, yaw, run = ctx.human, ctx.shoulders, ctx.yaw, ctx.run
         swing = np.sin(ctx.phase) * ctx.walk
         rest = human_swing_goal(human, shoulders, 'R', yaw, swing, run)
-        grip = ramp(t, 2.0, 2.5)
+        grip = ramp(t, 5.0, 5.5)
         hold = human_hold_goal(human, shoulders, yaw, swing, run, grip)
-        goal = blend_goal(rest, hold, ramp(t, 1.2, 1.9))
+        goal = blend_goal(rest, hold, ramp(t, 4.2, 4.9))
         goal.grip = grip
         arms = {'R': goal,
                 'L': human_swing_goal(human, shoulders, 'L', yaw, -swing, run)}
         return dict(
             arms=arms, human_gaze=self.human_gaze(t),
-            waist_y=0.0, waist_p=0.12 * run, reach=ramp(t, 1.3, 2.0),
+            spine_yaw=self.spine_yaw(t),
+            waist_y=0.0, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
             grip=grip, robot_gaze=self.robot_gaze(t))
 
 
@@ -664,6 +706,7 @@ class Timeline(object):
         phase = 0.0
         prev_xy = None
         prev_base = None
+        robot_phase = 0.0
         ik_seed = None
         robot_head = np.array([0.0, 0.0, 1.55])
         meet = None
@@ -709,7 +752,16 @@ class Timeline(object):
                 float(np.linalg.norm(base[:2] - prev_base[:2])) / DT
             prev_base = base
             robot_walk, robot_run = shm.gait_weights(robot_speed)
-            swing = np.sin(phase) * robot_walk
+            # 人が動いていれば人の歩調にそろえ、人が立っている間はロボット
+            # 自身の速さで刻む (後ろから走ってくるときなど)。
+            robot_phase += 2.0 * np.pi * robot_speed * DT \
+                / shm.stride_length(robot_speed)
+            if walk > 0.05:
+                robot_phase = phase
+            swing = np.sin(robot_phase) * robot_walk
+            # 走るときは少し前に傾く。
+            robot.waist_p_joint.joint_angle(
+                plan['waist_p'] + ROBOT_RUN_LEAN * robot_run)
             for arm, value in ((ROBOT_FREE_ARM, -swing),
                                (ROBOT_HOLD_ARM, swing)):
                 for name, angle in robot_swing_angles(
