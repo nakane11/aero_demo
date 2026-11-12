@@ -250,6 +250,26 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 
 テストに使う実機データの一覧は [`docs/test_data.md`](docs/test_data.md)。
 
+## 決め打ちの手繋ぎデモ (認識なし・理想モード)
+
+`scripts/scripted_handholding_demo.py` は、認識を入れずに人 (SMPL) とロボットの
+動きを台本で決めて、理想の手繋ぎを 1 本の連続した動作として viser で再生する
+(実機の速度上限はかけない)。シーンは次の 4 つで、それぞれ
+「気づく・向く → 手を出す → 握る → 一緒に動く」の段階を画面に出す。
+
+- A: 人がロボットの斜め後ろに来る (台車は動かさず上半身だけひねって手を取る)
+- A': ロボットが人の斜め後ろに来る (人が後ろに出した手を取る)
+- B: 横に並んで歩きながら、前を向いたまま手を繋ぐ
+- C: 手を繋いで一緒に走る (運動会、腕も一緒に振る)
+
+```bash
+FEETECH_HAND_DIR=~/ros/hand/src/feetech_hand \
+    python3 scripts/scripted_handholding_demo.py
+```
+
+人の動き (歩行・走行・腕の解析 IK・視線) は `src/aero_demo/scripted_human.py`。
+起動時に最初のシーンを、その後ほかのシーンを裏で計算する (1 シーン 20 秒ほど)。
+
 ## 座標系
 
 各 JSON の座標はロボット座標系 (x=前, y=左, z=上) で、両足が地面
