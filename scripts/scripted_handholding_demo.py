@@ -299,6 +299,7 @@ class Scene(object):
     duration = 10.0
     phases = []
     follow_camera = False
+    background = 'plain'  # 'plain' (灰色の地面) か 'track' (運動会のトラック)
 
     def human_pose(self, t):
         return self.human_track(t)
@@ -481,20 +482,32 @@ class SceneB(Scene):
 
 class SceneC(Scene):
     key = 'C'
-    title = 'C: 後ろから走ってきて、手を繋いで一緒に走る (運動会)'
-    duration = 14.0
+    title = 'C: 後ろから走ってきて、手を繋いで一緒に走る (運動会、途中で転ぶ)'
+    duration = 18.5
     phases = [('0 手を振りながら走ってくる', 0.0, 3.2), ('1 見合う', 3.2, 4.2),
               ('2 手を出す', 4.2, 5.0), ('3 握る', 5.0, 5.5),
-              ('4 一緒に走る', 5.5, 12.8), ('5 ゴール', 12.8, 14.0)]
+              ('4 一緒に走る', 5.5, 9.0), ('5 転ぶ', 9.0, 9.6),
+              ('6 振り返って手を引き、起こす', 9.6, 11.6),
+              ('7 見合う', 11.6, 12.2), ('8 また走ってゴールへ', 12.2, 17.0),
+              ('9 ゴール', 17.0, 18.5)]
     follow_camera = True
+    background = 'track'
     SPEED = 3.2           # 一緒に走る速さ [m/s]
     APPROACH_SPEED = 3.0  # ロボットが走ってくる速さ [m/s]
     START_X = -8.0        # 人が待っている位置 (スタートライン)
     STOP_T = 3.2          # ロボットが人の横で止まる時刻
+    FALL_T = 9.0          # 人がつまずく時刻
+    RESTART_T = 12.2      # また走り出す時刻
+    FALL_LEAD = 0.45      # 転んだとき、ロボットが行き過ぎて止まる距離 [m]
+    TURN = 1.6            # 振り返るときの上半身のひねり [rad]
 
     def __init__(self):
-        together = (lambda t: self.SPEED * (ramp(t, 5.8, 7.8)
-                                            - ramp(t, 11.3, 12.8)))
+        v = self.SPEED
+        together = (lambda t: v * (ramp(t, 5.8, 7.8)
+                                   - ramp(t, self.FALL_T, self.FALL_T + 0.5)
+                                   + ramp(t, self.RESTART_T,
+                                          self.RESTART_T + 2.0)
+                                   - ramp(t, 15.5, 17.0)))
         approach = (lambda t: self.APPROACH_SPEED
                     * (1.0 - ramp(t, 1.8, self.STOP_T)))
         self.human_track = SpeedTrack(self.START_X, SIDE_DISTANCE, together,
@@ -505,11 +518,16 @@ class SceneC(Scene):
         self.robot_track.shift(self.START_X + ROBOT_AHEAD
                                - self.robot_track(self.STOP_T)[0])
         # 走っている間、ロボットはときどき人の方を振り返り、人も見返す。
-        glances = [(7.8, 8.5), (9.9, 10.5), (11.6, 12.2)]
+        glances = [(7.9, 8.5), (14.4, 15.0)]
+        f = self.FALL_T
         robot_keys = [(0.0, 'face'), (4.3, 'hands'), (5.0, 'face'),
-                      (5.7, 'forward'), (12.9, 'face')]
+                      (5.7, 'forward'), (f + 0.15, 'face'),
+                      (10.4, 'hands'), (11.2, 'face'),
+                      (self.RESTART_T + 0.1, 'forward'), (17.0, 'face')]
         human_keys = [(0.0, 'forward'), (1.0, 'face'), (4.2, 'hands'),
-                      (5.0, 'face'), (5.6, 'forward'), (12.8, 'face')]
+                      (5.0, 'face'), (5.6, 'forward'), (f, 'ground'),
+                      (9.9, 'face'), (self.RESTART_T + 0.1, 'forward'),
+                      (16.9, 'face')]
         for t0, t1 in glances:
             robot_keys += [(t0, 'face'), (t1, 'forward')]
             human_keys += [(t0 + 0.15, 'face'), (t1 + 0.1, 'forward')]
@@ -517,30 +535,60 @@ class SceneC(Scene):
         self.human_gaze = GazeSchedule(human_keys)
 
     def drift(self, t):
-        # 走り出したらロボットが少し前に出て引っぱる (10〜20 cm 前で揺らぐ)。
-        w = ramp(t, 6.0, 7.5) - ramp(t, 11.3, 12.8)
+        # 走っているときはロボットが少し前に出て引っぱる (5〜15 cm 前で揺らぐ。
+        # 前に出すぎると Aero の肩が後ろへ振れきり、繋いだ手が離れる)。
+        # 人が転ぶとロボットは少し行き過ぎて止まり、走り出すと横へ戻る。
+        w = (ramp(t, 6.0, 7.5) - ramp(t, 15.5, 17.0))
         u = t - 6.0
-        return w * (0.15 + 0.04 * np.sin(2.0 * np.pi * u / 3.3)
-                    + 0.02 * np.sin(2.0 * np.pi * u / 1.9))
+        lead = w * (0.10 + 0.035 * np.sin(2.0 * np.pi * u / 3.3)
+                    + 0.015 * np.sin(2.0 * np.pi * u / 1.9))
+        fall = self.FALL_LEAD * (ramp(t, self.FALL_T, self.FALL_T + 0.9)
+                                 - ramp(t, self.RESTART_T,
+                                        self.RESTART_T + 1.3))
+        return lead + fall
 
     def spine_yaw(self, t):
         # 足音に気づいて右後ろを振り返り、ロボットが横に来たら戻す。
         return -0.45 * (ramp(t, 1.0, 1.8) - ramp(t, 2.6, 3.4))
 
+    def kneel(self, t):
+        """膝をつく量: つまずいて 0.5 秒で膝と手をつき、手を引かれて立つ。"""
+        return ramp(t, self.FALL_T, self.FALL_T + 0.5) - ramp(t, 10.4, 11.6)
+
     def script(self, t, ctx):
         human, shoulders, yaw, run = ctx.human, ctx.shoulders, ctx.yaw, ctx.run
+        fwd, left, up = body_axes(yaw)
         swing = np.sin(ctx.phase) * ctx.walk
         rest = human_swing_goal(human, shoulders, 'R', yaw, swing, run)
         grip = ramp(t, 5.0, 5.5)
         hold = human_hold_goal(human, shoulders, yaw, swing, run, grip)
         goal = blend_goal(rest, hold, ramp(t, 4.2, 4.9))
         goal.grip = grip
-        arms = {'R': goal,
-                'L': human_swing_goal(human, shoulders, 'L', yaw, -swing, run)}
+        kneel = self.kneel(t)
+        # 転んだ間、繋いだ右手は前のロボットの方へ伸ばす (引かれる)。
+        reach_out = shm.ArmGoal(
+            wrist=shoulders['R'] + 0.46 * fwd - 0.10 * left - 0.04 * up,
+            # 腕はほぼ伸ばし、肘はわずかに外・下へ。掌は握手のように横向き。
+            bend=left + 0.3 * up, palm=left, grip=1.0)
+        # 走り出してロボットに追いつくまでは手を前に伸ばしたまま。
+        pulled = ramp(t, self.FALL_T, self.FALL_T + 0.6) \
+            - ramp(t, self.RESTART_T + 0.2, self.RESTART_T + 1.4)
+        goal = blend_goal(goal, reach_out, pulled)
+        # 左手は地面につく。
+        left_goal = human_swing_goal(human, shoulders, 'L', yaw, -swing, run)
+        ground = shm.ArmGoal(
+            wrist=np.array([*(shoulders['L'] + 0.32 * fwd + 0.06 * left)[:2],
+                            0.06]), bend=fwd)
+        left_goal = blend_goal(left_goal, ground, kneel)
+        # ひねりは人が追いついてから戻す (人が後ろにいるうちに戻すと、Aero の
+        # 肩は後ろへ 15 度しか振れないので繋いだ手に届かない)。
+        twist = self.TURN * (ramp(t, self.FALL_T + 0.4, self.FALL_T + 1.1)
+                             - ramp(t, self.RESTART_T + 0.3,
+                                    self.RESTART_T + 1.4))
         return dict(
-            arms=arms, human_gaze=self.human_gaze(t),
-            spine_yaw=self.spine_yaw(t),
-            waist_y=0.0, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
+            arms={'R': goal, 'L': left_goal}, human_gaze=self.human_gaze(t),
+            spine_yaw=self.spine_yaw(t), kneel=kneel,
+            waist_y=twist, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
             # 走ってきながら大きく手を振り、止まる前に下ろす。
             wave=ramp(t, 0.2, 0.8) - ramp(t, 2.6, 3.4),
             grip=grip, robot_gaze=self.robot_gaze(t))
@@ -687,6 +735,9 @@ class Context(object):
     pass
 
 
+# この見出しより後ろ (ビューア) を変えても計算結果は作り直さない。
+VIEWER_SECTION_MARK = '# viser ' + 'ビューア'
+
 # 計算したタイムラインの保存先 (台本・人のモデルのコードが変わると作り直す)。
 CACHE_DIR = os.path.expanduser('~/.cache/aero_demo/scripted_handholding')
 CACHE_FIELDS = ('times', 'vertices', 'robot_angles', 'robot_bases', 'centers',
@@ -698,7 +749,9 @@ def cache_path(scene_key, model_path):
     digest = hashlib.sha1()
     for path in (os.path.abspath(__file__), os.path.abspath(shm.__file__)):
         with open(path, 'rb') as f:
-            digest.update(f.read())
+            text = f.read()
+        # ビューア (背景・GUI) の部分は計算結果に効かないので見ない。
+        digest.update(text.split(VIEWER_SECTION_MARK.encode())[0])
     digest.update(os.path.abspath(model_path).encode())
     digest.update(np.asarray(HUMAN_BETAS).tobytes())
     name = 'scene_{}_{}.npz'.format(scene_key.replace("'", '2'),
@@ -761,6 +814,7 @@ class Timeline(object):
             # 背骨のひねりは肩の位置を変えるので先に入れる。
             plan = scene.script(t, _ShoulderProbe(human, spec, ctx))
             spec.spine_yaw = plan.get('spine_yaw', 0.0)
+            spec.kneel = plan.get('kneel', 0.0)
             ctx.shoulders = human.shoulder_position(spec)
             plan = scene.script(t, ctx)
             spec.arms = dict(plan['arms'])
@@ -886,6 +940,10 @@ class Timeline(object):
             return np.asarray(other_head)
         if name == 'hands' and meet is not None:
             return np.asarray(meet)
+        if name == 'ground':  # 足もと (1 m 先の地面)
+            p = np.asarray(own_head) + 1.0 * fwd
+            p[2] = 0.0
+            return p
         # 進行方向の 4 m 先、少し下。
         p = np.asarray(own_head) + 4.0 * fwd
         p[2] = own_head[2] - 0.5
@@ -944,6 +1002,99 @@ def remove_robot_gui(viewer):
     viewer._joint_folders.clear()
 
 
+# 運動会のトラック (シーン C の背景)。
+TRACK_COLOR = (178, 88, 62)
+GRASS_COLOR = (104, 158, 82)
+LINE_COLOR = (245, 245, 240)
+LANE_WIDTH = 1.22
+TRACK_X = (-30.0, 25.0)
+TRACK_Y = (-3.4, 4.0)
+FINISH_X = 6.0  # 2 度目の走りの途中 (15 秒ごろ) で越える
+FLAG_COLORS = [(220, 60, 60), (240, 200, 50), (60, 120, 220), (70, 170, 90),
+               (250, 250, 250)]
+
+
+def sky_image(top, bottom, height=256):
+    """上から下へ ``top`` → ``bottom`` のグラデーションの背景画像。"""
+    ratio = np.linspace(0.0, 1.0, height)[:, None, None]
+    column = (1.0 - ratio) * np.asarray(top) + ratio * np.asarray(bottom)
+    return np.repeat(column, 4, axis=1).astype(np.uint8)
+
+
+def add_plain_ground(scene):
+    """灰色の地面と 1 m の格子。格子の handle を返す。"""
+    scene.add_box('/bg_plain/ground', color=GROUND_COLOR,
+                  dimensions=(80.0, 30.0, 0.02), position=(0.0, 0.0, -0.011))
+    return scene.add_grid(
+        '/bg_plain/grid', width=80.0, height=30.0, cell_size=1.0,
+        section_size=5.0, cell_color=GRID_CELL_COLOR,
+        section_color=GRID_SECTION_COLOR, position=(0.0, 0.0, 0.001))
+
+
+def add_track(scene, lane_center):
+    """運動会のトラック (走路・レーン線・スタート/ゴール・万国旗) を
+    ``/bg_track`` の下に作る。2 人は ``lane_center`` のレーンを走る。"""
+    x0, x1 = TRACK_X
+    y0, y1 = TRACK_Y
+    scene.add_box('/bg_track/grass', color=GRASS_COLOR,
+                  dimensions=(140.0, 70.0, 0.02), position=(0.0, 0.0, -0.03))
+    scene.add_box('/bg_track/track', color=TRACK_COLOR,
+                  dimensions=(x1 - x0, y1 - y0, 0.02),
+                  position=(0.5 * (x0 + x1), 0.5 * (y0 + y1), -0.011))
+    # レーン線 (2 人のレーンの両側と、その外側)。
+    k = 0
+    y = lane_center - 0.5 * LANE_WIDTH
+    while y > y0:
+        y -= LANE_WIDTH
+    y += LANE_WIDTH
+    while y < y1:
+        scene.add_box('/bg_track/lane_{}'.format(k), color=LINE_COLOR,
+                      dimensions=(x1 - x0, 0.05, 0.004),
+                      position=(0.5 * (x0 + x1), y, 0.001))
+        y += LANE_WIDTH
+        k += 1
+    # スタートとゴールの線。
+    for name, x in (('start', SceneC.START_X), ('finish', FINISH_X)):
+        scene.add_box('/bg_track/{}_line'.format(name), color=LINE_COLOR,
+                      dimensions=(0.1, y1 - y0, 0.005),
+                      position=(x, 0.5 * (y0 + y1), 0.0015))
+    # ゴールの柱と横断幕。
+    for i, y in enumerate((y0 - 0.3, y1 + 0.3)):
+        scene.add_box('/bg_track/finish_pole_{}'.format(i),
+                      color=(235, 235, 235), dimensions=(0.08, 0.08, 2.6),
+                      position=(FINISH_X, y, 1.3))
+    scene.add_box('/bg_track/finish_banner', color=(210, 50, 50),
+                  dimensions=(0.04, y1 - y0 + 0.6, 0.45),
+                  position=(FINISH_X, 0.5 * (y0 + y1), 2.35))
+    scene.add_label('/bg_track/finish_label', 'GOAL',
+                    position=(FINISH_X - 0.05, 0.5 * (y0 + y1), 2.35),
+                    font_size_mode='scene', font_scene_height=0.35,
+                    anchor='center-center', depth_test=True)
+    scene.add_label('/bg_track/start_label', 'START',
+                    position=(SceneC.START_X, y0 - 0.6, 0.05),
+                    font_size_mode='scene', font_scene_height=0.3,
+                    anchor='center-center', depth_test=True)
+    # 万国旗 (トラックの両側、高さ 2.4 m の綱から三角の旗を下げる)。
+    for side, y in (('l', y1 + 2.0), ('r', y0 - 2.0)):
+        for i, x in enumerate(np.arange(x0, x1, 4.0)):
+            scene.add_box('/bg_track/pole_{}_{}'.format(side, i),
+                          color=(240, 240, 240), dimensions=(0.05, 0.05, 2.5),
+                          position=(x, y, 1.25))
+        flags = {}
+        for i, x in enumerate(np.arange(x0, x1, 0.5)):
+            sag = 0.25 * np.sin(np.pi * ((x - x0) % 4.0) / 4.0)
+            top = 2.4 - sag
+            flags.setdefault(i % len(FLAG_COLORS), []).append(
+                [[x - 0.18, y, top], [x + 0.18, y, top],
+                 [x, y, top - 0.35]])
+        for c, tris in flags.items():
+            verts = np.asarray(tris, dtype=np.float32).reshape(-1, 3)
+            faces = np.arange(len(verts), dtype=np.uint32).reshape(-1, 3)
+            scene.add_mesh_simple('/bg_track/flags_{}_{}'.format(side, c),
+                                  vertices=verts, faces=faces,
+                                  color=FLAG_COLORS[c], side='double')
+
+
 class DemoViewer(object):
     """シーンの選択・再生の GUI。タイムラインは裏のスレッドで、選ばれたシーンを
     優先して計算し、ディスクに保存する (2 回目からは読み込むだけ)。"""
@@ -967,13 +1118,11 @@ class DemoViewer(object):
         self.viewer = ViserViewer(draw_grid=False)
         server = self.viewer._server
         self.server = server
-        server.scene.add_box(
-            '/ground', color=GROUND_COLOR, dimensions=(80.0, 30.0, 0.02),
-            position=(0.0, 0.0, -0.011))
-        self.grid = server.scene.add_grid(
-            '/ground_grid', width=80.0, height=30.0, cell_size=1.0,
-            section_size=5.0, cell_color=GRID_CELL_COLOR,
-            section_color=GRID_SECTION_COLOR, position=(0.0, 0.0, 0.001))
+        self.bg_plain = server.scene.add_frame('/bg_plain', show_axes=False)
+        self.grid = add_plain_ground(server.scene)
+        self.bg_track = server.scene.add_frame('/bg_track', show_axes=False,
+                                               visible=False)
+        add_track(server.scene, lane_center=0.5 * SIDE_DISTANCE)
         self.viewer.add(self.robot)
         remove_robot_gui(self.viewer)
         self.mesh = None
@@ -1097,6 +1246,7 @@ class DemoViewer(object):
             timeline = self.timelines[key]
         if self.wanted != key:  # 待っている間に別のシーンが選ばれた
             return
+        self._set_background(scene.background)
         with self.lock:
             self.current = timeline
             self.follow.value = scene.follow_camera
@@ -1105,6 +1255,16 @@ class DemoViewer(object):
         self.time_slider.value = 0.0
         self.render(0.0)
         self._look_at_scene()
+
+    def _set_background(self, kind):
+        track = kind == 'track'
+        self.bg_track.visible = track
+        self.bg_plain.visible = not track
+        if track:  # 晴れた運動会の空
+            sky = sky_image((70, 140, 225), (200, 225, 245))
+        else:
+            sky = sky_image((205, 218, 232), (238, 241, 245))
+        self.server.scene.set_background_image(sky, format='png')
 
     def _offset(self, tl, i):
         """表示のずらし量 (2 人を中央に留めるときは 2 人の中点を原点へ)。"""
@@ -1145,8 +1305,10 @@ class DemoViewer(object):
             else:
                 self.mesh.vertices = vertices
             # 地面の格子は 5 m 周期なので、ずらし量の余りだけ動かす。
+            # トラックは有限なのでそのままずらす。
             self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
                                   0.001)
+            self.bg_track.position = (-offset[0], -offset[1], 0.0)
             self.status.content = '**{}**  \n{:.2f} / {:.1f} 秒'.format(
                 tl.phase_at(tl.times[i]), tl.times[i], tl.times[-1])
 

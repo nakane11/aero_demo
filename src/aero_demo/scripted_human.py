@@ -56,6 +56,13 @@ RUN_KNEE_STANCE = 0.45
 RUN_KNEE_SWING = 1.45
 RUN_LEAN = 0.16  # 走るときの前傾 [rad]
 
+# 膝をつく (転んだ) ときの脚と上体 [rad]。腿はほぼ鉛直、すねは後ろへ水平。
+KNEEL_HIP = 0.05
+KNEEL_KNEE = 1.65
+KNEEL_LEAN = 0.6
+# 膝の関節から膝頭の表面まで [m] (膝をついたときの接地に使う)。
+KNEE_RADIUS = 0.055
+
 
 def rot(axis, angle):
     return sb.rodrigues(np.asarray(axis, dtype=np.float64) * angle)
@@ -118,6 +125,7 @@ class HumanSpec:
     gait_phase: float = 0.0   # 歩行周期の位相 [rad]
     spine_yaw: float = 0.0    # 上半身のひねり (左が正) [rad]
     lean: float = 0.0         # 前傾の追加分 [rad]
+    kneel: float = 0.0        # 膝をつく量 0〜1 (転んだとき)
     arms: dict = field(default_factory=dict)  # side -> ArmGoal
     gaze: np.ndarray = None   # 見る先 (ワールド位置、None なら正面)
 
@@ -218,7 +226,8 @@ class ScriptedHuman(object):
         """腰・脚・背骨の局所回転と、足が地面に着く骨盤の位置。"""
         local = np.tile(np.eye(3), (24, 1, 1))
         walk, run = gait_weights(spec.speed)
-        lean = spec.lean + RUN_LEAN * run
+        k = spec.kneel
+        lean = spec.lean + RUN_LEAN * run + KNEEL_LEAN * k
         local[0] = rot_z(spec.yaw).dot(rot_y(lean))
 
         hip_amp = (1.0 - run) * WALK_HIP_AMP + run * RUN_HIP_AMP
@@ -231,6 +240,8 @@ class ScriptedHuman(object):
             # sin > 0 で腿が前、cos > 0 で腿が前へ振れている (遊脚)。
             flex = walk * (hip_amp * np.sin(phase) + 0.1 * run)
             bend = walk * (knee_st + knee_sw * max(0.0, np.cos(phase)) ** 2)
+            flex = (1.0 - k) * flex + k * KNEEL_HIP
+            bend = (1.0 - k) * bend + k * KNEEL_KNEE
             local[hip] = rot_y(-flex - lean)
             local[knee] = rot_y(bend)
             # 足裏をおおよそ水平に保つ。
@@ -245,7 +256,9 @@ class ScriptedHuman(object):
 
         joints, _ = self.fk(local, np.zeros(3))
         feet = [sb.L_ANKLE, sb.R_ANKLE, L_FOOT, R_FOOT]
-        height = -(joints[feet, 2].min() - self.sole_offset)
+        lowest = min(joints[feet, 2].min() - self.sole_offset,
+                     joints[[sb.L_KNEE, sb.R_KNEE], 2].min() - KNEE_RADIUS)
+        height = -lowest
         root = np.array([spec.xy[0], spec.xy[1], height])
         return local, root
 
