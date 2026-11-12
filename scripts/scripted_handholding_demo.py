@@ -895,22 +895,26 @@ class SceneD(Scene):
         under = v[(v[:, 0] > -0.25) & (v[:, 0] < self.feet_x - 0.12)]
         top = float(under[:, 2].min())
         back = float(v[:, 0].min()) - 0.03
-        front = self.feet_x - 0.12
-        wood, leg = (176, 128, 84), (90, 90, 95)
-        return [
-            dict(name='seat', color=wood,
-                 dimensions=(front - back, 1.3, 0.04),
-                 position=(0.5 * (front + back), 0.0, top - 0.02)),
-            dict(name='back', color=wood, dimensions=(0.04, 1.3, 0.45),
-                 position=(back - 0.02, 0.0, top + 0.30),
-                 wxyz=(np.cos(-0.06), 0.0, np.sin(-0.06), 0.0)),
-            dict(name='leg_l', color=leg,
-                 dimensions=(front - back - 0.06, 0.05, top - 0.04),
-                 position=(0.5 * (front + back), 0.6, 0.5 * (top - 0.04))),
-            dict(name='leg_r', color=leg,
-                 dimensions=(front - back - 0.06, 0.05, top - 0.04),
-                 position=(0.5 * (front + back), -0.6, 0.5 * (top - 0.04))),
-        ]
+        return bench_props(top, back, self.feet_x - 0.12)
+
+
+def bench_props(top, back, front):
+    """ベンチ (局所座標: 座った人の骨盤の下が原点で前が +x)。"""
+    wood, leg = (176, 128, 84), (90, 90, 95)
+    return [
+        dict(name='seat', color=wood,
+             dimensions=(front - back, 1.3, 0.04),
+             position=(0.5 * (front + back), 0.0, top - 0.02)),
+        dict(name='back', color=wood, dimensions=(0.04, 1.3, 0.45),
+             position=(back - 0.02, 0.0, top + 0.30),
+             wxyz=(np.cos(-0.06), 0.0, np.sin(-0.06), 0.0)),
+        dict(name='leg_l', color=leg,
+             dimensions=(front - back - 0.06, 0.05, top - 0.04),
+             position=(0.5 * (front + back), 0.6, 0.5 * (top - 0.04))),
+        dict(name='leg_r', color=leg,
+             dimensions=(front - back - 0.06, 0.05, top - 0.04),
+             position=(0.5 * (front + back), -0.6, 0.5 * (top - 0.04))),
+    ]
 
 
 class SceneE(Scene):
@@ -1243,7 +1247,326 @@ class SceneF(Scene):
                      color=(96, 128, 168))]
 
 
-SCENES = [SceneA, SceneA2, SceneB, SceneC, SceneD, SceneE, SceneF]
+def rot2(yaw):
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array([[c, -s], [s, c]])
+
+
+def to_world(origin, yaw, p):
+    """ベンチなどの局所座標 (前, 左, 高さ) をワールドへ。"""
+    q = np.asarray(p, dtype=np.float64).copy()
+    q[:2] = np.asarray(origin[:2]) + rot2(yaw).dot(q[:2])
+    return q
+
+
+def face_offset(wrist_z, lifter, bow):
+    """向かい合って下から支えるときの、ロボットから見た手首の (前, 左)。"""
+    fwd, height = robot_shoulder_offset(lifter, bow)
+    dz = height - wrist_z
+    horiz = np.sqrt(max(FACE_ARM_REACH ** 2 - dz * dz, 0.2 ** 2))
+    return np.array([0.07 + horiz + fwd, FACE_BASE_DY])
+
+
+class SitGeometry(object):
+    """ベンチに座る・立つ動き (ベンチの局所座標、座ったときの骨盤が原点で前が
+    +x)。``stand(tau)`` は ``tau`` = 0 (座って背を起こしている) 〜
+    ``DURATION`` (立った) の姿勢。D と同じ順序 (前かがみ → お尻が浮く → 立つ)。"""
+
+    DURATION = 2.8
+    LEAN = (0.0, 1.0)
+    RISE = (0.8, 2.8)
+
+    def __init__(self, human, person):
+        sp = PERSONS[person]
+        j = human.rest_joints
+        leg = human.leg['R']
+        self.pz_sit = human.ankle_height + 0.98 * leg['L2'] \
+            - j[smpl_body.R_HIP][2]
+        self.feet_x = j[smpl_body.R_HIP][0] + 0.9 * leg['L1']
+        self.feet = {side: np.array([
+            self.feet_x, j[human.leg[side]['joints'][2]][1],
+            human.ankle_height]) for side in ('L', 'R')}
+        self.pz_stand, ankles = human.stance(sp['stoop'], sp['crouch'])
+        self.x_stand = self.feet_x - 0.5 * (ankles['L'][0] + ankles['R'][0])
+        shoulder_y = j[smpl_body.R_SHOULDER][1]
+        self.w_take = np.array([self.feet_x + 0.06, shoulder_y + 0.01,
+                                self.pz_sit + 0.16])
+        sh = human.body_joints(shm.HumanSpec(
+            xy=np.array([self.x_stand, 0.0]), yaw=0.0, stoop=sp['stoop'],
+            crouch=sp['crouch']))[smpl_body.R_SHOULDER]
+        self.w_stand = sh + np.array([0.27, 0.01, -0.30])
+        # 立っているときの手首 (骨盤から見た前・左・高さ)。
+        self.w_stand_rel = self.w_stand - np.array([self.x_stand, 0.0, 0.0])
+        # 横に並んで繋ぐときの右手首 (骨盤から見た前・左・高さ)。
+        self.w_side_rel = sh - np.array([self.x_stand, 0.0, 0.0]) \
+            + np.array([0.03, -0.08, -0.97 * human.arm_length])
+        l0, l1 = self.LEAN
+        r0, r1 = self.RISE
+        wt = self.w_take
+        self.hold_track = KeyframeTrack([
+            (l0,) + tuple(wt),
+            (l1,) + tuple(wt + [0.18, 0.0, -0.03]),
+            (r0 + 0.35 * (r1 - r0),) + tuple(wt + [0.32, 0.0, 0.0]),
+            (r1,) + tuple(self.w_stand)])
+
+    def rise(self, tau):
+        r0, r1 = self.RISE
+        return ramp(tau, r0, r0 + 0.7 * (r1 - r0)), \
+            ramp(tau, r0 + 0.25 * (r1 - r0), r1)
+
+    def pelvis(self, tau):
+        """骨盤の (前, 高さ)。"""
+        fwd, up = self.rise(tau)
+        return self.x_stand * fwd, lerp(self.pz_sit, self.pz_stand, up)
+
+    def lean(self, tau):
+        r0, r1 = self.RISE
+        return 0.12 + 0.55 * ramp(tau, *self.LEAN) \
+            - 0.67 * ramp(tau, r0 + 0.45 * (r1 - r0), r1)
+
+    def robot_lifter(self, tau):
+        r0, r1 = self.RISE
+        return 1.3 - 0.9 * ramp(tau, r0 + 0.3, r1)
+
+    def robot_bow(self, tau):
+        return 0.3 - 0.2 * ramp(tau, *self.RISE)
+
+
+class SceneG(Scene):
+    key = 'G'
+    title = 'G: 散歩の途中で座る (支える ⇄ 横に並ぶ、繋ぎ方を持ち替える)'
+    person = 'elderly'
+    duration = 30.0
+    # 1 つ目のベンチから立つ (D と同じ)。
+    APPROACH_END = 2.2
+    CROUCH = (1.6, 3.0)
+    OFFER = (3.0, 3.8)
+    TAKE = (3.5, 4.4)
+    REACH = (4.0, 4.7)
+    ROBOT_GRIP = (4.5, 5.0)
+    HUMAN_GRIP = (4.7, 5.2)
+    STAND_T = 5.2          # 立ち上がり始め (SitGeometry.DURATION かかる)
+    LEAD = (8.6, 11.4)     # 後ずさりして手を引く
+    PIVOT1 = (11.4, 13.8)  # 手を繋いだまま横へ回り込む
+    WALK = (13.8, 21.0)    # 横に並んで歩く
+    TURN = (20.2, 21.6)    # 2 つ目のベンチの前で向きを変える
+    PIVOT2 = (20.6, 22.8)  # 手を繋いだまま前へ回り込む
+    SIT_T = 23.4           # 座り始め (立つ動きを逆に)
+    RELEASE = (26.8, 27.4)
+    STAND_UP = (27.2, 28.4)  # ロボットが手を離して立つ
+    LEAD_SPEED = 0.35
+    WALK_SPEED = 0.5
+    SIDE = 0.48            # 横に並ぶときの左右の間隔 [m]
+    AHEAD = 0.02
+    phases = [('0 ロボットが前に来てしゃがむ', 0.0, 3.0),
+              ('1 掌を上にして差し出し、下から包んで握る', 3.0, 5.2),
+              ('2 手を引き上げて立たせる [下から支える]', 5.2, 8.6),
+              ('3 後ずさりして手を引く [下から支える]', 8.6, 11.4),
+              ('4 手を繋いだまま横へ回り込む [持ち替え]', 11.4, 13.8),
+              ('5 横に並んで歩く [横に並んで繋ぐ]', 13.8, 20.6),
+              ('6 ベンチの前で向き直り、前へ回り込む [持ち替え]', 20.6, 23.4),
+              ('7 下から支えて座らせる [下から支える]', 23.4, 26.8),
+              ('8 手を離して見合う', 26.8, 30.0)]
+
+    def __init__(self):
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'face'), (3.2, 'hands'), (4.9, 'face'), (6.0, 'hands'),
+            (7.6, 'face'), (11.4, 'hands'), (12.6, 'face'),
+            (14.6, 'forward'), (17.0, 'face'), (17.6, 'forward'),
+            (20.4, 'face'), (23.8, 'hands'), (25.6, 'face')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'ground'), (0.7, 'face'), (3.4, 'hands'), (5.0, 'face'),
+            (5.6, 'feet'), (7.9, 'face'), (9.0, 'ground'), (10.6, 'face'),
+            (14.4, 'forward'), (16.9, 'face'), (17.5, 'forward'),
+            (19.6, 'bench'), (20.6, 'face'), (23.6, 'feet'), (25.8, 'face')])
+
+    def setup(self, human):
+        self.g = g = SitGeometry(human, self.person)
+        l0, l1 = self.LEAD
+        w0, w1 = self.WALK
+        self.track = SpeedTrack(
+            g.x_stand, 0.0,
+            lambda t: self.LEAD_SPEED * (ramp(t, l0, l0 + 1.0)
+                                         - ramp(t, l1 - 1.0, l1))
+            + self.WALK_SPEED * (ramp(t, w0, w0 + 1.2)
+                                 - ramp(t, w1 - 1.6, w1)),
+            self.duration)
+        # 2 つ目のベンチ: 止まった位置で右へ向き直ると背中側に来るように置く
+        # (道の左側、道の方を向く)。
+        self.yaw2 = -0.5 * np.pi
+        stop = self.track(self.duration)[0]
+        self.bench2 = np.array([stop, g.x_stand])
+
+    # --- 人 ---------------------------------------------------------
+    def yaw(self, t):
+        return self.yaw2 * ramp(t, *self.TURN)
+
+    def sitting(self, t):
+        """(ベンチの原点, 向き, tau) 。座る・立つ途中でなければ None。"""
+        d = SitGeometry.DURATION
+        if t < self.STAND_T + d:
+            return np.zeros(2), 0.0, max(0.0, t - self.STAND_T)
+        if t >= self.SIT_T:
+            return self.bench2, self.yaw2, max(0.0, d - (t - self.SIT_T))
+        return None
+
+    def human_pose(self, t):
+        sit = self.sitting(t)
+        if sit is not None:
+            origin, yaw, tau = sit
+            x, _ = self.g.pelvis(tau)
+            p = to_world(origin, yaw, [x, 0.0, 0.0])
+            return np.array([p[0], p[1], yaw])
+        p = self.track(t)
+        return np.array([p[0], p[1], self.yaw(t)])
+
+    def still(self, t):
+        return self.sitting(t) is not None or t < self.LEAD[0]
+
+    # --- 手 ---------------------------------------------------------
+    def side_weight(self, t):
+        """横に並ぶ繋ぎ方の割合 (0: 下から支える、1: 横に並ぶ)。"""
+        return ramp(t, *self.PIVOT1) - ramp(t, *self.PIVOT2)
+
+    def hold_point(self, t, swing=0.0):
+        """人の右手首の目標 (ワールド)。"""
+        g = self.g
+        sit = self.sitting(t)
+        if sit is not None:
+            origin, yaw, tau = sit
+            return to_world(origin, yaw, g.hold_track(tau))
+        x, y, yaw = self.human_pose(t)
+        face = to_world([x, y], yaw, g.w_stand_rel)
+        side = to_world([x, y], yaw, g.w_side_rel + [0.06 * swing, 0, 0])
+        return lerp(face, side, minjerk(self.side_weight(t)))
+
+    def lifter(self, t):
+        sit = self.sitting(t)
+        if t < self.STAND_T:
+            return 1.3 * ramp(t, *self.CROUCH)
+        if sit is not None:
+            lifter = self.g.robot_lifter(sit[2])
+            return lifter * (1.0 - ramp(t, *self.STAND_UP))
+        return 0.4 - 0.1 * self.side_weight(t)
+
+    def bow(self, t):
+        sit = self.sitting(t)
+        if t < self.STAND_T:
+            return 0.3 * ramp(t, *self.CROUCH)
+        if sit is not None:
+            return self.g.robot_bow(sit[2]) * (1.0 - ramp(t, *self.STAND_UP))
+        return 0.1 * (1.0 - self.side_weight(t))
+
+    def robot_pose(self, t):
+        w = self.hold_point(t)
+        x, y, hyaw = self.human_pose(t)
+        s = minjerk(self.side_weight(t))
+        # 向かい合うとき: ロボットは人の方を向き、手首はロボットの左前。
+        face_yaw = hyaw + np.pi
+        o_face = face_offset(w[2], self.lifter(t), self.bow(t))
+        # 横に並ぶとき: 人の右に並んで同じ向き。
+        side_base = to_world([x, y], hyaw, [self.AHEAD, -self.SIDE, 0.0])
+        o_side = rot2(-hyaw).dot(w[:2] - side_base[:2])
+        # 回り込むときは繋いだ手を中心に、人の前 (右) 側を回る。
+        if t < self.WALK[0]:   # 向かい合う → 横 (時計回り)
+            yaw = face_yaw - np.pi * s
+        else:                  # 横 → 向かい合う (反時計回り)
+            yaw = hyaw + np.pi * (1.0 - s)
+        offset = lerp(o_face, o_side, s)
+        xy = w[:2] - rot2(yaw).dot(offset)
+        base = np.array([xy[0], xy[1], yaw])
+        if t < self.APPROACH_END:  # 前から近づいて止まる
+            base[0] += 2.4 * (1.0 - ramp(t, 0.0, self.APPROACH_END))
+        if t > self.STAND_UP[0]:  # 手を離したら少し下がる
+            base[:2] -= 0.25 * ramp(t, *self.STAND_UP) * np.array(
+                [np.cos(yaw), np.sin(yaw)])
+        return base
+
+    def script(self, t, ctx):
+        human, shoulders, yaw = ctx.human, ctx.shoulders, ctx.yaw
+        fwd, left, up = body_axes(yaw)
+        body = ctx.body
+        g = self.g
+        swing = np.sin(ctx.phase) * ctx.walk
+        s = minjerk(self.side_weight(t))
+        sit = self.sitting(t)
+        tau = sit[2] if sit is not None else SitGeometry.DURATION
+        released = ramp(t, *self.RELEASE)
+
+        def on_thigh(side, along):
+            knee = body[smpl_body.L_KNEE if side == 'L'
+                        else smpl_body.R_KNEE]
+            return shm.ArmGoal(wrist=knee - along * fwd + 0.09 * up,
+                               bend=up - 0.5 * left * shm.SIDE_SIGN[side],
+                               palm=-up)
+
+        grip_h = (0.55 + 0.2 * s) * ramp(t, *self.HUMAN_GRIP) * (1 - released)
+        hold = shm.ArmGoal(wrist=self.hold_point(t, swing),
+                           bend=lerp(up + 0.4 * left, fwd, s),
+                           palm=lerp(-up, fwd, s), grip=grip_h)
+        right = blend_goal(on_thigh('R', 0.14), hold, ramp(t, *self.TAKE))
+        right = blend_goal(right, on_thigh('R', 0.14), released)
+        right.grip = grip_h
+        # 左手: 座っている間は膝に置き、立つ・座るときは膝を押す。
+        l0, l1 = SitGeometry.LEAN
+        r0, r1 = SitGeometry.RISE
+        knee_hand = blend_goal(on_thigh('L', 0.14), on_thigh('L', 0.03),
+                               ramp(tau, l0, l1))
+        left_goal = blend_goal(
+            knee_hand,
+            human_swing_goal(human, shoulders, 'L', yaw, -swing, 0.0),
+            ramp(tau, r0 + 0.5 * (r1 - r0), r1 + 0.3))
+        robot_palm = unit_xy(-fwd) * s + PALM_UP * (1.0 - s)
+        robot_palm = robot_palm / np.linalg.norm(robot_palm)
+        human_gaze = self.human_gaze(t)
+        if human_gaze == 'bench':
+            human_gaze = np.array([self.bench2[0] + 0.3, self.bench2[1],
+                                   0.4])
+        plan = dict(
+            arms={'R': right, 'L': left_goal}, human_gaze=human_gaze,
+            lean=g.lean(tau) if sit is not None else 0.0,
+            waist_y=0.0, waist_p=self.bow(t), lifter=self.lifter(t),
+            offer=ramp(t, *self.OFFER) * (1.0 - released),
+            offer_point=self.hold_point(t) + 0.10 * fwd - 0.06 * up,
+            reach=ramp(t, *self.REACH) * (1.0 - released),
+            hold_palm=robot_palm,
+            grip=ramp(t, *self.ROBOT_GRIP) * (1.0 - released),
+            robot_gaze=self.robot_gaze(t))
+        if sit is not None:
+            origin, byaw, tau = sit
+            plan['feet'] = {side: to_world(origin, byaw, f)
+                            for side, f in g.feet.items()}
+            plan['pelvis_z'] = g.pelvis(tau)[1]
+        return plan
+
+    def props(self, timeline):
+        g = self.g
+        v = np.asarray(timeline.vertices[0])
+        under = v[(v[:, 0] > -0.25) & (v[:, 0] < g.feet_x - 0.12)]
+        top = float(under[:, 2].min())
+        back = float(v[:, 0].min()) - 0.03
+        items = []
+        for k, (origin, yaw) in enumerate(((np.zeros(2), 0.0),
+                                           (self.bench2, self.yaw2))):
+            for item in bench_props(top, back, g.feet_x - 0.12):
+                p = to_world(origin, yaw, item['position'])
+                q = (np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw))
+                wxyz = quat_mul(q, item.get('wxyz', (1.0, 0.0, 0.0, 0.0)))
+                items.append(dict(item, name='{}_{}'.format(item['name'], k),
+                                  position=tuple(p), wxyz=wxyz))
+        return items
+
+
+def quat_mul(a, b):
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+
+
+SCENES = [SceneA, SceneA2, SceneB, SceneC, SceneD, SceneE, SceneF, SceneG]
 
 
 def unit_xy(v):
