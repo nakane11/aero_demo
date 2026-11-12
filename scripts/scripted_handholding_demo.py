@@ -2079,7 +2079,11 @@ class DemoViewer(object):
         if key not in self.props:
             name = '/props_{}'.format(key.replace("'", '2'))
             frame = self.server.scene.add_frame(name, show_axes=False)
-            for item in self.scenes[key].props(timeline):
+            scene = self.scenes[key]
+            # 保存した計算結果を読んだときは setup が呼ばれていないので、
+            # 物の寸法 (ベンチの高さなど) のために人の体から決め直す。
+            scene.setup(self._human(scene.person))
+            for item in scene.props(timeline):
                 path = '{}/{}'.format(name, item['name'])
                 if 'mesh' in item:
                     verts, faces = item['mesh']
