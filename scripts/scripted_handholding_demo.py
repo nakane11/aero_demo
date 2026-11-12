@@ -30,13 +30,19 @@ Usage
 
 import argparse
 import dataclasses
+import hashlib
 import os
 import sys
 import threading
 import time
 
-import numpy as np
-from scipy.interpolate import PchipInterpolator
+# numpy の並列化は小さな行列ばかりのこの計算では空回りして CPU を食うだけなので
+# 1 スレッドにする (numpy の import より前に設定する)。
+for _name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+    os.environ.setdefault(_name, '1')
+
+import numpy as np  # noqa: E402
+from scipy.interpolate import PchipInterpolator  # noqa: E402
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', 'src')
@@ -609,6 +615,25 @@ class Context(object):
     pass
 
 
+# 計算したタイムラインの保存先 (台本・人のモデルのコードが変わると作り直す)。
+CACHE_DIR = os.path.expanduser('~/.cache/aero_demo/scripted_handholding')
+CACHE_FIELDS = ('times', 'vertices', 'robot_angles', 'robot_bases', 'centers',
+                'ik_errors', 'ik_rot_errors')
+
+
+def cache_path(scene_key, model_path):
+    """台本・人のモデルのコードと SMPL のモデル・体型から決まる保存先。"""
+    digest = hashlib.sha1()
+    for path in (os.path.abspath(__file__), os.path.abspath(shm.__file__)):
+        with open(path, 'rb') as f:
+            digest.update(f.read())
+    digest.update(os.path.abspath(model_path).encode())
+    digest.update(np.asarray(HUMAN_BETAS).tobytes())
+    name = 'scene_{}_{}.npz'.format(scene_key.replace("'", '2'),
+                                    digest.hexdigest()[:12])
+    return os.path.join(CACHE_DIR, name)
+
+
 class Timeline(object):
     """シーンを ``FPS`` で刻んで、人の頂点とロボットの関節角を前もって求める。"""
 
@@ -624,7 +649,9 @@ class Timeline(object):
         self._human = human
         self._robot = robot
 
-    def build(self, progress=None):
+    def build(self, progress=None, should_stop=None):
+        """全フレームを計算する。``should_stop()`` が真になったら途中でやめて
+        None を返す。"""
         human, robot, scene = self._human, self._robot, self.scene
         joints = robot.joint_list
         hold_end = getattr(robot, '{}arm_end_coords'.format(ROBOT_HOLD_ARM))
@@ -642,6 +669,8 @@ class Timeline(object):
         meet = None
 
         for i, t in enumerate(self.times):
+            if should_stop is not None and should_stop():
+                return None
             hx, hy, hyaw = scene.human_pose(t)
             xy = np.array([hx, hy])
             speed = 0.0 if prev_xy is None else \
@@ -775,6 +804,21 @@ class Timeline(object):
         p[2] = own_head[2] - 0.5
         return p
 
+    def save(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp.npz'
+        np.savez(tmp, **{name: np.asarray(getattr(self, name))
+                         for name in CACHE_FIELDS})
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path, scene):
+        tl = cls(scene, None, None)
+        with np.load(path) as data:
+            for name in CACHE_FIELDS:
+                setattr(tl, name, data[name])
+        return tl
+
     def phase_at(self, t):
         for name, t0, t1 in self.scene.phases:
             if t0 <= t < t1:
@@ -814,30 +858,35 @@ def remove_robot_gui(viewer):
 
 
 class DemoViewer(object):
+    """シーンの選択・再生の GUI。タイムラインは裏のスレッドで、選ばれたシーンを
+    優先して計算し、ディスクに保存する (2 回目からは読み込むだけ)。"""
 
     def __init__(self, args):
         from skrobot.viewers import ViserViewer
+        self.args = args
         self.robot = setup_robot()
         # タイムラインの計算は関節角を書き換えるので、表示用とは別のモデルで行う。
         self.build_robot = setup_robot()
-        self.build_lock = threading.Lock()
         model = smpl_body.load_smpl_model(args.model_path)
         self.human = shm.ScriptedHuman(model, HUMAN_BETAS)
         self.faces = np.asarray(model.f, dtype=np.uint32)
         self.scenes = {cls.key: cls() for cls in SCENES}
         self.timelines = {}
         self.lock = threading.RLock()
+        self.build_cv = threading.Condition()
+        self.wanted = SCENES[0].key
+        self.building = None
 
         self.viewer = ViserViewer(draw_grid=False)
         server = self.viewer._server
         self.server = server
         server.scene.add_box(
-            '/ground', color=GROUND_COLOR, dimensions=(44.0, 16.0, 0.02),
-            position=(1.0, 0.0, -0.011))
-        server.scene.add_grid(
-            '/ground_grid', width=44.0, height=16.0, cell_size=1.0,
+            '/ground', color=GROUND_COLOR, dimensions=(80.0, 30.0, 0.02),
+            position=(0.0, 0.0, -0.011))
+        self.grid = server.scene.add_grid(
+            '/ground_grid', width=80.0, height=30.0, cell_size=1.0,
             section_size=5.0, cell_color=GRID_CELL_COLOR,
-            section_color=GRID_SECTION_COLOR, position=(1.0, 0.0, 0.001))
+            section_color=GRID_SECTION_COLOR, position=(0.0, 0.0, 0.001))
         self.viewer.add(self.robot)
         remove_robot_gui(self.viewer)
         self.mesh = None
@@ -854,15 +903,24 @@ class DemoViewer(object):
         self.speed = gui.add_dropdown(
             '再生速度', ('1x', '0.5x', '0.25x'), initial_value='1x')
         self.loop = gui.add_checkbox('くり返す', initial_value=True)
-        self.follow = gui.add_checkbox('カメラ追従', initial_value=False)
+        # 追従はカメラを動かさず、2 人が原点付近に留まるよう世界の方をずらす
+        # (カメラを動かすとブラウザでのズーム・回転を上書きしてしまうため)。
+        self.follow = gui.add_checkbox('2 人を画面の中央に留める',
+                                       initial_value=False)
         self.current = None
-        self._camera_center = None
 
         @self.scene_dropdown.on_update
         def _(_):  # noqa: ANN001
-            self.select(self._key_of(self.scene_dropdown.value))
+            key = self._key_of(self.scene_dropdown.value)
+            # 計算待ちで GUI を止めないよう、切り替えは別スレッドで。
+            threading.Thread(target=self.select, args=(key,),
+                             daemon=True).start()
 
         @self.time_slider.on_update
+        def _(_):  # noqa: ANN001
+            self.render(self.time_slider.value)
+
+        @self.follow.on_update
         def _(_):  # noqa: ANN001
             self.render(self.time_slider.value)
 
@@ -871,29 +929,62 @@ class DemoViewer(object):
             if self.current is not None:
                 self._look_at_scene([client])
 
+        threading.Thread(target=self._build_loop, daemon=True).start()
+        threading.Thread(target=self._play_loop, daemon=True).start()
         print('[demo] viser を開いてください (既定 http://localhost:8080)')
         self.select(SCENES[0].key)
-        threading.Thread(target=self._play_loop, daemon=True).start()
-        # 残りのシーンも裏で計算しておく (切り替えを待たせない)。
-        threading.Thread(target=self._build_all, daemon=True).start()
 
-    def _build_all(self):
-        for cls in SCENES:
-            self.timeline(cls.key)
+    # ------------------------------------------------------------------
+    def _build_loop(self):
+        """選ばれているシーンを優先して、まだのシーンを順に用意する。"""
+        while True:
+            with self.build_cv:
+                pending = [cls.key for cls in SCENES
+                           if cls.key not in self.timelines]
+                if not pending:
+                    return
+                key = self.wanted if self.wanted in pending else pending[0]
+                self.building = key
+            timeline = self._prepare(key)
+            with self.build_cv:
+                if timeline is None:  # 別のシーンが選ばれたので後回し
+                    self.building = None
+                    continue
+                self.timelines[key] = timeline
+                self.building = None
+                self.build_cv.notify_all()
 
-    def timeline(self, key, progress=None):
-        """シーン ``key`` のタイムライン (未計算なら計算する)。"""
-        with self.build_lock:
-            if key not in self.timelines:
-                scene = self.scenes[key]
-                started = time.time()
-                tl = Timeline(scene, self.human, self.build_robot).build(
-                    progress)
-                self.timelines[key] = tl
-                print('[demo] {} を計算しました ({:.1f} 秒、最大の手先誤差 '
-                      '{:.3f} m)'.format(scene.title, time.time() - started,
-                                         max(tl.ik_errors)))
-            return self.timelines[key]
+    def _prepare(self, key):
+        scene = self.scenes[key]
+        path = cache_path(key, self.args.model_path)
+        if os.path.exists(path):
+            try:
+                return Timeline.load(path, scene)
+            except Exception as e:  # 壊れた保存は作り直す
+                print('[demo] {} を読めないので計算し直します ({})'.format(
+                    path, e))
+
+        def progress(ratio):
+            if self.wanted == key:
+                self.status.content = '**{} を計算中** {:.0f}%'.format(
+                    key, 100 * ratio)
+        def should_stop():
+            # 選ばれているシーンが別にあり、まだ用意できていなければ譲る。
+            return self.wanted != key and self.wanted not in self.timelines
+
+        started = time.time()
+        timeline = Timeline(scene, self.human, self.build_robot).build(
+            progress, should_stop)
+        if timeline is None:
+            return None
+        print('[demo] {} を計算しました ({:.1f} 秒、最大の手先誤差 {:.3f} m)'
+              .format(scene.title, time.time() - started,
+                      max(timeline.ik_errors)))
+        try:
+            timeline.save(path)
+        except OSError as e:
+            print('[demo] 計算結果を保存できませんでした ({})'.format(e))
+        return timeline
 
     def _key_of(self, title):
         for key, scene in self.scenes.items():
@@ -904,31 +995,39 @@ class DemoViewer(object):
     def select(self, key):
         self.play.value = False
         scene = self.scenes[key]
-        if key not in self.timelines:
-            self.status.content = '**計算中...** (1 シーン 20 秒ほど)'
-
-            def progress(ratio):
-                self.status.content = '**計算中** {:.0f}%'.format(100 * ratio)
-        else:
-            progress = None
-        timeline = self.timeline(key, progress)
-        self.phase_table.content = phase_table_markdown(scene)
+        with self.build_cv:
+            self.wanted = key
+            if key not in self.timelines:
+                self.status.content = '**{} を計算中...** (1 シーン 20 秒ほど。' \
+                    '次からは保存した結果を読む)'.format(key)
+            while key not in self.timelines:
+                self.build_cv.wait()
+            timeline = self.timelines[key]
+        if self.wanted != key:  # 待っている間に別のシーンが選ばれた
+            return
         with self.lock:
             self.current = timeline
             self.follow.value = scene.follow_camera
-            self._camera_center = None
-        self.time_slider.max = float(self.current.times[-1])
+        self.phase_table.content = phase_table_markdown(scene)
+        self.time_slider.max = float(timeline.times[-1])
         self.time_slider.value = 0.0
         self.render(0.0)
         self._look_at_scene()
 
+    def _offset(self, tl, i):
+        """表示のずらし量 (2 人を中央に留めるときは 2 人の中点を原点へ)。"""
+        if not self.follow.value:
+            return np.zeros(2)
+        return np.asarray(tl.centers[i], dtype=np.float64)
+
     def _look_at_scene(self, clients=None):
-        center = self.current.centers[0]
+        tl = self.current
+        center = np.asarray(tl.centers[0]) - self._offset(tl, 0)
         if clients is None:
             clients = list(self.server.get_clients().values())
         for client in clients:
-            client.camera.look_at = (center[0], center[1], 1.0)
-            client.camera.position = (center[0] + 1.5, center[1] - 4.5, 2.4)
+            client.camera.look_at = (center[0], center[1], 0.9)
+            client.camera.position = (center[0] + 1.2, center[1] - 3.2, 1.9)
 
     def render(self, t):
         with self.lock:
@@ -936,39 +1035,28 @@ class DemoViewer(object):
             if tl is None:
                 return
             i = int(np.clip(round(t / DT), 0, len(tl.times) - 1))
+            offset = self._offset(tl, i)
             for joint, angle in zip(self.robot.joint_list,
                                     tl.robot_angles[i]):
                 joint.joint_angle(angle)
             base = tl.robot_bases[i]
             self.robot.base_link.newcoords(Coordinates(
-                pos=[base[0], base[1], 0.0],
+                pos=[base[0] - offset[0], base[1] - offset[1], 0.0],
                 rot=rpy_matrix(base[2], 0.0, 0.0)))
             self.viewer.redraw()
+            vertices = np.asarray(tl.vertices[i], dtype=np.float32).copy()
+            vertices[:, :2] -= offset.astype(np.float32)
             if self.mesh is None:
                 self.mesh = self.server.scene.add_mesh_simple(
-                    '/human', vertices=tl.vertices[i], faces=self.faces,
+                    '/human', vertices=vertices, faces=self.faces,
                     color=HUMAN_COLOR)
             else:
-                self.mesh.vertices = tl.vertices[i]
+                self.mesh.vertices = vertices
+            # 地面の格子は 5 m 周期なので、ずらし量の余りだけ動かす。
+            self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
+                                  0.001)
             self.status.content = '**{}**  \n{:.2f} / {:.1f} 秒'.format(
                 tl.phase_at(tl.times[i]), tl.times[i], tl.times[-1])
-            self._follow_camera(tl.centers[i])
-
-    def _follow_camera(self, center):
-        if not self.follow.value:
-            self._camera_center = None
-            return
-        if self._camera_center is not None:
-            delta = np.array([center[0] - self._camera_center[0],
-                              center[1] - self._camera_center[1], 0.0])
-            if np.linalg.norm(delta) > 1e-6:
-                for client in self.server.get_clients().values():
-                    with client.atomic():
-                        client.camera.position = tuple(
-                            np.asarray(client.camera.position) + delta)
-                        client.camera.look_at = tuple(
-                            np.asarray(client.camera.look_at) + delta)
-        self._camera_center = np.asarray(center, dtype=np.float64)
 
     def _play_loop(self):
         last = time.time()
