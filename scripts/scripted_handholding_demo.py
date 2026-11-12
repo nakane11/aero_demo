@@ -19,6 +19,12 @@ A' ロボットが人の斜め後ろに来る: 台車で人の右後ろへ回り
 B  横に並んで歩きながら: 前を向いたまま (腰をひねらず) 手を繋ぐ。
 C  手を繋いで一緒に走る (運動会): 繋いだ手を一緒に振って走る。
 
+支える場面 (人が手を取ってロボットが握り返すだけでは成り立たない):
+D  ベンチに座った高齢者の手を下から支えて、引き上げて立たせる。
+E  段差を降りる高齢者の手を、下の床から向かい合って支える。
+F  子どもの手を引き上げて水たまりを跳び越えさせる。
+人の体型は対象者に合わせる (``PERSONS``)。
+
 ロボットは左手、人は右手で繋ぐ (人はロボットの左側)。人の手の位置・向きを
 先に決め、ロボットの手はそれに合わせて腕の IK で解く。
 
@@ -64,6 +70,49 @@ DEFAULT_SMPL_MODEL = os.path.expanduser(
 # 腕をほぼ伸ばしたまま掌を合わせられる (既定の 0 だと身長 1.79 m で、Aero は
 # 肘を大きく曲げないと届かず掌が下を向く)。
 HUMAN_BETAS = np.array([2.0] + [0.0] * 9)
+
+# 支える場面 (D〜F) の対象者。シーンの ``person`` で選ぶ。
+#   model   : SMPL の男性 'm' / 女性 'f'
+#   betas   : 体型 (女性は betas[0] が負で背が低い、betas[1] が負でふくよか)
+#   scale / head : 全体と頭の倍率 (子どもは大人を縮めて頭の割合を大きくする)
+#   stoop / crouch : いつもの姿勢 (背中の丸まり、股・膝の曲げ) [rad]
+PERSONS = {
+    'adult': dict(label='大人 (身長 1.64 m)', model='m', betas=HUMAN_BETAS,
+                  scale=1.0, head=1.0, stoop=0.0, crouch=0.0,
+                  color=(105, 155, 220)),
+    # 小柄な高齢の女性 (身長 1.49 m): 背中が丸く、膝が少し曲がっている。
+    'elderly': dict(label='高齢の女性 (身長 1.49 m、背中が丸い)', model='f',
+                    betas=np.array([-2.2, -1.0] + [0.0] * 8), scale=1.0,
+                    head=1.0, stoop=0.38, crouch=0.07,
+                    color=(170, 120, 175)),
+    # 5〜6 歳の子ども (身長 1.12 m): 頭が大きめ。
+    'child': dict(label='5〜6 歳の子ども (身長 1.12 m)', model='m',
+                  betas=np.zeros(10), scale=0.6, head=1.4, stoop=0.0,
+                  crouch=0.0, color=(240, 160, 60)),
+}
+
+
+def person_model_path(person, model_path):
+    """男性モデルのパス ``model_path`` から、``person`` の SMPL モデルのパス。"""
+    if PERSONS[person]['model'] == 'm':
+        return model_path
+    return os.path.join(os.path.dirname(model_path),
+                        'basicModel_f_lbs_10_207_0_v1.0.0.pkl')
+
+
+def make_person(person, model_path, models=None):
+    """``person`` の ``ScriptedHuman`` (``models`` は読んだ SMPL の使い回し)。"""
+    spec = PERSONS[person]
+    path = person_model_path(person, model_path)
+    if models is not None and path in models:
+        model = models[path]
+    else:
+        model = smpl_body.load_smpl_model(path)
+        if models is not None:
+            models[path] = model
+    body = shm.make_body_model(model, spec['betas'], spec['scale'],
+                               spec['head'])
+    return shm.ScriptedHuman(body, np.zeros(10))
 
 FPS = 30.0
 DT = 1.0 / FPS
@@ -301,6 +350,18 @@ class Scene(object):
     phases = []
     follow_camera = False
     background = 'plain'  # 'plain' (灰色の地面) か 'track' (運動会のトラック)
+    person = 'adult'      # 人の体型 (``PERSONS``)
+
+    def setup(self, human):
+        """計算の前に人の体の寸法から台本の位置を決める (必要なシーンだけ)。"""
+
+    def still(self, t):
+        """脚を台本で置く (歩行の脚を使わない) 時刻なら真。"""
+        return False
+
+    def props(self, timeline):
+        """シーンに置く物 (ベンチ・段差・水たまり) の一覧。"""
+        return []
 
     def human_pose(self, t):
         return self.human_track(t)
@@ -631,7 +692,558 @@ class SceneC(Scene):
             grip=grip, robot_gaze=self.robot_gaze(t))
 
 
-SCENES = [SceneA, SceneA2, SceneB, SceneC]
+# ----------------------------------------------------------------------
+# 支える場面 (ロボットが握り返すだけでは成り立たない手繋ぎ)
+# ----------------------------------------------------------------------
+# 向かい合って手を引くとき: ロボットは人の方 (-x) を向き、掌を上へ向けて
+# 差し出す。人はその上に掌を下にして手を乗せ、ロボットが指で包んで握る
+# (介助で「手を下から支える」持ち方)。人が体重をかけてもロボットの手で
+# 受け止められる。
+FACE_YAW = np.pi
+# ロボットの肩から掌までの距離 (腕を少し曲げた楽な長さ) [m] と、人の手首
+# から台車の中心までの左右のずれ [m]。
+FACE_ARM_REACH = 0.52
+FACE_BASE_DY = 0.22
+PALM_UP = np.array([0.0, 0.0, 1.0])
+
+
+def robot_shoulder_offset(lifter, bow):
+    """昇降 ``lifter`` とお辞儀 ``bow`` での肩の (前, 高さ) [m] (Aero の実測の
+    近似: 昇降は 1 - cos で下がり、腰の軸から肩まで 0.305 m)。"""
+    return (-0.018 + 0.305 * np.sin(bow),
+            1.37 - 0.50 * (1.0 - np.cos(lifter))
+            - 0.305 * (1.0 - np.cos(bow)))
+
+
+def face_base(wrist, lifter=0.0, bow=0.0, min_x=None):
+    """人の手首 ``wrist`` の手を向かい合って下から支えるときの台車 (x, y, yaw)。
+    肩から掌が ``FACE_ARM_REACH`` になる距離に立つ。"""
+    fwd, height = robot_shoulder_offset(lifter, bow)
+    palm_x = wrist[0] + 0.07
+    dz = height - wrist[2]
+    horiz = np.sqrt(max(FACE_ARM_REACH ** 2 - dz * dz, 0.2 ** 2))
+    x = palm_x + horiz + fwd
+    if min_x is not None:
+        x = max(x, min_x)
+    return np.array([x, wrist[1] + FACE_BASE_DY, FACE_YAW])
+
+
+def feet_arc(start, end, s, lift=0.05, early=0.35):
+    """足首を ``start`` から ``end`` へ運ぶ (前へ出してから下ろす弧)。"""
+    s = float(np.clip(s, 0.0, 1.0))
+    p = lerp(start, end, minjerk(min(1.0, s / (1.0 - early))))
+    p[2] = lerp(start[2], end[2], minjerk((s - early) / (1.0 - early)))
+    p[2] += lift * np.sin(np.pi * s)
+    return p
+
+
+class SceneD(Scene):
+    key = 'D'
+    title = 'D: ベンチに座った高齢者の手を下から支えて立ち上がらせる'
+    person = 'elderly'
+    duration = 14.0
+    APPROACH_END = 2.2   # ロボットが前に来て止まる
+    CROUCH = (1.6, 3.0)  # しゃがんで目線を合わせる
+    OFFER = (3.0, 3.8)   # 掌を上にして手を差し出す
+    TAKE = (3.5, 4.4)    # 人がその上に手を乗せる
+    REACH = (4.0, 4.7)   # ロボットが下から手を合わせる
+    ROBOT_GRIP = (4.5, 5.0)
+    HUMAN_GRIP = (4.7, 5.2)
+    LEAN = (5.2, 6.2)    # 前かがみ (お辞儀) で重心を足の上へ
+    RISE = (6.0, 8.0)    # お尻が浮いて立ち上がる
+    WALK_T = 8.8         # 手を引かれて歩き出す
+    WALK_SPEED = 0.45
+    phases = [('0 ロボットが前に来る', 0.0, 2.2),
+              ('1 しゃがんで目線を合わせる', 2.2, 3.0),
+              ('2 掌を上にして手を差し出す', 3.0, 3.8),
+              ('3 手を乗せる・下から包んで握る', 3.8, 5.2),
+              ('4 前かがみになる', 5.2, 6.0),
+              ('5 手を引いて立ち上がらせる', 6.0, 8.0),
+              ('6 立って落ち着く', 8.0, 8.8),
+              ('7 手を引いて歩く (ロボットは後ずさり)', 8.8, 14.0)]
+
+    def __init__(self):
+        w = self.WALK_T
+        self.walk_track = SpeedTrack(
+            0.0, 0.0, lambda t: self.WALK_SPEED * ramp(t, w, w + 1.2),
+            self.duration)
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'face'), (3.2, 'hands'), (4.9, 'face'), (6.3, 'hands'),
+            (7.6, 'face')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'ground'), (0.7, 'face'), (3.4, 'hands'), (5.0, 'face'),
+            (5.6, 'feet'), (7.9, 'face'), (w + 0.6, 'ground'),
+            (w + 2.6, 'face'), (w + 3.4, 'ground')])
+
+    def setup(self, human):
+        sp = PERSONS[self.person]
+        j = human.rest_joints
+        leg = human.leg['R']
+        # 座る: すねは鉛直、腿はほぼ水平 (座面の高さは膝下の長さ)。
+        self.pz_sit = human.ankle_height + 0.98 * leg['L2'] \
+            - j[smpl_body.R_HIP][2]
+        self.feet_x = j[smpl_body.R_HIP][0] + 0.9 * leg['L1']
+        self.feet = {side: np.array([
+            self.feet_x, j[human.leg[side]['joints'][2]][1],
+            human.ankle_height]) for side in ('L', 'R')}
+        self.pz_stand, ankles = human.stance(sp['stoop'], sp['crouch'])
+        self.x_stand = self.feet_x - 0.5 * (ankles['L'][0] + ankles['R'][0])
+        shoulder_y = j[smpl_body.R_SHOULDER][1]
+        self.w_take = np.array([self.feet_x + 0.06, shoulder_y + 0.01,
+                                self.pz_sit + 0.16])
+        # 立ったときの右肩から手首 (前へ出して少し下)。
+        sh = human.body_joints(shm.HumanSpec(
+            xy=np.array([self.x_stand, 0.0]), yaw=0.0, stoop=sp['stoop'],
+            crouch=sp['crouch']))[smpl_body.R_SHOULDER]
+        self.w_stand = sh + np.array([0.27, 0.01, -0.30])
+        # 手の通り道: 前かがみで前へ → お尻が浮くときにいちばん前 → 立つと
+        # 胸の前へ上がる。
+        l0, l1 = self.LEAN
+        r0, r1 = self.RISE
+        wt = self.w_take
+        self.hold_track = KeyframeTrack([
+            (l0,) + tuple(wt),
+            (l1,) + tuple(wt + [0.18, 0.0, -0.03]),
+            (r0 + 0.35 * (r1 - r0),) + tuple(wt + [0.32, 0.0, 0.0]),
+            (r1,) + tuple(self.w_stand)])
+
+    def _rise(self, t):
+        """(前へ出る量, 上がる量) 0〜1。お尻は前へ出てから上がる。"""
+        r0, r1 = self.RISE
+        return ramp(t, r0, r0 + 0.7 * (r1 - r0)), \
+            ramp(t, r0 + 0.25 * (r1 - r0), r1)
+
+    def human_pose(self, t):
+        fwd, _ = self._rise(t)
+        p = self.walk_track(t)
+        p[0] += self.x_stand * fwd
+        return p
+
+    def still(self, t):
+        return t < self.WALK_T
+
+    def hold_point(self, t):
+        """手を繋いだ人の右手首の位置。"""
+        w = self.hold_track(t)
+        w[0] += self.walk_track(t)[0]
+        return w
+
+    def lifter(self, t):
+        """しゃがんで目線を合わせ、立ち上がらせるときに伸びる。"""
+        r0, r1 = self.RISE
+        return 1.3 * ramp(t, *self.CROUCH) - 0.9 * ramp(t, r0 + 0.3, r1)
+
+    def bow(self, t):
+        return 0.3 * ramp(t, *self.CROUCH) - 0.2 * ramp(t, *self.RISE)
+
+    def robot_pose(self, t):
+        base = face_base(self.hold_point(t), self.lifter(t), self.bow(t))
+        # 前から近づいて止まる。
+        base[0] += 2.4 * (1.0 - ramp(t, 0.0, self.APPROACH_END))
+        return base
+
+    def script(self, t, ctx):
+        human, shoulders, yaw = ctx.human, ctx.shoulders, ctx.yaw
+        fwd, left, up = body_axes(yaw)
+        body = ctx.body
+        swing = np.sin(ctx.phase) * ctx.walk
+        _, rise_up = self._rise(t)
+        r0, r1 = self.RISE
+        # 膝の上に置いた手 (座っている間)。
+        def on_thigh(side, along):
+            knee = body[smpl_body.L_KNEE if side == 'L'
+                        else smpl_body.R_KNEE]
+            return shm.ArmGoal(wrist=knee - along * fwd + 0.09 * up,
+                               bend=up - 0.5 * left * shm.SIDE_SIGN[side],
+                               palm=-up)
+        human_grip = 0.55 * ramp(t, *self.HUMAN_GRIP)  # 握る力は弱い
+        take = shm.ArmGoal(wrist=self.hold_point(t),
+                           bend=up + 0.4 * left, palm=-up, grip=human_grip)
+        right = blend_goal(on_thigh('R', 0.14), take, ramp(t, *self.TAKE))
+        right.grip = human_grip
+        # 左手は膝に置き、立つときは膝を押して、立ったら下ろす。
+        left_goal = blend_goal(on_thigh('L', 0.14), on_thigh('L', 0.03),
+                               ramp(t, *self.LEAN))
+        left_goal = blend_goal(
+            left_goal, human_swing_goal(human, shoulders, 'L', yaw, -swing,
+                                        0.0),
+            ramp(t, r0 + 0.5 * (r1 - r0), r1 + 0.3))
+        plan = dict(
+            arms={'R': right, 'L': left_goal},
+            human_gaze=self.human_gaze(t),
+            # 座っているときは少し前かがみ、立ち上がるときに大きく傾けて
+            # から起こす。
+            lean=0.12 + 0.55 * ramp(t, *self.LEAN)
+            - 0.67 * ramp(t, r0 + 0.45 * (r1 - r0), r1),
+            waist_y=0.0,
+            # しゃがんで (昇降を縮めて) 目線を合わせ、お辞儀して手を出す。
+            # 立ち上がらせるときに昇降を伸ばして手を持ち上げる。
+            waist_p=self.bow(t), lifter=self.lifter(t),
+            offer=ramp(t, *self.OFFER),
+            offer_point=self.w_take + 0.10 * fwd - 0.06 * up,
+            reach=ramp(t, *self.REACH), hold_palm=PALM_UP,
+            grip=ramp(t, *self.ROBOT_GRIP),
+            robot_gaze=self.robot_gaze(t))
+        if t < self.WALK_T:
+            plan['feet'] = self.feet
+            plan['pelvis_z'] = lerp(self.pz_sit, self.pz_stand, rise_up)
+        return plan
+
+    def props(self, timeline):
+        """ベンチ: 座面は最初の姿勢のお尻・腿の下面に合わせる。"""
+        v = np.asarray(timeline.vertices[0])
+        under = v[(v[:, 0] > -0.25) & (v[:, 0] < self.feet_x - 0.12)]
+        top = float(under[:, 2].min())
+        back = float(v[:, 0].min()) - 0.03
+        front = self.feet_x - 0.12
+        wood, leg = (176, 128, 84), (90, 90, 95)
+        return [
+            dict(name='seat', color=wood,
+                 dimensions=(front - back, 1.3, 0.04),
+                 position=(0.5 * (front + back), 0.0, top - 0.02)),
+            dict(name='back', color=wood, dimensions=(0.04, 1.3, 0.45),
+                 position=(back - 0.02, 0.0, top + 0.30),
+                 wxyz=(np.cos(-0.06), 0.0, np.sin(-0.06), 0.0)),
+            dict(name='leg_l', color=leg,
+                 dimensions=(front - back - 0.06, 0.05, top - 0.04),
+                 position=(0.5 * (front + back), 0.6, 0.5 * (top - 0.04))),
+            dict(name='leg_r', color=leg,
+                 dimensions=(front - back - 0.06, 0.05, top - 0.04),
+                 position=(0.5 * (front + back), -0.6, 0.5 * (top - 0.04))),
+        ]
+
+
+class SceneE(Scene):
+    key = 'E'
+    title = 'E: 段差を降りる高齢者の手を下から支える'
+    person = 'elderly'
+    duration = 14.6
+    STEP_H = 0.15  # 1 段の高さ [m]
+    STEP_D = 0.32  # 踏み面の奥行き [m]
+    EDGE_X = -0.45  # 段差の手前で止まる骨盤の位置
+    STOP_T = 2.4
+    APPROACH = (2.4, 3.4)  # ロボットが寄ってくる
+    OFFER = (3.3, 4.0)
+    TAKE = (3.7, 4.6)
+    REACH = (4.1, 4.8)
+    ROBOT_GRIP = (4.6, 5.0)
+    HUMAN_GRIP = (4.8, 5.2)
+    # 1 歩ごとの (始め, 終わり, 足, 段): 先に左足を下ろし、右足をそろえる。
+    STEPS = [(5.5, 6.4, 'L', 1), (6.6, 7.4, 'R', 1),
+             (7.8, 8.7, 'L', 2), (8.9, 9.7, 'R', 2)]
+    WALK_T = 10.5
+    WALK_SPEED = 0.45
+    phases = [('0 段差の手前まで歩いて止まる', 0.0, 2.4),
+              ('1 足もとを見る・ロボットが寄る', 2.4, 3.3),
+              ('2 掌を上にして手を差し出す', 3.3, 4.0),
+              ('3 手を乗せる・下から包んで握る', 4.0, 5.2),
+              ('4 1 段目を降りる', 5.5, 7.4), ('5 2 段目を降りる', 7.8, 9.7),
+              ('6 降りて一息', 9.7, 10.5),
+              ('7 手を引いて歩く (ロボットは後ずさり)', 10.5, 14.6)]
+
+    def __init__(self):
+        e, s = self.EDGE_X, self.STOP_T
+        walk = SpeedTrack(0.0, 0.0, lambda t: 0.5 * (
+            ramp(t, 0.0, 0.6) - ramp(t, s - 0.8, s)), self.duration)
+        walk.shift(e - walk(s)[0])
+        self.approach_track = walk
+        w = self.WALK_T
+        self.walk_track = SpeedTrack(
+            0.0, 0.0, lambda t: self.WALK_SPEED * ramp(t, w, w + 1.2),
+            self.duration)
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'face'), (3.5, 'hands'), (5.0, 'face'), (5.4, 'hands'),
+            (9.8, 'face'), (w + 1.0, 'hands'), (w + 2.0, 'face')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'forward'), (1.6, 'feet'), (2.9, 'face'), (3.6, 'hands'),
+            (5.0, 'feet'), (9.8, 'face'), (w + 0.6, 'ground'),
+            (w + 2.4, 'face')])
+
+    def ground_at(self, x):
+        """床の高さ (段差は -x 側が高い)。"""
+        if x < -self.STEP_D:
+            return 2.0 * self.STEP_H
+        if x < 0.0:
+            return self.STEP_H
+        return 0.0
+
+    def setup(self, human):
+        sp = PERSONS[self.person]
+        self.pz_stand, ankles = human.stance(sp['stoop'], sp['crouch'])
+        self.ankles = ankles
+        # 段ごとの足首の位置 (骨盤から見た左右はそのまま)。
+        ah = human.ankle_height
+        toe = 0.5 * (ankles['L'][0] + ankles['R'][0])
+        tread = [self.EDGE_X + toe, -0.5 * self.STEP_D - 0.03, 0.18]
+        self.foot_at = {
+            (side, k): np.array([tread[k], ankles[side][1],
+                                 (2 - k) * self.STEP_H + ah])
+            for side in ('L', 'R') for k in range(3)}
+        self.pelvis_x = [x - toe for x in tread]
+        shoulder_y = human.rest_joints[smpl_body.R_SHOULDER][1]
+        self.hold_rel = np.array([0.32, shoulder_y + 0.01, 0.07])
+
+    def _feet(self, t):
+        """各足の段 (0〜2) と運んでいる途中の位置。"""
+        feet = {}
+        for side in ('L', 'R'):
+            level = 0
+            pos = self.foot_at[(side, 0)]
+            for t0, t1, foot, k in self.STEPS:
+                if foot != side or t < t0:
+                    continue
+                pos = feet_arc(self.foot_at[(side, k - 1)],
+                               self.foot_at[(side, k)],
+                               (t - t0) / (t1 - t0))
+                level = k
+            feet[side] = (level, pos)
+        return feet
+
+    def _pelvis(self, t):
+        """骨盤の (x, 高さ)。前の足を下ろす間は後ろの膝を曲げて沈み、
+        そろえると立つ。"""
+        x = self.pelvis_x[0]
+        z = 2.0 * self.STEP_H + self.pz_stand
+        for t0, t1, foot, k in self.STEPS:
+            s = ramp(t, t0, t1)
+            if foot == 'L':  # 前の足を下ろす: 半分前へ、後ろの膝を曲げて沈む
+                x += 0.5 * (self.pelvis_x[k] - self.pelvis_x[k - 1]) * s
+                z -= 0.95 * self.STEP_H * s
+            else:  # 後ろの足をそろえる: 残りを前へ
+                x += 0.5 * (self.pelvis_x[k] - self.pelvis_x[k - 1]) * s
+                z -= 0.05 * self.STEP_H * s
+        return x, z
+
+    def human_pose(self, t):
+        if t < self.STEPS[0][0]:
+            return self.approach_track(t)
+        x, _ = self._pelvis(t)
+        return np.array([x + self.walk_track(t)[0], 0.0, 0.0])
+
+    def still(self, t):
+        return self.STEPS[0][0] <= t < self.WALK_T
+
+    def hold_point(self, t):
+        if t < self.STEPS[0][0]:
+            x, z = self.approach_track(t)[0], 2.0 * self.STEP_H + self.pz_stand
+        else:
+            x, z = self._pelvis(t)
+            x += self.walk_track(t)[0]
+        if t >= self.WALK_T:
+            z = self.pz_stand
+        return np.array([x, 0.0, z]) + self.hold_rel
+
+    def lifter(self, t):
+        """降りていく人の手に合わせて少し低くなる。"""
+        return 0.45 * ramp(t, self.STEPS[0][0], self.STEPS[-1][1])
+
+    def robot_pose(self, t):
+        # 段差の蹴上げ (x=0) に台車の前がぶつからない位置まで。
+        base = face_base(self.hold_point(t), self.lifter(t), 0.1,
+                         min_x=0.38)
+        if t < self.APPROACH[1]:
+            s = ramp(t, *self.APPROACH)
+            arrive = face_base(self.hold_point(self.APPROACH[1]), 0.0, 0.1,
+                               min_x=0.38)
+            return lerp(arrive + np.array([0.9, 0.0, 0.0]), arrive, s)
+        return base
+
+    def script(self, t, ctx):
+        human, shoulders, yaw = ctx.human, ctx.shoulders, ctx.yaw
+        fwd, left, up = body_axes(yaw)
+        swing = np.sin(ctx.phase) * ctx.walk
+        rest = human_swing_goal(human, shoulders, 'R', yaw, swing, 0.0)
+        human_grip = 0.55 * ramp(t, *self.HUMAN_GRIP)
+        take = shm.ArmGoal(wrist=self.hold_point(t), bend=up + 0.4 * left,
+                           palm=-up, grip=human_grip)
+        right = blend_goal(rest, take, ramp(t, *self.TAKE))
+        right.grip = human_grip
+        # 左手は少し横へ広げて釣り合いをとる。
+        stepping = ramp(t, 5.2, 5.8) - ramp(t, 9.7, 10.5)
+        left_goal = human_swing_goal(
+            human, shoulders, 'L', yaw, -swing, 0.0,
+            outward=0.06 + 0.14 * stepping)
+        plan = dict(
+            arms={'R': right, 'L': left_goal},
+            human_gaze=self.human_gaze(t),
+            lean=0.12 * stepping,
+            waist_y=0.0, waist_p=0.1, lifter=self.lifter(t),
+            offer=ramp(t, *self.OFFER),
+            offer_point=self.hold_point(t) + 0.10 * fwd - 0.06 * up,
+            reach=ramp(t, *self.REACH), hold_palm=PALM_UP,
+            grip=ramp(t, *self.ROBOT_GRIP),
+            robot_gaze=self.robot_gaze(t))
+        if t < self.STEPS[0][0]:
+            plan['ground'] = 2.0 * self.STEP_H
+        elif t < self.WALK_T:
+            _, z = self._pelvis(t)
+            plan['feet'] = {side: pos for side, (_, pos)
+                            in self._feet(t).items()}
+            plan['pelvis_z'] = z
+            plan['ground'] = self.ground_at(self.human_pose(t)[0] + 0.1)
+        return plan
+
+    def props(self, timeline):
+        stone = (196, 190, 178)
+        d, h = self.STEP_D, self.STEP_H
+        return [
+            dict(name='step1', color=stone, dimensions=(d, 1.6, h),
+                 position=(-0.5 * d, 0.0, 0.5 * h)),
+            dict(name='step2', color=(184, 178, 166),
+                 dimensions=(3.0, 1.6, 2.0 * h),
+                 position=(-d - 1.5, 0.0, h)),
+            dict(name='edge1', color=(230, 200, 60),
+                 dimensions=(0.05, 1.6, 0.005), position=(-0.025, 0.0, h)),
+            dict(name='edge2', color=(230, 200, 60),
+                 dimensions=(0.05, 1.6, 0.005),
+                 position=(-d - 0.025, 0.0, 2.0 * h)),
+        ]
+
+
+class SceneF(Scene):
+    key = 'F'
+    title = 'F: 子どもの手を引き上げて水たまりを跳び越えさせる'
+    person = 'child'
+    duration = 10.5
+    SIDE = 0.48          # 子どもとロボットの左右の間隔 [m]
+    SPEED = 0.8
+    STOP_T = 2.6
+    PUDDLE = (0.0, 0.40, 0.42, 0.34)  # 中心 x, y と半径 x, y [m]
+    TAKE_OFF_X = -0.62
+    CROUCH = (3.5, 4.1)  # せーの (かがむ)
+    FLIGHT = (4.1, 4.65)
+    LAND = (4.65, 5.2)   # 着地して膝で受ける
+    JUMP_HEIGHT = 0.18   # 骨盤が上がる高さ [m] (足は膝を曲げてもっと上がる)
+    FEET_LIFT = 0.28
+    RESTART_T = 6.4
+    phases = [('0 手を繋いで歩く', 0.0, 2.6), ('1 水たまりの前で止まり見合う',
+                                              2.6, 3.5),
+              ('2 せーの (かがむ)', 3.5, 4.1),
+              ('3 手を引き上げて跳ぶ', 4.1, 4.65),
+              ('4 着地', 4.65, 5.2), ('5 見合って喜ぶ', 5.2, 6.4),
+              ('6 また歩く', 6.4, 10.5)]
+
+    def __init__(self):
+        s, r = self.STOP_T, self.RESTART_T
+        walk = SpeedTrack(0.0, self.SIDE, lambda t: self.SPEED * (
+            1.0 - ramp(t, s - 1.0, s) + ramp(t, r, r + 1.0)), self.duration)
+        walk.shift(self.TAKE_OFF_X - walk(s)[0])
+        self.walk_track = walk
+        self.jump = 2.0 * abs(self.TAKE_OFF_X)  # 跳ぶ距離
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'forward'), (1.0, 'face'), (1.6, 'forward'),
+            (2.4, 'puddle'), (3.0, 'face'), (4.0, 'forward'), (4.9, 'face'),
+            (self.RESTART_T + 0.6, 'forward'), (8.3, 'face'),
+            (8.9, 'forward')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'forward'), (1.1, 'face'), (1.7, 'forward'),
+            (2.1, 'puddle'), (3.1, 'face'), (3.7, 'puddle'),
+            (4.9, 'face'), (self.RESTART_T + 0.5, 'forward'), (8.4, 'face'),
+            (9.0, 'forward')])
+
+    def setup(self, human):
+        sp = PERSONS[self.person]
+        self.pz_stand, self.ankles = human.stance(sp['stoop'], sp['crouch'])
+        self.ankle_height = human.ankle_height
+        self.leg_length = human.leg['R']['L1'] + human.leg['R']['L2']
+
+    def _flight(self, t):
+        """跳んでいる割合 0〜1 (空中では水平に等速)。"""
+        return float(np.clip(
+            (t - self.FLIGHT[0]) / (self.FLIGHT[1] - self.FLIGHT[0]),
+            0.0, 1.0))
+
+    def human_pose(self, t):
+        p = self.walk_track(t)
+        p[0] += self.jump * self._flight(t)
+        return p
+
+    def robot_pose(self, t):
+        p = self.human_pose(t)
+        return np.array([p[0] + ROBOT_AHEAD, 0.0, 0.0])
+
+    def still(self, t):
+        return self.CROUCH[0] <= t < self.LAND[1]
+
+    def script(self, t, ctx):
+        human, shoulders, yaw = ctx.human, ctx.shoulders, ctx.yaw
+        fwd, left, up = body_axes(yaw)
+        swing = np.sin(ctx.phase) * ctx.walk
+        s = self._flight(t)
+        # かがむ量 (せーの と着地)。
+        dip = ramp(t, *self.CROUCH) - ramp(t, self.FLIGHT[0] - 0.08,
+                                           self.FLIGHT[0] + 0.1) \
+            + ramp(t, self.LAND[0] - 0.05, self.LAND[0] + 0.15) \
+            - ramp(t, self.LAND[0] + 0.2, self.LAND[1])
+        air = np.sin(np.pi * s)
+        # 繋いだ右手: ロボットの方へ斜め下に伸ばす。跳ぶときは引き上げられる。
+        S = shoulders['R']
+        hold = shm.ArmGoal(
+            wrist=S + (0.10 - 0.04 * air) * fwd - 0.12 * left
+            - (0.25 - 0.17 * air) * up,
+            bend=fwd + 0.5 * up, palm=fwd, grip=1.0)
+        # 空いた左手: かがむと後ろへ引き、跳ぶと前へ振り上げる。
+        SL = shoulders['L']
+        back = shm.ArmGoal(wrist=SL - 0.14 * fwd + 0.06 * left - 0.26 * up,
+                           bend=fwd)
+        throw = shm.ArmGoal(wrist=SL + 0.24 * fwd + 0.16 * left - 0.06 * up,
+                            bend=up + left)
+        left_goal = human_swing_goal(human, shoulders, 'L', yaw, -swing, 0.0)
+        left_goal = blend_goal(left_goal, back, ramp(t, *self.CROUCH))
+        left_goal = blend_goal(left_goal, throw,
+                               ramp(t, self.FLIGHT[0] - 0.05,
+                                    self.FLIGHT[0] + 0.2))
+        left_goal = blend_goal(
+            left_goal,
+            human_swing_goal(human, shoulders, 'L', yaw, -swing, 0.0),
+            ramp(t, self.LAND[0] + 0.2, self.RESTART_T))
+        cx, cy, _, _ = self.PUDDLE
+        plan = dict(
+            arms={'R': hold, 'L': left_goal},
+            human_gaze=(self.human_gaze(t) if self.human_gaze(t) != 'puddle'
+                        else np.array([cx, cy, 0.0])),
+            lean=0.35 * dip + 0.15 * air,
+            waist_y=0.0, waist_p=0.0,
+            # 子どもの背に合わせて低くし、子どもと一緒に沈んで、跳ぶときに
+            # 伸ばして手を引き上げる。
+            lifter=0.65 + 0.3 * dip - 0.55 * air,
+            reach=1.0, grip=1.0,
+            robot_gaze=(self.robot_gaze(t) if self.robot_gaze(t) != 'puddle'
+                        else np.array([cx, cy, 0.0])))
+        if self.still(t):
+            x0 = self.TAKE_OFF_X
+            x1 = x0 + self.jump
+            ah = self.ankle_height
+            feet = {}
+            for side in ('L', 'R'):
+                a = self.ankles[side]
+                start = np.array([x0 + a[0], self.SIDE + a[1], ah])
+                end = np.array([x1 + a[0], self.SIDE + a[1], ah])
+                p = lerp(start, end, minjerk(s))
+                # 跳んでいる間は膝を曲げて足を引きつける。
+                p[2] += self.FEET_LIFT * air
+                feet[side] = p
+            plan['feet'] = feet
+            plan['pelvis_z'] = self.pz_stand - 0.13 * dip \
+                + self.JUMP_HEIGHT * air
+        return plan
+
+    def props(self, timeline):
+        cx, cy, rx, ry = self.PUDDLE
+        n = 48
+        a = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        wobble = 1.0 + 0.08 * np.sin(3.0 * a) + 0.05 * np.cos(5.0 * a)
+        ring = np.stack([cx + rx * wobble * np.cos(a),
+                         cy + ry * wobble * np.sin(a),
+                         np.full(n, 0.004)], axis=1)
+        verts = np.vstack([[cx, cy, 0.004], ring]).astype(np.float32)
+        faces = np.array([[0, 1 + i, 1 + (i + 1) % n] for i in range(n)],
+                         dtype=np.uint32)
+        return [dict(name='puddle', mesh=(verts, faces),
+                     color=(96, 128, 168))]
+
+
+SCENES = [SceneA, SceneA2, SceneB, SceneC, SceneD, SceneE, SceneF]
 
 
 def unit_xy(v):
@@ -695,6 +1307,71 @@ def robot_palm_normal(robot, arm):
     end = getattr(robot, '{}arm_end_coords'.format(arm))
     y = end.worldrot()[:, 1]
     return -y if arm == 'l' else y
+
+
+def best_wrist_y(robot, arm, desired):
+    """掌の法線を ``desired`` (ワールド) へいちばん近づける手首のひねり
+    (wrist_y) の角度。手首のひねりは前腕の軸まわりの回転なので、法線は
+    c + a cos(q) + b sin(q) と書け、3 点で係数を決めて最大を解析的に求める。"""
+    joint = getattr(robot, '{}_wrist_y_joint'.format(arm))
+    keep = joint.joint_angle()
+    q = 1.2
+    normals = []
+    for angle in (0.0, q, -q):
+        joint.joint_angle(angle)
+        normals.append(robot_palm_normal(robot, arm))
+    joint.joint_angle(keep)
+    n0, n1, n2 = normals
+    b = (n1 - n2) / (2.0 * np.sin(q))
+    a = (n0 - 0.5 * (n1 + n2)) / (1.0 - np.cos(q))
+    d = np.asarray(desired, dtype=np.float64)
+    best = float(np.arctan2(np.dot(d, b), np.dot(d, a)))
+    best = float(np.clip(best, joint.min_angle, joint.max_angle))
+    score = float(np.dot(d, a * np.cos(best) + b * np.sin(best)
+                         + (n0 - a)))
+    return best, score
+
+
+def solve_hold_ik_palm(robot, target_pos, desired, warm_start,
+                       prev_shoulder_y, turn=1.0):
+    """手先の位置を合わせつつ、掌をできるだけ ``desired`` (ワールド) へ向ける。
+    上腕のひねり (shoulder_y) をいくつか試し、それぞれで位置の IK と手首の
+    ひねり (wrist_y) を交互に解いて、位置の誤差・掌の向きのずれ・前フレーム
+    からの飛びの小さい解を採る (Aero の手首は掌を真上まで回しきれないので、
+    残ったずれは人が手首を曲げて合わせる)。(位置誤差, shoulder_y, wrist_y)
+    を返す。"""
+    arm = ROBOT_HOLD_ARM
+    shoulder = getattr(robot, '{}_shoulder_y_joint'.format(arm))
+    wrist = getattr(robot, '{}_wrist_y_joint'.format(arm))
+    links = hold_ik_links(robot, arm)
+    best = None
+    for dq in (0.0, -0.3, 0.3, -0.6, 0.6):
+        q = float(np.clip(prev_shoulder_y + dq, max(shoulder.min_angle, -1.2),
+                          min(shoulder.max_angle, 0.8)))
+        shoulder.joint_angle(q * turn)
+        for link, angle in zip(links, warm_start):
+            link.joint.joint_angle(angle)
+        w = wrist.joint_angle()
+        err = solve_hold_ik(robot, target_pos, warm_start)
+        for _ in range(2):
+            w, _ = best_wrist_y(robot, arm, desired)
+            wrist.joint_angle(w * turn)
+            err = solve_hold_ik(robot, target_pos,
+                                [link.joint.joint_angle() for link in links])
+        n = robot_palm_normal(robot, arm)
+        angle = float(np.arccos(np.clip(np.dot(n, desired), -1.0, 1.0)))
+        score = 10.0 * err + 0.3 * angle + 0.3 * abs(dq)
+        if best is None or score < best[0]:
+            best = (score, err, q, w,
+                    [link.joint.joint_angle() for link in links])
+        if dq == 0.0 and err < HOLD_IK_POS_TOL and angle < 0.5:
+            break
+    _, err, q, w, angles = best
+    shoulder.joint_angle(q * turn)
+    wrist.joint_angle(w * turn)
+    for link, angle in zip(links, angles):
+        link.joint.joint_angle(angle)
+    return err, q, w
 
 
 # つなぐ腕の位置を合わせる関節 (肩 2 軸 + 肘)。上腕のひねり (shoulder_y) と
@@ -781,7 +1458,7 @@ CACHE_FIELDS = ('times', 'vertices', 'robot_angles', 'robot_bases', 'centers',
                 'ik_errors', 'ik_rot_errors')
 
 
-def cache_path(scene_key, model_path):
+def cache_path(scene_key, model_path, person='adult'):
     """台本・人のモデルのコードと SMPL のモデル・体型から決まる保存先。"""
     digest = hashlib.sha1()
     for path in (os.path.abspath(__file__), os.path.abspath(shm.__file__)):
@@ -789,8 +1466,11 @@ def cache_path(scene_key, model_path):
             text = f.read()
         # ビューア (背景・GUI) の部分は計算結果に効かないので見ない。
         digest.update(text.split(VIEWER_SECTION_MARK.encode())[0])
-    digest.update(os.path.abspath(model_path).encode())
-    digest.update(np.asarray(HUMAN_BETAS).tobytes())
+    digest.update(os.path.abspath(person_model_path(person, model_path))
+                  .encode())
+    digest.update(repr(sorted(
+        (k, np.asarray(v).tolist() if k == 'betas' else v)
+        for k, v in PERSONS[person].items())).encode())
     name = 'scene_{}_{}.npz'.format(scene_key.replace("'", '2'),
                                     digest.hexdigest()[:12])
     return os.path.join(CACHE_DIR, name)
@@ -815,6 +1495,8 @@ class Timeline(object):
         """全フレームを計算する。``should_stop()`` が真になったら途中でやめて
         None を返す。"""
         human, robot, scene = self._human, self._robot, self.scene
+        scene.setup(human)
+        person = PERSONS[scene.person]
         joints = robot.joint_list
         hold_end = getattr(robot, '{}arm_end_coords'.format(ROBOT_HOLD_ARM))
         hold_links = hold_ik_links(robot)
@@ -830,16 +1512,19 @@ class Timeline(object):
         ik_seed = None
         robot_head = np.array([0.0, 0.0, 1.55])
         meet = None
+        prev_wrist_y = 0.0
+        prev_shoulder_y = 0.0
+        eye_height = 0.93 * human.height
 
         for i, t in enumerate(self.times):
             if should_stop is not None and should_stop():
                 return None
             hx, hy, hyaw = scene.human_pose(t)
             xy = np.array([hx, hy])
-            speed = 0.0 if prev_xy is None else \
+            speed = 0.0 if prev_xy is None or scene.still(t) else \
                 float(np.linalg.norm(xy - prev_xy)) / DT
             prev_xy = xy
-            phase += 2.0 * np.pi * speed * DT / shm.stride_length(speed)
+            phase += 2.0 * np.pi * speed * DT / human.stride_length(speed)
             walk, run = shm.gait_weights(speed)
             base = np.asarray(scene.robot_pose(t), dtype=np.float64)
 
@@ -847,12 +1532,20 @@ class Timeline(object):
             ctx.human, ctx.yaw, ctx.phase = human, hyaw, phase
             ctx.walk, ctx.run, ctx.robot_base = walk, run, base
             spec = shm.HumanSpec(xy=xy, yaw=hyaw, speed=speed,
-                                 gait_phase=phase)
-            # 背骨のひねりは肩の位置を変えるので先に入れる。
+                                 gait_phase=phase, stoop=person['stoop'],
+                                 crouch=person['crouch'])
+            # 背骨のひねり・脚の置き方は肩の位置を変えるので先に入れる。
             plan = scene.script(t, _ShoulderProbe(human, spec, ctx))
-            spec.spine_yaw = plan.get('spine_yaw', 0.0)
-            spec.kneel = plan.get('kneel', 0.0)
-            ctx.shoulders = human.shoulder_position(spec)
+            for name in ('spine_yaw', 'kneel', 'lean', 'ground', 'feet',
+                         'pelvis_z'):
+                if name in plan:
+                    setattr(spec, name, plan[name])
+            spec.stoop += plan.get('stoop', 0.0)
+            spec.crouch += plan.get('crouch', 0.0)
+            ctx.body = human.body_joints(spec)
+            ctx.shoulders = {side: ctx.body[shm.ARM_JOINTS[side][1]]
+                             for side in ('L', 'R')}
+            ctx.ground = spec.ground
             plan = scene.script(t, ctx)
             spec.arms = dict(plan['arms'])
 
@@ -867,6 +1560,10 @@ class Timeline(object):
                 rot=rpy_matrix(base[2], 0.0, 0.0)))
             robot.waist_y_joint.joint_angle(plan['waist_y'])
             robot.waist_p_joint.joint_angle(plan['waist_p'])
+            # 昇降 (膝・足首) で上体を下げる量 [rad]。
+            lifter = plan.get('lifter', 0.0)
+            robot.knee_joint.joint_angle(-lifter)
+            robot.ankle_joint.joint_angle(lifter)
             # 腕振り: 振り幅は台車の速さ (止まっていれば振らない)、リズムは人の
             # 歩調にそろえる (つなぐ腕は人の右腕と同じ向き、空いた腕は逆)。
             robot_speed = 0.0 if prev_base is None else \
@@ -903,13 +1600,18 @@ class Timeline(object):
             # 手を伸ばして待つ。そこから人の掌へ合わせて握るのが ``reach``。
             reach = plan['reach']
             offer = plan.get('offer', 0.0)
+            hold_palm = plan.get('hold_palm')
             err = 0.0
             if reach > 0.0 or offer > 0.0:
                 turn = max(ramp(reach, 0.0, 0.7), ramp(offer, 0.0, 0.7))
-                hold_wrist_y.joint_angle(
-                    plan.get('hold_wrist_y', -1.5) * turn)
-                hold_shoulder_y.joint_angle(
-                    plan.get('hold_shoulder_y', 0.0) * turn)
+                if hold_palm is None:
+                    hold_wrist_y.joint_angle(
+                        plan.get('hold_wrist_y', -1.5) * turn)
+                    hold_shoulder_y.joint_angle(
+                        plan.get('hold_shoulder_y', 0.0) * turn)
+                else:
+                    hold_wrist_y.joint_angle(prev_wrist_y * turn)
+                    hold_shoulder_y.joint_angle(prev_shoulder_y * turn)
                 target_pos = hold_end.worldpos().copy()
                 if offer > 0.0:
                     target_pos = lerp(target_pos, plan['offer_point'],
@@ -922,6 +1624,11 @@ class Timeline(object):
                 if ik_seed is None:
                     ik_seed = [link.joint.joint_angle() for link in hold_links]
                 err = solve_hold_ik(robot, target_pos, ik_seed)
+                if hold_palm is not None:
+                    err, prev_shoulder_y, prev_wrist_y = solve_hold_ik_palm(
+                        robot, target_pos, hold_palm,
+                        [link.joint.joint_angle() for link in hold_links],
+                        prev_shoulder_y, turn)
                 ik_seed = [link.joint.joint_angle() for link in hold_links]
             else:
                 ik_seed = None
@@ -947,7 +1654,7 @@ class Timeline(object):
                 goal.wrist = np.asarray(goal.wrist) + (want - moved)
             spec.gaze = self._gaze_point(
                 plan['human_gaze'], 'human', ctx, robot_head, meet,
-                np.array([hx, hy, 1.5]), hyaw)
+                np.array([hx, hy, spec.ground + eye_height]), hyaw)
             frame = human.solve(spec, gaze_filter=human_gaze)
             palm = frame.palm(HUMAN_HOLD_SIDE)
             meet = palm[0]
@@ -981,6 +1688,8 @@ class Timeline(object):
     @staticmethod
     def _gaze_point(name, who, ctx, other_head, meet, own_head, yaw):
         fwd, _, _ = body_axes(yaw)
+        if not isinstance(name, str):  # 見る先の位置をじかに与えたとき
+            return np.asarray(name, dtype=np.float64)
         if name == 'face' and other_head is not None:
             return np.asarray(other_head)
         if name == 'hands' and meet is not None:
@@ -988,6 +1697,10 @@ class Timeline(object):
         if name == 'ground':  # 足もと (1 m 先の地面)
             p = np.asarray(own_head) + 1.0 * fwd
             p[2] = 0.0
+            return p
+        if name == 'feet':  # すぐ足もと (段差を降りるとき)
+            p = np.asarray(own_head) + 0.45 * fwd
+            p[2] = ctx.ground
             return p
         # 進行方向の 4 m 先、少し下。
         p = np.asarray(own_head) + 4.0 * fwd
@@ -1021,7 +1734,10 @@ class _ShoulderProbe(object):
 
     def __init__(self, human, spec, ctx):
         self.__dict__.update(ctx.__dict__)
-        self.shoulders = human.shoulder_position(spec)
+        self.body = human.body_joints(spec)
+        self.shoulders = {side: self.body[shm.ARM_JOINTS[side][1]]
+                          for side in ('L', 'R')}
+        self.ground = spec.ground
 
 
 # ----------------------------------------------------------------------
@@ -1174,8 +1890,10 @@ class DemoViewer(object):
         self.robot = setup_robot()
         # タイムラインの計算は関節角を書き換えるので、表示用とは別のモデルで行う。
         self.build_robot = setup_robot()
+        self.models = {}
+        self.humans = {}
         model = smpl_body.load_smpl_model(args.model_path)
-        self.human = shm.ScriptedHuman(model, HUMAN_BETAS)
+        self.models[args.model_path] = model
         self.faces = np.asarray(model.f, dtype=np.uint32)
         self.scenes = {cls.key: cls() for cls in SCENES}
         self.timelines = {}
@@ -1196,6 +1914,8 @@ class DemoViewer(object):
         self.viewer.add(self.robot)
         remove_robot_gui(self.viewer)
         self.mesh = None
+        self.mesh_person = None
+        self.props = {}  # scene key -> 物を置いた frame
 
         gui = server.gui
         labels = [s.title for s in self.scenes.values()]
@@ -1267,9 +1987,15 @@ class DemoViewer(object):
                 self.building = None
                 self.build_cv.notify_all()
 
+    def _human(self, person):
+        if person not in self.humans:
+            self.humans[person] = make_person(person, self.args.model_path,
+                                              self.models)
+        return self.humans[person]
+
     def _prepare(self, key):
         scene = self.scenes[key]
-        path = cache_path(key, self.args.model_path)
+        path = cache_path(key, self.args.model_path, scene.person)
         if os.path.exists(path):
             try:
                 return Timeline.load(path, scene)
@@ -1286,8 +2012,8 @@ class DemoViewer(object):
             return self.wanted != key and self.wanted not in self.timelines
 
         started = time.time()
-        timeline = Timeline(scene, self.human, self.build_robot).build(
-            progress, should_stop)
+        timeline = Timeline(scene, self._human(scene.person),
+                            self.build_robot).build(progress, should_stop)
         if timeline is None:
             return None
         print('[demo] {} を計算しました ({:.1f} 秒、最大の手先誤差 {:.3f} m)'
@@ -1324,7 +2050,12 @@ class DemoViewer(object):
         if self.wanted != key:  # 待っている間に別のシーンが選ばれた
             return
         self._set_background(scene.background)
+        self._show_props(key, timeline)
         with self.lock:
+            if self.mesh is not None and self.mesh_person != scene.person:
+                self.mesh.remove()
+                self.mesh = None
+            self.mesh_person = scene.person
             self.current = timeline
             self.follow.value = scene.follow_camera
         self.phase_table.content = phase_table_markdown(scene)
@@ -1342,6 +2073,28 @@ class DemoViewer(object):
         else:
             sky = sky_image((205, 218, 232), (238, 241, 245))
         self.server.scene.set_background_image(sky, format='png')
+
+    def _show_props(self, key, timeline):
+        """シーンの物 (ベンチ・段差・水たまり) を出し、他のシーンの物は隠す。"""
+        if key not in self.props:
+            name = '/props_{}'.format(key.replace("'", '2'))
+            frame = self.server.scene.add_frame(name, show_axes=False)
+            for item in self.scenes[key].props(timeline):
+                path = '{}/{}'.format(name, item['name'])
+                if 'mesh' in item:
+                    verts, faces = item['mesh']
+                    self.server.scene.add_mesh_simple(
+                        path, vertices=verts, faces=faces,
+                        color=item['color'], side='double')
+                else:
+                    self.server.scene.add_box(
+                        path, color=item['color'],
+                        dimensions=item['dimensions'],
+                        position=item['position'],
+                        wxyz=item.get('wxyz', (1.0, 0.0, 0.0, 0.0)))
+            self.props[key] = frame
+        for k, frame in self.props.items():
+            frame.visible = k == key
 
     def _offset(self, tl, i):
         """表示のずらし量 (2 人を中央に留めるときは 2 人の中点を原点へ)。"""
@@ -1378,7 +2131,7 @@ class DemoViewer(object):
             if self.mesh is None:
                 self.mesh = self.server.scene.add_mesh_simple(
                     '/human', vertices=vertices, faces=self.faces,
-                    color=HUMAN_COLOR)
+                    color=PERSONS[tl.scene.person]['color'])
             else:
                 self.mesh.vertices = vertices
             # 地面の格子は 5 m 周期なので、ずらし量の余りだけ動かす。
@@ -1386,6 +2139,9 @@ class DemoViewer(object):
             self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
                                   0.001)
             self.bg_track.position = (-offset[0], -offset[1], 0.0)
+            props = self.props.get(tl.scene.key)
+            if props is not None:
+                props.position = (-offset[0], -offset[1], 0.0)
             # 2 人の胸 (前の方) がゴールを越えたらテープを切る。
             front = max(tl.robot_bases[i][0],
                         float(np.max(tl.vertices[i][:, 0])))

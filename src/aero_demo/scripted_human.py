@@ -63,6 +63,9 @@ KNEEL_LEAN = 0.6
 # 膝の関節から膝頭の表面まで [m] (膝をついたときの接地に使う)。
 KNEE_RADIUS = 0.055
 
+# 背中を丸める (``stoop``) ときの背骨 3 関節への配分。
+STOOP_RATIO = (0.3, 0.35, 0.35)
+
 
 def rot(axis, angle):
     return sb.rodrigues(np.asarray(axis, dtype=np.float64) * angle)
@@ -126,6 +129,13 @@ class HumanSpec:
     spine_yaw: float = 0.0    # 上半身のひねり (左が正) [rad]
     lean: float = 0.0         # 前傾の追加分 [rad]
     kneel: float = 0.0        # 膝をつく量 0〜1 (転んだとき)
+    stoop: float = 0.0        # 背中の丸まり (前へ曲げて正) [rad]
+    crouch: float = 0.0       # 立っているときの股・膝の曲げ (膝は 2 倍) [rad]
+    ground: float = 0.0       # 足もとの地面の高さ [m] (歩行の脚のとき)
+    # 足首の目標 (side -> ワールド位置)。与えると歩行の脚の代わりに脚の
+    # IK で足を置き、骨盤の高さは ``pelvis_z`` を使う (座る・段差・跳ぶ)。
+    feet: dict = None
+    pelvis_z: float = None
     arms: dict = field(default_factory=dict)  # side -> ArmGoal
     gaze: np.ndarray = None   # 見る先 (ワールド位置、None なら正面)
 
@@ -162,6 +172,25 @@ def stride_length(speed):
     return 0.7 + 0.6 * max(speed, 0.0)
 
 
+def make_body_model(model, betas, scale=1.0, head_scale=1.0):
+    """体型 ``betas`` を焼き込み、全体を ``scale`` 倍、頭を ``head_scale`` 倍に
+    した SMPL モデル (betas はすべて 0 で使う)。子どもは大人の体を縮めて頭の
+    割合を大きくして作る。"""
+    betas = np.asarray(betas, dtype=np.float64)
+    v = model.v_template + np.tensordot(model.shapedirs, betas,
+                                        axes=([2], [0]))
+    if head_scale != 1.0:
+        joints = model.J_regressor.dot(v)
+        w = model.weights[:, sb.HEAD][:, None]
+        v = v + (head_scale - 1.0) * w * (v - joints[sb.HEAD])
+    v = v * scale
+    return sb.SmplModel(
+        v_template=v, shapedirs=np.zeros_like(model.shapedirs),
+        posedirs=model.posedirs * scale, J_regressor=model.J_regressor,
+        weights=model.weights, parent=model.parent, f=model.f,
+        J=model.J_regressor.dot(v))
+
+
 class ScriptedHuman(object):
     """1 人分の SMPL (体型固定) を台本から姿勢づけする."""
 
@@ -182,6 +211,28 @@ class ScriptedHuman(object):
         feet = [sb.L_ANKLE, sb.R_ANKLE, L_FOOT, R_FOOT]
         self.sole_offset = float(
             self.rest_joints[feet, 2].min() - v_rest[:, 2].min())
+        # 身長、足首の関節から足裏までの高さ、脚の長さ。
+        self.height = float(v_rest[:, 2].max() - v_rest[:, 2].min())
+        self.ankle_height = float(
+            self.rest_joints[sb.L_ANKLE, 2] - v_rest[:, 2].min())
+        j = self.rest_joints
+        self.leg = {}
+        for side, (hip, knee, ankle) in (
+                ('L', (sb.L_HIP, sb.L_KNEE, sb.L_ANKLE)),
+                ('R', (sb.R_HIP, sb.R_KNEE, sb.R_ANKLE))):
+            t0 = j[knee] - j[hip]
+            s0 = j[ankle] - j[knee]
+            self.leg[side] = dict(
+                joints=(hip, knee, ankle),
+                L1=float(np.hypot(t0[0], t0[2])),
+                L2=float(np.hypot(s0[0], s0[2])),
+                a1=float(np.arctan2(t0[0], -t0[2])),
+                a2=float(np.arctan2(s0[0], -s0[2])))
+        # 立って膝を伸ばしたときの骨盤の高さ。
+        self.pelvis_height = float(-v_rest[:, 2].min())
+        # 歩幅は脚の長さに比例させる (既定の大人 (betas[0]=2) の股から足首 0.736 m を 1 とする)。
+        self.leg_scale = float(
+            (j[sb.L_HIP, 2] - j[sb.L_ANKLE, 2]) / 0.736)
 
         self.arm = {}
         for side, (_, sh, el, wr, _) in ARM_JOINTS.items():
@@ -194,6 +245,10 @@ class ScriptedHuman(object):
                 L1=float(np.linalg.norm(j[el] - j[sh])),
                 L2=float(np.linalg.norm(j[wr] - j[el])),
                 b0=b0, b0f=b0f, d0=d0, rest_frame=frame_from(b0, d0))
+
+    def stride_length(self, speed):
+        """1 周期で進む距離 [m] (脚の長さに比例)。"""
+        return stride_length(speed) * self.leg_scale
 
     @property
     def arm_length(self):
@@ -218,14 +273,32 @@ class ScriptedHuman(object):
 
     def shoulder_position(self, spec):
         """台本 ``spec`` の腕以外を決めたときの肩の位置 (腕の目標を作るため)。"""
-        local, root = self._body(spec)
-        joints, _ = self.fk(local, root)
+        joints = self.body_joints(spec)
         return {side: joints[ARM_JOINTS[side][1]] for side in ('L', 'R')}
 
+    def body_joints(self, spec):
+        """台本 ``spec`` の腕以外を決めたときの関節位置 (24, 3)。"""
+        local, root = self._body(spec)
+        joints, _ = self.fk(local, root)
+        return joints
+
+    def stance(self, stoop=0.0, crouch=0.0, lean=0.0):
+        """止まって立つ姿勢の (骨盤の高さ, 骨盤から見た足首の位置 {side: (前,
+        左, 上)})。脚の IK で立たせるときに、歩行の脚で立つ姿勢とそろえる。"""
+        spec = HumanSpec(xy=np.zeros(2), yaw=0.0, stoop=stoop, crouch=crouch,
+                         lean=lean)
+        joints = self.body_joints(spec)
+        return float(joints[0, 2]), {
+            side: joints[self.leg[side]['joints'][2]] - joints[0]
+            for side in ('L', 'R')}
+
     def _body(self, spec):
-        """腰・脚・背骨の局所回転と、足が地面に着く骨盤の位置。"""
+        """腰・脚・背骨の局所回転と骨盤の位置。``spec.feet`` があれば脚の IK で
+        足を置き、なければ歩行の脚で足 (か膝) が地面に着く高さに置く。"""
         local = np.tile(np.eye(3), (24, 1, 1))
         walk, run = gait_weights(spec.speed)
+        if spec.feet is not None:
+            walk, run = 0.0, 0.0
         k = spec.kneel
         lean = spec.lean + RUN_LEAN * run + KNEEL_LEAN * k
         local[0] = rot_z(spec.yaw).dot(rot_y(lean))
@@ -238,8 +311,9 @@ class ScriptedHuman(object):
                 (sb.R_HIP, sb.R_KNEE, sb.R_ANKLE,
                  spec.gait_phase + np.pi)):
             # sin > 0 で腿が前、cos > 0 で腿が前へ振れている (遊脚)。
-            flex = walk * (hip_amp * np.sin(phase) + 0.1 * run)
-            bend = walk * (knee_st + knee_sw * max(0.0, np.cos(phase)) ** 2)
+            flex = walk * (hip_amp * np.sin(phase) + 0.1 * run) + spec.crouch
+            bend = walk * (knee_st + knee_sw * max(0.0, np.cos(phase)) ** 2) \
+                + 2.0 * spec.crouch
             flex = (1.0 - k) * flex + k * KNEEL_HIP
             bend = (1.0 - k) * bend + k * KNEEL_KNEE
             local[hip] = rot_y(-flex - lean)
@@ -250,17 +324,48 @@ class ScriptedHuman(object):
         # 歩くときの骨盤の小さな回旋は背骨で打ち消す。
         pelvis_twist = 0.08 * walk * np.sin(spec.gait_phase)
         local[0] = local[0].dot(rot_z(pelvis_twist))
-        for i, ratio in ((SPINE1, 0.3), (SPINE2, 0.35), (SPINE3, 0.35)):
-            local[i] = rot_z(ratio * (spec.spine_yaw - pelvis_twist))
+        for i, ratio, bow in ((SPINE1, 0.3, STOOP_RATIO[0]),
+                              (SPINE2, 0.35, STOOP_RATIO[1]),
+                              (SPINE3, 0.35, STOOP_RATIO[2])):
+            local[i] = rot_z(ratio * (spec.spine_yaw - pelvis_twist)).dot(
+                rot_y(bow * spec.stoop))
         local[SPINE1] = local[SPINE1].dot(rot_y(-0.5 * lean * run))
+
+        if spec.feet is not None:
+            root = np.array([spec.xy[0], spec.xy[1], spec.pelvis_z])
+            for side, target in spec.feet.items():
+                self._leg_ik(local, root, spec.yaw, lean, side, target)
+            return local, root
 
         joints, _ = self.fk(local, np.zeros(3))
         feet = [sb.L_ANKLE, sb.R_ANKLE, L_FOOT, R_FOOT]
         lowest = min(joints[feet, 2].min() - self.sole_offset,
                      joints[[sb.L_KNEE, sb.R_KNEE], 2].min() - KNEE_RADIUS)
-        height = -lowest
+        height = spec.ground - lowest
         root = np.array([spec.xy[0], spec.xy[1], height])
         return local, root
+
+    def _leg_ik(self, local, root, yaw, lean, side, target):
+        """足首を ``target`` へ置く股・膝の曲げ (体の前後の面内で解く 2 リンク)。
+        足裏は水平に保つ。"""
+        leg = self.leg[side]
+        hip, knee, ankle = leg['joints']
+        rest_hip = self.rest_joints[hip] - self.rest_joints[0]
+        hip_world = root + rot_z(yaw).dot(rot_y(lean)).dot(rest_hip)
+        d = rot_z(yaw).T.dot(np.asarray(target, dtype=np.float64) - hip_world)
+        L1, L2 = leg['L1'], leg['L2']
+        D = float(np.clip(np.hypot(d[0], d[2]), abs(L1 - L2) + 1e-3,
+                          (L1 + L2) * 0.9995))
+        gamma = np.arctan2(d[0], -d[2])
+        th1 = gamma + np.arccos(np.clip(
+            (L1 * L1 + D * D - L2 * L2) / (2.0 * L1 * D), -1.0, 1.0))
+        th2 = gamma - np.arccos(np.clip(
+            (L2 * L2 + D * D - L1 * L1) / (2.0 * L2 * D), -1.0, 1.0))
+        flex = th1 - leg['a1']
+        bend = flex + leg['a2'] - th2
+        local[hip] = rot_y(-flex - lean)
+        local[knee] = rot_y(bend)
+        local[ankle] = rot_y(flex - bend)
 
     def _arm_ik(self, local, world_rots, joints, side, goal):
         """肩・肘を解析的に決める (2 リンク)。"""
