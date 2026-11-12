@@ -236,6 +236,25 @@ def human_hold_goal(human, shoulders, yaw, swing, run, grip,
                        palm=-fwd if palm_back else fwd, grip=grip)
 
 
+# 手を振る: 前へ上げた腕 (手先は頭の高さ、掌は前向き) を左右に揺らす。
+WAVE_FREQ = 1.6  # [Hz]
+
+
+def robot_wave_angles(arm, t):
+    """手を振る腕の関節角 (左腕の符号)。"""
+    mirror = 1.0 if arm == 'l' else -1.0
+    phase = 2.0 * np.pi * WAVE_FREQ * t
+    return {
+        '{}_shoulder_p_joint'.format(arm): -1.35,
+        '{}_shoulder_r_joint'.format(arm): mirror * (0.6 + 0.35 * np.sin(phase)),
+        '{}_shoulder_y_joint'.format(arm): 0.0,
+        '{}_elbow_joint'.format(arm): -1.4 + 0.2 * np.sin(phase + 0.5),
+        '{}_wrist_y_joint'.format(arm): 0.0,
+        '{}_wrist_p_joint'.format(arm): 0.0,
+        '{}_wrist_r_joint'.format(arm): 0.0,
+    }
+
+
 def blend_goal(a, b, s):
     """2 つの ``ArmGoal`` を ``s`` で混ぜる。"""
     if s <= 0.0:
@@ -464,7 +483,7 @@ class SceneC(Scene):
     key = 'C'
     title = 'C: 後ろから走ってきて、手を繋いで一緒に走る (運動会)'
     duration = 14.0
-    phases = [('0 後ろから走ってくる', 0.0, 3.2), ('1 見合う', 3.2, 4.2),
+    phases = [('0 手を振りながら走ってくる', 0.0, 3.2), ('1 見合う', 3.2, 4.2),
               ('2 手を出す', 4.2, 5.0), ('3 握る', 5.0, 5.5),
               ('4 一緒に走る', 5.5, 12.8), ('5 ゴール', 12.8, 14.0)]
     follow_camera = True
@@ -485,15 +504,24 @@ class SceneC(Scene):
         # 止まった位置が人の横 (ROBOT_AHEAD だけ前) になるよう平行移動する。
         self.robot_track.shift(self.START_X + ROBOT_AHEAD
                                - self.robot_track(self.STOP_T)[0])
-        self.robot_gaze = GazeSchedule([
-            (0.0, 'face'), (4.3, 'hands'), (5.0, 'face'),
-            (5.7, 'forward'), (12.9, 'face')])
-        self.human_gaze = GazeSchedule([
-            (0.0, 'forward'), (1.0, 'face'), (4.2, 'hands'), (5.0, 'face'),
-            (5.6, 'forward'), (12.8, 'face')])
+        # 走っている間、ロボットはときどき人の方を振り返り、人も見返す。
+        glances = [(7.8, 8.5), (9.9, 10.5), (11.6, 12.2)]
+        robot_keys = [(0.0, 'face'), (4.3, 'hands'), (5.0, 'face'),
+                      (5.7, 'forward'), (12.9, 'face')]
+        human_keys = [(0.0, 'forward'), (1.0, 'face'), (4.2, 'hands'),
+                      (5.0, 'face'), (5.6, 'forward'), (12.8, 'face')]
+        for t0, t1 in glances:
+            robot_keys += [(t0, 'face'), (t1, 'forward')]
+            human_keys += [(t0 + 0.15, 'face'), (t1 + 0.1, 'forward')]
+        self.robot_gaze = GazeSchedule(robot_keys)
+        self.human_gaze = GazeSchedule(human_keys)
 
     def drift(self, t):
-        return side_by_side_drift(t, 6.6, 12.6, 0.25)
+        # 走り出したらロボットが少し前に出て引っぱる (10〜20 cm 前で揺らぐ)。
+        w = ramp(t, 6.0, 7.5) - ramp(t, 11.3, 12.8)
+        u = t - 6.0
+        return w * (0.15 + 0.04 * np.sin(2.0 * np.pi * u / 3.3)
+                    + 0.02 * np.sin(2.0 * np.pi * u / 1.9))
 
     def spine_yaw(self, t):
         # 足音に気づいて右後ろを振り返り、ロボットが横に来たら戻す。
@@ -513,6 +541,8 @@ class SceneC(Scene):
             arms=arms, human_gaze=self.human_gaze(t),
             spine_yaw=self.spine_yaw(t),
             waist_y=0.0, waist_p=0.0, reach=ramp(t, 4.3, 5.0),
+            # 走ってきながら大きく手を振り、止まる前に下ろす。
+            wave=ramp(t, 0.2, 0.8) - ramp(t, 2.6, 3.4),
             grip=grip, robot_gaze=self.robot_gaze(t))
 
 
@@ -764,8 +794,13 @@ class Timeline(object):
                 plan['waist_p'] + ROBOT_RUN_LEAN * robot_run)
             for arm, value in ((ROBOT_FREE_ARM, -swing),
                                (ROBOT_HOLD_ARM, swing)):
-                for name, angle in robot_swing_angles(
-                        arm, value, robot_run).items():
+                angles = robot_swing_angles(arm, value, robot_run)
+                wave = plan.get('wave', 0.0)
+                if arm == ROBOT_HOLD_ARM and wave > 0.0:
+                    waving = robot_wave_angles(arm, t)
+                    angles = {name: lerp(angle, waving[name], wave)
+                              for name, angle in angles.items()}
+                for name, angle in angles.items():
                     joint = getattr(robot, name)
                     joint.joint_angle(float(np.clip(
                         angle, joint.min_angle, joint.max_angle)))
