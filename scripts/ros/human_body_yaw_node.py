@@ -20,6 +20,11 @@ Publish
     信頼度が ``~min_confidence`` 以上のときだけ出す。stamp は画像の時刻。
 ~debug (std_msgs/String)
     部位ごとの向き [deg, base_link]・使った部位・信頼度の JSON。
+    folded_base_deg は 180° 折り返し (~max_relative_yaw) 後の向き。
+
+背中側から見ると左右の肩を取り違えて向きが 180° 逆になるので、ロボット
+正面から ``~max_relative_yaw`` (既定 90°) を超える向きは折り返す
+(手をつないで横に並ぶ人はロボットと逆向きにならない前提)。
 ~skeleton_image (sensor_msgs/Image)
     骨格を重ねた画像 (購読者がいるときだけ)。
 
@@ -77,6 +82,10 @@ class HumanBodyYawNode(object):
             time_constant=rospy.get_param('~smoothing_time', 0.3),
             reset_after=rospy.get_param('~smoothing_reset', 1.0))
         self._smoother_frame = None
+        # ロボット正面からこの角度 [deg] を超える向きは 180° 折り返す
+        # (背中側から見たときの左右の肩の取り違え対策)。180 で無効。
+        self.max_relative_yaw = math.radians(
+            rospy.get_param('~max_relative_yaw', 90.0))
 
         color_topic = rospy.get_param(
             '~color_topic', '/camera/color/image_raw/decompressed')
@@ -174,22 +183,29 @@ class HumanBodyYawNode(object):
         odom_from_base = self._lookup_odom_from_base(stamp)
         if odom_from_base is not None:
             frame = self.odom_frame
-            yaw = body_yaw.wrap_angle(result.yaw
-                                      + _yaw_of_matrix(odom_from_base))
+            base_yaw = _yaw_of_matrix(odom_from_base)
             center = odom_from_base.dot(np.append(result.center, 1.0))[:3]
         else:
             rospy.logwarn_throttle(
                 5.0, 'human_body_yaw: %s -> %s の TF が無いので %s で出します',
                 self.base_frame, self.odom_frame, self.base_frame)
             frame = self.base_frame
-            yaw = result.yaw
+            base_yaw = 0.0
             center = result.center
         if frame != self._smoother_frame:
             self.smoother.reset()
             self._smoother_frame = frame
+        # 背中側からの左右の肩の取り違え (180° 逆) を、人はロボットと逆向き
+        # にならない前提で直す。前回の向きは base_link に戻して比べる。
+        previous = self.smoother.current(stamp.to_sec())
+        if previous is not None:
+            previous = body_yaw.wrap_angle(previous - base_yaw)
+        folded = body_yaw.fold_to_front(
+            result.yaw, self.max_relative_yaw, previous)
+        yaw = body_yaw.wrap_angle(folded + base_yaw)
         smoothed = self.smoother.update(yaw, stamp.to_sec(),
                                         result.confidence)
-        self._publish_debug(result, smoothed)
+        self._publish_debug(result, smoothed, folded)
         if result.confidence < self.min_confidence:
             return
 
@@ -203,7 +219,7 @@ class HumanBodyYawNode(object):
         msg.pose.orientation.w = math.cos(0.5 * smoothed)
         self.pose_pub.publish(msg)
 
-    def _publish_debug(self, result, smoothed):
+    def _publish_debug(self, result, smoothed, folded=None):
         if self.debug_pub.get_num_connections() == 0:
             return
         if result is None:
@@ -212,6 +228,7 @@ class HumanBodyYawNode(object):
             data = {
                 'valid': True,
                 'yaw_base_deg': round(math.degrees(result.yaw), 1),
+                'folded_base_deg': round(math.degrees(folded), 1),
                 'smoothed_deg': round(math.degrees(smoothed), 1),
                 'frame': self._smoother_frame,
                 'confidence': round(result.confidence, 3),

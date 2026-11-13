@@ -191,3 +191,27 @@ def test_smoother():
     y1 = smoother.update(math.radians(60.0), 0.1)
     y2 = smoother.update(math.radians(60.0), 0.2)
     assert 0.0 < y1 < y2 < math.radians(60.0)
+
+
+def test_fold_to_front():
+    d = math.radians
+    fold = body_yaw.fold_to_front
+    # 正面寄りはそのまま、後ろ寄りは 180 度折り返す。
+    assert fold(d(30.0)) == pytest.approx(d(30.0))
+    assert fold(d(128.0)) == pytest.approx(d(-52.0))
+    assert fold(d(-150.0)) == pytest.approx(d(30.0))
+    # 境目の近くは前回に近い方 (ばたつかない)。
+    assert fold(d(95.0), previous=d(-80.0)) == pytest.approx(d(-85.0))
+    assert fold(d(95.0), previous=d(80.0)) == pytest.approx(d(95.0))
+    # 境目から離れていれば前回によらず折り返す。
+    assert fold(d(150.0), previous=d(150.0)) == pytest.approx(d(-30.0))
+    # 180 度以上なら無効。
+    assert fold(d(150.0), max_relative=math.pi) == pytest.approx(d(150.0))
+
+
+def test_smoother_current():
+    smoother = body_yaw.YawSmoother(time_constant=0.3, reset_after=1.0)
+    assert smoother.current(0.0) is None
+    smoother.update(0.5, 0.0)
+    assert smoother.current(0.5) == pytest.approx(0.5)
+    assert smoother.current(2.0) is None

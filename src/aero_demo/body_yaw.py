@@ -230,3 +230,35 @@ class YawSmoother(object):
             self._vec = (1.0 - alpha) * self._vec + alpha * obs
         self._stamp = stamp
         return math.atan2(self._vec[1], self._vec[0])
+
+    def current(self, stamp):
+        """``stamp`` [s] の時点で有効なならした向き [rad] (無ければ None)."""
+        if (self._vec is None or self._stamp is None
+                or stamp - self._stamp > self.reset_after
+                or stamp < self._stamp):
+            return None
+        return math.atan2(self._vec[1], self._vec[0])
+
+
+def fold_to_front(yaw, max_relative=math.pi / 2, previous=None,
+                  margin=math.radians(20.0)):
+    """向き ``yaw`` をロボット正面 (0) から ``max_relative`` 以内に折り返す.
+
+    背中側から見ると MediaPipe が左右の肩を取り違え、肩の線の向きが 180°
+    逆になる。手をつないで横に並んでいる人はロボットと逆向きにはなれない
+    (腕が交差する) ので、``yaw`` と ``yaw + 180°`` のうちロボット正面に近い
+    方を選ぶ。どちらも境目 (``max_relative``) から ``margin`` 以内のときは、
+    ``previous`` (同じ座標系の前回の向き) に近い方を選んでばたつきを防ぐ。
+    ``max_relative`` が 180° 以上なら何もしない。
+    """
+    yaw = wrap_angle(yaw)
+    if max_relative >= math.pi:
+        return yaw
+    flipped = wrap_angle(yaw + math.pi)
+    if (previous is not None
+            and abs(abs(yaw) - max_relative) < margin):
+        if abs(wrap_angle(flipped - previous)) < abs(
+                wrap_angle(yaw - previous)):
+            return flipped
+        return yaw
+    return yaw if abs(yaw) <= max_relative else flipped
