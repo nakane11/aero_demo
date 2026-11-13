@@ -35,6 +35,7 @@ import json
 import math
 import os
 import sys
+import threading
 
 import numpy as np
 
@@ -124,13 +125,27 @@ class HumanBodyYawNode(object):
             [color_sub, depth_sub],
             queue_size=rospy.get_param('~sync_queue_size', 10),
             slop=rospy.get_param('~sync_slop', 0.1))
+        # 終了時に処理中の画像があると閉じた推定器を使ってしまうので、
+        # 推定と終了処理を同じロックで分ける。
+        self._lock = threading.Lock()
+        self._closed = False
         self.sync.registerCallback(self._on_frame)
-        rospy.on_shutdown(self.estimator.close)
+        rospy.on_shutdown(self._close)
         rospy.loginfo('human_body_yaw: %s + %s -> ~body_pose (%s)',
                       color_topic, depth_topic, self.odom_frame)
 
     def _on_camera_info(self, msg):
         self._camera_info = msg
+
+    def _close(self):
+        with self._lock:
+            self._closed = True
+            self.estimator.close()
+
+    def _on_frame(self, color_msg, depth_msg):
+        with self._lock:
+            if not self._closed:
+                self._process_frame(color_msg, depth_msg)
 
     def _lookup_odom_from_base(self, stamp):
         for when in (stamp, rospy.Time(0)):
@@ -144,7 +159,7 @@ class HumanBodyYawNode(object):
                 continue
         return None
 
-    def _on_frame(self, color_msg, depth_msg):
+    def _process_frame(self, color_msg, depth_msg):
         info = self._camera_info
         if info is None:
             rospy.logwarn_throttle(5.0, 'human_body_yaw: camera_info を待っています')
