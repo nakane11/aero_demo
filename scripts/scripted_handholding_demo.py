@@ -31,6 +31,14 @@ I  大人: 横に並んで歩く → 対向者が来たら前に出て後ろ手�
    → 横に戻る。
 J  高齢者: G〜I を 1 本にした散歩 (立たせる → 並んで歩く → すれ違う →
    横断歩道の手前で止めて渡る → 座らせる)。
+
+手を繋いだり離したりをくり返すシナリオ (日常の買い物):
+K  大人とスーパーへ: 入口でカートを押して出てくる客の前で、繋いだ手を後ろへ
+   引いて右手で前をふさぐ → ロボットが手を離してカートを取りに行く (コインを
+   入れて引き出す) → 繋ぎ直して右手でカートを押す → 人が両手で商品を取る間は
+   離し、取り終えたらロボットが手を差し出す → 走ってくる子どもを手のアーチの
+   下にくぐらせる → 狭い通路で一列ですれ違う → 人がしゃがんで低い棚の商品を
+   取るのを手を下げて支え、取った商品をかごへ入れる → レジで手を離す。
 人の体型は対象者に合わせる (``PERSONS``)。
 
 ロボットは左手、人は右手で繋ぐ (人はロボットの左側)。人の手の位置・向きを
@@ -372,13 +380,28 @@ class Scene(object):
         return []
 
     def moving_props(self, t):
-        """動く物の時刻 ``t`` の位置 {名前: 位置}。"""
+        """動く物の時刻 ``t`` の位置 {名前: (x, y, z) か (x, y, z, 向き)}。
+        台本の ``carry`` (手に持った物) はこれより優先する。"""
         return {}
 
     # すれ違う歩行者 (いなければ None)。``other_pose(t)`` が (x, y, 向き)。
     other_person = None
 
     def other_pose(self, t):
+        return None
+
+    def others(self):
+        """一緒に映る他の人 [{'person': 体型, 'window': (現れる, 消える)}]。"""
+        if self.other_person is None:
+            return []
+        return [dict(person=self.other_person, window=(0.0, self.duration))]
+
+    def other_state(self, k, t):
+        """他の人 ``k`` の (x, y, 向き)。"""
+        return self.other_pose(t)
+
+    def other_arms(self, k, t, human, shoulders, yaw, swing, run):
+        """他の人 ``k`` の腕の目標 {side: ArmGoal} (None なら腕を振って歩く)。"""
         return None
 
     def human_pose(self, t):
@@ -2175,8 +2198,690 @@ class SceneJ(Scene):
         return items
 
 
+# ----------------------------------------------------------------------
+# K: スーパーで買い物
+# ----------------------------------------------------------------------
+# ショッピングカート (原点は床の中心、+x が押して進む向き、取っ手は -x 側)。
+CART_AHEAD = 0.93                       # 押すときの台車の中心からカートの中心 [m]
+CART_GRIP = np.array([-0.55, -0.08, 0.99])  # ロボットの右手で握る取っ手の位置
+CART_LOCK = np.array([-0.50, -0.20, 1.03])  # コインを入れる錠
+CART_HANDLE_SIDES = (np.array([-0.55, 0.18, 0.99]),
+                     np.array([-0.55, -0.18, 0.99]))
+CART_DROP = np.array([0.05, 0.06, 0.70])    # かごに入れた商品の位置
+CART_DROP2 = np.array([-0.17, 0.03, 0.64])  # 2 つ目の商品
+
+
+def cart_parts(color, lock=False):
+    """カートの部品 [(名前, 寸法, 位置, 色)] (上の開いたかご・台・取っ手・脚)。"""
+    wire = (190, 197, 206)
+    dark = (55, 57, 62)
+    parts = [
+        ('floor', (0.76, 0.48, 0.02), (0.02, 0.0, 0.58), wire),
+        ('front', (0.02, 0.50, 0.38), (0.40, 0.0, 0.76), wire),
+        ('back', (0.02, 0.50, 0.38), (-0.36, 0.0, 0.76), wire),
+        ('left', (0.78, 0.02, 0.38), (0.02, 0.24, 0.76), wire),
+        ('right', (0.78, 0.02, 0.38), (0.02, -0.24, 0.76), wire),
+        ('tray', (0.66, 0.42, 0.02), (0.05, 0.0, 0.20), wire),
+        ('handle', (0.04, 0.54, 0.04), (-0.55, 0.0, 0.99), color),
+        ('post_l', (0.19, 0.025, 0.025), (-0.455, 0.24, 0.97), wire),
+        ('post_r', (0.19, 0.025, 0.025), (-0.455, -0.24, 0.97), wire),
+    ]
+    for sx in (1, -1):
+        for sy in (1, -1):
+            tag = '{}{}'.format('f' if sx > 0 else 'b', 'l' if sy > 0 else 'r')
+            parts.append(('leg_' + tag, (0.025, 0.025, 0.52),
+                          (0.31 * sx, 0.20 * sy, 0.32), wire))
+            parts.append(('wheel_' + tag, (0.08, 0.035, 0.08),
+                          (0.31 * sx, 0.20 * sy, 0.04), dark))
+    if lock:
+        parts.append(('lock', (0.07, 0.07, 0.05), tuple(CART_LOCK),
+                      (230, 185, 55)))
+    return parts
+
+
+def cart_point(pose, local):
+    """カートの姿勢 (x, y, 向き) とカートから見た位置からワールドの位置。"""
+    return to_world(pose[:2], pose[2], local)
+
+
+def cart_props(prefix, pose, color, lock=False):
+    yaw = pose[2]
+    q = (np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw))
+    return [dict(name='{}_{}'.format(prefix, name), color=c, dimensions=dims,
+                 position=tuple(cart_point(pose, pos)), wxyz=q)
+            for name, dims, pos, c in cart_parts(color, lock)]
+
+
+def cart_moving(prefix, pose, lock=False):
+    return {'{}_{}'.format(prefix, name): np.append(cart_point(pose, pos),
+                                                     pose[2])
+            for name, _, pos, _ in cart_parts((0, 0, 0), lock)}
+
+
+SHELF_BOARDS = (0.08, 0.42, 0.85, 1.28, 1.70)  # 棚板の上面の高さ [m]
+
+
+def shelf_props(name, x0, x1, y_front, depth, gaps=(), seed=0, height=1.85):
+    """商品棚 (``y_front`` が通路側の面、``depth`` は奥への符号つきの奥行き)。
+    ``gaps`` の (x, 棚板の番号) には台本で取る商品を置くので並べない。
+    ``height`` は棚の高さ (低い棚はその下の棚板だけ)。"""
+    rng = np.random.default_rng(seed)
+    frame = (178, 182, 188)
+    y_back = y_front + depth
+    yc = 0.5 * (y_front + y_back)
+    items = [dict(name=name + '_backboard', color=frame,
+                  dimensions=(x1 - x0, 0.03, height),
+                  position=(0.5 * (x0 + x1), y_back, 0.5 * height))]
+    for side, x in (('s0', x0), ('s1', x1)):
+        items.append(dict(name='{}_{}'.format(name, side), color=frame,
+                          dimensions=(0.03, abs(depth), height),
+                          position=(x, yc, 0.5 * height)))
+    boards = [top for top in SHELF_BOARDS if top < height]
+    palette = [(205, 80, 70), (235, 175, 60), (90, 160, 95), (80, 125, 200),
+               (225, 225, 215), (160, 95, 150), (240, 130, 60)]
+    for b, top in enumerate(boards):
+        items.append(dict(name='{}_board{}'.format(name, b), color=frame,
+                          dimensions=(x1 - x0, abs(depth), 0.03),
+                          position=(0.5 * (x0 + x1), yc, top - 0.015)))
+        if b == len(boards) - 1 and height > 1.5:
+            continue
+        x = x0 + 0.04
+        k = 0
+        while x < x1 - 0.2:
+            w = float(rng.uniform(0.18, 0.3))
+            h = float(rng.uniform(0.14, 0.3))
+            cx = x + 0.5 * w
+            x += w + 0.03
+            if any(abs(cx - gx) < 0.25 and gb == b for gx, gb in gaps):
+                continue
+            items.append(dict(
+                name='{}_p{}_{}'.format(name, b, k),
+                color=palette[int(rng.integers(len(palette)))],
+                dimensions=(w, 0.7 * abs(depth), h),
+                position=(cx, y_front + 0.45 * depth, top + 0.5 * h)))
+            k += 1
+    return items
+
+
+class SceneK(Scene):
+    key = 'K'
+    title = 'K: スーパーで買い物 (入口で止める → カートを取る → 商品を取る → ' \
+        '子どもをくぐらせる → すれ違う → しゃがんで取る → レジ)'
+    duration = 62.2
+    WALK_SPEED = 0.65
+    SIDE = SIDE_DISTANCE
+    AHEAD = ROBOT_AHEAD
+    # 1 入口: カートを押した客が出てくるので止める (前をふさぐ)。
+    BLOCK = (3.3, 4.0)          # 手を後ろへ引き、右手で前をふさぐ
+    BLOCK_STOP = (3.6, 4.4)     # 人が止まる
+    UNBLOCK = (6.4, 7.1)
+    WALK_IN = 6.9
+    STOP_IN = (10.4, 11.2)
+    # 2 カートを取ってくる (ロボットの都合で手を離す)。
+    ROBOT_OPEN1 = (11.2, 11.6)
+    HUMAN_OPEN1 = (11.3, 11.7)
+    LET_GO1 = (11.5, 12.1)
+    TO_CORRAL = (11.7, 13.1)
+    COIN_REACH = (13.0, 13.6)   # 着いてから右手 (コイン) を錠へ
+    COIN_IN = (13.5, 14.0)      # コインを入れる
+    GRAB_HANDLE = (14.0, 14.5)  # 取っ手を握る
+    PULL = (14.8, 16.2)         # カートを引き出す
+    PULL_DIST = 0.95
+    TO_SIDE = (16.2, 17.9)      # 人の右へ寄る
+    OFFER2 = (17.4, 18.2)
+    TAKE2 = (17.9, 18.7)
+    REACH2 = (18.2, 18.9)
+    ROBOT_GRIP2 = (18.7, 19.1)
+    HUMAN_GRIP2 = (18.8, 19.2)
+    WALK2 = 19.2
+    # 3 棚の前で人が両手で商品を取り、かごへ入れる (人の都合で手を離す)。
+    STOP_A = (22.4, 23.2)
+    HUMAN_OPEN2 = (23.2, 23.5)
+    ROBOT_OPEN2 = (23.3, 23.6)
+    LET_GO2 = (23.4, 24.0)
+    TURN_A1 = (23.5, 24.3)      # 棚の方 (左) を向く
+    ROBOT_BACK = (23.8, 25.2)   # かごが人の右に来るよう下がる
+    REACH_A = (24.2, 25.0)
+    GRAB_A = 25.0
+    LIFT_A = (25.1, 25.8)
+    TURN_A2 = (25.8, 27.0)      # 右へ回ってカートの方を向く
+    PUT_A = (27.0, 27.6)
+    DROP_A = 27.6
+    HANDS_BACK = (27.8, 28.4)
+    TURN_A3 = (28.2, 29.0)      # 前を向く
+    ROBOT_FWD = (28.4, 29.8)
+    OFFER3 = (29.3, 30.1)
+    TAKE3 = (29.8, 30.6)
+    REACH3 = (30.1, 30.8)
+    ROBOT_GRIP3 = (30.6, 31.0)
+    HUMAN_GRIP3 = (30.7, 31.1)
+    WALK3 = 31.0
+    # 4 走ってくる子どもを、繋いだ手のアーチの下にくぐらせる。
+    STOP_ARCH = (33.0, 33.8)
+    SPREAD = (32.9, 34.1)       # 間を広げて手を上げる
+    CHILD_T = 35.0              # 子どもがアーチの下を通る
+    CLOSE = (35.6, 36.8)
+    WALK4 = 36.4
+    ARCH_SPREAD = 0.38          # 間を広げる量 [m]
+    CHILD_SPEED = 2.4
+    # 5 狭い通路で一列になってすれ違う (I と同じ、カートを押したまま)。
+    LEAD = (38.4, 40.4)
+    MEET_T = 42.4
+    BACK = (44.2, 46.2)
+    LEAD_OFFSET = (0.68, -0.28)  # 前に出たときの台車 (人から見た前・左)
+    LEAD_HUMAN_Y = -0.30         # 人も右へ寄る [m]
+    TWIST = 1.3                  # 上半身のひねり (カートを持つので I より小さく)
+    OTHER_Y = 0.22
+    # 6 人がしゃがんで低い棚の商品を取る (ロボットも手を下げて支える)。
+    STOP_C = (47.4, 48.2)
+    TURN_C1 = (48.0, 48.7)
+    CROUCH = (48.7, 50.1)
+    PICK = (49.6, 50.4)
+    GRAB_C = 50.4
+    RISE = (50.7, 52.1)
+    TURN_C2 = (52.0, 53.0)      # 右 (カートの方) を向く
+    ROBOT_BACK2 = (52.1, 53.1)  # かごが人の前に来るよう下がる
+    BACK2_DIST = 0.60
+    PUT_C = (52.9, 53.5)        # 片手でかごへ入れる
+    DROP_C = 53.5
+    HAND_BACK_C = (53.7, 54.2)
+    TURN_C3 = (54.0, 54.7)      # 前を向く
+    ROBOT_FWD2 = (54.2, 55.3)
+    WALK5 = 54.8
+    CROUCH_YAW = 0.6
+    CROUCH_DEPTH = 0.46
+    # 7 レジに着いて手を離す。
+    STOP_R = (58.4, 59.2)
+    ROBOT_OPEN_E = (59.6, 60.0)
+    HUMAN_OPEN_E = (59.7, 60.1)
+    LET_GO_E = (59.9, 60.5)
+    SHELF_FRONT = 0.50           # 左の棚の前面の y [m]
+    AISLE_RIGHT = -1.00          # 狭い通路の右の棚の前面の y [m]
+    phases = [('0 手を繋いで店の前まで歩く [横に並ぶ]', 0.0, 3.3),
+              ('1 カートを押した客が出てくる: 手を後ろへ引き、右手で前を'
+               'ふさぐ', 3.3, 7.1),
+              ('2 並んで店に入る [横に並ぶ]', 7.1, 11.2),
+              ('3 ロボットが手を離してカートを取りに行く (コインを入れて'
+               '引き出す)', 11.2, 17.4),
+              ('4 手を差し出して繋ぎ直し、カートを押して歩く', 17.4, 22.4),
+              ('5 棚の前で手を離し、人が両手で商品を取ってかごへ入れる',
+               22.4, 29.3),
+              ('6 ロボットが手を差し出して繋ぎ直す', 29.3, 31.0),
+              ('7 走ってくる子どもを手のアーチの下にくぐらせる', 31.0, 36.8),
+              ('8 狭い通路: 前に出て後ろ手に引き、一列ですれ違う', 36.8,
+               46.2),
+              ('9 しゃがんで低い棚の商品を取る [手を下げて支える]', 46.2,
+               52.1),
+              ('10 取った商品を片手でかごへ入れる', 52.1, 54.8),
+              ('11 レジまで歩いて手を離す', 54.8, 62.2)]
+
+    def __init__(self):
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'forward'), (1.7, 'face'), (2.3, 'forward'), (2.8, 'cust'),
+            (4.4, 'face'), (5.0, 'cust'), (6.6, 'face'), (7.2, 'forward'),
+            (10.8, 'face'), (11.6, 'lock'), (14.8, 'face'), (15.6, 'forward'),
+            (16.6, 'face'), (17.4, 'hands'), (18.9, 'face'), (19.6, 'forward'),
+            (22.4, 'face'), (23.6, 'item1'), (25.6, 'face'), (26.6, 'basket'),
+            (28.0, 'face'), (29.3, 'hands'), (30.9, 'face'), (31.4, 'forward'),
+            (32.2, 'child'), (33.6, 'face'), (34.2, 'child'), (35.8, 'face'),
+            (36.6, 'forward'), (37.8, 'cust2'), (38.4, 'face'),
+            (39.2, 'hands'), (40.4, 'cust2'), (43.2, 'forward'),
+            (44.4, 'face'), (45.6, 'forward'), (47.6, 'face'), (48.8, 'hands'),
+            (50.2, 'item2'), (50.8, 'face'), (52.4, 'basket'),
+            (54.0, 'face'), (55.0, 'forward'), (57.6, 'register'),
+            (59.4, 'face')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'forward'), (1.6, 'face'), (2.2, 'forward'), (3.0, 'cust'),
+            (5.0, 'face'), (5.8, 'cust'), (6.6, 'forward'), (10.6, 'face'),
+            (11.8, 'lock'), (14.6, 'face'), (15.4, 'cart'), (17.6, 'hands'),
+            (18.9, 'face'), (19.6, 'forward'), (22.2, 'item1'),
+            (25.9, 'basket'), (28.2, 'face'), (29.6, 'hands'), (30.9, 'face'),
+            (31.5, 'forward'), (32.4, 'child'), (34.0, 'hands'),
+            (34.5, 'child'), (35.8, 'face'), (36.6, 'forward'),
+            (38.0, 'cust2'), (38.8, 'face'), (39.4, 'hands'),
+            (40.6, 'forward'), (41.4, 'cust2'), (43.0, 'forward'),
+            (45.0, 'face'), (45.8, 'forward'), (47.0, 'item2'),
+            (51.0, 'face'), (52.4, 'basket'), (54.2, 'face'),
+            (55.0, 'forward'), (57.2, 'register'), (60.0, 'face')])
+
+    # --- 寸法・配置 -------------------------------------------------
+    def setup(self, human):
+        w = self.WALK_SPEED
+
+        def speed(t):
+            v = 1.0 - ramp(t, *self.BLOCK_STOP)
+            for start, stop in ((self.WALK_IN, self.STOP_IN),
+                                (self.WALK2, self.STOP_A),
+                                (self.WALK3, self.STOP_ARCH),
+                                (self.WALK4, self.STOP_C),
+                                (self.WALK5, self.STOP_R)):
+                v += ramp(t, start, start + 1.0) - ramp(t, *stop)
+            return w * v
+        self.track = SpeedTrack(0.0, 0.0, speed, self.duration)
+        x = lambda t: float(self.track(t)[0])  # noqa: E731
+        self.door_x = x(self.BLOCK_STOP[1]) + 1.7
+        self.x_in = x(self.STOP_IN[1])
+        # ロボットがカートを引き出し終える位置が人の右前になるようにカート
+        # 置き場を置く (台車の中心)。
+        self.corral = np.array([self.x_in + self.AHEAD + self.PULL_DIST,
+                                -1.45])
+        self.x_a = x(self.STOP_A[1])
+        self.item1 = np.array([self.x_a, self.SHELF_FRONT + 0.045,
+                               SHELF_BOARDS[2] + 0.12])
+        self.x_arch = x(self.CHILD_T)
+        self.x_c = x(self.STOP_C[1])
+        self.item2 = np.array([self.x_c + 0.32, self.SHELF_FRONT + 0.045,
+                               SHELF_BOARDS[1] + 0.06])
+        self.x_r = x(self.duration)
+        # 狭い通路はアーチの先から (アーチで広がったロボットとカートが
+        # 右の棚にかからないように)。
+        self.aisle = (self.x_arch + 1.7, self.x_c + 1.6)
+        # しゃがむ間の足 (止まって立つ姿勢の足首をそのまま床に置く)。
+        self.pz_stand, ankles = human.stance()
+        self.feet = {side: to_world([self.x_c, 0.0], self.CROUCH_YAW,
+                                    ankles[side] + [0.0, 0.0, self.pz_stand])
+                     for side in ('L', 'R')}
+        self.human_height = human.height
+        # 出てくる客 (カートを押す): 店の中から出口へ、出たら左 (+y) へ曲がる。
+        d = self.door_x
+        self.cust_track = KeyframeTrack([
+            (0.0, d + 3.6, 0.35), (2.5, d + 1.5, 0.35), (4.2, d + 0.15, 0.35),
+            (5.5, d - 0.22, 0.95), (6.8, d - 0.3, 1.9), (10.0, d - 0.3, 4.6)])
+
+    # --- 位置 -------------------------------------------------------
+    def _xy(self, t):
+        return float(self.track(t)[0]), self.LEAD_HUMAN_Y * self.shift(t)
+
+    def shift(self, t):
+        """狭い通路で人が右へ寄る割合。"""
+        l0, l1 = self.LEAD
+        b0, b1 = self.BACK
+        return ramp(t, l0 + 0.8, l1 + 0.4) - ramp(t, b0, b1 - 0.6)
+
+    def turn(self, t):
+        return 0.5 * np.pi * ramp(t, *self.TURN_A1) \
+            - np.pi * ramp(t, *self.TURN_A2) \
+            + 0.5 * np.pi * ramp(t, *self.TURN_A3) \
+            + self.CROUCH_YAW * ramp(t, *self.TURN_C1) \
+            - (self.CROUCH_YAW + 0.5) * ramp(t, *self.TURN_C2) \
+            + 0.5 * ramp(t, *self.TURN_C3)
+
+    def crouch(self, t):
+        return ramp(t, *self.CROUCH) - ramp(t, *self.RISE)
+
+    def human_pose(self, t):
+        x, y = self._xy(t)
+        x1, y1 = self._xy(t - 0.1)
+        x2, y2 = self._xy(t + 0.1)
+        heading = float(np.arctan2(y2 - y1, x2 - x1)) if x2 - x1 > 0.02 \
+            else 0.0
+        yaw = heading + self.turn(t)
+        c = 0.10 * self.crouch(t)  # しゃがむと骨盤は後ろへ
+        return np.array([x - c * np.cos(yaw), y - c * np.sin(yaw), yaw])
+
+    def still(self, t):
+        return self.TURN_C1[1] <= t <= self.TURN_C2[0]
+
+    def lead_weights(self, t):
+        l0, l1 = self.LEAD
+        b0, b1 = self.BACK
+        k = minjerk(ramp(t, l0, l1) - ramp(t, b0, b1))
+        # ひねりを先に始めてから前へ出る (戻るときは下がってから戻す)。
+        fx = ramp(t, l0 + 0.2 * (l1 - l0), l0 + 0.8 * (l1 - l0)) \
+            - ramp(t, b0 + 0.2 * (b1 - b0), b0 + 0.8 * (b1 - b0))
+        fy = ramp(t, l0 + 0.4 * (l1 - l0), l1) \
+            - ramp(t, b0, b0 + 0.6 * (b1 - b0))
+        return k, fx, fy
+
+    def block(self, t):
+        return ramp(t, *self.BLOCK) - ramp(t, *self.UNBLOCK)
+
+    def arch(self, t):
+        return ramp(t, *self.SPREAD) - ramp(t, *self.CLOSE)
+
+    def robot_pose(self, t):
+        hx, hy = self._xy(t)
+        _, fx, fy = self.lead_weights(t)
+        b = self.block(t)
+        back = ramp(t, *self.ROBOT_BACK) - ramp(t, *self.ROBOT_FWD)
+        back2 = ramp(t, *self.ROBOT_BACK2) - ramp(t, *self.ROBOT_FWD2)
+        off = np.array([self.AHEAD + 0.08 * b - 0.84 * back
+                        - self.BACK2_DIST * back2,
+                        -self.SIDE + 0.08 * b - self.ARCH_SPREAD * self.arch(t)
+                        - 0.05 * back])
+        off[0] = lerp(off[0], self.LEAD_OFFSET[0], fx)
+        off[1] = lerp(off[1], self.LEAD_OFFSET[1], fy)
+        p = np.array([hx, hy]) + off
+        # カート置き場へ行って引き出し、人の右へ戻る。
+        c = ramp(t, *self.TO_CORRAL) - ramp(t, *self.TO_SIDE)
+        corral = self.corral - [self.PULL_DIST * ramp(t, *self.PULL), 0.0]
+        p = lerp(p, corral, c)
+        return np.array([p[0], p[1], 0.0])
+
+    def cart_pose(self, t):
+        if t < self.PULL[0]:
+            return np.array([self.corral[0] + CART_AHEAD, self.corral[1], 0.0])
+        b = self.robot_pose(t)
+        return np.array([b[0] + CART_AHEAD, b[1], 0.0])
+
+    # --- 他の人 -----------------------------------------------------
+    def others(self):
+        return [dict(person='adult', window=(0.0, 10.0)),
+                dict(person='child', window=(self.CHILD_T - 3.0,
+                                             self.CHILD_T + 2.2)),
+                dict(person='adult', window=(self.MEET_T - 5.5,
+                                             self.MEET_T + 4.5))]
+
+    def other_state(self, k, t):
+        if k == 0:
+            p = self.cust_track(t)
+            q = self.cust_track(t + 0.1)
+            if np.linalg.norm(q - p) < 1e-4:
+                q = p + (self.cust_track(t) - self.cust_track(t - 0.1))
+            yaw = float(np.arctan2(q[1] - p[1], q[0] - p[0]))
+            return np.array([p[0], p[1], yaw])
+        if k == 1:
+            return np.array([self.x_arch - self.CHILD_SPEED
+                             * (t - self.CHILD_T),
+                             -0.5 * (self.SIDE + self.ARCH_SPREAD), np.pi])
+        meet_x = float(self.track(self.MEET_T)[0])
+        return np.array([meet_x - 1.0 * (t - self.MEET_T), self.OTHER_Y,
+                         np.pi])
+
+    def cust_cart(self, t):
+        x, y, yaw = self.other_state(0, t)
+        return np.array([x + 0.95 * np.cos(yaw), y + 0.95 * np.sin(yaw), yaw])
+
+    def other_arms(self, k, t, human, shoulders, yaw, swing, run):
+        if k != 0:
+            return None
+        fwd, left, up = body_axes(yaw)
+        cart = self.cust_cart(t)
+        arms = {}
+        for side, local in zip(('L', 'R'), CART_HANDLE_SIDES):
+            arms[side] = shm.ArmGoal(
+                wrist=cart_point(cart, local) - 0.06 * fwd, bend=fwd,
+                palm=-up, grip=0.8)
+        return arms
+
+    # --- 物 ---------------------------------------------------------
+    def door_offset(self, t):
+        return 1.0 * (ramp(t, 1.8, 2.8) - ramp(t, 12.0, 13.0))
+
+    def moving_props(self, t):
+        d = self.door_x
+        o = self.door_offset(t)
+        items = {'door_l': (d, 0.475 + o, 1.1), 'door_r': (d, -0.575 - o, 1.1)}
+        items.update(cart_moving('cart', self.cart_pose(t), lock=True))
+        cust = self.cust_cart(t) if t <= 10.0 else np.array([0, 0, 0.0])
+        ocart = cart_moving('ocart', cust)
+        if t > 10.0:
+            ocart = {k: v - [0, 0, 5.0, 0] for k, v in ocart.items()}
+        items.update(ocart)
+        cart = self.cart_pose(t)
+        slot = cart_point(cart, CART_LOCK + [0.0, 0.0, 0.01])
+        items['coin'] = np.append(slot if t >= self.COIN_REACH[0] - 0.3
+                                  else [0.0, 0.0, -1.0], 0.0)
+        if t < 0.5 * (self.GRAB_A + self.DROP_A):
+            items['item1'] = np.append(self.item1, 0.5 * np.pi)
+        else:
+            items['item1'] = np.append(cart_point(cart, CART_DROP),
+                                       -0.5 * np.pi)
+        if t < 0.5 * (self.GRAB_C + self.DROP_C):
+            items['item2'] = np.append(self.item2, 0.5 * np.pi)
+        else:
+            items['item2'] = np.append(cart_point(cart, CART_DROP2), 0.0)
+        return items
+
+    def props(self, timeline):
+        d = self.door_x
+        x_end = self.x_r + 3.0
+        items = [
+            dict(name='sidewalk', color=(204, 194, 176),
+                 dimensions=(d + 4.0, 7.0, 0.012),
+                 position=(0.5 * (d - 4.0), -0.5, 0.003)),
+            dict(name='floor', color=(232, 228, 220),
+                 dimensions=(x_end - d, 3.8, 0.012),
+                 position=(0.5 * (d + x_end), -0.5, 0.003)),
+        ]
+        glass = (185, 212, 228)
+        # 店の正面のガラス (入口の両脇だけ。外から中が見えるよう短く)。
+        for name, y0, y1 in (('wall_l', 1.0, 2.2), ('wall_r', -2.3, -1.1)):
+            items.append(dict(name=name, color=glass,
+                              dimensions=(0.04, y1 - y0, 2.3),
+                              position=(d, 0.5 * (y0 + y1), 1.15)))
+        items.append(dict(name='door_head', color=(120, 124, 130),
+                          dimensions=(0.12, 2.1, 0.2),
+                          position=(d, -0.05, 2.3)))
+        o = self.door_offset(0.0)
+        items += [dict(name='door_l', color=(165, 200, 222),
+                       dimensions=(0.03, 1.05, 2.2),
+                       position=(d, 0.475 + o, 1.1)),
+                  dict(name='door_r', color=(165, 200, 222),
+                       dimensions=(0.03, 1.05, 2.2),
+                       position=(d, -0.575 - o, 1.1))]
+        # カート置き場 (ロボットが引き出す 1 台と、奥に入れ子で並ぶ 3 台)。
+        cx, cy = self.corral
+        for j in range(1, 4):
+            items += cart_props('park{}'.format(j),
+                                [cx + CART_AHEAD + 0.32 * j, cy, 0.0],
+                                (60, 110, 200), lock=True)
+        items.append(dict(name='corral_rail', color=(95, 100, 108),
+                          dimensions=(2.6, 0.04, 0.8),
+                          position=(cx + CART_AHEAD + 0.9, cy - 0.32, 0.4)))
+        items += cart_props('cart', self.cart_pose(0.0), (60, 110, 200),
+                            lock=True)
+        items += cart_props('ocart', self.cust_cart(0.0), (200, 70, 60))
+        items.append(dict(name='coin', color=(235, 200, 70),
+                          dimensions=(0.025, 0.004, 0.025),
+                          position=(0.0, 0.0, -1.0)))
+        items.append(dict(name='item1', color=(225, 120, 50),
+                          dimensions=(0.07, 0.18, 0.24),
+                          position=tuple(self.item1),
+                          wxyz=(np.cos(0.25 * np.pi), 0, 0,
+                                np.sin(0.25 * np.pi))))
+        items.append(dict(name='item2', color=(70, 150, 200),
+                          dimensions=(0.08, 0.08, 0.12),
+                          position=tuple(self.item2)))
+        # 棚: 左は入口の先から奥まで、右は狭い通路だけ。
+        items += shelf_props('shelf_l', d + 1.2, x_end - 1.0,
+                             self.SHELF_FRONT, 0.4,
+                             gaps=[(self.item1[0], 2), (self.item2[0], 1)],
+                             seed=1)
+        a0, a1 = self.aisle
+        # 右は見通せるよう低い棚 (腰の高さ)。
+        items += shelf_props('shelf_r', a0, a1, self.AISLE_RIGHT, -0.4, seed=2,
+                             height=1.0)
+        # レジ。
+        xr = self.x_r
+        items += [dict(name='counter', color=(150, 120, 95),
+                       dimensions=(1.6, 0.6, 0.9),
+                       position=(xr + 0.7, -1.35, 0.45)),
+                  dict(name='register', color=(70, 72, 78),
+                       dimensions=(0.35, 0.3, 0.25),
+                       position=(xr + 1.2, -1.45, 1.025))]
+        return items
+
+    # --- 台本 -------------------------------------------------------
+    def _gaze(self, name, t, head):
+        if name in ('cust', 'child', 'cust2'):
+            k = ('cust', 'child', 'cust2').index(name)
+            p = self.other_state(k, t)
+            return np.array([p[0], p[1], 1.45 if k != 1 else 0.95])
+        if name == 'lock':
+            return cart_point(self.cart_pose(t), CART_LOCK)
+        if name == 'cart':
+            return cart_point(self.cart_pose(t), [0.0, 0.0, 0.8])
+        if name == 'basket':
+            return cart_point(self.cart_pose(t), CART_DROP)
+        if name == 'item1':
+            return self.item1
+        if name == 'item2':
+            return self.item2
+        if name == 'register':
+            return np.array([self.x_r + 1.2, -1.45, 1.0])
+        return name
+
+    def _held(self, t, spans):
+        """手を繋いでいる割合 (``spans`` は繋ぐ・離す区間の並び)。"""
+        v = 1.0
+        for k, span in enumerate(spans):
+            v += (1.0 if k % 2 else -1.0) * ramp(t, *span)
+        return v
+
+    def script(self, t, ctx):
+        human, shoulders, yaw, run = ctx.human, ctx.shoulders, ctx.yaw, ctx.run
+        fwd, left, up = body_axes(yaw)
+        swing = np.sin(ctx.phase) * ctx.walk
+        X = np.array([1.0, 0.0, 0.0])
+        Y = np.array([0.0, 1.0, 0.0])
+        Z = up
+        k, _, _ = self.lead_weights(t)
+        b = self.block(t)
+        a = self.arch(t)
+        cw = self.crouch(t)
+        hx, hy, _ = self.human_pose(t)
+        cart = self.cart_pose(t)
+
+        # --- 人の右手 (繋ぐ手) ---
+        side = human_hold_goal(human, shoulders, yaw, 0.5 * swing, run, 1.0)
+        side = dataclasses.replace(side, wrist=side.wrist - 0.10 * b * X)
+        arch = shm.ArmGoal(wrist=shoulders['R'] + 0.06 * fwd - 0.28 * left
+                           - 0.03 * Z, bend=Z, palm=fwd, grip=1.0)
+        ahead = shm.ArmGoal(wrist=shoulders['R'] + 0.38 * fwd + 0.08 * left
+                            - 0.25 * Z, bend=Z + 0.4 * left, palm=-Z,
+                            grip=0.8)
+        support = shm.ArmGoal(wrist=shoulders['R'] + 0.12 * X - 0.12 * Y
+                              - 0.40 * Z, bend=X, palm=-Z, grip=0.8)
+        hold = blend_goal(side, arch, a)
+        hold = blend_goal(hold, ahead, k)
+        hold = blend_goal(hold, support, cw)
+        held = self._held(t, (self.LET_GO1, self.TAKE2, self.LET_GO2,
+                              self.TAKE3, self.LET_GO_E))
+        grip_h = 0.8 * self._held(t, (self.HUMAN_OPEN1, self.HUMAN_GRIP2,
+                                      self.HUMAN_OPEN2, self.HUMAN_GRIP3,
+                                      self.HUMAN_OPEN_E))
+
+        # 両手で商品を取ってかごへ入れる (人は棚の方・カートの方を向く)。
+        def both(center, grip, toward=None):
+            """両手の掌で ``center`` を左右から挟む目標。"""
+            f = fwd if toward is None else toward
+            lft = np.cross(Z, f)
+            goals = {}
+            for s, sign in (('L', 1.0), ('R', -1.0)):
+                goals[s] = shm.ArmGoal(
+                    wrist=center + sign * 0.10 * lft - 0.07 * f,
+                    bend=Z + 0.3 * f, palm=-sign * lft, grip=grip)
+            return goals
+        chest = np.array([hx, hy, 0.0]) + 0.30 * fwd + [0.0, 0.0, 1.05]
+        drop = cart_point(cart, CART_DROP + [0.0, 0.0, 0.26])
+        task = {s: human_swing_goal(human, shoulders, s, yaw,
+                                    swing if s == 'R' else -swing, run)
+                for s in ('L', 'R')}
+        rest = dict(task)
+        g_grip = 0.7 * (ramp(t, self.GRAB_A - 0.2, self.GRAB_A + 0.1)
+                        - ramp(t, self.DROP_A - 0.1, self.DROP_A + 0.2))
+        for center, w, toward in (
+                (self.item1, ramp(t, *self.REACH_A), Y),
+                (chest, ramp(t, *self.LIFT_A), None),
+                (drop, ramp(t, *self.PUT_A), None)):
+            if w > 0.0:
+                goals = both(center, g_grip, toward)
+                task = {s: blend_goal(task[s], goals[s], w) for s in task}
+        task = {s: blend_goal(task[s], rest[s], ramp(t, *self.HANDS_BACK))
+                for s in task}
+        for s in task:
+            task[s] = dataclasses.replace(task[s], grip=g_grip)
+        right = blend_goal(task['R'], hold, held)
+        right = dataclasses.replace(right, grip=max(grip_h, g_grip))
+
+        # 左手: 腕振り、両手で取る、しゃがんで低い棚の商品を取って持つ。
+        left_goal = task['L']
+        pick = shm.ArmGoal(wrist=self.item2 - 0.07 * unit_xy(
+            self.item2 - shoulders['L']) + [0.0, 0.0, 0.02],
+            bend=Z, palm=None, grip=0.0)
+        c_grip = 0.7 * ramp(t, self.GRAB_C - 0.2, self.GRAB_C + 0.1) \
+            * (1.0 - ramp(t, self.DROP_C - 0.2, self.DROP_C + 0.1))
+        left_goal = blend_goal(left_goal, pick, ramp(t, *self.PICK)
+                               * (1.0 - ramp(t, self.RISE[0],
+                                             self.RISE[0] + 1.0)))
+        # 立ち上がったら右へ向いて、片手でかごへ入れる。
+        drop2 = cart_point(cart, CART_DROP2 + [0.0, 0.0, 0.30])
+        put = shm.ArmGoal(wrist=drop2 - 0.07 * unit_xy(
+            drop2 - shoulders['L']) + [0.0, 0.0, 0.03],
+            bend=Z, palm=-Z, grip=0.0)
+        left_goal = blend_goal(left_goal, put, ramp(t, *self.PUT_C)
+                               * (1.0 - ramp(t, *self.HAND_BACK_C)))
+        left_goal = dataclasses.replace(left_goal,
+                                        grip=max(c_grip, left_goal.grip))
+
+        # --- ロボット ---
+        robot_palm = lerp(-X, PALM_UP, max(k, cw))
+        robot_palm = robot_palm / np.linalg.norm(robot_palm)
+        reach = self._held(t, (self.LET_GO1, self.REACH2, self.LET_GO2,
+                               self.REACH3, self.LET_GO_E))
+        offer = ramp(t, *self.OFFER2) - ramp(t, *self.LET_GO2) \
+            + ramp(t, *self.OFFER3) - ramp(t, *self.LET_GO_E)
+        grip = self._held(t, (self.ROBOT_OPEN1, self.ROBOT_GRIP2,
+                              self.ROBOT_OPEN2, self.ROBOT_GRIP3,
+                              self.ROBOT_OPEN_E))
+        offer_point = side.wrist + 0.10 * X - 0.03 * Z
+        # 右手: 前をふさぐ → コインを入れる → カートの取っ手を握る。
+        if t < 10.0:
+            free_target = np.array([hx + 0.30, hy - 0.02, 1.0])
+            free_reach = b
+            free_grip = 0.0
+        else:
+            slot = cart_point(cart, CART_LOCK)
+            target = lerp(slot + [-0.07, 0.0, 0.05], slot,
+                          ramp(t, *self.COIN_IN))
+            free_target = lerp(target, cart_point(cart, CART_GRIP),
+                               ramp(t, *self.GRAB_HANDLE))
+            free_reach = ramp(t, *self.COIN_REACH)
+            free_grip = 0.55 * ramp(t, self.COIN_REACH[0] - 0.4,
+                                    self.COIN_REACH[0]) \
+                * (1.0 - ramp(t, self.COIN_IN[1] - 0.2, self.COIN_IN[1])) \
+                + ramp(t, self.GRAB_HANDLE[0] + 0.2, self.GRAB_HANDLE[1] + 0.1)
+        carry = {}
+        if self.COIN_REACH[0] - 0.3 <= t < self.COIN_IN[1]:
+            carry['coin'] = ('robot_r', (0.0, 0.0, 0.0))
+        # つかむ・置くときは物を手へ (手から) 少しずつ寄せる。
+        w1 = ramp(t, self.GRAB_A - 0.25, self.GRAB_A + 0.1) \
+            * (1.0 - ramp(t, self.DROP_A - 0.1, self.DROP_A + 0.25))
+        if w1 > 0.0:
+            carry['item1'] = ('hands', (0.0, 0.0, 0.0), w1)
+        w2 = ramp(t, self.GRAB_C - 0.25, self.GRAB_C + 0.1) \
+            * (1.0 - ramp(t, self.DROP_C - 0.1, self.DROP_C + 0.25))
+        if w2 > 0.0:
+            carry['item2'] = ('hand_L', (0.0, 0.0, 0.0), w2)
+
+        head = None
+        plan = dict(
+            arms={'R': right, 'L': left_goal},
+            human_gaze=self._gaze(self.human_gaze(t), t, head),
+            lean=0.12 * (ramp(t, *self.REACH_A) - ramp(t, *self.LIFT_A))
+            + 0.52 * cw,
+            waist_y=0.7 * b + self.TWIST * k,
+            waist_p=0.1 * b + 0.15 * cw,
+            lifter=0.3 - 0.3 * a + 0.6 * cw,
+            offer=offer, offer_point=offer_point,
+            reach=reach, hold_palm=robot_palm, grip=grip,
+            free_target=free_target, free_reach=free_reach,
+            free_grip=free_grip, carry=carry,
+            robot_gaze=self._gaze(self.robot_gaze(t), t, head))
+        plan['smooth_wrist'] = True
+        if 0.0 < offer and reach < 1.0:
+            plan['hold_elbow_max'] = -0.35 * ramp(offer, 0.0, 0.5)
+        if b > 0.0:  # 手を後ろへ引くときも肘を曲げた解のまま
+            plan['hold_elbow_max'] = -0.8 * ramp(b, 0.0, 0.3)
+        if self.still(t):
+            plan['feet'] = self.feet
+            plan['pelvis_z'] = self.pz_stand - self.CROUCH_DEPTH * cw
+        return plan
+
+
 SCENES = [SceneA, SceneA2, SceneB, SceneC, SceneD, SceneE, SceneF, SceneG,
-          SceneH, SceneI, SceneJ]
+          SceneH, SceneI, SceneJ, SceneK]
 
 
 def unit_xy(v):
@@ -2242,7 +2947,7 @@ def robot_palm_normal(robot, arm):
     return -y if arm == 'l' else y
 
 
-def best_wrist_y(robot, arm, desired):
+def best_wrist_y(robot, arm, desired, prev=None):
     """掌の法線を ``desired`` (ワールド) へいちばん近づける手首のひねり
     (wrist_y) の角度。手首のひねりは前腕の軸まわりの回転なので、法線は
     c + a cos(q) + b sin(q) と書け、3 点で係数を決めて最大を解析的に求める。"""
@@ -2258,21 +2963,28 @@ def best_wrist_y(robot, arm, desired):
     b = (n1 - n2) / (2.0 * np.sin(q))
     a = (n0 - 0.5 * (n1 + n2)) / (1.0 - np.cos(q))
     d = np.asarray(desired, dtype=np.float64)
+    def score_of(q):
+        return float(np.dot(d, a * np.cos(q) + b * np.sin(q) + (n0 - a)))
     best = float(np.arctan2(np.dot(d, b), np.dot(d, a)))
-    best = float(np.clip(best, joint.min_angle, joint.max_angle))
-    score = float(np.dot(d, a * np.cos(best) + b * np.sin(best)
-                         + (n0 - a)))
-    return best, score
+    if not joint.min_angle <= best <= joint.max_angle:
+        # 最適が可動域の外 (真裏に近い) ときは両端の向きがほぼ同じになり、
+        # フレームごとに端から端へ飛ぶので、前の角度に近い端を選ぶ。
+        ends = (joint.min_angle, joint.max_angle)
+        weight = 0.0 if prev is None else 0.3
+        best = max(ends, key=lambda q: score_of(q) - weight * abs(
+            q - (prev if prev is not None else 0.0)))
+    return best, score_of(best)
 
 
 def solve_hold_ik_palm(robot, target_pos, desired, warm_start,
-                       prev_shoulder_y, turn=1.0):
+                       prev_shoulder_y, turn=1.0, prev_wrist_y=None):
     """手先の位置を合わせつつ、掌をできるだけ ``desired`` (ワールド) へ向ける。
     上腕のひねり (shoulder_y) をいくつか試し、それぞれで位置の IK と手首の
     ひねり (wrist_y) を交互に解いて、位置の誤差・掌の向きのずれ・前フレーム
     からの飛びの小さい解を採る (Aero の手首は掌を真上まで回しきれないので、
     残ったずれは人が手首を曲げて合わせる)。(位置誤差, shoulder_y, wrist_y)
-    を返す。"""
+    を返す。``prev_wrist_y`` を与えると手首のひねりを前のフレームから少しずつ
+    変える (K のように掌の向きの目標が可動域の端をまたぐシーン用)。"""
     arm = ROBOT_HOLD_ARM
     shoulder = getattr(robot, '{}_shoulder_y_joint'.format(arm))
     wrist = getattr(robot, '{}_wrist_y_joint'.format(arm))
@@ -2287,7 +2999,10 @@ def solve_hold_ik_palm(robot, target_pos, desired, warm_start,
         w = wrist.joint_angle()
         err = solve_hold_ik(robot, target_pos, warm_start)
         for _ in range(2):
-            w, _ = best_wrist_y(robot, arm, desired)
+            w, _ = best_wrist_y(robot, arm, desired, prev_wrist_y)
+            if prev_wrist_y is not None:  # 手首のひねりは 1 フレームで大きく変えない
+                w = prev_wrist_y + float(np.clip(w - prev_wrist_y,
+                                                 -WRIST_Y_STEP, WRIST_Y_STEP))
             wrist.joint_angle(w * turn)
             err = solve_hold_ik(robot, target_pos,
                                 [link.joint.joint_angle() for link in links])
@@ -2306,6 +3021,9 @@ def solve_hold_ik_palm(robot, target_pos, desired, warm_start,
         link.joint.joint_angle(angle)
     return err, q, w
 
+
+# 手首のひねり (wrist_y) を 1 フレームで変える上限 [rad] (4.5 rad/s)。
+WRIST_Y_STEP = 0.15
 
 # つなぐ腕の位置を合わせる関節 (肩 2 軸 + 肘)。上腕のひねり (shoulder_y) と
 # 手首は台本で決める。Aero の手首はピッチがほぼ動かず、掌の向きまで IK で
@@ -2329,12 +3047,11 @@ def hold_ik_links(robot, arm=ROBOT_HOLD_ARM):
             for name in HOLD_IK_JOINTS]
 
 
-def solve_hold_ik(robot, target_pos, warm_start):
-    """つなぐ腕の位置の IK。前フレームの解と自然な初期姿勢 (肘を少し曲げて
+def solve_hold_ik(robot, target_pos, warm_start, arm=ROBOT_HOLD_ARM):
+    """腕 ``arm`` の位置の IK。前フレームの解と自然な初期姿勢 (肘を少し曲げて
     下ろした腕) から解き、誤差が残れば初期姿勢を増やす。誤差・曲げ量・前
     フレームからの飛びの小さい解を採る (可動域の端に張りついた局所解を避ける)。
     位置誤差 [m] を返す。"""
-    arm = ROBOT_HOLD_ARM
     links = hold_ik_links(robot, arm)
     end = getattr(robot, '{}arm_end_coords'.format(arm))
     target = Coordinates(pos=target_pos)
@@ -2412,12 +3129,18 @@ def cache_path(scene_key, model_path, person='adult'):
 class Timeline(object):
     """シーンを ``FPS`` で刻んで、人の頂点とロボットの関節角を前もって求める。"""
 
-    def __init__(self, scene, human, robot, other=None):
+    def __init__(self, scene, human, robot, others=()):
         self.scene = scene
         self.times = np.arange(0.0, scene.duration + 1e-9, DT)
         self.vertices = []
-        self.other_vertices = []  # すれ違う歩行者 (いるシーンだけ)
-        self._other = other
+        # 他の人 (いるシーンだけ): 人ごとに、現れている間のフレームの頂点と
+        # 最初のフレームの番号。
+        self._others = list(others)
+        self.other_vertices = [[] for _ in self._others]
+        self.other_starts = [None for _ in self._others]
+        self._walker_state = {}
+        # 動く物の時刻ごとの (x, y, z, 向き)。
+        self.prop_tracks = {}
         self.robot_angles = []
         self.robot_bases = []
         self.centers = []
@@ -2438,6 +3161,11 @@ class Timeline(object):
         hold_wrist_y = getattr(robot, '{}_wrist_y_joint'.format(ROBOT_HOLD_ARM))
         hold_shoulder_y = getattr(
             robot, '{}_shoulder_y_joint'.format(ROBOT_HOLD_ARM))
+        free_end = getattr(robot, '{}arm_end_coords'.format(ROBOT_FREE_ARM))
+        free_links = hold_ik_links(robot, ROBOT_FREE_ARM)
+        free_wrist_y = getattr(robot, '{}_wrist_y_joint'.format(ROBOT_FREE_ARM))
+        free_elbow = getattr(robot, '{}_elbow_joint'.format(ROBOT_FREE_ARM))
+        free_seed = None
         human_gaze = CriticalDamper(HUMAN_GAZE_FREQ)
         robot_gaze = CriticalDamper(ROBOT_GAZE_FREQ)
         phase = 0.0
@@ -2558,17 +3286,51 @@ class Timeline(object):
                     minjerk(min(1.0, reach / 0.8)))
                 if ik_seed is None:
                     ik_seed = [link.joint.joint_angle() for link in hold_links]
+                # 台本が肘を曲げておくよう指示したとき (手を差し出す途中で、
+                # 伸ばしきった解から曲げた解へ飛ばないように)。
+                hold_elbow = hold_links[2].joint
+                elbow_max = hold_elbow.max_angle
+                if 'hold_elbow_max' in plan:
+                    hold_elbow.max_angle = min(elbow_max,
+                                               plan['hold_elbow_max'])
+                    ik_seed = list(ik_seed)
+                    ik_seed[2] = min(ik_seed[2], hold_elbow.max_angle)
                 err = solve_hold_ik(robot, target_pos, ik_seed)
                 if hold_palm is not None:
                     err, prev_shoulder_y, prev_wrist_y = solve_hold_ik_palm(
                         robot, target_pos, hold_palm,
                         [link.joint.joint_angle() for link in hold_links],
-                        prev_shoulder_y, turn)
+                        prev_shoulder_y, turn,
+                        prev_wrist_y if plan.get('smooth_wrist') else None)
+                hold_elbow.max_angle = elbow_max
                 ik_seed = [link.joint.joint_angle() for link in hold_links]
             else:
                 ik_seed = None
+            # 空いた腕 (右): 台本の ``free_target`` (前をふさぐ、カートの取っ手
+            # など) へ、腕振りの姿勢から ``free_reach`` の割合で手先を寄せる。
+            free_reach = plan.get('free_reach', 0.0)
+            if free_reach > 0.0:
+                free_wrist_y.joint_angle(
+                    plan.get('free_wrist_y', 0.0) * ramp(free_reach, 0.0, 0.7))
+                # 肘を伸ばしきった解に張りつくと、体の近くへ手を寄せる途中で
+                # 曲げた解へ飛ぶので、手を伸ばす間は肘を少し曲げたままにする。
+                elbow_max = free_elbow.max_angle
+                free_elbow.max_angle = min(elbow_max, -0.8 * ramp(
+                    free_reach, 0.0, 0.3))
+                target_pos = lerp(free_end.worldpos().copy(),
+                                  plan['free_target'], minjerk(free_reach))
+                if free_seed is None:
+                    free_seed = [link.joint.joint_angle()
+                                 for link in free_links]
+                free_seed = list(free_seed)
+                free_seed[2] = min(free_seed[2], free_elbow.max_angle)
+                solve_hold_ik(robot, target_pos, free_seed, ROBOT_FREE_ARM)
+                free_elbow.max_angle = elbow_max
+                free_seed = [link.joint.joint_angle() for link in free_links]
+            else:
+                free_seed = None
             set_fingers(robot, ROBOT_HOLD_ARM, plan['grip'])
-            set_fingers(robot, ROBOT_FREE_ARM, 0.0)
+            set_fingers(robot, ROBOT_FREE_ARM, plan.get('free_grip', 0.0))
 
             # 人: 触れる直前から、掌をロボットの掌に合わせる (手首を返し、
             # 掌の中心をロボットの掌の上へ寄せる)。
@@ -2610,8 +3372,28 @@ class Timeline(object):
             robot_head = robot.head_link.worldpos().copy()
 
             self.vertices.append(frame.vertices)
-            if self._other is not None:
-                self.other_vertices.append(self._walker(t))
+            for k, info in enumerate(scene.others()):
+                t0, t1 = info['window']
+                if t0 - 1e-9 <= t <= t1 + 1e-9:
+                    if self.other_starts[k] is None:
+                        self.other_starts[k] = i
+                    self.other_vertices[k].append(self._walker(k, t))
+            # 動く物: 台本の位置、手に持った物は手の位置。
+            props = {name: np.append(np.asarray(p, dtype=np.float64),
+                                     [0.0] * (4 - len(p)))
+                     for name, p in scene.moving_props(t).items()}
+            hands = {'hand_L': frame.palm('L')[0], 'hand_R': frame.palm('R')[0],
+                     'robot_r': free_end.worldpos()}
+            hands['hands'] = 0.5 * (hands['hand_L'] + hands['hand_R'])
+            # ``carry`` は {名前: (手, ずらし量[, 割合])}。割合が 1 未満なら台本の
+            # 位置と手の間 (つかむ・置く途中)。
+            for name, held in plan.get('carry', {}).items():
+                p = np.asarray(hands[held[0]]) + np.asarray(held[1])
+                yaw = base[2] if held[0].startswith('robot') else hyaw
+                w = held[2] if len(held) > 2 else 1.0
+                props[name] = lerp(props[name], np.append(p, yaw), w)
+            for name, p in props.items():
+                self.prop_tracks.setdefault(name, []).append(p)
             self.robot_angles.append(
                 np.array([j.joint_angle() for j in joints]))
             self.robot_bases.append(base)
@@ -2622,28 +3404,44 @@ class Timeline(object):
                 progress((i + 1) / len(self.times))
         return self
 
-    def _walker(self, t):
-        """すれ違う歩行者 (腕を振って歩くだけ) の頂点。"""
-        other = self._other
-        ox, oy, oyaw = self.scene.other_pose(t)
+    def _walker(self, k, t):
+        """他の人 ``k`` (歩くか走るだけ、腕は台本か腕振り) の頂点。"""
+        other = self._others[k]
+        ox, oy, oyaw = self.scene.other_state(k, t)
         xy = np.array([ox, oy])
-        prev = getattr(self, '_walker_state', None)
+        prev = self._walker_state.get(k)
         speed, phase = 0.0, 0.0
         if prev is not None:
             speed = float(np.linalg.norm(xy - prev[0])) / DT
             phase = prev[1] + 2.0 * np.pi * speed * DT \
                 / other.stride_length(speed)
-        self._walker_state = (xy, phase)
+        self._walker_state[k] = (xy, phase)
         walk, run = shm.gait_weights(speed)
         spec = shm.HumanSpec(xy=xy, yaw=oyaw, speed=speed, gait_phase=phase)
         shoulders = other.shoulder_position(spec)
         swing = np.sin(phase) * walk
-        spec.arms = {
+        arms = self.scene.other_arms(k, t, other, shoulders, oyaw, swing, run)
+        spec.arms = arms if arms is not None else {
             'R': human_swing_goal(other, shoulders, 'R', oyaw, swing, run),
             'L': human_swing_goal(other, shoulders, 'L', oyaw, -swing, run)}
         fwd, _, _ = body_axes(oyaw)
-        spec.gaze = np.array([ox, oy, 1.0]) + 4.0 * fwd
-        return other.solve(spec).vertices
+        spec.gaze = np.array([ox, oy, 0.9 * other.height]) + 4.0 * fwd
+        return np.asarray(other.solve(spec).vertices, dtype=np.float32)
+
+    def other_frame(self, k, i):
+        """他の人 ``k`` のフレーム ``i`` の頂点 (いなければ None)。"""
+        start = self.other_starts[k]
+        if start is None or not start <= i < start + len(
+                self.other_vertices[k]):
+            return None
+        return self.other_vertices[k][i - start]
+
+    def prop_pose(self, name, i):
+        """動く物のフレーム ``i`` の (x, y, z, 向き) (記録がなければ None)。"""
+        track = self.prop_tracks.get(name)
+        if track is None or not len(track):
+            return None
+        return np.asarray(track[min(i, len(track) - 1)])
 
     @staticmethod
     def _gaze_point(name, who, ctx, other_head, meet, own_head, yaw):
@@ -2672,8 +3470,14 @@ class Timeline(object):
         tmp = path + '.tmp.npz'
         fields = {name: np.asarray(getattr(self, name))
                   for name in CACHE_FIELDS}
-        if len(self.other_vertices):
-            fields['other_vertices'] = np.asarray(self.other_vertices)
+        for k, (verts, start) in enumerate(zip(self.other_vertices,
+                                               self.other_starts)):
+            if start is not None:
+                fields['other_vertices_{}'.format(k)] = np.asarray(
+                    verts, dtype=np.float32)
+                fields['other_start_{}'.format(k)] = np.array(start)
+        for name, track in self.prop_tracks.items():
+            fields['prop__' + name] = np.asarray(track)
         np.savez(tmp, **fields)
         os.replace(tmp, path)
 
@@ -2683,8 +3487,14 @@ class Timeline(object):
         with np.load(path) as data:
             for name in CACHE_FIELDS:
                 setattr(tl, name, data[name])
-            if 'other_vertices' in data:
-                tl.other_vertices = data['other_vertices']
+            k = 0
+            while 'other_vertices_{}'.format(k) in data:
+                tl.other_vertices.append(data['other_vertices_{}'.format(k)])
+                tl.other_starts.append(int(data['other_start_{}'.format(k)]))
+                k += 1
+            for name in data.files:
+                if name.startswith('prop__'):
+                    tl.prop_tracks[name[len('prop__'):]] = data[name]
         return tl
 
     def phase_at(self, t):
@@ -2842,7 +3652,7 @@ def add_track(scene, lane_center):
 
 
 # すれ違う歩行者の色 (主役の人と区別できる落ち着いた緑)。
-OTHER_COLOR = (120, 160, 130)
+OTHER_COLORS = [(120, 160, 130), (200, 175, 95), (150, 140, 120)]
 
 # 動画の保存先。
 VIDEO_DIR = os.path.expanduser('~/aero_demo_videos')
@@ -2883,7 +3693,7 @@ class DemoViewer(object):
         remove_robot_gui(self.viewer)
         self.mesh = None
         self.mesh_person = None
-        self.other_mesh = None  # すれ違う歩行者
+        self.other_meshes = []  # 他の人 (すれ違う歩行者など)
         self.props = {}  # scene key -> 物を置いた frame
         self.prop_handles = {}  # scene key -> {物の名前: handle}
 
@@ -2982,11 +3792,10 @@ class DemoViewer(object):
             return self.wanted != key and self.wanted not in self.timelines
 
         started = time.time()
-        other = None if scene.other_person is None \
-            else self._human(scene.other_person)
+        others = [self._human(info['person']) for info in scene.others()]
         timeline = Timeline(scene, self._human(scene.person),
-                            self.build_robot, other).build(progress,
-                                                           should_stop)
+                            self.build_robot, others).build(progress,
+                                                            should_stop)
         if timeline is None:
             return None
         print('[demo] {} を計算しました ({:.1f} 秒、最大の手先誤差 {:.3f} m)'
@@ -3015,7 +3824,7 @@ class DemoViewer(object):
         with self.build_cv:
             self.wanted = key
             if key not in self.timelines:
-                self.status.content = '**{} を計算中...** (1 シーン 20 秒〜13 分ほど。' \
+                self.status.content = '**{} を計算中...** (1 シーン 20 秒〜20 分ほど。' \
                     '次からは保存した結果を読む)'.format(key)
             while key not in self.timelines:
                 self.build_cv.wait()
@@ -3113,19 +3922,25 @@ class DemoViewer(object):
                     color=PERSONS[tl.scene.person]['color'])
             else:
                 self.mesh.vertices = vertices
-            if len(tl.other_vertices):
-                other = np.asarray(tl.other_vertices[i],
-                                   dtype=np.float32).copy()
+            for k in range(max(len(tl.other_vertices),
+                               len(self.other_meshes))):
+                other = tl.other_frame(k, i) \
+                    if k < len(tl.other_vertices) else None
+                if other is None:
+                    if k < len(self.other_meshes):
+                        self.other_meshes[k].visible = False
+                    continue
+                other = np.asarray(other, dtype=np.float32).copy()
                 other[:, :2] -= offset.astype(np.float32)
-                if self.other_mesh is None:
-                    self.other_mesh = self.server.scene.add_mesh_simple(
-                        '/other', vertices=other, faces=self.faces,
-                        color=OTHER_COLOR)
+                if k >= len(self.other_meshes):
+                    self.other_meshes.append(
+                        self.server.scene.add_mesh_simple(
+                            '/other_{}'.format(k), vertices=other,
+                            faces=self.faces,
+                            color=OTHER_COLORS[k % len(OTHER_COLORS)]))
                 else:
-                    self.other_mesh.vertices = other
-                    self.other_mesh.visible = True
-            elif self.other_mesh is not None:
-                self.other_mesh.visible = False
+                    self.other_meshes[k].vertices = other
+                    self.other_meshes[k].visible = True
             # 地面の格子は 5 m 周期なので、ずらし量の余りだけ動かす。
             # トラックは有限なのでそのままずらす。
             self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
@@ -3135,9 +3950,15 @@ class DemoViewer(object):
             if props is not None:
                 props.position = (-offset[0], -offset[1], 0.0)
                 handles = self.prop_handles.get(tl.scene.key, {})
-                for name, pos in tl.scene.moving_props(tl.times[i]).items():
+                moving = dict(tl.scene.moving_props(tl.times[i]))
+                for name in tl.prop_tracks:
+                    moving[name] = tl.prop_pose(name, i)
+                for name, pose in moving.items():
                     if name in handles:
-                        handles[name].position = tuple(pos)
+                        handles[name].position = tuple(pose[:3])
+                        if len(pose) > 3:
+                            handles[name].wxyz = (np.cos(0.5 * pose[3]), 0.0,
+                                                  0.0, np.sin(0.5 * pose[3]))
             # 2 人の胸 (前の方) がゴールを越えたらテープを切る。
             front = max(tl.robot_bases[i][0],
                         float(np.max(tl.vertices[i][:, 0])))
