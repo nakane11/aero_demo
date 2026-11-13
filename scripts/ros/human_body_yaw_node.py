@@ -3,8 +3,9 @@
 
 """頭のカメラの画像から人の体の向き (ヨー角) を求めて publish するノード.
 
-MediaPipe (aero_demo.people_pose_estimator) で骨格を求め、腰・肩・顔の
-関節から体の正面の向きを出す (aero_demo.body_yaw)。手つなぎ歩行で台車を
+MediaPipe (aero_demo.people_pose_estimator) で骨格を求め、両肩の線から
+体の正面の向きを出す (aero_demo.body_yaw。~weight_hip・~weight_face を
+正にすると腰・顔も混ぜる)。手つなぎ歩行で台車を
 人と同じ向きへ回す制御 (aero-hand-open の aero_hand_magnetic_cmd_vel_node)
 が使う。
 
@@ -15,7 +16,7 @@ TF で ``~odom_frame`` 座標系に直して出す (odom が引けなければ b
 Publish
 -------
 ~body_pose (geometry_msgs/PoseStamped)
-    位置は腰の中点 (無ければ肩の中点)、向きは体の正面のヨー角。
+    位置は肩の中点 (腰を使うときは腰の中点)、向きは体の正面のヨー角。
     信頼度が ``~min_confidence`` 以上のときだけ出す。stamp は画像の時刻。
 ~debug (std_msgs/String)
     部位ごとの向き [deg, base_link]・使った部位・信頼度の JSON。
@@ -65,10 +66,12 @@ class HumanBodyYawNode(object):
         self.min_confidence = rospy.get_param('~min_confidence', 0.2)
         self.face_max_deviation = math.radians(
             rospy.get_param('~face_max_deviation', 45.0))
+        # 既定は肩だけ (横に並ぶと腰が画角の外になるため)。
+        # 0 にした部位は使わない。
         self.weights = {
-            'hip': rospy.get_param('~weight_hip', 0.5),
-            'shoulder': rospy.get_param('~weight_shoulder', 0.3),
-            'face': rospy.get_param('~weight_face', 0.2),
+            'hip': rospy.get_param('~weight_hip', 0.0),
+            'shoulder': rospy.get_param('~weight_shoulder', 1.0),
+            'face': rospy.get_param('~weight_face', 0.0),
         }
         self.smoother = body_yaw.YawSmoother(
             time_constant=rospy.get_param('~smoothing_time', 0.3),

@@ -14,7 +14,10 @@
 腰と肩を ``重み x 関節の信頼度`` で円周上の加重平均にして体の向きとする。
 顔は話しかけるときにロボットのほうを向くなど体とずれやすいので、体の向き
 から ``face_max_deviation`` 以上ずれていたら捨てる。腰と肩の両方とも
-取れなければ (顔だけでは) 向きを返さない。
+取れなければ (顔だけでは) 向きを返さない。重みが 0 の部位は使わない。
+
+既定は肩だけ (腰 0・肩 1・顔 0)。手つなぎで横に並ぶと頭のカメラには
+人の顔と胸元しか写らず、腰は画角の外になるため (10/21 試行1 の bag)。
 """
 
 import math
@@ -35,7 +38,7 @@ MIN_EAR_NOSE_DISTANCE = 0.04
 # 左耳 -> 鼻は右へこれだけ回っている。
 EAR_NOSE_YAW_OFFSET = math.atan2(0.075, 0.10)
 
-DEFAULT_WEIGHTS = {'hip': 0.5, 'shoulder': 0.3, 'face': 0.2}
+DEFAULT_WEIGHTS = {'hip': 0.0, 'shoulder': 1.0, 'face': 0.0}
 DEFAULT_FACE_MAX_DEVIATION = math.radians(45.0)
 
 BodyYaw = namedtuple('BodyYaw', [
@@ -43,7 +46,7 @@ BodyYaw = namedtuple('BodyYaw', [
     'confidence',   # 0..1 (使えた部位の 重み x 信頼度 の和 / 重みの和)
     'parts',        # {部位名: (yaw, 信頼度)} 求められた部位 (使わなかった顔も含む)
     'used',         # 平均に使った部位名のリスト
-    'center',       # (3,) 腰の中点 (無ければ肩の中点)
+    'center',       # (3,) 腰の中点 (腰を使っていなければ肩の中点)
 ])
 
 
@@ -134,7 +137,8 @@ def estimate_body_yaw(joints, scores=None, weights=None,
     scores : dict or None
         関節名 -> 信頼度 (0..1)。無い関節は 1 とみなす。
     weights : dict or None
-        'hip', 'shoulder', 'face' の重み。
+        'hip', 'shoulder', 'face' の重み (省略した部位は ``DEFAULT_WEIGHTS``、
+        既定は肩だけ)。0 の部位は使わない。
     face_max_deviation : float
         顔の向きが腰・肩の向きからこれ [rad] 以上ずれていたら使わない。
     min_part_confidence : float
@@ -143,7 +147,7 @@ def estimate_body_yaw(joints, scores=None, weights=None,
     Returns
     -------
     BodyYaw or None
-        腰も肩も取れなければ None。
+        (重みが正の) 腰も肩も取れなければ None。
     """
     scores = scores or {}
     weights = dict(DEFAULT_WEIGHTS, **(weights or {}))
@@ -158,7 +162,8 @@ def estimate_body_yaw(joints, scores=None, weights=None,
                 and found[1] > 0.0:
             parts[name] = found
 
-    body_parts = [n for n in ('hip', 'shoulder') if n in parts]
+    body_parts = [n for n in ('hip', 'shoulder')
+                  if n in parts and weights[n] > 0.0]
     if not body_parts:
         return None
     body_yaw = circular_mean([parts[n][0] for n in body_parts],
@@ -167,8 +172,8 @@ def estimate_body_yaw(joints, scores=None, weights=None,
         return None
 
     used = list(body_parts)
-    if 'face' in parts and abs(wrap_angle(parts['face'][0] - body_yaw)) \
-            < face_max_deviation:
+    if 'face' in parts and weights['face'] > 0.0 and \
+            abs(wrap_angle(parts['face'][0] - body_yaw)) < face_max_deviation:
         used.append('face')
     yaw = circular_mean([parts[n][0] for n in used],
                         [weights[n] * parts[n][1] for n in used])
@@ -179,9 +184,12 @@ def estimate_body_yaw(joints, scores=None, weights=None,
     confidence = (sum(weights[n] * parts[n][1] for n in used) / total_weight
                   if total_weight > 0 else 0.0)
 
+    # 位置は使った部位の中点 (腰を使っていれば腰、無ければ肩)。
     center = None
-    for right_name, left_name in (('RHip', 'LHip'),
-                                  ('RShoulder', 'LShoulder')):
+    pairs = [('RShoulder', 'LShoulder')]
+    if 'hip' in used:
+        pairs.insert(0, ('RHip', 'LHip'))
+    for right_name, left_name in pairs:
         if right_name in joints and left_name in joints:
             center = 0.5 * (np.asarray(joints[right_name], dtype=np.float64)
                             + np.asarray(joints[left_name], dtype=np.float64))

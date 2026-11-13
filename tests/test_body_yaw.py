@@ -15,6 +15,13 @@ sys.path.insert(0, os.path.abspath(_SRC_DIR))
 
 from aero_demo import body_yaw  # noqa: E402
 
+# 腰・肩・顔を混ぜるときの重み (既定は肩だけ)。
+MIXED_WEIGHTS = {'hip': 0.5, 'shoulder': 0.3, 'face': 0.2}
+
+
+def _mixed(joints, scores=None):
+    return body_yaw.estimate_body_yaw(joints, scores, weights=MIXED_WEIGHTS)
+
 
 def _rot(yaw):
     c, s = math.cos(yaw), math.sin(yaw)
@@ -46,7 +53,7 @@ def _person(body_yaw_deg, face_yaw_deg=None, center=(1.5, 0.3, 0.0)):
 
 @pytest.mark.parametrize('yaw_deg', [0.0, 30.0, 90.0, -120.0, 180.0])
 def test_all_parts_agree(yaw_deg):
-    result = body_yaw.estimate_body_yaw(_person(yaw_deg))
+    result = _mixed(_person(yaw_deg))
     assert result is not None
     assert abs(body_yaw.wrap_angle(result.yaw - math.radians(yaw_deg))) \
         < 1e-6
@@ -56,14 +63,14 @@ def test_all_parts_agree(yaw_deg):
 
 def test_face_looking_at_robot_is_ignored():
     # 体は +x、顔は横 (ロボットのほう) を 80 度向いている。
-    result = body_yaw.estimate_body_yaw(_person(0.0, face_yaw_deg=80.0))
+    result = _mixed(_person(0.0, face_yaw_deg=80.0))
     assert 'face' not in result.used
     assert abs(result.yaw) < 1e-6
     assert result.confidence == pytest.approx(0.8)
 
 
 def test_face_small_deviation_is_blended():
-    result = body_yaw.estimate_body_yaw(_person(0.0, face_yaw_deg=30.0))
+    result = _mixed(_person(0.0, face_yaw_deg=30.0))
     assert 'face' in result.used
     expected = math.atan2(0.2 * math.sin(math.radians(30.0)),
                           0.8 + 0.2 * math.cos(math.radians(30.0)))
@@ -79,7 +86,7 @@ def test_hip_preferred_over_shoulder_by_weight():
         joints[name] = rs.dot(joints[name] - mid) + mid
     for name in ('REar', 'LEar', 'REye', 'LEye', 'Nose'):
         del joints[name]
-    result = body_yaw.estimate_body_yaw(joints)
+    result = _mixed(joints)
     expected = math.atan2(0.3 * math.sin(math.radians(40.0)),
                           0.5 + 0.3 * math.cos(math.radians(40.0)))
     assert result.yaw == pytest.approx(expected)
@@ -94,7 +101,7 @@ def test_scores_weight_parts():
     for name in ('REar', 'LEar', 'REye', 'LEye', 'Nose'):
         del joints[name]
     scores = {'RHip': 0.1, 'LHip': 0.1}
-    result = body_yaw.estimate_body_yaw(joints, scores)
+    result = _mixed(joints, scores)
     # 腰の信頼度が低いので肩 (40 度) 寄りになる。
     expected = math.atan2(0.3 * math.sin(math.radians(40.0)),
                           0.05 + 0.3 * math.cos(math.radians(40.0)))
@@ -106,14 +113,14 @@ def test_face_only_returns_none():
     joints = _person(0.0)
     for name in ('RHip', 'LHip', 'RShoulder', 'LShoulder'):
         del joints[name]
-    assert body_yaw.estimate_body_yaw(joints) is None
+    assert _mixed(joints) is None
 
 
 def test_degenerate_pair_is_skipped():
     joints = _person(0.0)
     # 腰の左右が奥行き方向に重なって水平距離がほぼ 0。
     joints['LHip'] = joints['RHip'] + np.array([0.0, 0.02, 0.0])
-    result = body_yaw.estimate_body_yaw(joints)
+    result = _mixed(joints)
     assert 'hip' not in result.parts
     assert abs(result.yaw) < 1e-6
 
@@ -122,7 +129,7 @@ def test_face_single_ear_uses_ear_to_nose():
     joints = _person(0.0, face_yaw_deg=20.0)
     for name in ('LEar', 'REye', 'LEye'):
         del joints[name]
-    result = body_yaw.estimate_body_yaw(joints)
+    result = _mixed(joints)
     assert 'face' in result.parts
     assert 'face' in result.used
     # 耳と鼻の横のずれを差し引いて 20 度に近くなる。
@@ -140,8 +147,31 @@ def test_face_front_back_from_nose():
 
 
 def test_center_is_hip_midpoint():
-    result = body_yaw.estimate_body_yaw(_person(30.0))
+    result = _mixed(_person(30.0))
     assert result.center == pytest.approx([1.5, 0.3, 0.9])
+
+
+def test_default_uses_shoulders_only():
+    joints = _person(0.0, face_yaw_deg=30.0)
+    # 腰を 40 度ねじっても既定 (肩だけ) では効かない。
+    rh = _rot(math.radians(40.0))
+    mid = 0.5 * (joints['RHip'] + joints['LHip'])
+    for name in ('RHip', 'LHip'):
+        joints[name] = rh.dot(joints[name] - mid) + mid
+    result = body_yaw.estimate_body_yaw(joints, {'RShoulder': 0.9})
+    assert result.used == ['shoulder']
+    assert abs(result.yaw) < 1e-6
+    assert result.confidence == pytest.approx(0.9)
+    # 位置は肩の中点。
+    assert result.center == pytest.approx([1.5, 0.3, 1.4])
+
+
+def test_default_without_shoulders_returns_none():
+    joints = _person(0.0)
+    for name in ('RShoulder', 'LShoulder'):
+        del joints[name]
+    # 腰と顔があっても既定 (肩だけ) では向きを返さない。
+    assert body_yaw.estimate_body_yaw(joints) is None
 
 
 def test_smoother():
