@@ -27,7 +27,10 @@ F  子どもの手を引き上げて水たまりを跳び越えさせる。
 繋ぎ方を持ち替えるシナリオ (台車のまま、平らな床で):
 G  高齢者: 下から支えて立たせる → 横に並んで歩く → 下から支えて座らせる。
 H  子ども: 横に並んで歩く → 駆け出したら前へ回り込んで止める → 横に戻って渡る。
-I  大人: 横に並んで歩く → 前に出て後ろ手に引き一列で通路を通る → 横に戻る。
+I  大人: 横に並んで歩く → 対向者が来たら前に出て後ろ手に引き一列ですれ違う
+   → 横に戻る。
+J  高齢者: G〜I を 1 本にした散歩 (立たせる → 並んで歩く → すれ違う →
+   横断歩道の手前で止めて渡る → 座らせる)。
 人の体型は対象者に合わせる (``PERSONS``)。
 
 ロボットは左手、人は右手で繋ぐ (人はロボットの左側)。人の手の位置・向きを
@@ -371,6 +374,12 @@ class Scene(object):
     def moving_props(self, t):
         """動く物の時刻 ``t`` の位置 {名前: 位置}。"""
         return {}
+
+    # すれ違う歩行者 (いなければ None)。``other_pose(t)`` が (x, y, 向き)。
+    other_person = None
+
+    def other_pose(self, t):
+        return None
 
     def human_pose(self, t):
         return self.human_track(t)
@@ -1578,6 +1587,31 @@ def quat_mul(a, b):
             w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
 
 
+def zebra_props(x0, x1, y_center, width=3.0):
+    """横断歩道の縞: 車の走る向き (y) に長い白線を、渡る向き (x) に並べる。"""
+    items = []
+    for i, x in enumerate(np.arange(x0 + 0.35, x1 - 0.2, 0.9)):
+        items.append(dict(name='zebra_{}'.format(i), color=(240, 240, 235),
+                          dimensions=(0.45, width, 0.012),
+                          position=(x, y_center, 0.004)))
+    return items
+
+
+def sidewalk_props(name, x0, x1, y0, y1):
+    """地面に敷いた歩道 (タイル色の帯と両側の縁石)。"""
+    return [
+        dict(name=name, color=(204, 194, 176),
+             dimensions=(x1 - x0, y1 - y0, 0.012),
+             position=(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.003)),
+        dict(name=name + '_edge_l', color=(160, 158, 152),
+             dimensions=(x1 - x0, 0.08, 0.03),
+             position=(0.5 * (x0 + x1), y1, 0.012)),
+        dict(name=name + '_edge_r', color=(160, 158, 152),
+             dimensions=(x1 - x0, 0.08, 0.03),
+             position=(0.5 * (x0 + x1), y0, 0.012)),
+    ]
+
+
 class SceneH(Scene):
     key = 'H'
     title = 'H: 子どもの飛び出しを止める (横に並ぶ → 前をふさいで止める → 横に戻って渡る)'
@@ -1701,7 +1735,7 @@ class SceneH(Scene):
 
     def props(self, timeline):
         x0, x1 = self.ROAD
-        asphalt, white = (70, 72, 78), (240, 240, 235)
+        asphalt = (70, 72, 78)
         items = [
             dict(name='road', color=asphalt,
                  dimensions=(x1 - x0, 40.0, 0.01),
@@ -1711,10 +1745,7 @@ class SceneH(Scene):
             dict(name='curb_far', color=(205, 205, 200),
                  dimensions=(0.15, 40.0, 0.03), position=(x1, 0.0, 0.01)),
         ]
-        for i, y in enumerate(np.arange(-1.4, 1.5, 0.55)):
-            items.append(dict(name='zebra_{}'.format(i), color=white,
-                              dimensions=(x1 - x0 - 0.4, 0.3, 0.012),
-                              position=(0.5 * (x0 + x1), y, 0.004)))
+        items += zebra_props(x0, x1, 0.0)
         p = self.car_position(0.0)
         items += [
             dict(name='car_body', color=(200, 60, 55),
@@ -1728,34 +1759,49 @@ class SceneH(Scene):
 
 class SceneI(Scene):
     key = 'I'
-    title = 'I: 狭い通路を一列で通る (横に並ぶ → 前に出て後ろ手に引く → 横に戻る)'
+    title = 'I: 対向者とすれ違う (横に並ぶ → 前に出て後ろ手に引き一列に → 横に戻る)'
     duration = 15.0
     SPEED = 0.85
     SIDE = SIDE_DISTANCE
-    PASSAGE = (0.0, 2.2)      # 通路の入口と出口の x [m]
-    GAP = (-0.66, 0.30)       # 通路の右と左の壁の y [m] (並んでは通れない幅)
+    SIDEWALK = (-1.15, 0.45)  # 歩道の右端と左端の y [m] (並ぶと塞ぐ幅)
     LEAD = (1.6, 3.6)         # 前に出て上半身をひねる
-    BACK = (8.0, 10.2)        # 横に戻る
+    BACK = (7.6, 9.8)         # 横に戻る
     LEAD_OFFSET = (0.70, -0.35)  # 前に出たときの台車 (人から見た前・左)
     TWIST = 2.0               # 前に出たときの上半身のひねり (左回り) [rad]
-    phases = [('0 横に並んで歩く', 0.0, 1.6),
+    other_person = 'adult'
+    OTHER_Y = -0.85           # 対向者の歩く y [m]
+    OTHER_SPEED = 1.1
+    MEET_T = 5.6              # 対向者とすれ違う時刻
+    phases = [('0 横に並んで歩く (向こうから人が来る)', 0.0, 1.6),
               ('1 前に出て上半身をひねり、後ろ手に引く [持ち替え]', 1.6, 3.6),
-              ('2 一列で通路を通る [後ろ手に引く]', 3.6, 8.0),
-              ('3 横に戻る [持ち替え]', 8.0, 10.2),
-              ('4 また並んで歩く', 10.2, 15.0)]
+              ('2 一列になって対向者とすれ違う [後ろ手に引く]', 3.6, 7.6),
+              ('3 横に戻る [持ち替え]', 7.6, 9.8),
+              ('4 また並んで歩く', 9.8, 15.0)]
 
     def __init__(self):
         self.human_track = SpeedTrack(
             -3.2, 0.0, lambda t: self.SPEED * ramp(t, 0.0, 1.0),
             self.duration)
         self.robot_gaze = GazeSchedule([
-            (0.0, 'forward'), (1.4, 'face'), (2.2, 'hands'), (3.4, 'face'),
-            (4.2, 'forward'), (5.6, 'face'), (6.2, 'forward'), (8.2, 'face'),
-            (9.0, 'forward'), (11.5, 'face'), (12.1, 'forward')])
+            (0.0, 'forward'), (0.9, 'other'), (1.4, 'face'), (2.2, 'hands'),
+            (3.4, 'face'), (4.0, 'other'), (5.4, 'face'), (6.2, 'forward'),
+            (7.8, 'face'), (8.6, 'forward'), (11.5, 'face'),
+            (12.1, 'forward')])
         self.human_gaze = GazeSchedule([
-            (0.0, 'forward'), (1.5, 'face'), (2.3, 'hands'), (3.4, 'face'),
-            (4.1, 'forward'), (5.7, 'face'), (6.3, 'forward'), (8.3, 'face'),
-            (9.1, 'forward'), (11.6, 'face'), (12.2, 'forward')])
+            (0.0, 'forward'), (1.0, 'other'), (1.5, 'face'), (2.3, 'hands'),
+            (3.4, 'face'), (4.1, 'other'), (5.5, 'forward'), (7.9, 'face'),
+            (8.7, 'forward'), (11.6, 'face'), (12.2, 'forward')])
+
+    def other_pose(self, t):
+        meet_x = self.human_track(self.MEET_T)[0]
+        return np.array([meet_x - self.OTHER_SPEED * (t - self.MEET_T),
+                         self.OTHER_Y, np.pi])
+
+    def _gaze(self, name, t):
+        if name == 'other':
+            p = self.other_pose(t)
+            return np.array([p[0], p[1], 1.5])
+        return name
 
     def lead(self, t):
         return minjerk(ramp(t, *self.LEAD) - ramp(t, *self.BACK))
@@ -1792,25 +1838,345 @@ class SceneI(Scene):
             arms={'R': goal,
                   'L': human_swing_goal(human, shoulders, 'L', yaw, -swing,
                                         run)},
-            human_gaze=self.human_gaze(t),
+            human_gaze=self._gaze(self.human_gaze(t), t),
             waist_y=self.TWIST * k, waist_p=0.0,
             reach=1.0, grip=1.0, hold_palm=palm / np.linalg.norm(palm),
-            robot_gaze=self.robot_gaze(t))
+            robot_gaze=self._gaze(self.robot_gaze(t), t))
 
     def props(self, timeline):
-        x0, x1 = self.PASSAGE
-        right, left = self.GAP
-        wall = (176, 170, 160)
-        return [
-            dict(name='wall_l', color=wall, dimensions=(x1 - x0, 0.6, 1.0),
-                 position=(0.5 * (x0 + x1), left + 0.3, 0.5)),
-            dict(name='wall_r', color=wall, dimensions=(x1 - x0, 0.6, 1.0),
-                 position=(0.5 * (x0 + x1), right - 0.3, 0.5)),
+        y0, y1 = self.SIDEWALK
+        return sidewalk_props('sidewalk', -8.0, 14.0, y0, y1)
+
+
+class SceneJ(Scene):
+    key = 'J'
+    title = 'J: 高齢者と散歩 (立たせる → 並んで歩く → すれ違う → 横断歩道 → 座らせる)'
+    person = 'elderly'
+    duration = 62.5
+    # 1 つ目のベンチから立つ (G と同じ)。
+    APPROACH_END = 2.2
+    CROUCH = (1.6, 3.0)
+    OFFER = (3.0, 3.8)
+    TAKE = (3.5, 4.4)
+    REACH = (4.0, 4.7)
+    ROBOT_GRIP = (4.5, 5.0)
+    HUMAN_GRIP = (4.7, 5.2)
+    STAND_T = 5.2
+    LEAD_WALK = (8.6, 11.4)     # 後ずさりして手を引く
+    PIVOT1 = (11.4, 13.8)       # 横へ回り込む
+    WALK1 = 13.8                # 並んで歩き出す
+    # 対向者とすれ違う (I と同じ)。
+    LEAD = (16.8, 18.8)
+    BACK = (23.4, 25.6)
+    MEET_T = 21.2
+    # 横断歩道の手前で止める (H を高齢者向けに)。
+    STOP = (27.6, 29.2)         # 人は車に気づかず進みかけ、ロボットが止める
+    PIVOT_STOP = (27.4, 29.2)   # 前へ回り込んで道をふさぐ
+    CAR = (29.4, 32.0)
+    PIVOT_BACK = (32.4, 34.4)   # 横へ戻る
+    LOOK = (34.4, 35.6)         # 左右を確かめる
+    CROSS_T = 35.6              # 渡り始める
+    ARRIVE = (51.8, 53.4)       # 2 つ目のベンチの前で止まる
+    TURN = (52.6, 54.0)
+    PIVOT2 = (53.0, 55.2)
+    SIT_T = 55.8
+    RELEASE = (59.2, 59.8)
+    STAND_UP = (59.6, 60.8)
+    LEAD_SPEED = 0.35
+    WALK_SPEED = 0.45
+    SIDE = 0.48
+    AHEAD = 0.02
+    LEAD_OFFSET = (0.70, -0.35)
+    TWIST = 2.0
+    ROAD_WIDTH = 5.0
+    SIDEWALK = (-1.15, 0.45)
+    other_person = 'adult'
+    OTHER_Y = -0.85
+    OTHER_SPEED = 1.0
+    phases = [('0 ロボットが前に来てしゃがむ', 0.0, 3.0),
+              ('1 掌を上にして差し出し、下から包んで握る', 3.0, 5.2),
+              ('2 手を引き上げて立たせる [下から支える]', 5.2, 8.6),
+              ('3 後ずさりして手を引く [下から支える]', 8.6, 11.4),
+              ('4 手を繋いだまま横へ回り込む [持ち替え]', 11.4, 13.8),
+              ('5 横に並んで歩道を歩く [横に並ぶ]', 13.8, 16.8),
+              ('6 対向者が来る: 前に出て後ろ手に引く [持ち替え]', 16.8, 18.8),
+              ('7 一列ですれ違う [後ろ手に引く]', 18.8, 23.4),
+              ('8 横に戻って歩く [持ち替え]', 23.4, 27.4),
+              ('9 車が来る: 前へ回り込んで止める [持ち替え]', 27.4, 29.4),
+              ('10 車が通り過ぎるのを待つ [下から支える]', 29.4, 32.4),
+              ('11 横に戻り、左右を確かめる [持ち替え]', 32.4, 35.6),
+              ('12 一緒に横断歩道を渡る [横に並ぶ]', 35.6, 51.8),
+              ('13 ベンチの前で向き直り、前へ回り込む [持ち替え]', 51.8, 55.8),
+              ('14 下から支えて座らせる [下から支える]', 55.8, 59.2),
+              ('15 手を離して見合う', 59.2, 62.5)]
+
+    def __init__(self):
+        self.robot_gaze = GazeSchedule([
+            (0.0, 'face'), (3.2, 'hands'), (4.9, 'face'), (6.0, 'hands'),
+            (7.6, 'face'), (11.4, 'hands'), (12.6, 'face'),
+            (14.6, 'forward'), (16.0, 'other'), (16.6, 'face'),
+            (17.4, 'hands'), (18.6, 'face'), (19.4, 'other'),
+            (20.8, 'face'), (21.8, 'forward'), (23.6, 'face'),
+            (24.6, 'forward'), (26.6, 'car'), (27.6, 'face'), (29.6, 'car'),
+            (31.6, 'face'), (34.4, 'right'), (34.9, 'left'), (35.4, 'face'),
+            (36.2, 'forward'), (42.0, 'face'), (42.6, 'forward'),
+            (51.4, 'face'), (56.2, 'hands'), (58.0, 'face')])
+        self.human_gaze = GazeSchedule([
+            (0.0, 'ground'), (0.7, 'face'), (3.4, 'hands'), (5.0, 'face'),
+            (5.6, 'feet'), (7.9, 'face'), (9.0, 'ground'), (10.6, 'face'),
+            (14.4, 'forward'), (16.1, 'other'), (16.8, 'face'),
+            (17.5, 'hands'), (18.6, 'face'), (19.5, 'other'),
+            (21.0, 'forward'), (23.7, 'face'), (24.7, 'ground'),
+            (26.0, 'forward'), (28.4, 'face'), (29.8, 'car'), (31.8, 'face'),
+            (34.5, 'right'), (35.0, 'left'), (35.5, 'face'),
+            (36.1, 'ground'), (40.0, 'forward'), (42.1, 'face'),
+            (42.7, 'ground'), (48.0, 'forward'), (51.0, 'bench'),
+            (52.8, 'face'), (56.0, 'feet'), (58.2, 'face')])
+
+    def setup(self, human):
+        self.g = g = SitGeometry(human, self.person)
+        sh = g.w_stand_rel - np.array([0.27, 0.01, -0.30])
+        self.ahead_rel = sh + np.array([0.34, -0.02, -0.22])
+        l0, l1 = self.LEAD_WALK
+        w0 = self.WALK1
+        a0, a1 = self.STOP
+        c0 = self.CROSS_T
+        r0, r1 = self.ARRIVE
+        b0, b1 = self.LEAD[0], self.BACK[1]
+
+        def speed(t):
+            v = self.LEAD_SPEED * (ramp(t, l0, l0 + 1.0)
+                                   - ramp(t, l1 - 1.0, l1))
+            v += self.WALK_SPEED * (ramp(t, w0, w0 + 1.2) - ramp(t, a0, a1))
+            v -= 0.07 * (ramp(t, b0, b0 + 1.0) - ramp(t, b1 - 1.0, b1))
+            v += self.WALK_SPEED * (ramp(t, c0, c0 + 1.0) - ramp(t, r0, r1))
+            return v
+        self.track = SpeedTrack(g.x_stand, 0.0, speed, self.duration)
+        stop_x = self.track(self.STOP[1])[0]
+        self.curb_x = stop_x + 0.8
+        self.road = (self.curb_x, self.curb_x + self.ROAD_WIDTH)
+        self.car_x = self.curb_x + 2.0
+        self.yaw2 = -0.5 * np.pi
+        self.bench2 = np.array([self.track(self.duration)[0], g.x_stand])
+
+    # --- 位置 -------------------------------------------------------
+    def other_pose(self, t):
+        meet_x = self.track(self.MEET_T)[0]
+        return np.array([meet_x - self.OTHER_SPEED * (t - self.MEET_T),
+                         self.OTHER_Y, np.pi])
+
+    def car_position(self, t):
+        s = (t - self.CAR[0]) / (self.CAR[1] - self.CAR[0])
+        return np.array([self.car_x, 12.0 - 24.0 * s, 0.0])
+
+    def moving_props(self, t):
+        p = self.car_position(t)
+        return {'car_body': p + [0.0, 0.0, 0.45],
+                'car_cabin': p + [0.0, -0.2, 1.05]}
+
+    def yaw(self, t):
+        return self.yaw2 * ramp(t, *self.TURN)
+
+    def sitting(self, t):
+        d = SitGeometry.DURATION
+        if t < self.STAND_T + d:
+            return np.zeros(2), 0.0, max(0.0, t - self.STAND_T)
+        if t >= self.SIT_T:
+            return self.bench2, self.yaw2, max(0.0, d - (t - self.SIT_T))
+        return None
+
+    def human_pose(self, t):
+        sit = self.sitting(t)
+        if sit is not None:
+            origin, yaw, tau = sit
+            x, _ = self.g.pelvis(tau)
+            p = to_world(origin, yaw, [x, 0.0, 0.0])
+            return np.array([p[0], p[1], yaw])
+        p = self.track(t)
+        return np.array([p[0], p[1], self.yaw(t)])
+
+    def still(self, t):
+        return self.sitting(t) is not None or t < self.LEAD_WALK[0]
+
+    # --- 繋ぎ方 -----------------------------------------------------
+    def side_weight(self, t):
+        """横に並ぶ割合 (0: 向かい合って下から支える)。"""
+        return ramp(t, *self.PIVOT1) - ramp(t, *self.PIVOT_STOP) \
+            + ramp(t, *self.PIVOT_BACK) - ramp(t, *self.PIVOT2)
+
+    def lead_weights(self, t):
+        """前に出て後ろ手に引く割合 (手・ひねり用, 前へ, 横へ)。"""
+        l0, l1 = self.LEAD
+        b0, b1 = self.BACK
+        k = minjerk(ramp(t, l0, l1) - ramp(t, b0, b1))
+        fx = ramp(t, l0, l0 + 0.6 * (l1 - l0)) \
+            - ramp(t, b0 + 0.4 * (b1 - b0), b1)
+        fy = ramp(t, l0 + 0.4 * (l1 - l0), l1) \
+            - ramp(t, b0, b0 + 0.6 * (b1 - b0))
+        return k, fx, fy
+
+    def hold_point(self, t, swing=0.0):
+        g = self.g
+        sit = self.sitting(t)
+        if sit is not None:
+            origin, yaw, tau = sit
+            return to_world(origin, yaw, g.hold_track(tau))
+        x, y, yaw = self.human_pose(t)
+        face = to_world([x, y], yaw, g.w_stand_rel)
+        side = to_world([x, y], yaw, g.w_side_rel + [0.06 * swing, 0, 0])
+        w = lerp(face, side, minjerk(self.side_weight(t)))
+        k, _, _ = self.lead_weights(t)
+        ahead = to_world([x, y], yaw, self.ahead_rel + [0.03 * swing, 0, 0])
+        return lerp(w, ahead, k)
+
+    def lifter(self, t):
+        sit = self.sitting(t)
+        if t < self.STAND_T:
+            return 1.3 * ramp(t, *self.CROUCH)
+        if sit is not None:
+            return self.g.robot_lifter(sit[2]) * (1.0 - ramp(t,
+                                                             *self.STAND_UP))
+        return 0.4 - 0.1 * self.side_weight(t)
+
+    def bow(self, t):
+        sit = self.sitting(t)
+        if t < self.STAND_T:
+            return 0.3 * ramp(t, *self.CROUCH)
+        if sit is not None:
+            return self.g.robot_bow(sit[2]) * (1.0 - ramp(t, *self.STAND_UP))
+        return 0.1 * (1.0 - self.side_weight(t))
+
+    def robot_pose(self, t):
+        x, y, hyaw = self.human_pose(t)
+        k, fx, fy = self.lead_weights(t)
+        if fx > 0.0 or fy > 0.0:
+            off = [lerp(self.AHEAD, self.LEAD_OFFSET[0], fx),
+                   lerp(-self.SIDE, self.LEAD_OFFSET[1], fy), 0.0]
+            p = to_world([x, y], hyaw, off)
+            return np.array([p[0], p[1], hyaw])
+        base = pair_base(self.hold_point(t), [x, y], hyaw,
+                         minjerk(self.side_weight(t)), self.lifter(t),
+                         self.bow(t), self.SIDE, self.AHEAD)
+        if t < self.APPROACH_END:
+            base[0] += 2.4 * (1.0 - ramp(t, 0.0, self.APPROACH_END))
+        if t > self.STAND_UP[0]:
+            base[:2] -= 0.25 * ramp(t, *self.STAND_UP) * np.array(
+                [np.cos(base[2]), np.sin(base[2])])
+        return base
+
+    def _gaze(self, name, t):
+        if name == 'other':
+            p = self.other_pose(t)
+            return np.array([p[0], p[1], 1.5])
+        if name == 'car':
+            return self.car_position(max(t, self.CAR[0] - 0.6)) \
+                + [0.0, 0.0, 0.9]
+        if name in ('right', 'left'):
+            return np.array([self.curb_x + 1.5,
+                             -4.0 if name == 'right' else 4.0, 0.6])
+        if name == 'bench':
+            return np.array([self.bench2[0] + 0.3, self.bench2[1], 0.4])
+        return name
+
+    def script(self, t, ctx):
+        human, shoulders, yaw = ctx.human, ctx.shoulders, ctx.yaw
+        fwd, left, up = body_axes(yaw)
+        body = ctx.body
+        g = self.g
+        swing = np.sin(ctx.phase) * ctx.walk
+        s = minjerk(self.side_weight(t))
+        k, _, _ = self.lead_weights(t)
+        sit = self.sitting(t)
+        tau = sit[2] if sit is not None else SitGeometry.DURATION
+        released = ramp(t, *self.RELEASE)
+
+        def on_thigh(side, along):
+            knee = body[smpl_body.L_KNEE if side == 'L'
+                        else smpl_body.R_KNEE]
+            return shm.ArmGoal(wrist=knee - along * fwd + 0.09 * up,
+                               bend=up - 0.5 * left * shm.SIDE_SIGN[side],
+                               palm=-up)
+
+        grip_h = (0.55 + 0.2 * s * (1.0 - k)) * ramp(t, *self.HUMAN_GRIP) \
+            * (1.0 - released)
+        side_ish = s * (1.0 - k)  # 掌を前へ向ける割合
+        hold = shm.ArmGoal(wrist=self.hold_point(t, swing),
+                           bend=lerp(up + 0.4 * left, fwd, side_ish),
+                           palm=lerp(-up, fwd, side_ish), grip=grip_h)
+        right = blend_goal(on_thigh('R', 0.14), hold, ramp(t, *self.TAKE))
+        right = blend_goal(right, on_thigh('R', 0.14), released)
+        right.grip = grip_h
+        l0, l1 = SitGeometry.LEAN
+        r0, r1 = SitGeometry.RISE
+        knee_hand = blend_goal(on_thigh('L', 0.14), on_thigh('L', 0.03),
+                               ramp(tau, l0, l1))
+        left_goal = blend_goal(
+            knee_hand,
+            human_swing_goal(human, shoulders, 'L', yaw, -swing, 0.0),
+            ramp(tau, r0 + 0.5 * (r1 - r0), r1 + 0.3))
+        robot_palm = unit_xy(-fwd) * side_ish + PALM_UP * (1.0 - side_ish)
+        robot_palm = robot_palm / np.linalg.norm(robot_palm)
+        plan = dict(
+            arms={'R': right, 'L': left_goal},
+            human_gaze=self._gaze(self.human_gaze(t), t),
+            lean=g.lean(tau) if sit is not None else 0.0,
+            waist_y=self.TWIST * k, waist_p=self.bow(t),
+            lifter=self.lifter(t),
+            offer=ramp(t, *self.OFFER) * (1.0 - released),
+            offer_point=self.hold_point(t) + 0.10 * fwd - 0.06 * up,
+            reach=ramp(t, *self.REACH) * (1.0 - released),
+            hold_palm=robot_palm,
+            grip=ramp(t, *self.ROBOT_GRIP) * (1.0 - released),
+            robot_gaze=self._gaze(self.robot_gaze(t), t))
+        if sit is not None:
+            origin, byaw, tau = sit
+            plan['feet'] = {side: to_world(origin, byaw, f)
+                            for side, f in g.feet.items()}
+            plan['pelvis_z'] = g.pelvis(tau)[1]
+        return plan
+
+    def props(self, timeline):
+        g = self.g
+        x0, x1 = self.road
+        y0, y1 = self.SIDEWALK
+        end = self.bench2[0] + 3.0
+        items = sidewalk_props('walk_a', -1.2, x0, y0, y1) \
+            + sidewalk_props('walk_b', x1, end, y0, y1)
+        items += [
+            dict(name='road', color=(70, 72, 78),
+                 dimensions=(x1 - x0, 40.0, 0.01),
+                 position=(0.5 * (x0 + x1), 0.0, 0.002)),
+            dict(name='curb_near', color=(205, 205, 200),
+                 dimensions=(0.15, 40.0, 0.03), position=(x0, 0.0, 0.01)),
+            dict(name='curb_far', color=(205, 205, 200),
+                 dimensions=(0.15, 40.0, 0.03), position=(x1, 0.0, 0.01)),
         ]
+        items += zebra_props(x0, x1, -0.35)
+        p = self.car_position(0.0)
+        items += [
+            dict(name='car_body', color=(200, 60, 55),
+                 dimensions=(1.7, 4.2, 0.8), position=tuple(p + [0, 0, 0.45])),
+            dict(name='car_cabin', color=(170, 200, 225),
+                 dimensions=(1.5, 2.2, 0.55),
+                 position=tuple(p + [0, -0.2, 1.05])),
+        ]
+        v = np.asarray(timeline.vertices[0])
+        under = v[(v[:, 0] > -0.25) & (v[:, 0] < g.feet_x - 0.12)]
+        top = float(under[:, 2].min())
+        back = float(v[:, 0].min()) - 0.03
+        for k, (origin, yaw) in enumerate(((np.zeros(2), 0.0),
+                                           (self.bench2, self.yaw2))):
+            for item in bench_props(top, back, g.feet_x - 0.12):
+                q = (np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw))
+                items.append(dict(
+                    item, name='{}_{}'.format(item['name'], k),
+                    position=tuple(to_world(origin, yaw, item['position'])),
+                    wxyz=quat_mul(q, item.get('wxyz', (1.0, 0.0, 0.0, 0.0)))))
+        return items
 
 
 SCENES = [SceneA, SceneA2, SceneB, SceneC, SceneD, SceneE, SceneF, SceneG,
-          SceneH, SceneI]
+          SceneH, SceneI, SceneJ]
 
 
 def unit_xy(v):
@@ -2046,10 +2412,12 @@ def cache_path(scene_key, model_path, person='adult'):
 class Timeline(object):
     """シーンを ``FPS`` で刻んで、人の頂点とロボットの関節角を前もって求める。"""
 
-    def __init__(self, scene, human, robot):
+    def __init__(self, scene, human, robot, other=None):
         self.scene = scene
         self.times = np.arange(0.0, scene.duration + 1e-9, DT)
         self.vertices = []
+        self.other_vertices = []  # すれ違う歩行者 (いるシーンだけ)
+        self._other = other
         self.robot_angles = []
         self.robot_bases = []
         self.centers = []
@@ -2242,6 +2610,8 @@ class Timeline(object):
             robot_head = robot.head_link.worldpos().copy()
 
             self.vertices.append(frame.vertices)
+            if self._other is not None:
+                self.other_vertices.append(self._walker(t))
             self.robot_angles.append(
                 np.array([j.joint_angle() for j in joints]))
             self.robot_bases.append(base)
@@ -2251,6 +2621,29 @@ class Timeline(object):
             if progress is not None:
                 progress((i + 1) / len(self.times))
         return self
+
+    def _walker(self, t):
+        """すれ違う歩行者 (腕を振って歩くだけ) の頂点。"""
+        other = self._other
+        ox, oy, oyaw = self.scene.other_pose(t)
+        xy = np.array([ox, oy])
+        prev = getattr(self, '_walker_state', None)
+        speed, phase = 0.0, 0.0
+        if prev is not None:
+            speed = float(np.linalg.norm(xy - prev[0])) / DT
+            phase = prev[1] + 2.0 * np.pi * speed * DT \
+                / other.stride_length(speed)
+        self._walker_state = (xy, phase)
+        walk, run = shm.gait_weights(speed)
+        spec = shm.HumanSpec(xy=xy, yaw=oyaw, speed=speed, gait_phase=phase)
+        shoulders = other.shoulder_position(spec)
+        swing = np.sin(phase) * walk
+        spec.arms = {
+            'R': human_swing_goal(other, shoulders, 'R', oyaw, swing, run),
+            'L': human_swing_goal(other, shoulders, 'L', oyaw, -swing, run)}
+        fwd, _, _ = body_axes(oyaw)
+        spec.gaze = np.array([ox, oy, 1.0]) + 4.0 * fwd
+        return other.solve(spec).vertices
 
     @staticmethod
     def _gaze_point(name, who, ctx, other_head, meet, own_head, yaw):
@@ -2277,8 +2670,11 @@ class Timeline(object):
     def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp.npz'
-        np.savez(tmp, **{name: np.asarray(getattr(self, name))
-                         for name in CACHE_FIELDS})
+        fields = {name: np.asarray(getattr(self, name))
+                  for name in CACHE_FIELDS}
+        if len(self.other_vertices):
+            fields['other_vertices'] = np.asarray(self.other_vertices)
+        np.savez(tmp, **fields)
         os.replace(tmp, path)
 
     @classmethod
@@ -2287,6 +2683,8 @@ class Timeline(object):
         with np.load(path) as data:
             for name in CACHE_FIELDS:
                 setattr(tl, name, data[name])
+            if 'other_vertices' in data:
+                tl.other_vertices = data['other_vertices']
         return tl
 
     def phase_at(self, t):
@@ -2443,6 +2841,9 @@ def add_track(scene, lane_center):
     return tape, broken
 
 
+# すれ違う歩行者の色 (主役の人と区別できる落ち着いた緑)。
+OTHER_COLOR = (120, 160, 130)
+
 # 動画の保存先。
 VIDEO_DIR = os.path.expanduser('~/aero_demo_videos')
 
@@ -2482,6 +2883,7 @@ class DemoViewer(object):
         remove_robot_gui(self.viewer)
         self.mesh = None
         self.mesh_person = None
+        self.other_mesh = None  # すれ違う歩行者
         self.props = {}  # scene key -> 物を置いた frame
         self.prop_handles = {}  # scene key -> {物の名前: handle}
 
@@ -2580,8 +2982,11 @@ class DemoViewer(object):
             return self.wanted != key and self.wanted not in self.timelines
 
         started = time.time()
+        other = None if scene.other_person is None \
+            else self._human(scene.other_person)
         timeline = Timeline(scene, self._human(scene.person),
-                            self.build_robot).build(progress, should_stop)
+                            self.build_robot, other).build(progress,
+                                                           should_stop)
         if timeline is None:
             return None
         print('[demo] {} を計算しました ({:.1f} 秒、最大の手先誤差 {:.3f} m)'
@@ -2610,7 +3015,7 @@ class DemoViewer(object):
         with self.build_cv:
             self.wanted = key
             if key not in self.timelines:
-                self.status.content = '**{} を計算中...** (1 シーン 20 秒〜6 分ほど。' \
+                self.status.content = '**{} を計算中...** (1 シーン 20 秒〜13 分ほど。' \
                     '次からは保存した結果を読む)'.format(key)
             while key not in self.timelines:
                 self.build_cv.wait()
@@ -2708,6 +3113,19 @@ class DemoViewer(object):
                     color=PERSONS[tl.scene.person]['color'])
             else:
                 self.mesh.vertices = vertices
+            if len(tl.other_vertices):
+                other = np.asarray(tl.other_vertices[i],
+                                   dtype=np.float32).copy()
+                other[:, :2] -= offset.astype(np.float32)
+                if self.other_mesh is None:
+                    self.other_mesh = self.server.scene.add_mesh_simple(
+                        '/other', vertices=other, faces=self.faces,
+                        color=OTHER_COLOR)
+                else:
+                    self.other_mesh.vertices = other
+                    self.other_mesh.visible = True
+            elif self.other_mesh is not None:
+                self.other_mesh.visible = False
             # 地面の格子は 5 m 周期なので、ずらし量の余りだけ動かす。
             # トラックは有限なのでそのままずらす。
             self.grid.position = (-(offset[0] % 5.0), -(offset[1] % 5.0),
