@@ -108,8 +108,13 @@ class HumanBodyYawNode(object):
             color_topic, Image, queue_size=1, buff_size=2 ** 24)
         depth_sub = message_filters.Subscriber(
             depth_topic, Image, queue_size=1, buff_size=2 ** 24)
+        # 実機では深度が色より平均 0.1 秒 (ばらつき 0.14 秒) 遅れて届く。
+        # 同期の待ち行列が短いと組む相手の色画像が先に捨てられ、組がほとんど
+        # できない (2 枚 = 30Hz で 66ms 分のとき約 2Hz しか出なかった)。
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [color_sub, depth_sub], queue_size=2, slop=0.1)
+            [color_sub, depth_sub],
+            queue_size=rospy.get_param('~sync_queue_size', 10),
+            slop=rospy.get_param('~sync_slop', 0.1))
         self.sync.registerCallback(self._on_frame)
         rospy.on_shutdown(self.estimator.close)
         rospy.loginfo('human_body_yaw: %s + %s -> ~body_pose (%s)',
