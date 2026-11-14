@@ -98,7 +98,8 @@ class PeoplePoseEstimator(object):
                  occlusion_radius=0.06,
                  occlusion_depth_tolerance=0.10,
                  history_duration=1.0,
-                 history_distance=1.0):
+                 history_distance=1.0,
+                 enable_segmentation=False):
         """
         Parameters
         ----------
@@ -122,7 +123,13 @@ class PeoplePoseEstimator(object):
             0 以下なら補正しない。
         history_duration, history_distance : float
             直近の検出位置付近 [m] を一定時間 [s] 人物として信頼する。
+        enable_segmentation : bool
+            True なら Pose (``use_hand=False``) で人の領域も推定し、
+            ``estimate`` のあと ``segmentation_mask`` (画像と同じ大きさの
+            0..1 の float 配列、人が見つからなければ None) に置く。
         """
+        self.enable_segmentation = enable_segmentation and not use_hand
+        self.segmentation_mask = None
         self.use_hand = use_hand
         self.min_detection_confidence = min_detection_confidence
         self.min_tracking_confidence = min_tracking_confidence
@@ -153,6 +160,7 @@ class PeoplePoseEstimator(object):
             self.holistic = None
             self.pose = mp.solutions.pose.Pose(
                 model_complexity=0,
+                enable_segmentation=self.enable_segmentation,
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence
             )
@@ -206,6 +214,9 @@ class PeoplePoseEstimator(object):
             pose_landmarks = results.pose_landmarks
             left_hand_landmarks = None
             right_hand_landmarks = None
+        self.segmentation_mask = (
+            getattr(results, 'segmentation_mask', None)
+            if self.enable_segmentation and pose_landmarks else None)
 
         if not pose_landmarks:
             return []

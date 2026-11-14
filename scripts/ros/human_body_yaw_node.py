@@ -3,9 +3,18 @@
 
 """頭のカメラの画像から人の体の向き (ヨー角) を求めて publish するノード.
 
-MediaPipe (aero_demo.people_pose_estimator) で骨格を求め、両肩の線から
-体の正面の向きを出す (aero_demo.body_yaw。~weight_hip・~weight_face を
-正にすると腰・顔も混ぜる)。手つなぎ歩行で台車を
+MediaPipe (aero_demo.people_pose_estimator) で骨格と人の領域を求め、
+体の正面の向きを出す (aero_demo.body_yaw)。``~method`` で選ぶ。
+
+- ``torso_band`` (既定): 手前の肩の高さの帯にある人の点群の主軸を肩の線
+  とし、つないでいる手 (``~hand_frame``) の側を人の左とする。反対側の肩が
+  隠れていても、背中側から見ても使える。主軸の 長軸/短軸 が
+  ``~min_band_ratio`` 未満のときは向きを出さない。
+- ``shoulders``: 両肩の関節の線 (~weight_hip・~weight_face を正にすると
+  腰・顔も混ぜる)。背中側からの左右の取り違えは ``~max_relative_yaw``
+  で折り返す。
+
+手つなぎ歩行で台車を
 人と同じ向きへ回す制御 (aero-hand-open の aero_hand_magnetic_cmd_vel_node)
 が使う。
 
@@ -16,15 +25,13 @@ TF で ``~odom_frame`` 座標系に直して出す (odom が引けなければ b
 Publish
 -------
 ~body_pose (geometry_msgs/PoseStamped)
-    位置は肩の中点 (腰を使うときは腰の中点)、向きは体の正面のヨー角。
-    信頼度が ``~min_confidence`` 以上のときだけ出す。stamp は画像の時刻。
+    位置は torso_band なら帯の点の重心、shoulders なら肩の中点 (腰を使う
+    ときは腰の中点)。向きは体の正面のヨー角。信頼度が ``~min_confidence``
+    以上のときだけ出す。stamp は画像の時刻。
 ~debug (std_msgs/String)
-    部位ごとの向き [deg, base_link]・使った部位・信頼度の JSON。
-    folded_base_deg は 180° 折り返し (~max_relative_yaw) 後の向き。
-
-背中側から見ると左右の肩を取り違えて向きが 180° 逆になるので、ロボット
-正面から ``~max_relative_yaw`` (既定 90°) を超える向きは折り返す
-(手をつないで横に並ぶ人はロボットと逆向きにならない前提)。
+    向き [deg, base_link]・ならした向き・信頼度の JSON。torso_band は
+    帯の比 (ratio)・点の数・手前の肩、shoulders は部位ごとの向きと
+    180° 折り返し後の向き (folded_base_deg)。
 ~skeleton_image (sensor_msgs/Image)
     骨格を重ねた画像 (購読者がいるときだけ)。
 
@@ -37,6 +44,7 @@ import os
 import sys
 import threading
 
+import cv2
 import numpy as np
 
 import message_filters
@@ -87,6 +95,18 @@ class HumanBodyYawNode(object):
         # (背中側から見たときの左右の肩の取り違え対策)。180 で無効。
         self.max_relative_yaw = math.radians(
             rospy.get_param('~max_relative_yaw', 90.0))
+        self.method = rospy.get_param('~method', 'torso_band')
+        if self.method not in ('torso_band', 'shoulders'):
+            raise ValueError('~method は torso_band か shoulders: %s'
+                             % self.method)
+        # 人の左手とつないでいるロボットの手のリンク。
+        self.hand_frame = rospy.get_param('~hand_frame', 'r_hand_link')
+        self.min_band_ratio = rospy.get_param('~min_band_ratio', 1.8)
+        self.band_stride = int(rospy.get_param('~band_stride', 4))
+        self.band = (rospy.get_param('~band_low', -0.20),
+                     rospy.get_param('~band_high', 0.03))
+        self.band_max_from_shoulder = rospy.get_param(
+            '~band_max_from_shoulder', 0.45)
 
         color_topic = rospy.get_param(
             '~color_topic', '/camera/color/image_raw/decompressed')
@@ -102,7 +122,8 @@ class HumanBodyYawNode(object):
         # 手のランドマークは使わないので軽い Pose だけにする。
         self.estimator = PeoplePoseEstimator(
             use_hand=False,
-            min_visibility=rospy.get_param('~min_visibility', 0.5))
+            min_visibility=rospy.get_param('~min_visibility', 0.5),
+            enable_segmentation=(self.method == 'torso_band'))
 
         self.pose_pub = rospy.Publisher('~body_pose', PoseStamped,
                                         queue_size=1)
@@ -185,43 +206,49 @@ class HumanBodyYawNode(object):
 
         if not people:
             return
-        scores = {j['limb']: j['score'] for j in joints_2d[0]
-                  if j['score'] >= 0}
-        result = body_yaw.estimate_body_yaw(
-            people[0], scores, weights=self.weights,
-            face_max_deviation=self.face_max_deviation)
-        if result is None:
-            self._publish_debug(None, None)
+        stamp = color_msg.header.stamp
+        if self.method == 'torso_band':
+            found = self._estimate_torso_band(
+                people[0], depth, info, camera_to_base, stamp)
+        else:
+            found = self._estimate_shoulders(people[0], joints_2d[0])
+        if found is None:
+            return
+        yaw_base, confidence, center_base, debug = found
+        if yaw_base is None:
+            self._publish_debug(debug)
             return
 
-        stamp = color_msg.header.stamp
         odom_from_base = self._lookup_odom_from_base(stamp)
         if odom_from_base is not None:
             frame = self.odom_frame
             base_yaw = _yaw_of_matrix(odom_from_base)
-            center = odom_from_base.dot(np.append(result.center, 1.0))[:3]
+            center = odom_from_base.dot(np.append(center_base, 1.0))[:3]
         else:
             rospy.logwarn_throttle(
                 5.0, 'human_body_yaw: %s -> %s の TF が無いので %s で出します',
                 self.base_frame, self.odom_frame, self.base_frame)
             frame = self.base_frame
             base_yaw = 0.0
-            center = result.center
+            center = center_base
         if frame != self._smoother_frame:
             self.smoother.reset()
             self._smoother_frame = frame
-        # 背中側からの左右の肩の取り違え (180° 逆) を、人はロボットと逆向き
-        # にならない前提で直す。前回の向きは base_link に戻して比べる。
-        previous = self.smoother.current(stamp.to_sec())
-        if previous is not None:
-            previous = body_yaw.wrap_angle(previous - base_yaw)
-        folded = body_yaw.fold_to_front(
-            result.yaw, self.max_relative_yaw, previous)
-        yaw = body_yaw.wrap_angle(folded + base_yaw)
-        smoothed = self.smoother.update(yaw, stamp.to_sec(),
-                                        result.confidence)
-        self._publish_debug(result, smoothed, folded)
-        if result.confidence < self.min_confidence:
+        if self.method == 'shoulders':
+            # 背中側からの左右の肩の取り違え (180° 逆) を、人はロボットと
+            # 逆向きにならない前提で直す。前回の向きは base_link に戻して比べる。
+            previous = self.smoother.current(stamp.to_sec())
+            if previous is not None:
+                previous = body_yaw.wrap_angle(previous - base_yaw)
+            yaw_base = body_yaw.fold_to_front(
+                yaw_base, self.max_relative_yaw, previous)
+            debug['folded_base_deg'] = round(math.degrees(yaw_base), 1)
+        yaw = body_yaw.wrap_angle(yaw_base + base_yaw)
+        smoothed = self.smoother.update(yaw, stamp.to_sec(), confidence)
+        debug['smoothed_deg'] = round(math.degrees(smoothed), 1)
+        debug['frame'] = frame
+        self._publish_debug(debug)
+        if confidence < self.min_confidence:
             return
 
         msg = PoseStamped()
@@ -234,24 +261,78 @@ class HumanBodyYawNode(object):
         msg.pose.orientation.w = math.cos(0.5 * smoothed)
         self.pose_pub.publish(msg)
 
-    def _publish_debug(self, result, smoothed, folded=None):
+    def _lookup_hand(self, stamp):
+        for when in (stamp, rospy.Time(0)):
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    self.base_frame, self.hand_frame, when,
+                    rospy.Duration(0.05))
+                p = t.transform.translation
+                return np.array([p.x, p.y, p.z])
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                continue
+        return None
+
+    def _estimate_torso_band(self, joints, depth, info, camera_to_base,
+                             stamp):
+        """(向き, 信頼度, 位置, debug) を返す. 向きが出せなければ向きは None."""
+        mask = self.estimator.segmentation_mask
+        if mask is None:
+            return None, 0.0, None, {'valid': False, 'reason': 'no mask'}
+        hand = self._lookup_hand(stamp)
+        if hand is None:
+            rospy.logwarn_throttle(5.0, 'human_body_yaw: %s の TF がありません',
+                                   self.hand_frame)
+            return None, 0.0, None, {'valid': False, 'reason': 'no hand tf'}
+        near_name = body_yaw.nearest_joint(
+            joints, ('LShoulder', 'RShoulder'), hand)
+        if near_name is None:
+            return None, 0.0, None, {'valid': False,
+                                     'reason': 'no shoulder'}
+        if mask.shape[:2] != depth.shape[:2]:
+            depth = cv2.resize(depth, (mask.shape[1], mask.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+        points = body_yaw.masked_depth_points(
+            depth, mask > 0.5, np.asarray(info.K).reshape(3, 3),
+            camera_to_base, stride=self.band_stride)
+        result = body_yaw.torso_band_yaw(
+            points, joints[near_name], hand, band=self.band,
+            max_from_shoulder=self.band_max_from_shoulder)
+        debug = {'method': 'torso_band', 'near': near_name}
+        if result is None:
+            debug.update(valid=False, reason='few band points')
+            return None, 0.0, None, debug
+        debug.update(yaw_base_deg=round(math.degrees(result.yaw), 1),
+                     ratio=round(result.ratio, 2), count=result.count)
+        if result.ratio < self.min_band_ratio:
+            debug.update(valid=False, reason='low ratio')
+            return None, 0.0, None, debug
+        debug.update(valid=True, confidence=1.0)
+        return result.yaw, 1.0, result.center, debug
+
+    def _estimate_shoulders(self, joints, joints_2d):
+        scores = {j['limb']: j['score'] for j in joints_2d if j['score'] >= 0}
+        result = body_yaw.estimate_body_yaw(
+            joints, scores, weights=self.weights,
+            face_max_deviation=self.face_max_deviation)
+        if result is None:
+            return None, 0.0, None, {'valid': False}
+        debug = {
+            'method': 'shoulders',
+            'valid': True,
+            'yaw_base_deg': round(math.degrees(result.yaw), 1),
+            'confidence': round(result.confidence, 3),
+            'used': result.used,
+            'parts': {name: {'yaw_base_deg': round(math.degrees(y), 1),
+                             'confidence': round(c, 3)}
+                      for name, (y, c) in result.parts.items()},
+        }
+        return result.yaw, result.confidence, result.center, debug
+
+    def _publish_debug(self, data):
         if self.debug_pub.get_num_connections() == 0:
             return
-        if result is None:
-            data = {'valid': False}
-        else:
-            data = {
-                'valid': True,
-                'yaw_base_deg': round(math.degrees(result.yaw), 1),
-                'folded_base_deg': round(math.degrees(folded), 1),
-                'smoothed_deg': round(math.degrees(smoothed), 1),
-                'frame': self._smoother_frame,
-                'confidence': round(result.confidence, 3),
-                'used': result.used,
-                'parts': {name: {'yaw_base_deg': round(math.degrees(y), 1),
-                                 'confidence': round(c, 3)}
-                          for name, (y, c) in result.parts.items()},
-            }
         self.debug_pub.publish(String(data=json.dumps(data)))
 
 

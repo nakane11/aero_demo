@@ -18,6 +18,10 @@
 
 既定は肩だけ (腰 0・肩 1・顔 0)。手つなぎで横に並ぶと頭のカメラには
 人の顔と胸元しか写らず、腰は画角の外になるため (10/21 試行1 の bag)。
+
+手をつないで横に並ぶと反対側の肩も隠れるので、``torso_band_yaw`` は
+人の領域の点群から胴体上部の主軸を取り、つないでいる手の側を左として
+向きを出す (関節の左右のラベルに頼らない)。
 """
 
 import math
@@ -238,6 +242,99 @@ class YawSmoother(object):
                 or stamp < self._stamp):
             return None
         return math.atan2(self._vec[1], self._vec[0])
+
+
+TorsoBandYaw = namedtuple('TorsoBandYaw', [
+    'yaw',      # 体の正面のヨー角 [rad] (-pi, pi]
+    'ratio',    # 帯の点の水平の広がりの 長軸 / 短軸 (標準偏差の比)
+    'count',    # 帯の点の数
+    'center',   # (3,) 帯の点の重心
+])
+
+# 手前の肩の高さからの帯 [m] (肩と上腕・胸の上部が入る)。
+DEFAULT_TORSO_BAND = (-0.20, 0.03)
+DEFAULT_TORSO_MAX_FROM_SHOULDER = 0.45
+DEFAULT_TORSO_MIN_POINTS = 50
+
+
+def nearest_joint(joints, names, target):
+    """``names`` のうち ``target`` に水平距離で最も近い関節名 (無ければ None)."""
+    best, best_dist = None, None
+    for name in names:
+        p = joints.get(name)
+        if p is None:
+            continue
+        dist = math.hypot(p[0] - target[0], p[1] - target[1])
+        if best_dist is None or dist < best_dist:
+            best, best_dist = name, dist
+    return best
+
+
+def masked_depth_points(depth, mask, K, transform=None, stride=4,
+                        min_depth=0.15, max_depth=3.0):
+    """``mask`` が真で深度が有効な画素を 3 次元点 (N, 3) にする.
+
+    ``depth`` [m] と ``mask`` は同じ大きさ、``K`` は 3x3 の内部パラメータ。
+    ``transform`` (4x4) を渡すとその座標系に直す。``stride`` 個に 1 個を使う。
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    ok = np.asarray(mask, dtype=bool) & (depth > min_depth) & (depth < max_depth)
+    v, u = np.nonzero(ok)
+    if stride > 1:
+        v, u = v[::stride], u[::stride]
+    z = depth[v, u].astype(np.float64)
+    pts = np.stack([(u - K[0][2]) / K[0][0] * z,
+                    (v - K[1][2]) / K[1][1] * z, z], axis=1)
+    if transform is not None:
+        transform = np.asarray(transform, dtype=np.float64)
+        pts = pts.dot(transform[:3, :3].T) + transform[:3, 3]
+    return pts
+
+
+def torso_band_yaw(points, near_shoulder, hand,
+                   band=DEFAULT_TORSO_BAND,
+                   max_from_shoulder=DEFAULT_TORSO_MAX_FROM_SHOULDER,
+                   min_points=DEFAULT_TORSO_MIN_POINTS):
+    """胴体の上部の点の並び (主軸) を肩の線とし、手をつないだ側を左として向きを出す.
+
+    手をつないで横に並ぶと頭のカメラから反対側の肩が隠れ、両肩の関節の線は
+    深度の誤差で決まってしまう。また背中側から見ると MediaPipe が左右の肩を
+    取り違える。そこで
+
+    1. 人の点群 (z 上向きの座標系) のうち、手前の肩 ``near_shoulder`` の
+       高さから ``band`` の範囲で、肩から水平に ``max_from_shoulder`` 以内の
+       点を取る (肩・上腕・見えている胸か背中の面で横に長い形になる)。
+    2. その点の水平の広がりの主軸を肩の線とする。
+    3. 主軸の両端のうち、つないでいる手 ``hand`` の側を人の左とする
+       (人の左手とロボットの手をつなぐ前提)。
+
+    主軸が決まりにくい (``ratio`` が 1 に近い) ときの扱いは呼び出し側で決める。
+
+    Returns
+    -------
+    TorsoBandYaw or None
+        帯の点が ``min_points`` 未満なら None。
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    near = np.asarray(near_shoulder, dtype=np.float64)
+    if len(pts) == 0:
+        return None
+    dz = pts[:, 2] - near[2]
+    sel = ((dz > band[0]) & (dz < band[1])
+           & (np.hypot(pts[:, 0] - near[0], pts[:, 1] - near[1])
+              < max_from_shoulder))
+    band_pts = pts[sel]
+    if len(band_pts) < max(min_points, 3):
+        return None
+    center = band_pts.mean(axis=0)
+    xy = band_pts[:, :2] - center[:2]
+    eigvals, eigvecs = np.linalg.eigh(xy.T.dot(xy) / len(xy))
+    axis = eigvecs[:, 1]
+    if axis.dot(np.asarray(hand[:2], dtype=np.float64) - center[:2]) < 0.0:
+        axis = -axis
+    ratio = math.sqrt(max(eigvals[1], 0.0) / max(eigvals[0], 1e-12))
+    return TorsoBandYaw(yaw=math.atan2(-axis[0], axis[1]), ratio=ratio,
+                        count=int(len(band_pts)), center=center)
 
 
 def fold_to_front(yaw, max_relative=math.pi / 2, previous=None,
