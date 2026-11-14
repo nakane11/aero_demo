@@ -123,6 +123,10 @@ class HumanBodyYawNode(object):
         self.estimator = PeoplePoseEstimator(
             use_hand=False,
             min_visibility=rospy.get_param('~min_visibility', 0.5),
+            # 横に並ぶと頭と肩しか写らず、背を向けると両肩が重なるので、
+            # 関節の範囲の対角線が 0.2〜0.3m になる (推定器の既定 0.3m だと
+            # 背を向けた場面を人として扱わない)。
+            min_body_size=rospy.get_param('~min_body_size', 0.15),
             enable_segmentation=(self.method == 'torso_band'))
 
         self.pose_pub = rospy.Publisher('~body_pose', PoseStamped,
