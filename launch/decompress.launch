@@ -4,15 +4,32 @@
   <arg name="depth_out" default="/camera/depth/image_raw/decompressed" />
   <arg name="color_camera_info" default="/camera/color/camera_info" />
   <arg name="points_out" default="/camera/depth_registered/points" />
+  <!-- true: ロボットからの圧縮画像を PC で 1 本だけ受けて relay_ns の下に
+       出し直し、展開はそれを使う。rosbag record も relay_ns の下を録れば、
+       ロボットから同じ画像が 2 本流れない (11/16: 録画と展開が別々に受けると
+       深度が 15 -> 8Hz、遅れが 0.13 -> 0.65 秒になった)。 -->
+  <arg name="relay" default="false" />
+  <arg name="relay_ns" default="/pc_relay" />
+  <arg name="color_in" value="$(arg relay_ns)/camera/color/image_raw" if="$(arg relay)" />
+  <arg name="color_in" value="/camera/color/image_raw" unless="$(arg relay)" />
+  <arg name="depth_in" value="$(arg relay_ns)/camera/depth/image_raw" if="$(arg relay)" />
+  <arg name="depth_in" value="/camera/depth/image_raw" unless="$(arg relay)" />
+
+  <group if="$(arg relay)">
+    <node pkg="topic_tools" type="relay" name="relay_color_compressed"
+          args="/camera/color/image_raw/compressed $(arg color_in)/compressed" />
+    <node pkg="topic_tools" type="relay" name="relay_depth_compressed"
+          args="/camera/depth/image_raw/compressedDepth $(arg depth_in)/compressedDepth" />
+  </group>
 
   <!-- Color画像の解凍 (compressed -> raw) -->
   <node pkg="image_transport" type="republish" name="decompress_color" output="screen"
-        args="compressed in:=/camera/color/image_raw raw out:=$(arg color_out)">
+        args="compressed in:=$(arg color_in) raw out:=$(arg color_out)">
   </node>
 
   <!-- Depth画像の解凍 (compressedDepth -> raw) -->
   <node pkg="image_transport" type="republish" name="decompress_depth" output="screen"
-        args="compressedDepth in:=/camera/depth/image_raw raw out:=$(arg depth_out)">
+        args="compressedDepth in:=$(arg depth_in) raw out:=$(arg depth_out)">
   </node>
 
   <!-- 解凍したColor/Depth画像からPointCloud2を生成 -->
