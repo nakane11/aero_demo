@@ -125,6 +125,10 @@ class HumanBodyYawNode(object):
         # (右に回って背を向けると手が体の後ろ側に回るため)。
         self.band_keep_cos = rospy.get_param(
             '~band_keep_cos', body_yaw.DEFAULT_TORSO_KEEP_COS)
+        # 前回の向きが無いときはロボットの正面 (0) を前回の代わりにする
+        # (並んで歩き出す人はロボットとほぼ同じ向き。11/16: 真横を向いて
+        # 立ち止まった人に左右が決まらず 4 秒反応しなかった)。
+        self.front_prior = rospy.get_param('~front_prior', True)
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
         # depth: 頭のてっぺんから手前の肩までの高さ [m]。
@@ -239,6 +243,12 @@ class HumanBodyYawNode(object):
             self._tf_reconnect_wall = now
         return None
 
+    def _side_prior(self, previous):
+        """左右を決める基準の向き: 前回の向き、無ければ (front_prior なら) 0."""
+        if previous is None and self.front_prior:
+            return 0.0
+        return previous
+
     def _previous_base_yaw(self, stamp, odom_from_base):
         """左右が曖昧なときに使う前回のならした向き (base_link, 無ければ None)."""
         if odom_from_base is None or self._smoother_frame != self.odom_frame:
@@ -291,7 +301,8 @@ class HumanBodyYawNode(object):
             head.points, near, hand, band=self.band,
             max_from_shoulder=self.band_max_from_shoulder,
             min_points=self.min_band_points,
-            previous=previous, ambiguous_cos=self.band_ambiguous_cos,
+            previous=self._side_prior(previous),
+            ambiguous_cos=self.band_ambiguous_cos,
             keep_cos=self.band_keep_cos)
         found = self._band_result(result, previous, debug)
         self._publish_result(stamp, odom_from_base, found)
@@ -431,7 +442,8 @@ class HumanBodyYawNode(object):
         result = body_yaw.torso_band_yaw(
             points, joints[near_name], hand, band=self.band,
             max_from_shoulder=self.band_max_from_shoulder,
-            previous=previous, ambiguous_cos=self.band_ambiguous_cos,
+            previous=self._side_prior(previous),
+            ambiguous_cos=self.band_ambiguous_cos,
             keep_cos=self.band_keep_cos)
         return self._band_result(
             result, previous, {'method': 'torso_band', 'near': near_name})
@@ -448,7 +460,7 @@ class HumanBodyYawNode(object):
         if result.ratio < self.min_band_ratio:
             debug.update(valid=False, reason='low ratio')
             return None, 0.0, None, debug
-        if result.ambiguous and previous is None:
+        if result.ambiguous and self._side_prior(previous) is None:
             debug.update(valid=False, reason='ambiguous side')
             return None, 0.0, None, debug
         debug.update(valid=True, confidence=1.0)
