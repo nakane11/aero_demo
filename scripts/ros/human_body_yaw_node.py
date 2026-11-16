@@ -107,6 +107,9 @@ class HumanBodyYawNode(object):
                      rospy.get_param('~band_high', 0.03))
         self.band_max_from_shoulder = rospy.get_param(
             '~band_max_from_shoulder', 0.45)
+        # 主軸と 重心 -> 手 の |cos| がこれ未満 (人がロボットへ真横・真後ろ
+        # を向いた ±90° 付近) なら、左右を前回の向きで決める。
+        self.band_ambiguous_cos = rospy.get_param('~band_ambiguous_cos', 0.35)
 
         color_topic = rospy.get_param(
             '~color_topic', '/camera/color/image_raw/decompressed')
@@ -211,9 +214,18 @@ class HumanBodyYawNode(object):
         if not people:
             return
         stamp = color_msg.header.stamp
+        odom_from_base = self._lookup_odom_from_base(stamp)
         if self.method == 'torso_band':
+            # 左右が曖昧なときに使う前回の向き (base_link)。
+            previous = None
+            if odom_from_base is not None and \
+                    self._smoother_frame == self.odom_frame:
+                previous = self.smoother.current(stamp.to_sec())
+                if previous is not None:
+                    previous = body_yaw.wrap_angle(
+                        previous - _yaw_of_matrix(odom_from_base))
             found = self._estimate_torso_band(
-                people[0], depth, info, camera_to_base, stamp)
+                people[0], depth, info, camera_to_base, stamp, previous)
         else:
             found = self._estimate_shoulders(people[0], joints_2d[0])
         if found is None:
@@ -223,7 +235,6 @@ class HumanBodyYawNode(object):
             self._publish_debug(debug)
             return
 
-        odom_from_base = self._lookup_odom_from_base(stamp)
         if odom_from_base is not None:
             frame = self.odom_frame
             base_yaw = _yaw_of_matrix(odom_from_base)
@@ -279,7 +290,7 @@ class HumanBodyYawNode(object):
         return None
 
     def _estimate_torso_band(self, joints, depth, info, camera_to_base,
-                             stamp):
+                             stamp, previous=None):
         """(向き, 信頼度, 位置, debug) を返す. 向きが出せなければ向きは None."""
         mask = self.estimator.segmentation_mask
         if mask is None:
@@ -302,15 +313,21 @@ class HumanBodyYawNode(object):
             camera_to_base, stride=self.band_stride)
         result = body_yaw.torso_band_yaw(
             points, joints[near_name], hand, band=self.band,
-            max_from_shoulder=self.band_max_from_shoulder)
+            max_from_shoulder=self.band_max_from_shoulder,
+            previous=previous, ambiguous_cos=self.band_ambiguous_cos)
         debug = {'method': 'torso_band', 'near': near_name}
         if result is None:
             debug.update(valid=False, reason='few band points')
             return None, 0.0, None, debug
         debug.update(yaw_base_deg=round(math.degrees(result.yaw), 1),
-                     ratio=round(result.ratio, 2), count=result.count)
+                     ratio=round(result.ratio, 2), count=result.count,
+                     hand_cos=round(result.hand_cos, 2),
+                     ambiguous=result.ambiguous)
         if result.ratio < self.min_band_ratio:
             debug.update(valid=False, reason='low ratio')
+            return None, 0.0, None, debug
+        if result.ambiguous and previous is None:
+            debug.update(valid=False, reason='ambiguous side')
             return None, 0.0, None, debug
         debug.update(valid=True, confidence=1.0)
         return result.yaw, 1.0, result.center, debug

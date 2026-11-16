@@ -249,12 +249,16 @@ TorsoBandYaw = namedtuple('TorsoBandYaw', [
     'ratio',    # 帯の点の水平の広がりの 長軸 / 短軸 (標準偏差の比)
     'count',    # 帯の点の数
     'center',   # (3,) 帯の点の重心
+    'hand_cos',  # |主軸と 重心 -> 手 の向きの cos| (小さいほど左右が曖昧)
+    'ambiguous',  # hand_cos < ambiguous_cos (左右を前回の向きで決めた/決められない)
 ])
 
 # 手前の肩の高さからの帯 [m] (肩と上腕・胸の上部が入る)。
 DEFAULT_TORSO_BAND = (-0.20, 0.03)
 DEFAULT_TORSO_MAX_FROM_SHOULDER = 0.45
 DEFAULT_TORSO_MIN_POINTS = 50
+# 主軸と 重心 -> 手 の向きの |cos| がこれ未満なら左右を前回の向きで決める。
+DEFAULT_TORSO_AMBIGUOUS_COS = 0.35
 
 
 def nearest_joint(joints, names, target):
@@ -294,7 +298,9 @@ def masked_depth_points(depth, mask, K, transform=None, stride=4,
 def torso_band_yaw(points, near_shoulder, hand,
                    band=DEFAULT_TORSO_BAND,
                    max_from_shoulder=DEFAULT_TORSO_MAX_FROM_SHOULDER,
-                   min_points=DEFAULT_TORSO_MIN_POINTS):
+                   min_points=DEFAULT_TORSO_MIN_POINTS,
+                   previous=None,
+                   ambiguous_cos=DEFAULT_TORSO_AMBIGUOUS_COS):
     """胴体の上部の点の並び (主軸) を肩の線とし、手をつないだ側を左として向きを出す.
 
     手をつないで横に並ぶと頭のカメラから反対側の肩が隠れ、両肩の関節の線は
@@ -309,6 +315,13 @@ def torso_band_yaw(points, near_shoulder, hand,
        (人の左手とロボットの手をつなぐ前提)。
 
     主軸が決まりにくい (``ratio`` が 1 に近い) ときの扱いは呼び出し側で決める。
+
+    人がロボットの方を真横に向く・真後ろを向く (±90° 付近) と、肩の線が
+    帯の重心 -> 手の向きとほぼ直交し、3. の左右が深度の誤差で入れ替わる
+    (11/16 の実機で向きが一瞬 180° 反転した)。主軸と 重心 -> 手 の向きの
+    cos の絶対値が ``ambiguous_cos`` 未満で ``previous`` (同じ座標系の
+    前回の向き) があれば、前回に近い方を選ぶ (前回が無ければ ``ambiguous``
+    を立てて返すので、呼び出し側で捨てる)。
 
     Returns
     -------
@@ -330,11 +343,20 @@ def torso_band_yaw(points, near_shoulder, hand,
     xy = band_pts[:, :2] - center[:2]
     eigvals, eigvecs = np.linalg.eigh(xy.T.dot(xy) / len(xy))
     axis = eigvecs[:, 1]
-    if axis.dot(np.asarray(hand[:2], dtype=np.float64) - center[:2]) < 0.0:
+    to_hand = np.asarray(hand[:2], dtype=np.float64) - center[:2]
+    cos = axis.dot(to_hand) / max(np.linalg.norm(to_hand), 1e-9)
+    if cos < 0.0:
         axis = -axis
+    yaw = math.atan2(-axis[0], axis[1])
+    ambiguous = abs(cos) < ambiguous_cos
+    if ambiguous and previous is not None:
+        flipped = wrap_angle(yaw + math.pi)
+        if abs(wrap_angle(flipped - previous)) < abs(wrap_angle(yaw - previous)):
+            yaw = flipped
     ratio = math.sqrt(max(eigvals[1], 0.0) / max(eigvals[0], 1e-12))
-    return TorsoBandYaw(yaw=math.atan2(-axis[0], axis[1]), ratio=ratio,
-                        count=int(len(band_pts)), center=center)
+    return TorsoBandYaw(yaw=yaw, ratio=ratio, count=int(len(band_pts)),
+                        center=center, hand_cos=float(abs(cos)),
+                        ambiguous=bool(ambiguous))
 
 
 def fold_to_front(yaw, max_relative=math.pi / 2, previous=None,

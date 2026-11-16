@@ -249,6 +249,30 @@ def test_torso_band_yaw_hand_side_is_left(yaw_deg):
         math.radians(5.0)
 
 
+@pytest.mark.parametrize('yaw_deg', [90.0, -90.0])
+def test_torso_band_yaw_ambiguous_side_uses_previous(yaw_deg):
+    # 手が肩の線のほぼ真横 (重心の前) にあると左右が決まらない
+    yaw = math.radians(yaw_deg)
+    pts, left = _band_points(yaw)
+    center = np.array([0.0, -0.6, 1.2])
+    fwd = np.array([math.cos(yaw), math.sin(yaw)])
+    hand = np.append(center[:2] + fwd * 0.5 + left * 0.05, 0.8)
+    result = body_yaw.torso_band_yaw(pts, center, hand)
+    assert result.ambiguous
+    assert result.hand_cos < 0.35
+    for prev in (yaw + math.radians(30.0), yaw + math.pi - 0.3):
+        r = body_yaw.torso_band_yaw(pts, center, hand, previous=prev)
+        expect = yaw if abs(body_yaw.wrap_angle(prev - yaw)) < 1.0 \
+            else yaw + math.pi
+        assert abs(body_yaw.wrap_angle(r.yaw - expect)) < math.radians(5.0)
+    # 曖昧でなければ前回の向きに引きずられない
+    hand_side = np.append(center[:2] + left * 0.5, 0.8)
+    r = body_yaw.torso_band_yaw(pts, center, hand_side,
+                                previous=yaw + math.pi)
+    assert not r.ambiguous
+    assert abs(body_yaw.wrap_angle(r.yaw - yaw)) < math.radians(5.0)
+
+
 def test_torso_band_yaw_round_blob_has_low_ratio():
     rng = np.random.RandomState(1)
     xy = rng.normal(0.0, 0.1, (500, 2)) + [0.0, -0.6]
