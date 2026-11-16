@@ -273,6 +273,27 @@ def test_torso_band_yaw_ambiguous_side_uses_previous(yaw_deg):
     assert abs(body_yaw.wrap_angle(r.yaw - yaw)) < math.radians(5.0)
 
 
+def test_torso_band_yaw_keeps_previous_side_below_keep_cos():
+    # 背を向けて -90° を越え、手が体の後ろ側 (人の右) に |cos| 0.5 で出る
+    yaw = math.radians(-120.0)
+    pts, left = _band_points(yaw)
+    center = np.array([0.0, -0.6, 1.2])
+    fwd = np.array([math.cos(yaw), math.sin(yaw)])
+    hand = np.append(center[:2] - left * 0.25 - fwd * 0.43, 0.8)
+    alone = body_yaw.torso_band_yaw(pts, center, hand)
+    assert 0.35 < alone.hand_cos < 0.6
+    assert abs(body_yaw.wrap_angle(alone.yaw - yaw - math.pi)) < \
+        math.radians(5.0)
+    kept = body_yaw.torso_band_yaw(pts, center, hand,
+                                   previous=yaw + math.radians(20.0))
+    assert abs(body_yaw.wrap_angle(kept.yaw - yaw)) < math.radians(5.0)
+    # keep_cos を下げれば手の側に従う
+    hand_rule = body_yaw.torso_band_yaw(pts, center, hand,
+                                        previous=yaw, keep_cos=0.35)
+    assert abs(body_yaw.wrap_angle(hand_rule.yaw - yaw - math.pi)) < \
+        math.radians(5.0)
+
+
 def test_torso_band_yaw_round_blob_has_low_ratio():
     rng = np.random.RandomState(1)
     xy = rng.normal(0.0, 0.1, (500, 2)) + [0.0, -0.6]

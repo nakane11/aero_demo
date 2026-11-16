@@ -121,6 +121,10 @@ class HumanBodyYawNode(object):
         # 主軸と 重心 -> 手 の |cos| がこれ未満 (人がロボットへ真横・真後ろ
         # を向いた ±90° 付近) なら、左右を前回の向きで決める。
         self.band_ambiguous_cos = rospy.get_param('~band_ambiguous_cos', 0.35)
+        # 前回の向きがあれば |cos| がこれ未満のうちは前回に近い側を保つ
+        # (右に回って背を向けると手が体の後ろ側に回るため)。
+        self.band_keep_cos = rospy.get_param(
+            '~band_keep_cos', body_yaw.DEFAULT_TORSO_KEEP_COS)
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
         # depth: 頭のてっぺんから手前の肩までの高さ [m]。
@@ -262,7 +266,8 @@ class HumanBodyYawNode(object):
             head.points, near, hand, band=self.band,
             max_from_shoulder=self.band_max_from_shoulder,
             min_points=self.min_band_points,
-            previous=previous, ambiguous_cos=self.band_ambiguous_cos)
+            previous=previous, ambiguous_cos=self.band_ambiguous_cos,
+            keep_cos=self.band_keep_cos)
         found = self._band_result(result, previous, debug)
         self._publish_result(stamp, odom_from_base, found)
 
@@ -402,7 +407,8 @@ class HumanBodyYawNode(object):
         result = body_yaw.torso_band_yaw(
             points, joints[near_name], hand, band=self.band,
             max_from_shoulder=self.band_max_from_shoulder,
-            previous=previous, ambiguous_cos=self.band_ambiguous_cos)
+            previous=previous, ambiguous_cos=self.band_ambiguous_cos,
+            keep_cos=self.band_keep_cos)
         return self._band_result(
             result, previous, {'method': 'torso_band', 'near': near_name})
 
