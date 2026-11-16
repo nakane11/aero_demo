@@ -142,6 +142,10 @@ class HumanBodyYawNode(object):
         # ~blind_x_max より前なら左回り (正) だけ通し、逆は 0 にする。
         self.step_direction_gate = rospy.get_param(
             '~step_direction_gate', True)
+        # depth: 向きが読めない間、最後に読めた向き (odom) をこの時間 [s]
+        # まで保つ (回り始めたら回りきる)。0 で保たない。
+        self.hold_time = rospy.get_param('~hold_time', 3.0)
+        self._last_valid = None
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
         # depth: 頭のてっぺんから手前の肩までの高さ [m]。
@@ -311,12 +315,10 @@ class HumanBodyYawNode(object):
         debug['top'] = [round(float(v), 3) for v in head.top]
         if (self.blind_x[0] <= head.top[0] <= self.blind_x[1]
                 and abs(head.top[1]) < self.blind_max_y):
-            # 向きが読めない領域: ロボットと同じ向きとみなす (次に回る
-            # ときの左右の基準にもなる)。
-            debug.update(valid=True, confidence=1.0, yaw_base_deg=0.0,
-                         blind=True)
-            self._publish_result(stamp, odom_from_base,
-                                 (0.0, 1.0, head.top, debug))
+            # 向きが読めない領域: 回っている途中なら直前の目標を保ち、
+            # そうでなければロボットと同じ向きとみなす (回らない)。
+            debug['blind'] = True
+            self._publish_held(stamp, odom_from_base, head.top, debug, 0.0)
             return
         near = head.top - np.array([0.0, 0.0, self.head_to_shoulder])
         result = body_yaw.torso_band_yaw(
@@ -329,7 +331,47 @@ class HumanBodyYawNode(object):
         found = self._band_result(result, previous, debug)
         if self.step_direction_gate and found[0] is not None:
             found = self._gate_by_step(found, head.top[0])
-        self._publish_result(stamp, odom_from_base, found)
+        if found[0] is None:
+            # 向きを捨てた (帯が丸い・点が少ない): 回っている途中なら直前の
+            # 目標を保つ。そうでなければ出さない。
+            self._publish_held(stamp, odom_from_base, head.top, debug, None)
+            return
+        if debug.get('step_gated'):
+            self._publish_held(stamp, odom_from_base, head.top, debug, 0.0)
+            return
+        self._publish_result(stamp, odom_from_base, found, genuine=True)
+
+    def _held_base_yaw(self, stamp, odom_from_base):
+        """~hold_time 以内に読めた最後の向き (odom) を base_link で返す."""
+        if (self._last_valid is None or odom_from_base is None
+                or self._smoother_frame != self.odom_frame):
+            return None
+        target, when = self._last_valid
+        if not 0.0 <= stamp.to_sec() - when <= self.hold_time:
+            return None
+        return body_yaw.wrap_angle(target - _yaw_of_matrix(odom_from_base))
+
+    def _publish_held(self, stamp, odom_from_base, center, debug, fallback):
+        """向きが読めないとき: 直前の目標を保つ。無ければ fallback (None なら出さない).
+
+        回り始めたあと、人が向きの読めない領域に入ったり帯が丸く見えたり
+        しても、回ってほしい量を回りきるため (11/16: 途中で 0 が出て止まった)。
+        保った目標では ~hold_time の起点を更新しない。
+        """
+        held = self._held_base_yaw(stamp, odom_from_base)
+        if held is not None:
+            debug.update(valid=True, confidence=1.0, held=True,
+                         yaw_base_deg=round(math.degrees(held), 1))
+            self._publish_result(stamp, odom_from_base,
+                                 (held, 1.0, center, debug), genuine=False)
+        elif fallback is not None:
+            debug.update(valid=True, confidence=1.0,
+                         yaw_base_deg=round(math.degrees(fallback), 1))
+            self._publish_result(stamp, odom_from_base,
+                                 (fallback, 1.0, center, debug),
+                                 genuine=False)
+        else:
+            self._publish_debug(debug)
 
     def _gate_by_step(self, found, top_x):
         """ロボットより後ろの人は右回りだけ、前の人は左回りだけ通す.
@@ -396,8 +438,11 @@ class HumanBodyYawNode(object):
             found = self._estimate_shoulders(people[0], joints_2d[0])
         self._publish_result(stamp, odom_from_base, found)
 
-    def _publish_result(self, stamp, odom_from_base, found):
-        """(向き, 信頼度, 位置, debug) をならして publish する."""
+    def _publish_result(self, stamp, odom_from_base, found, genuine=True):
+        """(向き, 信頼度, 位置, debug) をならして publish する.
+
+        genuine: 画像から読めた向き (保った目標・0 の代わりでない)。
+        """
         if found is None:
             return
         yaw_base, confidence, center_base, debug = found
@@ -430,6 +475,8 @@ class HumanBodyYawNode(object):
             debug['folded_base_deg'] = round(math.degrees(yaw_base), 1)
         yaw = body_yaw.wrap_angle(yaw_base + base_yaw)
         smoothed = self.smoother.update(yaw, stamp.to_sec(), confidence)
+        if genuine and frame == self.odom_frame:
+            self._last_valid = (smoothed, stamp.to_sec())
         debug['smoothed_deg'] = round(math.degrees(smoothed), 1)
         debug['frame'] = frame
         self._publish_debug(debug)
