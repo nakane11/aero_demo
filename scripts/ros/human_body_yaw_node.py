@@ -3,13 +3,18 @@
 
 """頭のカメラの画像から人の体の向き (ヨー角) を求めて publish するノード.
 
-MediaPipe (aero_demo.people_pose_estimator) で骨格と人の領域を求め、
 体の正面の向きを出す (aero_demo.body_yaw)。``~method`` で選ぶ。
 
-- ``torso_band`` (既定): 手前の肩の高さの帯にある人の点群の主軸を肩の線
-  とし、つないでいる手 (``~hand_frame``) の側を人の左とする。反対側の肩が
-  隠れていても、背中側から見ても使える。主軸の 長軸/短軸 が
-  ``~min_band_ratio`` 未満のときは向きを出さない。
+- ``depth`` (既定): 深度画像だけを使う。つないでいる手 (``~hand_frame``)
+  の近くで手より高い点を人とみなし、その最上部 (頭のてっぺん) から
+  ``~head_to_shoulder`` 下を肩の高さとして、その高さの帯の点の主軸を肩の
+  線とし、手の側を人の左とする。背中側から近くで見て MediaPipe が人を
+  見つけないとき・別の物を人と見誤るときも使える (11/16 の実機)。
+- ``torso_band``: 同じ帯の主軸を、MediaPipe (aero_demo.people_pose_estimator)
+  の人の領域と手前の肩の関節から取る。
+- 上の 2 つは主軸の 長軸/短軸 が ``~min_band_ratio`` 未満のときは向きを
+  出さない。人がロボットへ真横・真後ろを向いて左右が曖昧なときは前回の
+  向きに近い方を選ぶ。
 - ``shoulders``: 両肩の関節の線 (~weight_hip・~weight_face を正にすると
   腰・顔も混ぜる)。背中側からの左右の取り違えは ``~max_relative_yaw``
   で折り返す。
@@ -25,15 +30,16 @@ TF で ``~odom_frame`` 座標系に直して出す (odom が引けなければ b
 Publish
 -------
 ~body_pose (geometry_msgs/PoseStamped)
-    位置は torso_band なら帯の点の重心、shoulders なら肩の中点 (腰を使う
+    位置は depth・torso_band なら帯の点の重心、shoulders なら肩の中点 (腰を使う
     ときは腰の中点)。向きは体の正面のヨー角。信頼度が ``~min_confidence``
     以上のときだけ出す。stamp は画像の時刻。
 ~debug (std_msgs/String)
-    向き [deg, base_link]・ならした向き・信頼度の JSON。torso_band は
-    帯の比 (ratio)・点の数・手前の肩、shoulders は部位ごとの向きと
+    向き [deg, base_link]・ならした向き・信頼度の JSON。depth・torso_band
+    は帯の比 (ratio)・点の数・左右の曖昧さ (hand_cos)、depth は頭の
+    てっぺん (top)、torso_band は手前の肩、shoulders は部位ごとの向きと
     180° 折り返し後の向き (folded_base_deg)。
 ~skeleton_image (sensor_msgs/Image)
-    骨格を重ねた画像 (購読者がいるときだけ)。
+    骨格を重ねた画像 (depth 以外で購読者がいるときだけ)。
 
     rosrun aero_demo human_body_yaw_node.py
 """
@@ -44,15 +50,20 @@ import os
 import sys
 import threading
 
-import cv2
-import numpy as np
+# numpy の行列計算 (OpenBLAS) のスレッドは計算の合間も回り続け、15Hz で
+# 処理すると 2 コアを使い切る (11/16: 213% -> 1 本で 20%)。numpy を
+# import する前に決める。
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 
-import message_filters
-import rospy
-import tf2_ros
-from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+
+import message_filters  # noqa: E402
+import rospy  # noqa: E402
+import tf2_ros  # noqa: E402
+from geometry_msgs.msg import PoseStamped  # noqa: E402
+from sensor_msgs.msg import CameraInfo, Image  # noqa: E402
+from std_msgs.msg import String  # noqa: E402
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_SRC_DIR = os.path.join(_THIS_DIR, '..', '..', 'src')
@@ -95,9 +106,9 @@ class HumanBodyYawNode(object):
         # (背中側から見たときの左右の肩の取り違え対策)。180 で無効。
         self.max_relative_yaw = math.radians(
             rospy.get_param('~max_relative_yaw', 90.0))
-        self.method = rospy.get_param('~method', 'torso_band')
-        if self.method not in ('torso_band', 'shoulders'):
-            raise ValueError('~method は torso_band か shoulders: %s'
+        self.method = rospy.get_param('~method', 'depth')
+        if self.method not in ('depth', 'torso_band', 'shoulders'):
+            raise ValueError('~method は depth・torso_band・shoulders: %s'
                              % self.method)
         # 人の左手とつないでいるロボットの手のリンク。
         self.hand_frame = rospy.get_param('~hand_frame', 'r_hand_link')
@@ -110,6 +121,14 @@ class HumanBodyYawNode(object):
         # 主軸と 重心 -> 手 の |cos| がこれ未満 (人がロボットへ真横・真後ろ
         # を向いた ±90° 付近) なら、左右を前回の向きで決める。
         self.band_ambiguous_cos = rospy.get_param('~band_ambiguous_cos', 0.35)
+        # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
+        self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
+        # depth: 頭のてっぺんから手前の肩までの高さ [m]。
+        self.head_to_shoulder = rospy.get_param('~head_to_shoulder', 0.27)
+        # depth: 手から水平にこの距離 [m] 以内の点を人とみなす。
+        self.person_radius = rospy.get_param(
+            '~person_radius', body_yaw.DEFAULT_PERSON_RADIUS)
+        self.min_band_points = int(rospy.get_param('~min_band_points', 30))
 
         color_topic = rospy.get_param(
             '~color_topic', '/camera/color/image_raw/decompressed')
@@ -123,14 +142,16 @@ class HumanBodyYawNode(object):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         # 手のランドマークは使わないので軽い Pose だけにする。
-        self.estimator = PeoplePoseEstimator(
-            use_hand=False,
-            min_visibility=rospy.get_param('~min_visibility', 0.5),
-            # 横に並ぶと頭と肩しか写らず、背を向けると両肩が重なるので、
-            # 関節の範囲の対角線が 0.2〜0.3m になる (推定器の既定 0.3m だと
-            # 背を向けた場面を人として扱わない)。
-            min_body_size=rospy.get_param('~min_body_size', 0.15),
-            enable_segmentation=(self.method == 'torso_band'))
+        self.estimator = None
+        if self.method != 'depth':
+            self.estimator = PeoplePoseEstimator(
+                use_hand=False,
+                min_visibility=rospy.get_param('~min_visibility', 0.5),
+                # 横に並ぶと頭と肩しか写らず、背を向けると両肩が重なるので、
+                # 関節の範囲の対角線が 0.2〜0.3m になる (推定器の既定 0.3m
+                # だと背を向けた場面を人として扱わない)。
+                min_body_size=rospy.get_param('~min_body_size', 0.15),
+                enable_segmentation=(self.method == 'torso_band'))
 
         self.pose_pub = rospy.Publisher('~body_pose', PoseStamped,
                                         queue_size=1)
@@ -141,6 +162,18 @@ class HumanBodyYawNode(object):
         self._camera_info = None
         rospy.Subscriber(info_topic, CameraInfo, self._on_camera_info,
                          queue_size=1)
+        # 終了時に処理中の画像があると閉じた推定器を使ってしまうので、
+        # 推定と終了処理を同じロックで分ける。
+        self._lock = threading.Lock()
+        self._closed = False
+        rospy.on_shutdown(self._close)
+        if self.method == 'depth':
+            # 深度は色の画像と位置合わせ済み (内部パラメータは色のもの)。
+            rospy.Subscriber(depth_topic, Image, self._on_depth,
+                             queue_size=1, buff_size=2 ** 24)
+            rospy.loginfo('human_body_yaw: %s -> ~body_pose (%s)',
+                          depth_topic, self.odom_frame)
+            return
         # 推定が遅れても古い画像を溜めないよう queue_size=1 にする。
         color_sub = message_filters.Subscriber(
             color_topic, Image, queue_size=1, buff_size=2 ** 24)
@@ -153,12 +186,7 @@ class HumanBodyYawNode(object):
             [color_sub, depth_sub],
             queue_size=rospy.get_param('~sync_queue_size', 10),
             slop=rospy.get_param('~sync_slop', 0.1))
-        # 終了時に処理中の画像があると閉じた推定器を使ってしまうので、
-        # 推定と終了処理を同じロックで分ける。
-        self._lock = threading.Lock()
-        self._closed = False
         self.sync.registerCallback(self._on_frame)
-        rospy.on_shutdown(self._close)
         rospy.loginfo('human_body_yaw: %s + %s -> ~body_pose (%s)',
                       color_topic, depth_topic, self.odom_frame)
 
@@ -168,12 +196,75 @@ class HumanBodyYawNode(object):
     def _close(self):
         with self._lock:
             self._closed = True
-            self.estimator.close()
+            if self.estimator is not None:
+                self.estimator.close()
 
     def _on_frame(self, color_msg, depth_msg):
         with self._lock:
             if not self._closed:
                 self._process_frame(color_msg, depth_msg)
+
+    def _on_depth(self, depth_msg):
+        with self._lock:
+            if not self._closed:
+                self._process_depth(depth_msg)
+
+    def _previous_base_yaw(self, stamp, odom_from_base):
+        """左右が曖昧なときに使う前回のならした向き (base_link, 無ければ None)."""
+        if odom_from_base is None or self._smoother_frame != self.odom_frame:
+            return None
+        previous = self.smoother.current(stamp.to_sec())
+        if previous is None:
+            return None
+        return body_yaw.wrap_angle(previous - _yaw_of_matrix(odom_from_base))
+
+    def _process_depth(self, depth_msg):
+        info = self._camera_info
+        if info is None:
+            rospy.logwarn_throttle(5.0, 'human_body_yaw: camera_info を待っています')
+            return
+        transform = lookup_camera_to_base(self.tf_buffer, self.base_frame,
+                                          depth_msg.header)
+        if transform is None:
+            return
+        camera_to_base = transform_to_matrix(transform.transform)
+        stamp = depth_msg.header.stamp
+        hand = self._lookup_hand(stamp)
+        if hand is None:
+            rospy.logwarn_throttle(5.0, 'human_body_yaw: %s の TF がありません',
+                                   self.hand_frame)
+            return
+        depth = PeoplePoseEstimator.depth_to_meters(
+            imgmsg_to_ndarray(depth_msg), encoding=depth_msg.encoding)
+        step = self.depth_step
+        K = np.asarray(info.K, dtype=np.float64).reshape(3, 3).copy()
+        if (depth.shape[1], depth.shape[0]) != (info.width, info.height) \
+                and info.width > 0 and info.height > 0:
+            K[0] *= float(depth.shape[1]) / info.width
+            K[1] *= float(depth.shape[0]) / info.height
+        small = depth[::step, ::step]
+        K[:2] /= step
+        points = body_yaw.masked_depth_points(
+            small, np.ones(small.shape[:2], dtype=bool), K, camera_to_base,
+            stride=1)
+        odom_from_base = self._lookup_odom_from_base(stamp)
+        previous = self._previous_base_yaw(stamp, odom_from_base)
+        debug = {'method': 'depth'}
+        head = body_yaw.head_top_from_depth(points, hand,
+                                            radius=self.person_radius)
+        if head is None:
+            debug.update(valid=False, reason='no person')
+            self._publish_debug(debug)
+            return
+        debug['top'] = [round(float(v), 3) for v in head.top]
+        near = head.top - np.array([0.0, 0.0, self.head_to_shoulder])
+        result = body_yaw.torso_band_yaw(
+            head.points, near, hand, band=self.band,
+            max_from_shoulder=self.band_max_from_shoulder,
+            min_points=self.min_band_points,
+            previous=previous, ambiguous_cos=self.band_ambiguous_cos)
+        found = self._band_result(result, previous, debug)
+        self._publish_result(stamp, odom_from_base, found)
 
     def _lookup_odom_from_base(self, stamp):
         for when in (stamp, rospy.Time(0)):
@@ -216,18 +307,15 @@ class HumanBodyYawNode(object):
         stamp = color_msg.header.stamp
         odom_from_base = self._lookup_odom_from_base(stamp)
         if self.method == 'torso_band':
-            # 左右が曖昧なときに使う前回の向き (base_link)。
-            previous = None
-            if odom_from_base is not None and \
-                    self._smoother_frame == self.odom_frame:
-                previous = self.smoother.current(stamp.to_sec())
-                if previous is not None:
-                    previous = body_yaw.wrap_angle(
-                        previous - _yaw_of_matrix(odom_from_base))
+            previous = self._previous_base_yaw(stamp, odom_from_base)
             found = self._estimate_torso_band(
                 people[0], depth, info, camera_to_base, stamp, previous)
         else:
             found = self._estimate_shoulders(people[0], joints_2d[0])
+        self._publish_result(stamp, odom_from_base, found)
+
+    def _publish_result(self, stamp, odom_from_base, found):
+        """(向き, 信頼度, 位置, debug) をならして publish する."""
         if found is None:
             return
         yaw_base, confidence, center_base, debug = found
@@ -315,7 +403,11 @@ class HumanBodyYawNode(object):
             points, joints[near_name], hand, band=self.band,
             max_from_shoulder=self.band_max_from_shoulder,
             previous=previous, ambiguous_cos=self.band_ambiguous_cos)
-        debug = {'method': 'torso_band', 'near': near_name}
+        return self._band_result(
+            result, previous, {'method': 'torso_band', 'near': near_name})
+
+    def _band_result(self, result, previous, debug):
+        """torso_band_yaw の結果を (向き, 信頼度, 位置, debug) にする."""
         if result is None:
             debug.update(valid=False, reason='few band points')
             return None, 0.0, None, debug

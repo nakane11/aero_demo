@@ -292,6 +292,31 @@ def test_torso_band_yaw_ignores_points_outside_band():
     assert result is None
 
 
+def test_head_top_from_depth_finds_person_beyond_hand():
+    rng = np.random.RandomState(2)
+    # 人: 手 (y=-0.40) より外 (y=-0.6 付近)、頭のてっぺん 1.60m
+    person = np.column_stack([rng.uniform(-0.15, 0.15, 3000),
+                              rng.uniform(-0.75, -0.45, 3000),
+                              rng.uniform(1.0, 1.60, 3000)])
+    # ロボットの体 (手より内側) はもっと高くても使わない
+    robot = np.column_stack([rng.uniform(-0.1, 0.1, 500),
+                             rng.uniform(-0.2, 0.0, 500),
+                             rng.uniform(1.0, 1.8, 500)])
+    # 床・手より低い点・遠い点も使わない
+    floor = np.column_stack([rng.uniform(-1, 1, 500), rng.uniform(-1, 0, 500),
+                             np.zeros(500)])
+    far = np.column_stack([np.full(100, 2.0), np.full(100, -0.6),
+                           np.full(100, 1.9)])
+    hand = np.array([0.0, -0.40, 0.85])
+    ht = body_yaw.head_top_from_depth(
+        np.vstack([person, robot, floor, far]), hand)
+    assert ht is not None
+    assert ht.top[2] == pytest.approx(1.60, abs=0.02)
+    assert ht.top[1] == pytest.approx(-0.6, abs=0.05)
+    assert len(ht.points) == len(person) - (person[:, 2] <= 1.0).sum()
+    assert body_yaw.head_top_from_depth(floor, hand) is None
+
+
 def test_nearest_joint():
     joints = {'LShoulder': [0.0, -0.5, 1.2], 'RShoulder': [0.1, -0.8, 1.2]}
     assert body_yaw.nearest_joint(

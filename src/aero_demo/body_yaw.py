@@ -359,6 +359,63 @@ def torso_band_yaw(points, near_shoulder, hand,
                         ambiguous=bool(ambiguous))
 
 
+HeadTop = namedtuple('HeadTop', [
+    'top',      # (3,) 頭のてっぺん (xy は上端付近の点の中央値)
+    'points',   # (N, 3) 人とみなした点 (手の近く・手より上・ロボットより外)
+])
+
+# 手から水平にこの距離 [m] 以内の点を人とみなす。
+DEFAULT_PERSON_RADIUS = 0.7
+# 手よりこれ [m] 以上高い点だけ使う (ロボットの手・前腕を除く)。
+DEFAULT_PERSON_MIN_ABOVE_HAND = 0.15
+DEFAULT_PERSON_MAX_Z = 2.1
+# 頭のてっぺんの高さは上からこの個数目の点の高さ (飛び値を避ける)。
+DEFAULT_HEAD_TOP_RANK = 30
+
+
+def head_top_from_depth(points, hand, radius=DEFAULT_PERSON_RADIUS,
+                        min_above_hand=DEFAULT_PERSON_MIN_ABOVE_HAND,
+                        max_z=DEFAULT_PERSON_MAX_Z, behind_hand=0.05,
+                        top_rank=DEFAULT_HEAD_TOP_RANK, min_points=200):
+    """骨格を使わずに、手をつないでいる人の頭のてっぺんを深度の点群から探す.
+
+    背中側から近くで見ると頭の上と後ろ (髪) しか写らず、MediaPipe が人を
+    見つけない (11/16 の実機)。人の左手はロボットの手 ``hand`` とつながって
+    いるので、``points`` (base_link など z 上向き・原点がロボットの座標系)
+    のうち
+
+    - ``hand`` から水平に ``radius`` 以内
+    - ``hand`` より ``min_above_hand`` 以上高く ``max_z`` より低い
+    - ロボットの中心から手の向きに測って、手より ``behind_hand`` 以上
+      内側でない (ロボットの体・腕を除く)
+
+    の点を人とみなし、その最上部を頭のてっぺんとする。
+
+    Returns
+    -------
+    HeadTop or None
+        人とみなした点が ``min_points`` 未満なら None。
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    hand = np.asarray(hand, dtype=np.float64)
+    if len(pts) == 0:
+        return None
+    hand_dist = math.hypot(hand[0], hand[1])
+    if hand_dist < 1e-6:
+        return None
+    out = hand[:2] / hand_dist
+    sel = ((np.hypot(pts[:, 0] - hand[0], pts[:, 1] - hand[1]) < radius)
+           & (pts[:, 2] > hand[2] + min_above_hand) & (pts[:, 2] < max_z)
+           & (pts[:, :2].dot(out) > hand_dist - behind_hand))
+    person = pts[sel]
+    if len(person) < max(min_points, top_rank + 1):
+        return None
+    z_top = np.partition(person[:, 2], -top_rank - 1)[-top_rank - 1]
+    head = person[person[:, 2] > z_top - 0.05]
+    top = np.array([np.median(head[:, 0]), np.median(head[:, 1]), z_top])
+    return HeadTop(top=top, points=person)
+
+
 def fold_to_front(yaw, max_relative=math.pi / 2, previous=None,
                   margin=math.radians(20.0)):
     """向き ``yaw`` をロボット正面 (0) から ``max_relative`` 以内に折り返す.
