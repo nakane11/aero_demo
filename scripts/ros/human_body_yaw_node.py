@@ -144,6 +144,12 @@ class HumanBodyYawNode(object):
         self.tf_buffer = tf2_ros.Buffer(
             cache_time=rospy.Duration(rospy.get_param('~tf_cache_time', 10.0)))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        # 画像は届くのにカメラの TF が引けない状態がこれ [s] 続いたら TF の
+        # 購読をつなぎ直す (11/16: ロボット側の TF の publisher が起動し
+        # 直されたあと、このノードにだけ TF が届かなくなり向きが出なかった)。
+        self.tf_reconnect_after = rospy.get_param('~tf_reconnect_after', 3.0)
+        self._tf_ok_wall = rospy.get_time()
+        self._tf_reconnect_wall = None
 
         # 手のランドマークは使わないので軽い Pose だけにする。
         self.estimator = None
@@ -213,6 +219,26 @@ class HumanBodyYawNode(object):
             if not self._closed:
                 self._process_depth(depth_msg)
 
+    def _lookup_camera(self, header):
+        """カメラ -> base_frame の TF. 失敗が続けば TF の購読をつなぎ直す."""
+        transform = lookup_camera_to_base(self.tf_buffer, self.base_frame,
+                                          header)
+        now = rospy.get_time()
+        if transform is not None:
+            self._tf_ok_wall = now
+            return transform
+        if (self.tf_reconnect_after > 0
+                and now - self._tf_ok_wall > self.tf_reconnect_after
+                and (self._tf_reconnect_wall is None
+                     or now - self._tf_reconnect_wall > 10.0)):
+            rospy.logerr('human_body_yaw: カメラの TF が %.0f 秒引けないので'
+                         ' TF の購読をつなぎ直します',
+                         now - self._tf_ok_wall)
+            self.tf_listener.unregister()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+            self._tf_reconnect_wall = now
+        return None
+
     def _previous_base_yaw(self, stamp, odom_from_base):
         """左右が曖昧なときに使う前回のならした向き (base_link, 無ければ None)."""
         if odom_from_base is None or self._smoother_frame != self.odom_frame:
@@ -227,8 +253,7 @@ class HumanBodyYawNode(object):
         if info is None:
             rospy.logwarn_throttle(5.0, 'human_body_yaw: camera_info を待っています')
             return
-        transform = lookup_camera_to_base(self.tf_buffer, self.base_frame,
-                                          depth_msg.header)
+        transform = self._lookup_camera(depth_msg.header)
         if transform is None:
             return
         camera_to_base = transform_to_matrix(transform.transform)
@@ -288,8 +313,7 @@ class HumanBodyYawNode(object):
         if info is None:
             rospy.logwarn_throttle(5.0, 'human_body_yaw: camera_info を待っています')
             return
-        transform = lookup_camera_to_base(self.tf_buffer, self.base_frame,
-                                          color_msg.header)
+        transform = self._lookup_camera(color_msg.header)
         if transform is None:
             return
         camera_to_base = transform_to_matrix(transform.transform)
