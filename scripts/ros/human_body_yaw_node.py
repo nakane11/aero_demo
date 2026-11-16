@@ -129,6 +129,15 @@ class HumanBodyYawNode(object):
         # (並んで歩き出す人はロボットとほぼ同じ向き。11/16: 真横を向いて
         # 立ち止まった人に左右が決まらず 4 秒反応しなかった)。
         self.front_prior = rospy.get_param('~front_prior', True)
+        # depth: 頭のてっぺん (base_link) が x [~blind_x_min, ~blind_x_max]
+        # かつ |y| < ~blind_max_y (ロボットのすぐ横) にあるときは向きの差を
+        # 0 として出す (回らない)。ここでは頭のカメラから肩が頭に隠れ、人が
+        # どちらを向いても帯が同じ形に見える (11/16: 正面向き 0° も後ろ向き
+        # -90° も線が +60〜69° と出た)。回りたい人は左回りなら一歩前、
+        # 右回りなら一歩下がる (ユーザー)。~blind_max_y を 0 にすると無効。
+        self.blind_x = (rospy.get_param('~blind_x_min', -0.10),
+                        rospy.get_param('~blind_x_max', 0.10))
+        self.blind_max_y = rospy.get_param('~blind_max_y', 0.45)
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
         # depth: 頭のてっぺんから手前の肩までの高さ [m]。
@@ -296,6 +305,15 @@ class HumanBodyYawNode(object):
             self._publish_debug(debug)
             return
         debug['top'] = [round(float(v), 3) for v in head.top]
+        if (self.blind_x[0] <= head.top[0] <= self.blind_x[1]
+                and abs(head.top[1]) < self.blind_max_y):
+            # 向きが読めない領域: ロボットと同じ向きとみなす (次に回る
+            # ときの左右の基準にもなる)。
+            debug.update(valid=True, confidence=1.0, yaw_base_deg=0.0,
+                         blind=True)
+            self._publish_result(stamp, odom_from_base,
+                                 (0.0, 1.0, head.top, debug))
+            return
         near = head.top - np.array([0.0, 0.0, self.head_to_shoulder])
         result = body_yaw.torso_band_yaw(
             head.points, near, hand, band=self.band,
