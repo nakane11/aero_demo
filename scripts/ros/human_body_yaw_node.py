@@ -138,6 +138,10 @@ class HumanBodyYawNode(object):
         self.blind_x = (rospy.get_param('~blind_x_min', -0.10),
                         rospy.get_param('~blind_x_max', 0.10))
         self.blind_max_y = rospy.get_param('~blind_max_y', 0.45)
+        # depth: 頭のてっぺんが ~blind_x_min より後ろなら右回り (負) だけ、
+        # ~blind_x_max より前なら左回り (正) だけ通し、逆は 0 にする。
+        self.step_direction_gate = rospy.get_param(
+            '~step_direction_gate', True)
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
         # depth: 頭のてっぺんから手前の肩までの高さ [m]。
@@ -323,7 +327,27 @@ class HumanBodyYawNode(object):
             ambiguous_cos=self.band_ambiguous_cos,
             keep_cos=self.band_keep_cos)
         found = self._band_result(result, previous, debug)
+        if self.step_direction_gate and found[0] is not None:
+            found = self._gate_by_step(found, head.top[0])
         self._publish_result(stamp, odom_from_base, found)
+
+    def _gate_by_step(self, found, top_x):
+        """ロボットより後ろの人は右回りだけ、前の人は左回りだけ通す.
+
+        回りたい人は左回りなら一歩前、右回りなら一歩下がる (ユーザー)。
+        向きの推定には立ち位置で変わる偏りがあり (11/16 の確認: 正面向き
+        のまま半歩下がると +25°)、逆向きに回らないよう 0 にする。
+        """
+        yaw, confidence, center, debug = found
+        gated = yaw
+        if top_x < self.blind_x[0]:
+            gated = min(yaw, 0.0)
+        elif top_x > self.blind_x[1]:
+            gated = max(yaw, 0.0)
+        if gated != yaw:
+            debug.update(step_gated=True, yaw_base_deg=0.0,
+                         raw_yaw_base_deg=round(math.degrees(yaw), 1))
+        return gated, confidence, center, debug
 
     def _lookup_odom_from_base(self, stamp):
         for when in (stamp, rospy.Time(0)):
