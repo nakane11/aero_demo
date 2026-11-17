@@ -166,21 +166,54 @@ class Trial(object):
         move = out['base_move'] if spliced else base_move
         now_wp = et.prepend_base_move(press, move)[0]
         base_wps = [now_wp] + list(press[1:])
-        new_angles = np.array([wp['joint_angle_vector']
-                               for wp in press[1:]])
-        hover_angles = np.asarray(self.hover['joint_angle_vector'])
         self.t_splice = None
         self.t_press = self.t_hover
+        self.entry = 0
+        self.skipped = 0
+        target_plan = np.asarray(
+            out['info']['post_process']['target_position'] if spliced
+            else self.result['post_process']['target_position'])
+        # 計画の系 (台車が hover にいる前提) -> world (台車は actual から move
+        # 動いた位置)。押し込みの点・目標はこの変換で world に置かれる。
+        to_world = scan_matching.compose(scan_matching.compose(actual, move),
+                                         scan_matching.inverse(H))
+        c, s = math.cos(to_world[2]), math.sin(to_world[2])
+        self.target = np.array([
+            to_world[0] + c * target_plan[0] - s * target_plan[1],
+            to_world[1] + s * target_plan[0] + c * target_plan[1],
+            target_plan[2]])
         if spliced:
-            press_times = nsp.limited_times(base_wps, self.max_vel)
             t_s = decision + nsp.SPLICE_LEAD
-            angles, vels, all_times, ratio = nsp.splice_in_dwell(
-                self.arm_track, t_s, self.t_hover, hover_angles, new_angles,
-                press_times, self.max_vel)
+            q_s = self.arm_track.state(t_s)[0]
+            # 今の手先 (台車はまだ base_move だけ動いていない)。
+            current_hand = nsp.hand_position(
+                self.planner.robot, self.joint_names,
+                dict(now_wp, joint_angle_vector=[float(v) for v in q_s]),
+                self.robot_arm)
+            target = out['info']['post_process']['target_position']
+            keep = nsp.monotone_press(
+                self.planner.robot, self.joint_names, self.robot_arm, press,
+                current_hand, target)
+            self.entry = keep[0]
+            self.skipped = len(press) - len(keep)
+            # 押し込む向きに単調に進む点へ、腕と台車 (ずれの補正を含む) を
+            # 差し替えの時刻から一緒に動かす。
+            entry_wps = [press[k] for k in keep]
+            base_wps = [now_wp] + list(entry_wps)
+            seg = nsp.limited_times(
+                [dict(now_wp, joint_angle_vector=[float(v) for v in q_s])]
+                + list(entry_wps), self.max_vel)
+            if self.entry == 0:
+                # hover には予定の時刻に着く (早めない)。
+                seg[0] = max(seg[0], self.t_hover - t_s)
+            angles, vels, all_times, ratio = nsp.splice_at_entry(
+                self.arm_track, t_s,
+                [wp['joint_angle_vector'] for wp in entry_wps], seg,
+                self.max_vel)
+            self.t_press = t_s
+            times = list(all_times)
             self.track = self.arm_track.spliced(t_s, angles, vels, all_times)
             self.t_splice = t_s
-            self.t_press = t_s + all_times[0]
-            times = list(all_times[1:])
         else:
             times, ratio = list(self.press_times), None
             self.track = self.arm_track
@@ -211,8 +244,12 @@ class Trial(object):
             '- 掌のずれで台車を寄せる: {}'.format(
                 '-' if shift is None else '{} ({:.0f}mm)'.format(
                     shift['reason'], shift['distance'] * 1e3)),
-            '- 押し込みで台車を動かす量 ({:+.3f}m, {:+.3f}m, {:+.1f}deg)'
-            .format(move[0], move[1], math.degrees(move[2])),
+            '- 押し込みで台車を動かす量 ({:+.3f}m, {:+.3f}m, {:+.1f}deg){}'
+            .format(move[0], move[1], math.degrees(move[2]),
+                    '' if not refined else
+                    '、掌から離れる向きは除いた (腕で吸収)'
+                    if out.get('no_retreat') else
+                    '、**掌から離れる向きも動かす (除くと解けない)**'),
             '- 解き直し: {} (脚 {}、向きの寄せ {})、目標の変化 {:.0f}mm/{:.0f}deg'
             .format(info['reason'], info.get('legs'), info.get('blend'),
                     info['position_change'] * 1e3,
@@ -224,11 +261,12 @@ class Trial(object):
                 'しない (計画どおり押し込む)' if not spliced else
                 '{:.2f}s に (hover の {:.2f}s 前)'.format(
                     self.t_splice, self.t_hover - self.t_splice),
-                '' if ratio is None else '、hover に着くのは予定{} '
-                '(上限比 {:.2f})'.format(
-                    'どおり' if self.t_press <= self.t_hover + 1e-3
-                    else 'より {:.2f}s 遅れる'.format(
-                        self.t_press - self.t_hover), ratio)),
+                '' if ratio is None else
+                '、台車の補正と一緒に{}、後ろに戻る点を {} 個飛ばす (上限比 '
+                '{:.2f})'.format(
+                    ' hover へ' if self.entry == 0 else
+                    '、手先より後ろの hover を飛ばして押し込みの {} 点目へ'
+                    .format(self.entry), self.skipped, ratio)),
         ]
         print('\n'.join(self.summary))
         self.paths = self._paths(times if spliced else None)

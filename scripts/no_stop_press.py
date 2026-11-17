@@ -50,6 +50,9 @@ HOVER_DWELL = 1.5
 # 入った後) [m] (``retime_approach_arm``)。人体との距離の検証に通らなければ順に
 # 狭める。
 RETIME_RADII = (0.2, 0.15, 0.1)
+# 差し替えで入る押し込みの点は、今の手先より押し込みの目標の向きにこれ以上前
+# にある最初の点 [m] (``press_entry``)。
+ENTRY_AHEAD = 0.005
 # 差し替えのゴールを、開始時刻 (hover を通る時刻) のこれ以上前に送る [s]。
 SPLICE_LEAD = 0.15
 # 台車のずれの許容 (これ以内なら動かさない) と、押し込みに織り込む上限。
@@ -315,8 +318,17 @@ def plan_palm_base_shift(palm, expected_position, hover_wp, base_error,
     return shift, record
 
 
+def _without_retreat(move_xy, axis_xy):
+    """台車の並進 ``move_xy`` から、``axis_xy`` (掌へ向かう単位ベクトル) と逆向き
+    (掌から離れる向き) の成分を除く。"""
+    move_xy = np.asarray(move_xy, dtype=np.float64)
+    along = float(move_xy @ axis_xy)
+    return move_xy - min(0.0, along) * axis_xy
+
+
 def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
-                  palm_now, base_move, base_error=None, margin_fn=None):
+                  palm_now, base_move, base_error=None, margin_fn=None,
+                  no_retreat=True):
     """台車がまだ ``base_move`` (今の台車の系) だけ動いていない前提で、検出した
     掌 ``palm_now`` (今の台車の系) から押し込みを解き直す。
 
@@ -324,16 +336,47 @@ def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
     (``margin_fn`` があれば ``plan_palm_base_shift``) も ``base_move`` に足して
     から ``spik.refine_post_process`` で解く。
 
+    ``no_retreat`` なら、台車の動き (ずれの補正・寄せる分) のうち押し込む向き
+    (計画の hover の手先から押し込みの目標へ、水平) と逆向きの成分を除き、
+    その分は腕で吸収する。台車が人の側へずれた・人が手を前に出したときに
+    台車を下げると、押し込みの間に手先が引かれるため。それで解けなければ
+    除かずに解き直す。
+
     Returns: ``dict(press_waypoints (hover の次から) or None, base_move,
-    info (refine_post_process の結果), shift_record, observed (計画の系の掌))``。
-    解けなければ ``base_move`` は寄せる分を足さない元の値。
+    info (refine_post_process の結果), shift_record, observed (計画の系の掌),
+    no_retreat (掌から離れる向きを除いて解けたか))``。解けなければ
+    ``base_move`` は寄せる分を足さない元の値。
     """
+    axis = np.zeros(2)
+    found = press_direction(robot, joint_names, hover_wp, result)
+    if found is not None:
+        # 押し込む向きを hover の台車の系の水平へ。
+        axis = _rz(hover_wp['base_yaw']).T[:2, :2] @ found[1][:2]
+    axis_norm = float(np.linalg.norm(axis))
+    if no_retreat and axis_norm > 1e-6:
+        out = _refine_folded(robot, joint_names, hover_wp, result,
+                             planned_palm, palm_now, base_move, base_error,
+                             margin_fn, axis / axis_norm)
+        if out['press_waypoints'] is not None:
+            out['no_retreat'] = True
+            return out
+    out = _refine_folded(robot, joint_names, hover_wp, result, planned_palm,
+                         palm_now, base_move, base_error, margin_fn, None)
+    out['no_retreat'] = False
+    return out
+
+
+def _refine_folded(robot, joint_names, hover_wp, result, planned_palm,
+                   palm_now, base_move, base_error, margin_fn, axis):
     place_at(robot, joint_names, hover_wp)
     base_rot = robot.base_link.worldrot().copy()
     base_pos = robot.base_link.worldpos().copy()
     expected_position = base_rot.T @ (
         np.asarray(planned_palm['position'], dtype=np.float64) - base_pos)
-    move = np.asarray(base_move, dtype=np.float64)
+    move = np.asarray(base_move, dtype=np.float64).copy()
+    if axis is not None:
+        move[:2] = _without_retreat(move[:2], axis)
+    original_move = move.copy()
     move_rot = _rz(move[2])
     move_pos = np.array([move[0], move[1], 0.0])
     palm = spik.transform_palm(palm_now, move_rot.T, -move_rot.T @ move_pos)
@@ -343,6 +386,12 @@ def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
         shift, shift_record = plan_palm_base_shift(
             palm, expected_position, hover_wp, base_error, planned_palm,
             margin_fn)
+        if shift is not None and axis is not None:
+            # 寄せる分も掌から離れる向きは除く (動いた後の台車の系の向きで)。
+            shift = shift.copy()
+            shift[:2] = _without_retreat(shift[:2], move_rot[:2, :2].T @ axis)
+            if float(np.linalg.norm(shift[:2])) < 1e-3:
+                shift = None
         if shift is not None:
             palm = dict(palm, position=[
                 float(v) for v in np.asarray(palm['position']) - shift])
@@ -354,6 +403,7 @@ def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
         result['post_process'],
         planned_palm=(planned_palm if 'x_axis' in planned_palm else None))
     press = None
+    move = original_move
     if info['post_process'] is not None:
         press = build_press_in_waypoints(hover_wp, joint_names,
                                          info['post_process'])
@@ -445,6 +495,51 @@ def fit_bridge(start_position, start_velocity, angles, times, max_vel,
         times[0] *= math.sqrt(ratio)
     vel = et.point_velocities(np.diff(path, axis=0), times)
     return times, vel[1:], ratio
+
+
+def monotone_press(robot, joint_names, robot_arm, press_wps, current_hand,
+                   target, ahead=ENTRY_AHEAD):
+    """差し替えで通る押し込みの点 (``press_wps`` の添字の列、先頭が hover)。
+
+    押し込む向き (押し込みの最初の点の手先から目標 ``target`` へ) に、今の手先
+    ``current_hand`` より前へ単調に進む点だけを残す: 今の手先より後ろの点
+    (人が手を前に出した・台車が人の側へずれたときの hover など) と、手前の点
+    より後ろへ戻る点 (掌がずれて解き直した経路の始まりが計画の hover より後ろ
+    のとき) は飛ばす。そこを通ると「引いてから押し込む」になる。最後の点
+    (押し込みの最終姿勢) は必ず残す。
+    """
+    hands = [hand_position(robot, joint_names, waypoint, robot_arm)
+             for waypoint in press_wps]
+    target = np.asarray(target, dtype=np.float64)
+    direction = target - hands[min(1, len(hands) - 1)]
+    if float(np.linalg.norm(direction)) < 1e-3:
+        direction = target - current_hand
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return [len(press_wps) - 1]
+    direction /= norm
+    last = float(current_hand @ direction) + ahead
+    keep = []
+    for k, hand in enumerate(hands):
+        progress = float(hand @ direction)
+        if progress > last:
+            keep.append(k)
+            last = progress
+    if not keep or keep[-1] != len(press_wps) - 1:
+        keep.append(len(press_wps) - 1)
+    return keep
+
+
+def splice_at_entry(track, t_s, angles, times, max_vel):
+    """t_s の送った軌道 ``track`` の状態から、押し込みの入る点以降 ``angles``
+    へ直接つなぐ (``press_entry`` が hover より先のとき)。``times`` は
+    [今 -> angles[0], angles[0] -> angles[1], ...] の下限。
+    Returns: ``(angles, velocities, times, 上限比)``。"""
+    position, velocity = track.state(t_s)
+    times, velocities, ratio = fit_bridge(position, velocity, angles, times,
+                                          max_vel)
+    return ([np.asarray(a, dtype=np.float64) for a in angles], velocities,
+            times, ratio)
 
 
 def splice_in_dwell(track, t_s, t_hover, hover_angles, new_angles,

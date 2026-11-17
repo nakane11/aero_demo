@@ -3795,6 +3795,7 @@ class HandshakePipelineNode(object):
         if folded is not None:
             fold['base_move'] = folded['base_move']
             fold['ik_time'] = ik_time
+            fold['target_position'] = info['post_process']['target_position']
             return folded['press_waypoints']
         return build_press_in_waypoints(
             hover_wp, joint_names, info['post_process'])
@@ -5016,25 +5017,49 @@ class HandshakePipelineNode(object):
         send_time = no_stop['t_hover'] - (
             float(sum(no_stop['arm_times'][:n_base])) + no_stop['dwell'])
 
-        def splice(angles_after_hover, base_points_after):
-            """今から SPLICE_LEAD 後に [hover, angles_after_hover] へ差し替え、
-            hover に着く壁時計の時刻と hover からの区間の時間を返す (間に
-            合わなければ None)。"""
+        names = [joint.name for joint in self.real_robot.joint_list]
+
+        def splice(press_wps, now_wp, target):
+            """今から SPLICE_LEAD 後に押し込み ``press_wps`` (先頭が hover) へ
+            差し替える。今の手先より後ろの点 (hover など) は飛ばす
+            (``nsp.press_entry``)。Returns: ``(台車の押し込みを始める壁時計の
+            時刻, 台車の点列, 区間の時間, 上限比, 入る点)``、間に合わなければ
+            None。"""
             t_s = time.time() + nsp.SPLICE_LEAD - send_time
             t_hover = no_stop['t_hover'] - send_time
             if t_s > t_hover - 0.05:
                 return None
+            q_s, _ = old_track.state(t_s)
+            by_name = dict(zip(names, q_s))
+            current_wp = dict(now_wp, joint_angle_vector=[
+                float(by_name.get(name, angle)) for name, angle in zip(
+                    joint_names, now_wp['joint_angle_vector'])])
+            current_hand = nsp.hand_position(self.robot, joint_names,
+                                             current_wp, robot_arm)
+            keep = nsp.monotone_press(self.robot, joint_names, robot_arm,
+                                      press_wps, current_hand, target)
+            entry = keep[0]
+            # 押し込む向きに単調に進む点 (今の手先より後ろの hover や、後ろへ
+            # 戻る点は飛ばす) へ、腕と台車 (ずれの補正を含む) を差し替えの時刻
+            # から一緒に動かす。台車の補正を hover の後にまとめて行うと、ずれた
+            # 台車のまま hover へ伸びた手先が補正で戻される。
+            entry_wps = [press_wps[k] for k in keep]
+            base_points = execution_timing.base_trajectory_points(
+                [now_wp] + entry_wps)[1:]
+            avs = [self._waypoint_angle_vector(wp, joint_names)
+                   for wp in entry_wps]
             times = self._limited_time_list(
-                angles_after_hover, base_points_after,
-                [MIN_SEGMENT_TIME] * len(angles_after_hover),
-                start_av=hover_av)
-            angles, vels, all_times, ratio = nsp.splice_in_dwell(
-                old_track, t_s, t_hover, hover_av, angles_after_hover,
-                times, max_vel)
+                avs, base_points, [MIN_SEGMENT_TIME] * len(avs),
+                start_av=q_s)
+            if entry == 0:
+                # hover には予定の時刻に着く (早めない)。
+                times[0] = max(times[0], t_hover - t_s)
+            angles, vels, all_times, ratio = nsp.splice_at_entry(
+                old_track, t_s, avs, times, max_vel)
             self._send_arm_splice(
                 no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
                 all_times)
-            return send_time + t_s + all_times[0], list(all_times[1:]), ratio
+            return send_time + t_s, base_points, list(all_times), ratio, entry
 
         if not fold['ok']:
             # 織り込めない大きなずれ: 腕を hover で止めて従来どおり直す。
@@ -5062,28 +5087,29 @@ class HandshakePipelineNode(object):
             press_wps = self._hold_neck(press_wps, joint_names)
         now_wp = execution_timing.prepend_base_move(
             press_wps, fold['base_move'])[0]
-        base_points = execution_timing.base_trajectory_points(
-            [now_wp] + list(press_wps[1:]))
-        new_avs = [self._waypoint_angle_vector(wp, joint_names)
-                   for wp in press_wps[1:]]
+        target = (fold.get('target_position') if use_refined
+                  else result['post_process']['target_position'])
         decided_at = time.time()
         spliced = None
         if use_refined or hand_followed:
-            spliced = splice(new_avs, base_points[1:])
+            spliced = splice(press_wps, now_wp, target)
         if spliced is not None:
-            press_start, times, ratio = spliced
+            press_start, base_points, times, ratio, entry = spliced
         else:
-            press_start, times, ratio = (no_stop['t_hover'],
-                                         no_stop['press_times'], None)
-        # 台車の押し込み (ずれの補正を含む) を、腕が hover を通る時刻から。
+            base_points = execution_timing.base_trajectory_points(
+                [now_wp] + list(press_wps[1:]))[1:]
+            press_start, times, ratio, entry = (
+                no_stop['t_hover'], no_stop['press_times'], None, 0)
+        # 台車の押し込み (ずれの補正を含む) を、腕が hover を通る時刻 (hover を
+        # 飛ばすときは差し替えの時刻) から。
         wait = press_start - time.time()
         if wait > 0:
             rospy.sleep(wait)
         self._set_hand_tracking(False)
         self._set_activity(STAGE_PRESS_IN)
-        self._send_base_trajectory(base_points[1:], list(times), wait=False)
+        self._send_base_trajectory(base_points, list(times), wait=False)
         record = dict(
-            event='no_stop_press', spliced=spliced is not None,
+            event='no_stop_press', spliced=spliced is not None, entry=entry,
             refined=refined is not None, in_time=in_time,
             hover_delay=float(press_start - no_stop['t_hover']),
             bridge_ratio=ratio,
@@ -5094,12 +5120,15 @@ class HandshakePipelineNode(object):
             ik_time=fold.get('ik_time'))
         self._log_debug(record)
         print('[execute][no-stop] 押し込み{} (台車の補正 {:+.3f}m, {:+.3f}m, '
-              '{:+.1f}deg、hover の遅れ {:.2f}s)。'.format(
+              '{:+.1f}deg、{})。'.format(
                   'を差し替えました' if use_refined and spliced is not None
                   else 'は計画どおり' + ('' if in_time else ' (間に合わず)'),
                   fold['base_move'][0], fold['base_move'][1],
                   math.degrees(fold['base_move'][2]),
-                  press_start - no_stop['t_hover']))
+                  'hover の遅れ {:.2f}s'.format(
+                      press_start - no_stop['t_hover']) if entry == 0
+                  else '手先が hover より前にいたので押し込みの {} 点目へ直接'
+                       '入った'.format(entry)))
         self._wait_body_interpolation()
         self._log_controller_states()
         self.ri.move_base_trajectory_action.wait_for_result()
