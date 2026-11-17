@@ -601,6 +601,7 @@ class HandshakePlanner(object):
             spik.apply_press_in_forearm_argument(args)
         self.robot, self.verification_pairs = self._build_robot_and_pairs()
         self.motion_verification_pairs = self.verification_pairs
+        self._fk_robot()  # 計画の途中で作ると時間の上限に響くので先に作る
         # JIT キャッシュのためノードの寿命で使い回す。
         self._real_solver = create_solver(
             'jaxls', max_iterations=args.max_iterations, verbose=False)
@@ -630,6 +631,16 @@ class HandshakePlanner(object):
     @property
     def side_by_side_approach(self):
         return getattr(self.args, 'side_by_side_approach', 'sync')
+
+    def _fk_robot(self):
+        """手先の位置を求めるだけの指なしロボット (計画用の ``self.robot`` の
+        状態を変えないため。初めて使うときに作る)。"""
+        robot = getattr(self, '_fk_robot_model', None)
+        if robot is None:
+            robot = Aero(use_hand=False)
+            spik.lock_fixed_joints(robot)
+            self._fk_robot_model = robot
+        return robot
 
     def _build_robot_and_pairs(self):
         """IK・軌道計画用の指なしロボットと、事後検証用の総当たりペアを作る。"""
@@ -851,108 +862,178 @@ class HandshakePlanner(object):
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
-        self._stage(STAGE_PLAN_IK)
-        (picked, collision_ik_time, candidate_selection_time,
-         person_base_limits, x_margin) = \
-            spik.solve_person_ik_side_by_side(
-                self.robot, translated_palm, offered_hand, robot_arm,
-                collision_obstacles, person_base_limits, standing_x,
-                x_margins=args.base_x_standing_margins,
-                front_offset_weight=args.front_offset_weight,
-                facing_yaw_weight=args.facing_yaw_weight,
-                attempts_per_pose=args.attempts_per_pose,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions=collision_joints,
-                placement_joint_positions=translated_joints,
-                verification_pairs=self.verification_pairs,
-                deadline=deadline)
+        base_limits_in = person_base_limits
+        human_xy = spik.human_standing_xy(translated_joints)
+        if human_xy is None:
+            human_xy = np.array([args.human_front_distance, 0.0])
 
-        if picked is None:
-            result = spik.unsolved_result(
-                self.robot, robot_arm, rots[-1],
-                person_base_limits, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        else:
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            result = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, person_base_limits,
-                post_process_result, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        result['offered_hand'] = offered_hand
-        result['robot_arm'] = robot_arm
-        result['base_x_standing_margin'] = x_margin
+        def ik_and_motion(excluded_turns=()):
+            """IK と接近の軌道計画 (``excluded_turns`` の向きは使わない)。"""
+            self._stage(STAGE_PLAN_IK)
+            (picked, collision_ik_time, candidate_selection_time,
+             limits, x_margin) = \
+                spik.solve_person_ik_side_by_side(
+                    self.robot, translated_palm, offered_hand, robot_arm,
+                    collision_obstacles, base_limits_in, standing_x,
+                    x_margins=args.base_x_standing_margins,
+                    front_offset_weight=args.front_offset_weight,
+                    facing_yaw_weight=args.facing_yaw_weight,
+                    attempts_per_pose=args.attempts_per_pose,
+                    self_collision=self.collision_pairs is not None,
+                    collision_pairs=self.collision_pairs,
+                    joint_positions=collision_joints,
+                    placement_joint_positions=translated_joints,
+                    verification_pairs=self.verification_pairs,
+                    deadline=deadline, excluded_turns=excluded_turns)
+            if picked is None:
+                result = spik.unsolved_result(
+                    self.robot, robot_arm, rots[-1],
+                    limits, collision_ik_time,
+                    candidate_selection_time, offered_hand, translated_palm)
+            else:
+                turn_index, angle_vector, base_pose, post_process_result = \
+                    picked
+                result = spik.solved_result(
+                    self.robot, robot_arm, rots[turn_index],
+                    turn_index, angle_vector, base_pose, limits,
+                    post_process_result, collision_ik_time,
+                    candidate_selection_time, offered_hand, translated_palm)
+            result['offered_hand'] = offered_hand
+            result['robot_arm'] = robot_arm
+            result['base_x_standing_margin'] = x_margin
 
-        # 押し込み姿勢まで解けたら軌道計画する (untranslate の前に行う)。
-        motion = None
-        if result['solved'] and result.get('post_process') is None:
-            print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
-                  'かったため、軌道計画をしません。'.format(attempt))
-        elif result['solved'] and out_of_time('軌道計画'):
-            # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
-            # 実行しない。
-            result['plan_timed_out'] = True
-        elif result['solved']:
-            human_xy = spik.human_standing_xy(translated_joints)
-            if human_xy is None:
-                human_xy = np.array([args.human_front_distance, 0.0])
-            motion_args = copy.copy(args)
-            motion_args.collision_verify_tolerance = \
-                args.motion_collision_verify_tolerance
-            initial_base_pose = np.array([offset[0], offset[1], 0.0])
-            self._stage(STAGE_PLAN_APPROACH)
-            motion = phm.plan_person_motion(
-                self.robot, robot_arm, result, collision_joints, human_xy,
-                motion_args, self.motion_verification_pairs, self.solver,
-                initial_base_pose=initial_base_pose, deadline=deadline)
-            log_debug_event(dict(
-                event='motion', person=attempt,
-                verified=motion['verified'],
-                lead_in_verified=motion['lead_in_verified'],
-                min_dist=float(min(motion['waypoint_min_distances'])),
-                waypoint_min_distances=[
-                    float(d) for d in motion['waypoint_min_distances']],
-                kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
-                compute_time=motion['compute_time']))
-            # 押し込み後に手を下ろしながら横並びになる区間 (実行可能なときだけ)。
-            if (result.get('post_process') is not None
-                    and motion_verified(motion)):
-                # background/off は寄せを解かず最初の解で止める (background は
-                # 移動中に refine_transition で解く)。
-                self._stage(STAGE_PLAN_TRANSITION)
-                transition = sbs.plan_transition(
-                    self.robot, robot_arm, offered_hand,
-                    result['post_process'], result['turn_deg'],
-                    translated_joints, collision_joints,
-                    self.verification_pairs,
-                    self.collision_pairs, self.base_limits,
-                    approach=self.side_by_side_approach == 'sync',
-                    time_limit=(None if deadline is None
-                                else max(0.0, deadline - time.time())))
-                motion['transition'] = transition
-                if (self.refine_robot is not None
-                        and transition['verified']):
-                    # 平行移動後の座標系のまま渡す (untranslate は破壊的)。
-                    refine_job = dict(
-                        attempt=attempt, robot_arm=robot_arm,
-                        hand=offered_hand,
-                        post=copy.deepcopy(result['post_process']),
-                        turn_deg=result['turn_deg'],
-                        translated_joints=copy.deepcopy(translated_joints),
-                        collision_joints=copy.deepcopy(collision_joints),
-                        secured=copy.deepcopy(transition), offset=offset)
-                print('[transition] 試行{}: 横並び移動 {}'.format(
-                    attempt, sbs.transition_summary(transition)))
+            # 押し込み姿勢まで解けたら軌道計画する (untranslate の前に行う)。
+            motion = None
+            if result['solved'] and result.get('post_process') is None:
+                print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
+                      'かったため、軌道計画をしません。'.format(attempt))
+            elif result['solved'] and out_of_time('軌道計画'):
+                # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
+                # 実行しない。
+                result['plan_timed_out'] = True
+            elif result['solved']:
+                motion_args = copy.copy(args)
+                motion_args.collision_verify_tolerance = \
+                    args.motion_collision_verify_tolerance
+                initial_base_pose = np.array([offset[0], offset[1], 0.0])
+                self._stage(STAGE_PLAN_APPROACH)
+                motion = phm.plan_person_motion(
+                    self.robot, robot_arm, result, collision_joints, human_xy,
+                    motion_args, self.motion_verification_pairs, self.solver,
+                    initial_base_pose=initial_base_pose, deadline=deadline)
                 log_debug_event(dict(
-                    event='transition', person=attempt,
-                    verified=transition['verified'],
-                    fraction=transition['fraction'],
-                    x_margin=transition['x_margin'],
-                    placement_before=transition['placement_before'],
-                    placement_after=transition['placement_after'],
-                    reason=transition['reason'],
-                    compute_time=transition['compute_time']))
+                    event='motion', person=attempt,
+                    verified=motion['verified'],
+                    lead_in_verified=motion['lead_in_verified'],
+                    min_dist=float(min(motion['waypoint_min_distances'])),
+                    waypoint_min_distances=[
+                        float(d) for d in motion['waypoint_min_distances']],
+                    kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
+                    compute_time=motion['compute_time']))
+            return result, motion, limits, x_margin
+
+        def plan_transition_for(result, motion):
+            """押し込み後に手を下ろしながら横並びになる区間 (実行可能な
+            ときだけ) を計画して ``motion['transition']`` に入れ、裏の計画の
+            仕事 (無ければ None) を返す。``self.robot`` は IK の解の姿勢のまま
+            であること (横並び移動の計画はその姿勢から始める)。"""
+            if (motion is None or result.get('post_process') is None
+                    or not motion_verified(motion)):
+                return None
+            # background/off は寄せを解かず最初の解で止める (background は
+            # 移動中に refine_transition で解く)。
+            self._stage(STAGE_PLAN_TRANSITION)
+            transition = sbs.plan_transition(
+                self.robot, robot_arm, offered_hand,
+                result['post_process'], result['turn_deg'],
+                translated_joints, collision_joints,
+                self.verification_pairs,
+                self.collision_pairs, self.base_limits,
+                approach=self.side_by_side_approach == 'sync',
+                time_limit=(None if deadline is None
+                            else max(0.0, deadline - time.time())))
+            motion['transition'] = transition
+            job = None
+            if (self.refine_robot is not None
+                    and transition['verified']):
+                # 平行移動後の座標系のまま渡す (untranslate は破壊的)。
+                job = dict(
+                    attempt=attempt, robot_arm=robot_arm,
+                    hand=offered_hand,
+                    post=copy.deepcopy(result['post_process']),
+                    turn_deg=result['turn_deg'],
+                    translated_joints=copy.deepcopy(translated_joints),
+                    collision_joints=copy.deepcopy(collision_joints),
+                    secured=copy.deepcopy(transition), offset=offset)
+            print('[transition] 試行{}: 横並び移動 {}'.format(
+                attempt, sbs.transition_summary(transition)))
+            log_debug_event(dict(
+                event='transition', person=attempt,
+                verified=transition['verified'],
+                fraction=transition['fraction'],
+                x_margin=transition['x_margin'],
+                placement_before=transition['placement_before'],
+                placement_after=transition['placement_after'],
+                reason=transition['reason'],
+                compute_time=transition['compute_time']))
+            return job
+
+        def approach_cos(result, motion):
+            """接近とすべらせる向きの cos。計画用のロボット (``self.robot``) は
+            触らず、手先を求める専用のロボットで計算する (IK の後は脚の連動
+            関節のリンクが関節角とずれたままで、姿勢を入れ直すと横並び移動の
+            計画の結果が変わるため)。"""
+            if motion is None or not motion_verified(motion):
+                return None
+            return nsp.approach_slide_cos(
+                self._fk_robot(), motion['joint_names'], motion['waypoints'],
+                result, translated_palm)
+
+        def complete(motion):
+            return (motion is not None and motion_verified(motion)
+                    and (motion.get('transition') or {}).get('verified'))
+
+        result, motion, person_base_limits, x_margin = ik_and_motion()
+        refine_job = plan_transition_for(result, motion)
+        avoid = getattr(args, 'avoid_reverse_approach', True)
+        cos = approach_cos(result, motion) if avoid else None
+        if cos is not None:
+            log_debug('[plan] 試行{}: 接近とすべらせる向きの cos {:+.2f} (向き '
+                      '{:+.0f}deg)'.format(attempt, cos, result['turn_deg']))
+        if (avoid and cos is not None and cos < nsp.REVERSE_APPROACH_COS
+                and not out_of_time('逆向きの接近を避ける計画し直し')):
+            # 手先が人の指先の側から来て、掌を越えた手首の側の hover から折り
+            # 返してすべらせる向き。ほかの向き (turn) で横並び移動まで計画し
+            # 直し、向きがそろって最初の計画と同じ段階まで通れば採用する。
+            turn_degs = list(spik.turn_candidates_deg(offered_hand,
+                                                      translated_palm))
+            retry = ik_and_motion(excluded_turns={
+                int(np.argmin([abs(d - result['turn_deg'])
+                               for d in turn_degs]))})
+            retry_cos = approach_cos(retry[0], retry[1])
+            retry_job = None
+            if retry_cos is not None and retry_cos >= nsp.REVERSE_APPROACH_COS:
+                retry_job = plan_transition_for(retry[0], retry[1])
+            adopted = (retry_cos is not None
+                       and retry_cos >= nsp.REVERSE_APPROACH_COS
+                       and (complete(retry[1]) or not complete(motion)))
+            print('[plan] 試行{}: 接近がすべらせる向きと逆 (cos {:+.2f}) のため'
+                  '向き {:+.0f}deg を除いて計画し直しました: {}。'.format(
+                      attempt, cos, result['turn_deg'],
+                      '採用 (cos {:+.2f}、向き {:+.0f}deg)'.format(
+                          retry_cos, retry[0]['turn_deg']) if adopted
+                      else '採用しない ({})'.format(
+                          '軌道計画まで通らない' if retry_cos is None
+                          else 'cos {:+.2f}'.format(retry_cos)
+                          if retry_cos < nsp.REVERSE_APPROACH_COS
+                          else '横並び移動まで通らない')))
+            log_debug_event(dict(
+                event='reverse_approach', person=attempt, cos=cos,
+                turn_deg=result['turn_deg'], retry_cos=retry_cos,
+                retry_turn_deg=retry[0].get('turn_deg'), adopted=adopted))
+            if adopted:
+                result, motion, person_base_limits, x_margin = retry
+                refine_job = retry_job
 
         placement = (spik.base_placement_metrics(
             translated_joints, result['base_position'], result['base_yaw'])
@@ -962,6 +1043,8 @@ class HandshakePlanner(object):
         if motion is not None:
             untranslate_motion(motion, offset)
 
+        collision_ik_time = result['collision_ik_time']
+        candidate_selection_time = result['candidate_selection_time']
         log_debug_event(dict(
             event='result', person=attempt, offered_hand=offered_hand,
             robot_arm=robot_arm, solved=result['solved'],
@@ -5721,6 +5804,13 @@ def build_arg_parser():
         '--lead-in-sequential', action='store_true',
         help='接近の lead-in をその場で回ってから直進する (11/17 以前)。既定は'
              '回りながら直進する。')
+    parser.add_argument(
+        '--avoid-reverse-approach', dest='avoid_reverse_approach',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='接近の終わりの手先の向きが押し込みですべらせる向きと逆 (人の指先'
+             'の側から来て、掌を越えた手首の側の hover から折り返す) なら、その'
+             '向き (turn) を除いて計画し直し、向きがそろえば採用する (既定で'
+             '有効)。')
     parser.add_argument(
         '--no-stop-press', dest='no_stop_press',
         action=argparse.BooleanOptionalAction, default=True,

@@ -53,6 +53,10 @@ RETIME_RADII = (0.2, 0.15, 0.1)
 # 差し替えで入る押し込みの点は、今の手先より押し込みの目標の向きにこれ以上前
 # にある最初の点 [m] (``press_entry``)。
 ENTRY_AHEAD = 0.005
+# 接近の向き (``approach_slide_cos``) を見る、接近の末尾の点の数と、すべらせる
+# 向きとの cos がこれ未満なら逆向きとみなしてほかの向き (turn) で計画し直す。
+APPROACH_DIRECTION_POINTS = 6
+REVERSE_APPROACH_COS = 0.0
 # 差し替えのゴールを、開始時刻 (hover を通る時刻) のこれ以上前に送る [s]。
 SPLICE_LEAD = 0.15
 # 台車のずれの許容 (これ以内なら動かさない) と、押し込みに織り込む上限。
@@ -94,6 +98,31 @@ def press_direction(robot, joint_names, hover_wp, result):
     if norm < 1e-3:
         return None
     return hover_hand, direction / norm
+
+
+def approach_slide_cos(robot, joint_names, approach_wps, result, palm,
+                       n_last=APPROACH_DIRECTION_POINTS):
+    """接近の終わりの手先の向き (末尾 ``n_last`` 点の始めから hover へ) と、
+    押し込みですべらせる向き (``spik.press_in_slide_direction``) の cos。
+
+    負なら手先は人の指先の側から来て、掌を越えた手首の側の hover まで行って
+    から折り返してすべらせる (止まらないと「手首の方へ引いてから押し込む」に
+    見える)。決まらなければ None。"""
+    post = result.get('post_process')
+    if post is None or len(approach_wps) < 2:
+        return None
+    robot_arm = result['robot_arm']
+    first = hand_position(robot, joint_names,
+                          approach_wps[-min(n_last, len(approach_wps))],
+                          robot_arm)
+    last = hand_position(robot, joint_names, approach_wps[-1], robot_arm)
+    direction = last - first
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-3:
+        return None
+    slide = spik.press_in_slide_direction(
+        palm, np.asarray(post['target_rot'], dtype=np.float64))
+    return float(direction @ slide / norm)
 
 
 def retime_approach_arm(robot, joint_names, approach_wps, result,

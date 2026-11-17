@@ -22,6 +22,8 @@
 Usage (ROS の環境と FEETECH_HAND_DIR が要る、roscore は不要)::
 
     python3 tools/view_no_stop_press.py --work-dir data/real/2026-10-22/logs/20261022_160029
+
+保存した計画は当時のコードのもの。今のコードの計画で見るには ``--replan``。
 """
 
 import argparse
@@ -86,6 +88,13 @@ class Trial(object):
         self.motion = load('motions')
         palms = load('palms')
         self.hand = self.result['offered_hand']
+        if args.replan:
+            # 保存した計画でなく、今のコードで計画し直したものを使う。
+            planned = planner.plan(self.joint_positions, palms, self.hand, 1)
+            if (planned['motion'] is None
+                    or not rcpt.motion_verified(planned['motion'])):
+                raise RuntimeError('今のコードでは軌道計画まで通りません')
+            self.result, self.motion = planned['result'], planned['motion']
         self.planned_palm = palms[self.hand]
         self.robot_arm = self.result['robot_arm']
         names = self.motion['joint_names']
@@ -97,6 +106,9 @@ class Trial(object):
             [0.0, 0.0, 0.0], self.motion['waypoints'][0], names,
             start_joint_angles=start_angles)
         self.approach = lead_in + list(self.motion['waypoints'])
+        self.approach_cos = nsp.approach_slide_cos(
+            planner._fk_robot(), names, self.motion['waypoints'], self.result,
+            self.planned_palm)
         self.hover = self.approach[-1]
         self.press = [self.hover] + build_press_in_waypoints(
             self.hover, names, self.result['post_process'])
@@ -226,7 +238,18 @@ class Trial(object):
         info = out['info']
         shift = out['shift_record']
         self.summary = [
-            '**{}** ({}手/{}腕)'.format(self.name, self.hand, self.robot_arm),
+            '**{}** ({}手/{}腕、{})'.format(
+                self.name, self.hand, self.robot_arm,
+                '今のコードで計画し直した' if self.args.replan
+                else '保存した計画'),
+            '- 手の向き (turn) {:+.0f}deg、接近とすべらせる向きの cos {}{}'
+            .format(self.result['turn_deg'],
+                    '-' if self.approach_cos is None
+                    else '{:+.2f}'.format(self.approach_cos),
+                    ' (**逆向き: 掌を越えて手首の側から折り返す**)'
+                    if self.approach_cos is not None
+                    and self.approach_cos < nsp.REVERSE_APPROACH_COS
+                    else ''),
             '- 接近 (台車) {:.2f}s、手前の hover → hover {:.2f}s、押し込み '
             '{:.2f}s'.format(self.t_base, self.dwell, float(np.sum(times))),
             '- 接近の終わりの腕: hover から {:.0f}cm に入ってからの {} 点を '
@@ -328,6 +351,9 @@ class App(object):
         self.names = sorted(set.intersection(*names))
         node_args = rcpt.build_arg_parser().parse_args([])
         self.planner = rcpt.HandshakePlanner(node_args)
+        if args.replan:
+            print('[view] 計画し直すための準備 (warmup) をしています...')
+            self.planner.warmup()
         spik.attach_camera_optical_coords(self.planner.robot)
         args.torso_surface_offset = node_args.torso_surface_offset
         self.robot = load_aero(use_hand=True)
@@ -449,6 +475,10 @@ def main():
     parser.add_argument('--ik-scale', type=float, default=2.0,
                         help='この PC の IK の時間を実機の時間に直す倍率 (実機は '
                              'bag の再生の 2〜4 倍かかっていた)')
+    parser.add_argument('--replan', action='store_true',
+                        help='保存した計画でなく、今のコードで計画し直したもの '
+                             '(骨格と掌から) を表示する (起動時に warmup で '
+                             '数十秒かかる)')
     parser.add_argument('--no-open-browser', action='store_true')
     App(parser.parse_args()).run()
 

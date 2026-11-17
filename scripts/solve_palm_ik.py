@@ -2901,8 +2901,11 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             facing_yaw_weight=DEFAULT_FACING_YAW_WEIGHT,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
-                            placement_joint_positions=None):
-    """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
+                            placement_joint_positions=None,
+                            excluded_turns=()):
+    """``excluded_turns`` (向きの添字の集合) の候補は使わない。
+
+    バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
     (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、ロボットの差し出す腕の肘から先と
     差し出した手まわりの組だけ ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が
     解け、自己干渉と、肘から先 x 手まわり以外の人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) を
@@ -2965,10 +2968,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                     base_pose, facing))
         return cost
 
-    # 収束した候補をコスト昇順に (同着は添字順)。
+    # 収束した候補をコスト昇順に (同着は添字順)。除く向きの候補は使わない。
+    excluded_turns = set(excluded_turns or ())
     candidates = sorted(
         ((candidate_cost(candidate_index), candidate_index)
-         for candidate_index, ok in enumerate(success_flags) if ok),
+         for candidate_index, ok in enumerate(success_flags)
+         if ok and candidate_index // attempts_per_pose
+         not in excluded_turns),
         key=lambda item: (item[0], item[1]))
 
     # 人体の障害物と表面サンプルは候補ループの外で 1 回だけ作る。
@@ -3213,7 +3219,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     n_turn_candidates=None,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
-                    placement_joint_positions=None):
+                    placement_joint_positions=None,
+                    excluded_turns=()):
     """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉を回避する
     バッチ IK (jax) で解き、``pick_verified_candidate`` で 1 つ選ぶ。
 
@@ -3316,7 +3323,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         front_offset_weight=front_offset_weight,
         facing_yaw_weight=facing_yaw_weight,
         hover_human_clearance=hover_human_clearance,
-        placement_joint_positions=placement_joint_positions)
+        placement_joint_positions=placement_joint_positions,
+        excluded_turns=excluded_turns)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
