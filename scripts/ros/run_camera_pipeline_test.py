@@ -595,6 +595,7 @@ class HandshakePlanner(object):
         self.args = args
         # plan の各計算の開始時に説明文で呼ぶ (画面の状態表示用) or None。
         self.on_stage = None
+        phm.LEAD_IN_CONCURRENT = not getattr(args, 'lead_in_sequential', False)
         if hasattr(args, 'press_in_forearm_clearance'):
             spik.apply_press_in_forearm_argument(args)
         self.robot, self.verification_pairs = self._build_robot_and_pairs()
@@ -5435,6 +5436,10 @@ def build_arg_parser():
         '--no-press-in-base-shift', dest='press_in_base_shift',
         action='store_false',
         help='押し込み直前の補正で台車を寄せず、腕だけで吸収する。')
+    parser.add_argument(
+        '--lead-in-sequential', action='store_true',
+        help='接近の lead-in をその場で回ってから直進する (11/17 以前)。既定は'
+             '回りながら直進する。')
     parser.add_argument(
         '--press-in-fold-correction', dest='press_in_fold_correction',
         action=argparse.BooleanOptionalAction, default=True,
