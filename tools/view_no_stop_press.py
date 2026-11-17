@@ -102,13 +102,15 @@ class Trial(object):
             self.hover, names, self.result['post_process'])
         joints = {joint.name: joint for joint in robot.joint_list}
         self.max_vel = nsp.max_velocities(names, joints)
-        self.pre = nsp.pre_hover_waypoint(robot, names, self.hover,
-                                          self.result)
-        if self.pre is None:
-            raise RuntimeError('手前の hover が解けません')
+        retimed, self.retime_info = nsp.retime_approach_arm(
+            robot, names, self.approach, self.result, margin_fn=self.margin)
+        if retimed is None:
+            raise RuntimeError('接近の終わりの腕を割り振り直すと人に近づき'
+                               'すぎます ({})'.format(self.retime_info))
+        self.pre = retimed[-1]
         self.pre_margin = self.margin(self.pre, None)
         self.base_wps, self.arm_wps = nsp.no_stop_waypoints(
-            self.approach, self.pre, self.press)
+            retimed, self.press)
         self.n_base = len(self.base_wps)
         self.base_times = nsp.limited_times(self.base_wps, self.max_vel)
         self.dwell = max(nsp.HOVER_DWELL, nsp.limited_times(
@@ -194,7 +196,12 @@ class Trial(object):
             '**{}** ({}手/{}腕)'.format(self.name, self.hand, self.robot_arm),
             '- 接近 (台車) {:.2f}s、手前の hover → hover {:.2f}s、押し込み '
             '{:.2f}s'.format(self.t_base, self.dwell, float(np.sum(times))),
-            '- 手前の hover の人体距離の余裕 {:.0f}mm'.format(
+            '- 接近の終わりの腕: hover から {:.0f}cm に入ってからの {} 点を '
+            '{:.2f}s に割り振り直し、台車が着く時点で hover の {:.0f}mm 手前 '
+            '(人体距離の余裕 {:.0f}mm)'.format(
+                self.retime_info['radius'] * 100, self.retime_info['retimed'],
+                self.retime_info['arm_time'],
+                self.retime_info['pre_hover_distance'] * 1e3,
                 self.pre_margin * 1e3),
             '- 台車の残差 ({:+.3f}m, {:+.3f}m, {:+.1f}deg) → {}'.format(
                 residual[0], residual[1], math.degrees(residual[2]),

@@ -11,10 +11,13 @@
     腕    接近 ──→ 手前の hover ～～ HOVER_DWELL 秒で hover へ ～～→ 押し込み
                               ↑ 検出・ずれの計測・IK        ↑ t_s = hover を通る時刻
 
-- 手前の hover (``pre_hover_waypoint``): hover の手先を押し込みと逆向きへ
-  ``PRE_HOVER_OFFSET`` 引いた姿勢 (台車は hover と同じ、腕と腰だけの IK)。
-- 腕は最初から [接近 (末尾を手前の hover に替える), hover, 計画の押し込み] を
-  1 本で送る。差し替えなければ計画どおり押し込む (止まらない)。
+- 接近の終わり (``retime_approach_arm``): 腕は計画の経路のまま、手先が hover
+  に近づいてからの時間を、hover に着く時刻 (台車が着いてから ``HOVER_DWELL``
+  秒後) まで一定の速さで進むよう割り振り直す。台車の着く点が「手前の hover」に
+  なる。手前の hover を別の姿勢 (手を引いた IK) にすると、計画では腕が先に
+  hover に着いているので「伸ばす -> 引く -> 伸ばす」になっていた。
+- 腕は最初から [接近 (割り振り直した点を含む), hover, 計画の押し込み] を 1 本
+  で送る。差し替えなければ計画どおり押し込む (止まらない)。
 - 差し替え (``splice_in_dwell``): ``joint_trajectory_controller`` は、開始時刻
   t_s 付きの新しいゴールを受けると t_s までは古い軌道を続け、t_s の古い軌道の
   状態 (位置・速度) から新しい最初の点までを 1 本のスプラインでつなぐ
@@ -39,13 +42,14 @@ import solve_palm_ik as spik
 from handshake_viewer_common import apply_waypoint_pose
 from handshake_viewer_common import build_press_in_waypoints
 
-# 手前の hover の、hover の手先から押し込みと逆向きへ引く距離 [m]。解けなければ
-# 順に縮める。
-PRE_HOVER_OFFSETS = (0.06, 0.04, 0.02)
 # 台車が着いてから腕が hover に着くまで (手前の hover -> hover) の時間 [s]。
 # 実機 10 試行の見積もりで、止まるのを待つ・検出 3 枚・ずれの計測・IK・送信の
 # 余裕の合計は 0.5〜1.2 秒。
 HOVER_DWELL = 1.5
+# 接近の終わりの腕の時間を割り振り直す範囲 (手先が hover の手先からこの距離に
+# 入った後) [m] (``retime_approach_arm``)。人体との距離の検証に通らなければ順に
+# 狭める。
+RETIME_RADII = (0.2, 0.15, 0.1)
 # 差し替えのゴールを、開始時刻 (hover を通る時刻) のこれ以上前に送る [s]。
 SPLICE_LEAD = 0.15
 # 台車のずれの許容 (これ以内なら動かさない) と、押し込みに織り込む上限。
@@ -57,10 +61,6 @@ FOLD_MAX_ANGLE = math.radians(10.0)  # [rad]
 # 通る量まで) 台車で寄せる。
 PALM_SHIFT_MIN = 0.06  # [m]
 CLEARANCE_SCALES = (1.0, 0.5, 0.25)
-# 手前の hover の IK。
-PRE_HOVER_IK_STOP = 100
-PRE_HOVER_IK_THRE = 0.003  # [m]
-PRE_HOVER_IK_RTHRE = math.radians(3.0)  # [rad]
 
 
 def place_at(robot, joint_names, waypoint):
@@ -70,58 +70,106 @@ def place_at(robot, joint_names, waypoint):
     apply_waypoint_pose(robot, joint_names, [waypoint], 0)
 
 
-def pre_hover_waypoint(robot, joint_names, hover_wp, result,
-                       offsets=PRE_HOVER_OFFSETS):
-    """``offsets`` の順に ``_pre_hover_waypoint`` を試し、最初に解けたもの
-    (どれも解けなければ None)。"""
-    for offset in offsets:
-        waypoint = _pre_hover_waypoint(robot, joint_names, hover_wp, result,
-                                       offset)
-        if waypoint is not None:
-            waypoint['pre_hover_offset'] = offset
-            return waypoint
-    return None
+def hand_position(robot, joint_names, waypoint, robot_arm):
+    """``waypoint`` の手先の位置 (計画の系)。``robot`` の姿勢は書き換わる。"""
+    place_at(robot, joint_names, waypoint)
+    return getattr(robot, '{}arm_end_coords'.format(
+        robot_arm)).worldpos().copy()
 
 
-def _pre_hover_waypoint(robot, joint_names, hover_wp, result, offset):
-    """hover の手先を、計画の押し込みの最終目標と逆向きへ ``offset`` 引いた
-    「手前の hover」の waypoint (台車は hover と同じ、腕と腰の IK、脚は固定)。
-    解けなければ None。``robot`` の姿勢は書き換わる。"""
+def press_direction(robot, joint_names, hover_wp, result):
+    """``(hover の手先の位置, 押し込みの向きの単位ベクトル)`` (hover の手先から
+    計画の押し込みの最終目標へ)。決まらなければ None。"""
     post = result.get('post_process')
     if post is None:
         return None
-    robot_arm = result['robot_arm']
-    place_at(robot, joint_names, hover_wp)
-    end = getattr(robot, '{}arm_end_coords'.format(robot_arm))
-    position = end.worldpos().copy()
-    rotation = end.worldrot().copy()
-    direction = np.asarray(post['target_position'], dtype=np.float64) - position
+    hover_hand = hand_position(robot, joint_names, hover_wp,
+                               result['robot_arm'])
+    direction = np.asarray(post['target_position'],
+                           dtype=np.float64) - hover_hand
     norm = float(np.linalg.norm(direction))
     if norm < 1e-3:
         return None
-    target = position - offset * direction / norm
-    whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
-    links = spik._body_link_list(whole_body, True)
-    solved = robot.inverse_kinematics(
-        Coordinates(pos=target.tolist(), rot=rotation), move_target=end,
-        link_list=links, stop=PRE_HOVER_IK_STOP, thre=PRE_HOVER_IK_THRE,
-        rthre=PRE_HOVER_IK_RTHRE, revert_if_fail=True)
-    if solved is False:
-        return None
-    angles = {joint.name: float(joint.joint_angle())
-              for joint in robot.joint_list}
-    return dict(hover_wp, pre_hover=True, joint_angle_vector=[
-        angles.get(name, float(angle))
-        for name, angle in zip(joint_names, hover_wp['joint_angle_vector'])])
+    return hover_hand, direction / norm
 
 
-def no_stop_waypoints(approach_wps, pre_hover_wp, press_wps):
-    """台車に送る接近 (末尾が手前の hover) と、腕に送る 1 本
-    ([接近 (末尾が手前の hover), hover, 押し込み (hover の次から)]) の waypoint
-    列。``press_wps`` は先頭が hover。"""
-    base_wps = list(approach_wps[:-1]) + [pre_hover_wp]
-    arm_wps = base_wps + [press_wps[0]] + list(press_wps[1:])
-    return base_wps, arm_wps
+def retime_approach_arm(robot, joint_names, approach_wps, result,
+                        dwell=HOVER_DWELL, radii=RETIME_RADII,
+                        margin_fn=None):
+    """接近の waypoint 列 (末尾が hover) の終わりの腕を、計画の経路のまま
+    時間だけ割り振り直す (台車は同じ)。
+
+    計画では、台車がゆっくり回り終える間に腕はもう hover の姿勢に着いて
+    待っている。手先が hover の手先から ``radius`` に入った点 j から先は、
+    腕を計画の経路 (点 j から hover までの関節角の列) に沿って、hover に着く
+    時刻 (台車が着いてから ``dwell`` 秒後) まで一定の速さで進ませる
+    (経路の長さは関節ごとの速度上限で割った時間の尺度)。台車が着く点は
+    hover の少し手前 (「手前の hover」) になり、腕は後戻りしない。
+
+    ``margin_fn(waypoint, None)`` があれば割り振り直した点の人体との距離の余裕
+    を確かめ、通らなければ ``radii`` の次 (小さい範囲) で試す。
+    Returns: ``(waypoints, info)``、どれも通らなければ ``(None, info)``。
+    """
+    robot_arm = result['robot_arm']
+    hover_wp = approach_wps[-1]
+    hover_hand = hand_position(robot, joint_names, hover_wp, robot_arm)
+    hands = [hand_position(robot, joint_names, waypoint, robot_arm)
+             for waypoint in approach_wps]
+    joints = {joint.name: joint for joint in robot.joint_list}
+    max_vel = max_velocities(joint_names, joints)
+    times = limited_times(approach_wps, max_vel)
+    arrivals = np.concatenate([[0.0], np.cumsum(times)])
+    t_hover = float(arrivals[-1]) + dwell
+    angles = np.array([wp['joint_angle_vector'] for wp in approach_wps],
+                      dtype=np.float64)
+    weights = np.where(np.isfinite(max_vel), 1.0 / max_vel, 0.0)
+    n = len(approach_wps)
+    info = dict(reason='no_radius')
+    for radius in radii:
+        far = [k for k, hand in enumerate(hands)
+               if np.linalg.norm(hand - hover_hand) > radius]
+        start = min(far[-1] + 1 if far else 0, n - 2)
+        path = angles[start:]
+        steps = np.abs(np.diff(path, axis=0)) * weights
+        length = np.concatenate([[0.0], np.cumsum(np.max(steps, axis=1))])
+        out = list(approach_wps)
+        ok = True
+        for k in range(start + 1, n):
+            s = ((arrivals[k] - arrivals[start])
+                 / (t_hover - arrivals[start]))
+            if length[-1] > 1e-9:
+                vector = np.array([np.interp(s * length[-1], length,
+                                             path[:, i])
+                                   for i in range(path.shape[1])])
+            else:
+                vector = path[-1]
+            out[k] = dict(approach_wps[k], joint_angle_vector=[
+                float(v) for v in vector])
+            if margin_fn is not None:
+                margin = margin_fn(out[k], None)
+                if margin < 0.0:
+                    info = dict(reason='clearance', radius=radius, index=k,
+                                margin=margin)
+                    ok = False
+                    break
+        if ok:
+            out[-1] = dict(out[-1], pre_hover=True)
+            pre_hand = hand_position(robot, joint_names, out[-1], robot_arm)
+            return out, dict(
+                reason='ok', radius=radius, start=start,
+                retimed=n - 1 - start,
+                arm_time=float(t_hover - arrivals[start]),
+                pre_hover_distance=float(np.linalg.norm(
+                    pre_hand - hover_hand)))
+    return None, info
+
+
+def no_stop_waypoints(retimed_approach, press_wps):
+    """台車に送る接近 (``retime_approach_arm`` の結果、末尾が手前の hover) と、
+    腕に送る 1 本 ([接近, hover, 押し込み (hover の次から)])。``press_wps``
+    は先頭が hover。"""
+    base_wps = list(retimed_approach)
+    return base_wps, base_wps + list(press_wps)
 
 
 # ---------------------------------------------------------------------------

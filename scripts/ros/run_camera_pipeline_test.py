@@ -4878,28 +4878,26 @@ class HandshakePipelineNode(object):
         """止まらない押し込みの準備: 手前の hover を解き、人体との距離を確かめ、
         台車と腕に送る waypoint 列を作る (できなければ None で従来の流れ)。"""
         hover_wp = display_waypoints[reach_boundary - 1]
-        pre = nsp.pre_hover_waypoint(self.robot, joint_names, hover_wp, result)
-        if pre is None:
-            print('[execute][no-stop] 手前の hover が解けないため、hover で止まる'
-                  '流れで実行します。')
-            self._log_debug(dict(event='no_stop_plan', ok=False,
-                                 reason='pre_hover_ik'))
-            return None
-        margin = self._hover_clearance_margin(pre, joint_names,
-                                              result['offered_hand'])
-        if margin < 0.0:
-            print('[execute][no-stop] 手前の hover が人に近すぎる (余裕 {:.0f}mm)'
-                  'ため、hover で止まる流れで実行します。'.format(margin * 1e3))
-            self._log_debug(dict(event='no_stop_plan', ok=False,
-                                 reason='pre_hover_clearance', margin=margin))
+        offered_hand = result['offered_hand']
+
+        def margin_fn(waypoint, hand_shift):
+            return self._hover_clearance_margin(
+                waypoint, joint_names, offered_hand, hand_shift=hand_shift)
+
+        approach, info = nsp.retime_approach_arm(
+            self.robot, joint_names, display_waypoints[:reach_boundary],
+            result, margin_fn=margin_fn)
+        if approach is None:
+            print('[execute][no-stop] 接近の終わりの腕を割り振り直すと人に近づき'
+                  'すぎる ({}) ため、hover で止まる流れで実行します。'.format(
+                      info))
+            self._log_debug(dict(event='no_stop_plan', ok=False, **info))
             return None
         press_wps = display_waypoints[reach_boundary - 1:]
-        base_wps, arm_wps = nsp.no_stop_waypoints(
-            display_waypoints[:reach_boundary], pre, press_wps)
-        self._log_debug(dict(event='no_stop_plan', ok=True,
-                             pre_hover_margin=margin))
-        return dict(hover_wp=hover_wp, pre_hover=pre, press_wps=press_wps,
-                    base_wps=base_wps, arm_wps=arm_wps)
+        base_wps, arm_wps = nsp.no_stop_waypoints(approach, press_wps)
+        self._log_debug(dict(event='no_stop_plan', ok=True, **info))
+        return dict(hover_wp=hover_wp, pre_hover=approach[-1],
+                    press_wps=press_wps, base_wps=base_wps, arm_wps=arm_wps)
 
     def _send_no_stop_approach(self, no_stop, joint_names, on_sent=None):
         """腕に [接近 (末尾が手前の hover), hover, 計画の押し込み] を 1 本で、
