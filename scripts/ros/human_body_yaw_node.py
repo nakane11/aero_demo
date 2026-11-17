@@ -137,14 +137,22 @@ class HumanBodyYawNode(object):
         # 右回りなら一歩下がる (ユーザー)。~blind_max_y を 0 にすると無効。
         self.blind_x = (rospy.get_param('~blind_x_min', -0.10),
                         rospy.get_param('~blind_x_max', 0.10))
-        self.blind_max_y = rospy.get_param('~blind_max_y', 0.45)
+        # 11/17: 台車の中心で回すと人は |y| 0.45〜0.55 に立ち、0.45 では
+        # 外れて +40〜55° と読み左に回り続けたので 0.6。
+        self.blind_max_y = rospy.get_param('~blind_max_y', 0.6)
         # depth: 頭のてっぺんが ~blind_x_min より後ろなら右回り (負) だけ、
         # ~blind_x_max より前なら左回り (正) だけ通し、逆は 0 にする。
         self.step_direction_gate = rospy.get_param(
             '~step_direction_gate', True)
         # depth: 向きが読めない間、最後に読めた向き (odom) をこの時間 [s]
-        # まで保つ (回り始めたら回りきる)。0 で保たない。
-        self.hold_time = rospy.get_param('~hold_time', 3.0)
+        # まで保つ (回り始めたら回りきる)。0 で保たない。11/17: 3 秒では
+        # 横並びに戻っても回り続け 1 回 70〜110° 回りすぎ、0 では回りきら
+        # ないので 1 秒 (ユーザー)。
+        self.hold_time = rospy.get_param('~hold_time', 1.0)
+        # depth: 向きの読める位置 (blind の外) で、帯の向きからこの角度 [deg]
+        # を引く。正面向きのまま半歩前・半歩後ろに立つと +22°・+25° と出る
+        # (11/16 静止確認) ため。11/17: 左に回りすぎ、右に回りにくかった。
+        self.yaw_bias = math.radians(rospy.get_param('~yaw_bias_deg', 25.0))
         self._last_valid = None
         # depth: 深度画像をこの画素おきに使う (1920x1080 -> 480x270)。
         self.depth_step = max(1, int(rospy.get_param('~depth_step', 4)))
@@ -329,6 +337,9 @@ class HumanBodyYawNode(object):
             ambiguous_cos=self.band_ambiguous_cos,
             keep_cos=self.band_keep_cos)
         found = self._band_result(result, previous, debug)
+        if found[0] is not None and self.yaw_bias != 0.0:
+            debug['bias_deg'] = round(math.degrees(self.yaw_bias), 1)
+            found = (body_yaw.wrap_angle(found[0] - self.yaw_bias),) + found[1:]
         if self.step_direction_gate and found[0] is not None:
             found = self._gate_by_step(found, head.top[0])
         if found[0] is None:
@@ -343,7 +354,8 @@ class HumanBodyYawNode(object):
 
     def _held_base_yaw(self, stamp, odom_from_base):
         """~hold_time 以内に読めた最後の向き (odom) を base_link で返す."""
-        if (self._last_valid is None or odom_from_base is None
+        if (self.hold_time <= 0.0 or self._last_valid is None
+                or odom_from_base is None
                 or self._smoother_frame != self.odom_frame):
             return None
         target, when = self._last_valid
