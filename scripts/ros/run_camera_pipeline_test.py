@@ -86,6 +86,7 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
 import plan_handshake_motion as phm  # noqa: E402
+import no_stop_press as nsp  # noqa: E402
 import side_by_side_transition as sbs  # noqa: E402
 from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
 from handshake_viewer_common import apply_robot_pose as apply_result_pose  # noqa: E402,E501
@@ -287,12 +288,12 @@ PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
 PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
 # --press-in-base-shift: 検出し直した掌が計画から水平にこれ以上ずれていたら、
 # 腕だけで吸収せず先にその分だけ台車を寄せる。
-PRESS_IN_BASE_SHIFT_MIN = 0.06  # [m]
+PRESS_IN_BASE_SHIFT_MIN = nsp.PALM_SHIFT_MIN  # [m]
 # --press-in-fold-correction: hover で止まって台車を直さず、残差を測るだけにして
-# 押し込み区間の先頭で (腕は hover のまま) 止まらずに動かす。残差がこれを超えたら
-# 従来どおり止まって直す。実機 10/21〜22 で 1 回目の残差は最大 10cm。
-PRESS_IN_FOLD_MAX_POSITION = 0.12  # [m]
-PRESS_IN_FOLD_MAX_ANGLE = math.radians(10.0)  # [rad]
+# 押し込みに織り込む。残差がこれを超えたら従来どおり止まって直す。実機 10/21〜22
+# で 1 回目の残差は最大 10cm。
+PRESS_IN_FOLD_MAX_POSITION = nsp.FOLD_MAX_POSITION  # [m]
+PRESS_IN_FOLD_MAX_ANGLE = nsp.FOLD_MAX_ANGLE  # [rad]
 # 接近の螺旋〜押し込み直前、首は差し出し手の掌を向く。候補は直前位置からこの距離
 # 以内・score 以上のみ。
 HAND_FOLLOW_MAX_JUMP = 0.25  # [m]
@@ -3064,10 +3065,22 @@ class HandshakePipelineNode(object):
 
         self._tail_correction = None
         tail_stop = threading.Event()
+        no_stop = None
+        if (self.args.no_stop_press
+                and reach_boundary < len(display_waypoints)
+                and self.args.press_in_refine
+                and self.args.base_correction != 'none'):
+            no_stop = self._plan_no_stop(display_waypoints, reach_boundary,
+                                         joint_names, result)
         self._set_activity(STAGE_LEAD_IN)
-        start_odom_coords, final_traj_point = self._execute_waypoint_segment(
-            display_waypoints[:reach_boundary], joint_names,
-            on_sent=on_approach_sent)
+        if no_stop is not None:
+            start_odom_coords, final_traj_point = self._send_no_stop_approach(
+                no_stop, joint_names, on_sent=on_approach_sent)
+        else:
+            start_odom_coords, final_traj_point = \
+                self._execute_waypoint_segment(
+                    display_waypoints[:reach_boundary], joint_names,
+                    on_sent=on_approach_sent)
         tail_stop.set()
         for timer in follow_timers:
             timer.cancel()
@@ -3095,7 +3108,19 @@ class HandshakePipelineNode(object):
         robot_arm = result['robot_arm']
         hover_wp = display_waypoints[reach_boundary - 1]
         fold = None
-        if (self.args.press_in_fold_correction
+        press_done = None
+        if no_stop is not None:
+            press_done = self._run_no_stop_press(
+                no_stop, start_odom_coords, final_traj_point, ref_scan,
+                exclude_centers, palm_anchor, joint_names, result,
+                hand_followed)
+            if press_done is None:
+                # 腕は hover で止めた。従来どおり止まって台車を直す。
+                self._set_activity(STAGE_BASE_CORRECTION)
+                self._correct_base_residual(
+                    start_odom_coords, final_traj_point, ref_scan=ref_scan,
+                    exclude_centers=exclude_centers, palm_anchor=palm_anchor)
+        elif (self.args.press_in_fold_correction
                 and reach_boundary < len(display_waypoints)
                 and self.args.press_in_refine
                 and self.args.base_correction != 'none'
@@ -3127,14 +3152,16 @@ class HandshakePipelineNode(object):
                           settle_time, drift[0] * 1e3,
                           math.degrees(drift[1])))
 
-        if fold is None:
+        if fold is None and press_done is None:
             self._set_activity(STAGE_HOVER_SETTLE)
             self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
             self._end_hand_follow()
             if head_to_hover or hand_followed:
                 self.ri.wait_interpolation(controller_type='head_controller')
 
-        if reach_boundary < len(display_waypoints):
+        if press_done is not None:
+            press_waypoints = press_done
+        elif reach_boundary < len(display_waypoints):
             press_waypoints = display_waypoints[reach_boundary - 1:]
             if self.args.press_in_refine:
                 self._set_activity(STAGE_PRESS_REFINE)
@@ -3592,55 +3619,24 @@ class HandshakePipelineNode(object):
         決める (動かさない)。寄せないときは ``(None, None)`` (記録はここで
         ログに出す)、寄せるときは ``(shift, record)`` (``record`` の
         ``distance`` は掌の水平のずれ [m]。ログは呼び出し側で出す)。"""
-        shift = np.asarray(palm['position'], dtype=np.float64) - expected_position
-        shift[2] = 0.0
-        distance = float(np.linalg.norm(shift))
-        record = dict(event='press_in_base_shift',
-                      shift=[float(v) for v in shift[:2]], applied=False)
-        if distance < PRESS_IN_BASE_SHIFT_MIN:
+        def margin_fn(waypoint, hand_shift):
+            if hover_wp is None:
+                return float('inf')
+            return self._hover_clearance_margin(
+                waypoint, joint_names, offered_hand, hand_shift=hand_shift)
+
+        shift, record = nsp.plan_palm_base_shift(
+            palm, expected_position,
+            hover_wp if hover_wp is not None else dict(
+                base_position=[0.0, 0.0, 0.0], base_yaw=0.0),
+            base_error, planned_palm, margin_fn)
+        if shift is None:
             self._log_debug(record)
-            return None, None
-        if hover_wp is not None:
-            wanted = shift.copy()
-            actual_wp = hover_wp
-            if base_error is not None and planned_palm is not None:
-                # 計画の系の実際の台車の姿勢と、そこから見た掌。
-                actual = scan_matching.compose(
-                    [hover_wp['base_position'][0],
-                     hover_wp['base_position'][1], hover_wp['base_yaw']],
-                    base_error)
-                actual_wp = dict(
-                    hover_wp, base_position=[actual[0], actual[1], 0.0],
-                    base_yaw=float(actual[2]))
-                to_plan = self._planar_matrix(0.0, 0.0, actual[2])[:2, :2]
-                palm_plan = actual[:2] + to_plan @ np.asarray(
-                    palm['position'], dtype=np.float64)[:2]
-                hand_shift = palm_plan - np.asarray(
-                    planned_palm['position'], dtype=np.float64)[:2]
-                record.update(base_error=[float(v) for v in base_error],
-                              hand_shift=[float(v) for v in hand_shift])
-            else:
-                # hover の台車系のずれを計画の系へ。
-                to_plan = self._planar_matrix(
-                    0.0, 0.0, hover_wp['base_yaw'])[:2, :2]
-                hand_shift = to_plan @ wanted[:2]
-            scale, margin = self._clearance_scale(
-                lambda s: to_plan @ (wanted[:2] * s), actual_wp, joint_names,
-                offered_hand, hand_shift)
-            if scale is not None:
-                shift = wanted * scale
-            else:
-                record.update(reason='clearance', clearance_margin=margin)
-                self._log_debug(record)
+            if record['reason'] == 'clearance':
                 print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
                       'ずれていたが、台車を寄せると人に近づきすぎるため腕だけで'
-                      '補正します。'.format(distance * 1e3))
-                return None, None
-            record.update(scale=scale, clearance_margin=margin)
-            if float(np.linalg.norm(shift)) < PRESS_IN_BASE_SHIFT_MIN / 2:
-                self._log_debug(record)
-                return None, None
-        record['distance'] = distance
+                      '補正します。'.format(record['distance'] * 1e3))
+            return None, None
         return shift, record
 
     def _refine_press_in(self, hover_wp, joint_names, result, base_error=None,
@@ -3674,49 +3670,25 @@ class HandshakePipelineNode(object):
         expected_position = base_rot.T @ (
             np.asarray(planned_palm['position']) - base_pos)
         expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
-        move_rot = move_pos = pending_move = None
-        if fold is not None:
-            # 補正の移動 (今の台車の系) の剛体変換。動いた後の系 -> 今の系。
+        if fold is None:
+            detect_position, detect_normal = expected_position, expected_normal
+        else:
+            # 台車はまだ base_move だけ動いていないので、今の台車の系で探す。
             move = np.asarray(fold['base_move'], dtype=np.float64)
             c, s = math.cos(move[2]), math.sin(move[2])
             move_rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-            move_pos = np.array([move[0], move[1], 0.0])
+            detect_position = (move_rot @ expected_position
+                               + np.array([move[0], move[1], 0.0]))
+            detect_normal = move_rot @ expected_normal
         palm, hand_frames, distances, candidates = self._detect_offered_palm(
-            offered_hand,
-            expected_position if fold is None
-            else move_rot @ expected_position + move_pos,
-            expected_normal if fold is None else move_rot @ expected_normal,
+            offered_hand, detect_position, detect_normal,
             hand_frames=None if fold is None else fold.get('hand_frames'))
-        if palm is not None and fold is not None:
-            # 動いた後の台車の系へ。
-            palm = spik.transform_palm(palm, move_rot.T,
-                                       -move_rot.T @ move_pos)
-        if palm is not None and self.args.press_in_base_shift:
-            if fold is None:
-                palm = self._shift_base_to_palm(
-                    palm, offered_hand, expected_position, expected_normal,
-                    hover_wp=hover_wp, joint_names=joint_names,
-                    base_error=base_error, planned_palm=planned_palm)
-            else:
-                shift, shift_record = self._plan_palm_base_shift(
-                    palm, offered_hand, expected_position, hover_wp=hover_wp,
-                    joint_names=joint_names, base_error=fold.get('base_error'),
-                    planned_palm=planned_palm)
-                if shift is not None:
-                    palm = dict(palm, position=[
-                        float(v) for v in np.asarray(palm['position']) - shift])
-                    folded_move = scan_matching.compose(
-                        fold['base_move'], [shift[0], shift[1], 0.0])
-                    shift_record.update(
-                        applied='folded',
-                        base_move=[float(v) for v in folded_move])
-                    self._log_debug(shift_record)
-                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
-                          'ずれていたため、押し込みの前に台車を ({:+.3f}m, '
-                          '{:+.3f}m) 寄せます (止まらずに動かす)。'.format(
-                              shift_record['distance'] * 1e3, shift[0],
-                              shift[1]))
-                    pending_move = folded_move
+        if (palm is not None and fold is None
+                and self.args.press_in_base_shift):
+            palm = self._shift_base_to_palm(
+                palm, offered_hand, expected_position, expected_normal,
+                hover_wp=hover_wp, joint_names=joint_names,
+                base_error=base_error, planned_palm=planned_palm)
         wait_time = time.time() - t0
         if palm is None:
             nearest = [c['distance'] for frame in candidates for c in frame
@@ -3751,12 +3723,45 @@ class HandshakePipelineNode(object):
             return None
 
         t1 = time.time()
-        self._place_robot_at_waypoint(joint_names, hover_wp)
-        observed = spik.transform_palm(palm, base_rot, base_pos)
-        info = spik.refine_post_process(
-            self.robot, result['robot_arm'], observed, result['turn_deg'],
-            planned_post,
-            planned_palm=(planned_palm if 'x_axis' in planned_palm else None))
+        folded = None
+        if fold is None:
+            self._place_robot_at_waypoint(joint_names, hover_wp)
+            observed = spik.transform_palm(palm, base_rot, base_pos)
+            info = spik.refine_post_process(
+                self.robot, result['robot_arm'], observed, result['turn_deg'],
+                planned_post, planned_palm=(
+                    planned_palm if 'x_axis' in planned_palm else None))
+        else:
+            def clearance_margin(waypoint, hand_shift):
+                return self._hover_clearance_margin(
+                    waypoint, joint_names, offered_hand,
+                    hand_shift=hand_shift)
+
+            margin_fn = (clearance_margin if self.args.press_in_base_shift
+                         else None)
+            folded = nsp.refine_folded(
+                self.robot, joint_names, hover_wp, result, planned_palm,
+                palm, fold['base_move'], base_error=fold.get('base_error'),
+                margin_fn=margin_fn)
+            info, observed = folded['info'], folded['observed']
+            shift_record = folded['shift_record']
+            if shift_record is not None:
+                if shift_record['reason'] == 'shift':
+                    shift_record.update(
+                        applied='folded',
+                        base_move=[float(v) for v in folded['base_move']])
+                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                          'ずれていたため、台車を寄せる分も押し込みに織り込み'
+                          'ます (合計 {:+.3f}m, {:+.3f}m, {:+.1f}deg)。'.format(
+                              shift_record['distance'] * 1e3,
+                              folded['base_move'][0], folded['base_move'][1],
+                              math.degrees(folded['base_move'][2])))
+                elif shift_record['reason'] == 'clearance':
+                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                          'ずれていたが、台車を寄せると人に近づきすぎるため腕'
+                          'だけで補正します。'.format(
+                              shift_record['distance'] * 1e3))
+                self._log_debug(shift_record)
         ik_time = time.time() - t1
         palm_shift = np.asarray(observed['position']) - np.asarray(
             planned_palm['position'])
@@ -3787,8 +3792,10 @@ class HandshakePipelineNode(object):
                   if blend else '',
                   info['position_change'] * 1e3,
                   math.degrees(info['rotation_change']), wait_time, ik_time))
-        if pending_move is not None:
-            fold['base_move'] = pending_move
+        if folded is not None:
+            fold['base_move'] = folded['base_move']
+            fold['ik_time'] = ik_time
+            return folded['press_waypoints']
         return build_press_in_waypoints(
             hover_wp, joint_names, info['post_process'])
 
@@ -4580,12 +4587,13 @@ class HandshakePipelineNode(object):
             self.ri.move_base_trajectory_action.wait_for_result()
 
     def _limited_time_list(self, arm_angle_vectors, base_trajectory_points,
-                           time_list):
+                           time_list, start_av=None):
         """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど
         上限 (× ``VEL_LIMIT_RATIO``、加速度は ``ACCEL_TIME``) になるよう決めて返す。
         ``time_list`` は区間ごとの下限。
 
-        ``arm_angle_vectors``: 送る関節角列 (始点は実機の現在角)。
+        ``arm_angle_vectors``: 送る関節角列 (始点は ``start_av``、None なら
+        実機の現在角)。
         ``base_trajectory_points``: 区間先頭からの累積 ``[dx, dy, dyaw]`` 列。
         None/空なら判定から外す。コントローラが 3 次エルミートで補間するので、
         その最大値で判定する。
@@ -4599,7 +4607,8 @@ class HandshakePipelineNode(object):
             # コントローラで動かさない関節は判定から外す (inf)。
             arm_max_vel = execution_timing.joint_max_velocities(
                 self.real_robot.joint_list, controller_joint_names)
-            avs = [ri.angle_vector()] + list(arm_angle_vectors)
+            avs = [ri.angle_vector() if start_av is None
+                   else np.asarray(start_av)] + list(arm_angle_vectors)
             arm_deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
                                    for i in range(len(arm_angle_vectors))])
         return execution_timing.limited_time_list(
@@ -4855,9 +4864,256 @@ class HandshakePipelineNode(object):
                   match['rms'] * 1e3, match['inlier_ratio'], match_time))
         return scan_delta if ok else None
 
+    def _waypoint_angle_vector(self, waypoint, joint_names):
+        """``waypoint`` の関節角を ``self.real_robot`` の angle_vector の形で
+        (``_execute_waypoint_segment`` と同じ。real_robot の姿勢は書き換わる)。"""
+        name_to_angle = dict(zip(joint_names, waypoint['joint_angle_vector']))
+        for joint in self.real_robot.joint_list:
+            if joint.name in name_to_angle:
+                joint.joint_angle(name_to_angle[joint.name])
+        return self.real_robot.angle_vector().copy()
+
+    def _plan_no_stop(self, display_waypoints, reach_boundary, joint_names,
+                      result):
+        """止まらない押し込みの準備: 手前の hover を解き、人体との距離を確かめ、
+        台車と腕に送る waypoint 列を作る (できなければ None で従来の流れ)。"""
+        hover_wp = display_waypoints[reach_boundary - 1]
+        pre = nsp.pre_hover_waypoint(self.robot, joint_names, hover_wp, result)
+        if pre is None:
+            print('[execute][no-stop] 手前の hover が解けないため、hover で止まる'
+                  '流れで実行します。')
+            self._log_debug(dict(event='no_stop_plan', ok=False,
+                                 reason='pre_hover_ik'))
+            return None
+        margin = self._hover_clearance_margin(pre, joint_names,
+                                              result['offered_hand'])
+        if margin < 0.0:
+            print('[execute][no-stop] 手前の hover が人に近すぎる (余裕 {:.0f}mm)'
+                  'ため、hover で止まる流れで実行します。'.format(margin * 1e3))
+            self._log_debug(dict(event='no_stop_plan', ok=False,
+                                 reason='pre_hover_clearance', margin=margin))
+            return None
+        press_wps = display_waypoints[reach_boundary - 1:]
+        base_wps, arm_wps = nsp.no_stop_waypoints(
+            display_waypoints[:reach_boundary], pre, press_wps)
+        self._log_debug(dict(event='no_stop_plan', ok=True,
+                             pre_hover_margin=margin))
+        return dict(hover_wp=hover_wp, pre_hover=pre, press_wps=press_wps,
+                    base_wps=base_wps, arm_wps=arm_wps)
+
+    def _send_no_stop_approach(self, no_stop, joint_names, on_sent=None):
+        """腕に [接近 (末尾が手前の hover), hover, 計画の押し込み] を 1 本で、
+        台車に接近を送り、台車のゴールが終わるまで待つ (腕は待たない)。
+
+        ``no_stop`` に ``arm_avs``・``arm_times``・``n_base``・``dwell``・
+        ``send_ros_time`` (ゴールの開始の ROS 時刻)・``t_hover``/``t_hover_ros``
+        (腕が hover を通る壁時計・ROS 時刻) を足す。
+        Returns: ``(start_odom_coords, final_traj_point)``。
+        """
+        base_wps, arm_wps = no_stop['base_wps'], no_stop['arm_wps']
+        n_base = len(base_wps)
+        arm_avs = [self._waypoint_angle_vector(wp, joint_names)
+                   for wp in arm_wps]
+        base_points = execution_timing.base_trajectory_points(base_wps)
+        base_times = self._limited_time_list(
+            arm_avs[:n_base], base_points, [MIN_SEGMENT_TIME] * n_base)
+        dwell, = self._limited_time_list(
+            [arm_avs[n_base]], None, [nsp.HOVER_DWELL],
+            start_av=arm_avs[n_base - 1])
+        press_base = execution_timing.base_trajectory_points(
+            no_stop['press_wps'])
+        press_times = self._limited_time_list(
+            arm_avs[n_base + 1:], press_base[1:],
+            [MIN_SEGMENT_TIME] * (len(arm_avs) - n_base - 1),
+            start_av=arm_avs[n_base])
+        arm_times = list(base_times) + [dwell] + list(press_times)
+        start_av = self.ri.angle_vector().copy()
+        self._segment_time_list = list(base_times)
+        send_ros_time = rospy.Time.now()
+        send_time = time.time()
+        self.ri.angle_vector_sequence(arm_avs, arm_times)
+        start_odom_coords = self.ri.odom
+        plan = dict(points=np.asarray(base_points, dtype=np.float64),
+                    times=[float(t) for t in base_times],
+                    start_odom=start_odom_coords, sent_time=None)
+        self._segment_base_plan = plan
+        self._send_base_trajectory(base_points, base_times, wait=False)
+        plan['sent_time'] = time.time()
+        t_rel = float(sum(base_times)) + dwell
+        no_stop.update(
+            arm_avs=arm_avs, arm_times=arm_times, start_av=start_av,
+            n_base=n_base, dwell=dwell, send_ros_time=send_ros_time,
+            t_hover=send_time + t_rel,
+            t_hover_ros=send_ros_time + rospy.Duration(t_rel),
+            press_times=list(press_times))
+        log_debug('[debug][segment] 止まらない押し込み: 台車 {} 点 {:.2f}s、'
+                  '腕は台車の到着から {:.2f}s で hover、続けて押し込み {:.2f}s'
+                  .format(n_base, sum(base_times), dwell, sum(press_times)))
+        if on_sent is not None:
+            on_sent()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        state = self.ri.move_base_trajectory_action.get_state()
+        log_debug('[debug][segment] 接近の台車のゴール終了 ({})、腕が hover を'
+                  '通るまで {:.2f}s'.format(GOAL_STATUS_NAMES.get(state, state),
+                                          no_stop['t_hover'] - time.time()))
+        return start_odom_coords, base_points[-1]
+
+    def _send_arm_splice(self, start_ros_time, avs, velocities, times):
+        """腕のゴールを差し替える: ``start_ros_time`` までは今のゴールを続け、
+        そこからの点 ``avs`` (real_robot の angle_vector の形) を、点の速度
+        ``velocities`` と区間の時間 ``times`` (最初は差し替えの時刻から) で
+        送る。コントローラが差し替えの時刻の古い軌道の状態から最初の点までを
+        つなぐ。"""
+        joint_list = self.real_robot.joint_list
+        ri = self.ri
+        cumulative = np.cumsum(times)
+        for action, param in zip(ri.controller_table[ri.controller_type],
+                                 ri.controller_param_table[ri.controller_type]):
+            names = param['joint_names']
+            indices = [joint_list.index(getattr(self.real_robot, name))
+                       for name in names]
+            goal = control_msgs.msg.FollowJointTrajectoryGoal()
+            goal.trajectory.header.stamp = start_ros_time
+            goal.trajectory.joint_names = list(names)
+            for av, vel, t in zip(avs, velocities, cumulative):
+                goal.trajectory.points.append(
+                    trajectory_msgs.msg.JointTrajectoryPoint(
+                        positions=[float(av[i]) for i in indices],
+                        velocities=[float(vel[i]) for i in indices],
+                        time_from_start=rospy.Duration(float(t))))
+            action.send_goal(goal)
+
+    def _run_no_stop_press(self, no_stop, start_odom_coords, final_traj_point,
+                           ref_scan, exclude_centers, palm_anchor,
+                           joint_names, result, hand_followed):
+        """台車が着いた後、腕が hover を通るまでに手を検出し直して押し込みを
+        解き直し、腕のゴールを hover を通る時刻で差し替え、台車の押し込み
+        (ずれの補正を含む) をその時刻から送って押し込みの終わりまで待つ。
+
+        Returns: 実行した押し込みの waypoint 列 (先頭が hover)。残差が大きく
+        織り込めないときは腕を hover で止めて None (従来の流れで続ける)。
+        """
+        robot_arm = result['robot_arm']
+        hover_wp = no_stop['hover_wp']
+        deadline = no_stop['t_hover'] - nsp.SPLICE_LEAD
+        # IK に残す時間 (実機の解き直しは 0.02〜0.7 秒の見積もり)。
+        frame_timeout = max(0.2, min(PRESS_IN_REFINE_TIMEOUT,
+                                     deadline - time.time() - 0.6))
+        fold = self._prepare_folded_press(
+            start_odom_coords, final_traj_point, ref_scan, exclude_centers,
+            palm_anchor, hover_wp, joint_names, robot_arm, wait_head=False,
+            wait_arm=False, frame_timeout=frame_timeout)
+        n_base = no_stop['n_base']
+        hover_av = no_stop['arm_avs'][n_base]
+        max_vel = execution_timing.joint_max_velocities(
+            self.real_robot.joint_list, {
+                name for param in self.ri.controller_param_table[
+                    self.ri.controller_type]
+                for name in param['joint_names']})
+        # 送った腕の軌道 (時刻は送信からの秒数)。
+        points = [no_stop['start_av']] + list(no_stop['arm_avs'])
+        old_track = nsp.HermiteTrack(
+            points, nsp.point_velocities(points, no_stop['arm_times']),
+            no_stop['arm_times'])
+        send_time = no_stop['t_hover'] - (
+            float(sum(no_stop['arm_times'][:n_base])) + no_stop['dwell'])
+
+        def splice(angles_after_hover, base_points_after):
+            """今から SPLICE_LEAD 後に [hover, angles_after_hover] へ差し替え、
+            hover に着く壁時計の時刻と hover からの区間の時間を返す (間に
+            合わなければ None)。"""
+            t_s = time.time() + nsp.SPLICE_LEAD - send_time
+            t_hover = no_stop['t_hover'] - send_time
+            if t_s > t_hover - 0.05:
+                return None
+            times = self._limited_time_list(
+                angles_after_hover, base_points_after,
+                [MIN_SEGMENT_TIME] * len(angles_after_hover),
+                start_av=hover_av)
+            angles, vels, all_times, ratio = nsp.splice_in_dwell(
+                old_track, t_s, t_hover, hover_av, angles_after_hover,
+                times, max_vel)
+            self._send_arm_splice(
+                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
+                all_times)
+            return send_time + t_s + all_times[0], list(all_times[1:]), ratio
+
+        if not fold['ok']:
+            # 織り込めない大きなずれ: 腕を hover で止めて従来どおり直す。
+            t_s = time.time() + nsp.SPLICE_LEAD - send_time
+            angles, vels, all_times, _ = nsp.splice_in_dwell(
+                old_track, t_s, no_stop['t_hover'] - send_time, hover_av, [],
+                [], max_vel)
+            vels = np.zeros_like(np.asarray(vels))
+            self._send_arm_splice(
+                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
+                all_times)
+            self._log_debug(dict(event='no_stop_press', spliced='hold',
+                                 residual=[float(v) for v in fold['residual']]))
+            return None
+
+        refined = None
+        if time.time() < deadline:
+            refined = self._refine_press_in(hover_wp, joint_names, result,
+                                            fold=fold)
+        in_time = time.time() < deadline
+        use_refined = refined is not None and in_time
+        press_wps = (([hover_wp] + refined) if use_refined
+                     else no_stop['press_wps'])
+        if hand_followed:
+            press_wps = self._hold_neck(press_wps, joint_names)
+        now_wp = execution_timing.prepend_base_move(
+            press_wps, fold['base_move'])[0]
+        base_points = execution_timing.base_trajectory_points(
+            [now_wp] + list(press_wps[1:]))
+        new_avs = [self._waypoint_angle_vector(wp, joint_names)
+                   for wp in press_wps[1:]]
+        decided_at = time.time()
+        spliced = None
+        if use_refined or hand_followed:
+            spliced = splice(new_avs, base_points[1:])
+        if spliced is not None:
+            press_start, times, ratio = spliced
+        else:
+            press_start, times, ratio = (no_stop['t_hover'],
+                                         no_stop['press_times'], None)
+        # 台車の押し込み (ずれの補正を含む) を、腕が hover を通る時刻から。
+        wait = press_start - time.time()
+        if wait > 0:
+            rospy.sleep(wait)
+        self._set_hand_tracking(False)
+        self._set_activity(STAGE_PRESS_IN)
+        self._send_base_trajectory(base_points[1:], list(times), wait=False)
+        record = dict(
+            event='no_stop_press', spliced=spliced is not None,
+            refined=refined is not None, in_time=in_time,
+            hover_delay=float(press_start - no_stop['t_hover']),
+            bridge_ratio=ratio,
+            base_move=[float(v) for v in fold['base_move']],
+            residual=[float(v) for v in fold['residual']],
+            decision_before_hover=float(no_stop['t_hover'] - decided_at),
+            base_stop_to_decision=float(decided_at - fold['start_time']),
+            ik_time=fold.get('ik_time'))
+        self._log_debug(record)
+        print('[execute][no-stop] 押し込み{} (台車の補正 {:+.3f}m, {:+.3f}m, '
+              '{:+.1f}deg、hover の遅れ {:.2f}s)。'.format(
+                  'を差し替えました' if use_refined and spliced is not None
+                  else 'は計画どおり' + ('' if in_time else ' (間に合わず)'),
+                  fold['base_move'][0], fold['base_move'][1],
+                  math.degrees(fold['base_move'][2]),
+                  press_start - no_stop['t_hover']))
+        self._wait_body_interpolation()
+        self._log_controller_states()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        self._wait_joint_settle('押し込み終了', press_wps[-1], joint_names,
+                                robot_arm)
+        return press_wps
+
     def _prepare_folded_press(self, start_odom_coords, final_traj_point,
                               ref_scan, exclude_centers, palm_anchor,
-                              hover_wp, joint_names, robot_arm, wait_head):
+                              hover_wp, joint_names, robot_arm, wait_head,
+                              wait_arm=True,
+                              frame_timeout=PRESS_IN_REFINE_TIMEOUT):
         """押し込みに台車の補正を織り込む流れの、hover 到着後の準備。
 
         手の検出 (``PRESS_IN_REFINE_FRAMES`` 枚) を裏で始め、その間に odom の
@@ -4876,7 +5132,7 @@ class HandshakePipelineNode(object):
 
         def collect():
             frames['frames'] = self._collect_hand_frames(
-                PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+                PRESS_IN_REFINE_FRAMES, frame_timeout)
 
         collector = threading.Thread(target=collect, name='press-in-frames')
         collector.daemon = True
@@ -4890,18 +5146,16 @@ class HandshakePipelineNode(object):
                       settle_time, drift[0] * 1e3, math.degrees(drift[1])))
         residual = self._measure_base_residual(
             start_odom, plan, ref_scan, exclude_centers, palm_anchor, 0)
-        self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
+        if wait_arm:
+            self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
         if wait_head:
             self.ri.wait_interpolation(controller_type='head_controller')
         collector.join()
 
         error = residual['error']
         distance = math.hypot(error[0], error[1])
-        within = (distance <= BASE_CORRECTION_POSITION_TOLERANCE
-                  and abs(error[2]) <= BASE_CORRECTION_ANGLE_TOLERANCE)
-        ok = (distance <= PRESS_IN_FOLD_MAX_POSITION
-              and abs(error[2]) <= PRESS_IN_FOLD_MAX_ANGLE)
-        base_move = np.zeros(3) if within else error.copy()
+        base_move, ok = nsp.fold_move(error)
+        within = not np.any(base_move)
         # 寄せる量の人体距離の検証に使う、補正後の台車の hover 目標からのずれ。
         base_error = scan_matching.relative(plan, residual['target'])
         record = dict(event='press_in_fold_prepare', ok=ok, within=within,
@@ -5440,6 +5694,15 @@ def build_arg_parser():
         '--lead-in-sequential', action='store_true',
         help='接近の lead-in をその場で回ってから直進する (11/17 以前)。既定は'
              '回りながら直進する。')
+    parser.add_argument(
+        '--no-stop-press', dest='no_stop_press',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='止まらない押し込み: 台車は手前の hover で先に着き、腕は {:.1f} 秒'
+             'かけて hover へ伸び続ける。その間に手を検出し直して押し込みを'
+             '解き直し、腕が hover を通る時刻でゴールを差し替える (間に合わ'
+             'なければ計画どおり押し込む)。台車のずれは押し込みの台車の動き'
+             'に織り込む。既定で有効、--no-no-stop-press で hover で止まる'
+             '流れ。'.format(nsp.HOVER_DWELL))
     parser.add_argument(
         '--press-in-fold-correction', dest='press_in_fold_correction',
         action=argparse.BooleanOptionalAction, default=True,

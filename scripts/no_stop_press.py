@@ -1,0 +1,461 @@
+# -*- coding:utf-8 -*-
+"""止まらない押し込み (台車は先に着き、腕は動き続ける間に手を検出し直して
+押し込みの軌道を差し替える) の計算。ROS に依存しない。
+
+実機ノード (``scripts/ros/run_camera_pipeline_test.py``) と確認用の表示ツール
+(``tools/view_no_stop_press.py``) が同じ関数を使う。
+
+流れ (時刻は接近の送信からの秒数)::
+
+    台車  接近 ──────────────■ 着いて止まる (t_base) ──────── ■ 押し込み (t_s から)
+    腕    接近 ──→ 手前の hover ～～ HOVER_DWELL 秒で hover へ ～～→ 押し込み
+                              ↑ 検出・ずれの計測・IK        ↑ t_s = hover を通る時刻
+
+- 手前の hover (``pre_hover_waypoint``): hover の手先を押し込みと逆向きへ
+  ``PRE_HOVER_OFFSET`` 引いた姿勢 (台車は hover と同じ、腕と腰だけの IK)。
+- 腕は最初から [接近 (末尾を手前の hover に替える), hover, 計画の押し込み] を
+  1 本で送る。差し替えなければ計画どおり押し込む (止まらない)。
+- 差し替え (``splice_in_dwell``): ``joint_trajectory_controller`` は、開始時刻
+  t_s 付きの新しいゴールを受けると t_s までは古い軌道を続け、t_s の古い軌道の
+  状態 (位置・速度) から新しい最初の点までを 1 本のスプラインでつなぐ
+  (init_joint_trajectory.h)。t_s は判断できた直後 (手前の hover -> hover の
+  ゆっくりした区間の途中) にし、新しいゴールは [hover (予定の時刻), 解き直した
+  押し込み] にする。つなぎの区間の時間は、古い軌道の t_s の速度も入れて上限に
+  収める (``fit_bridge``)。hover の速度が速い押し込みの入口でつなぐと、向きを
+  変えるのに加速度の上限で 2〜3 秒延びることがあった。
+"""
+
+import math
+
+import numpy as np
+
+from skrobot.coordinates import Coordinates
+from skrobot.coordinates.math import rpy_matrix
+
+from aero_demo import execution_timing as et
+from aero_demo import scan_matching
+
+import solve_palm_ik as spik
+from handshake_viewer_common import apply_waypoint_pose
+from handshake_viewer_common import build_press_in_waypoints
+
+# 手前の hover の、hover の手先から押し込みと逆向きへ引く距離 [m]。解けなければ
+# 順に縮める。
+PRE_HOVER_OFFSETS = (0.06, 0.04, 0.02)
+# 台車が着いてから腕が hover に着くまで (手前の hover -> hover) の時間 [s]。
+# 実機 10 試行の見積もりで、止まるのを待つ・検出 3 枚・ずれの計測・IK・送信の
+# 余裕の合計は 0.5〜1.2 秒。
+HOVER_DWELL = 1.5
+# 差し替えのゴールを、開始時刻 (hover を通る時刻) のこれ以上前に送る [s]。
+SPLICE_LEAD = 0.15
+# 台車のずれの許容 (これ以内なら動かさない) と、押し込みに織り込む上限。
+BASE_POSITION_TOLERANCE = 0.025  # [m]
+BASE_ANGLE_TOLERANCE = math.radians(5.0)  # [rad]
+FOLD_MAX_POSITION = 0.12  # [m]
+FOLD_MAX_ANGLE = math.radians(10.0)  # [rad]
+# 検出した掌が計画から水平にこれ以上ずれていたら、その分 (人体との距離の検証に
+# 通る量まで) 台車で寄せる。
+PALM_SHIFT_MIN = 0.06  # [m]
+CLEARANCE_SCALES = (1.0, 0.5, 0.25)
+# 手前の hover の IK。
+PRE_HOVER_IK_STOP = 100
+PRE_HOVER_IK_THRE = 0.003  # [m]
+PRE_HOVER_IK_RTHRE = math.radians(3.0)  # [rad]
+
+
+def place_at(robot, joint_names, waypoint):
+    """``robot`` を ``waypoint`` の姿勢にする (IK で動いた本体を先に原点へ
+    戻す。実機ノードの ``_place_robot_at_waypoint`` と同じ)。"""
+    robot.newcoords(Coordinates())
+    apply_waypoint_pose(robot, joint_names, [waypoint], 0)
+
+
+def pre_hover_waypoint(robot, joint_names, hover_wp, result,
+                       offsets=PRE_HOVER_OFFSETS):
+    """``offsets`` の順に ``_pre_hover_waypoint`` を試し、最初に解けたもの
+    (どれも解けなければ None)。"""
+    for offset in offsets:
+        waypoint = _pre_hover_waypoint(robot, joint_names, hover_wp, result,
+                                       offset)
+        if waypoint is not None:
+            waypoint['pre_hover_offset'] = offset
+            return waypoint
+    return None
+
+
+def _pre_hover_waypoint(robot, joint_names, hover_wp, result, offset):
+    """hover の手先を、計画の押し込みの最終目標と逆向きへ ``offset`` 引いた
+    「手前の hover」の waypoint (台車は hover と同じ、腕と腰の IK、脚は固定)。
+    解けなければ None。``robot`` の姿勢は書き換わる。"""
+    post = result.get('post_process')
+    if post is None:
+        return None
+    robot_arm = result['robot_arm']
+    place_at(robot, joint_names, hover_wp)
+    end = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+    position = end.worldpos().copy()
+    rotation = end.worldrot().copy()
+    direction = np.asarray(post['target_position'], dtype=np.float64) - position
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-3:
+        return None
+    target = position - offset * direction / norm
+    whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
+    links = spik._body_link_list(whole_body, True)
+    solved = robot.inverse_kinematics(
+        Coordinates(pos=target.tolist(), rot=rotation), move_target=end,
+        link_list=links, stop=PRE_HOVER_IK_STOP, thre=PRE_HOVER_IK_THRE,
+        rthre=PRE_HOVER_IK_RTHRE, revert_if_fail=True)
+    if solved is False:
+        return None
+    angles = {joint.name: float(joint.joint_angle())
+              for joint in robot.joint_list}
+    return dict(hover_wp, pre_hover=True, joint_angle_vector=[
+        angles.get(name, float(angle))
+        for name, angle in zip(joint_names, hover_wp['joint_angle_vector'])])
+
+
+def no_stop_waypoints(approach_wps, pre_hover_wp, press_wps):
+    """台車に送る接近 (末尾が手前の hover) と、腕に送る 1 本
+    ([接近 (末尾が手前の hover), hover, 押し込み (hover の次から)]) の waypoint
+    列。``press_wps`` は先頭が hover。"""
+    base_wps = list(approach_wps[:-1]) + [pre_hover_wp]
+    arm_wps = base_wps + [press_wps[0]] + list(press_wps[1:])
+    return base_wps, arm_wps
+
+
+# ---------------------------------------------------------------------------
+# ずれ (表示ツールの仮想のずれ、実機の検出) から押し込みを解き直す
+# ---------------------------------------------------------------------------
+
+def _rz(yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def wp_pose(wp):
+    return np.array([wp['base_position'][0], wp['base_position'][1],
+                     wp['base_yaw']], dtype=np.float64)
+
+
+def offset_palm(palm, translation, rpy_deg=(0.0, 0.0, 0.0)):
+    """掌 ``palm`` (world) を ``translation`` [m] (world) 動かし、掌の位置を
+    中心に world の軸まわり (yaw, pitch, roll [deg]) に回したコピー。"""
+    rot = rpy_matrix(*[math.radians(v) for v in rpy_deg])
+    moved = spik.transform_palm(palm, rot, np.zeros(3))
+    moved['position'] = (np.asarray(palm['position'], dtype=np.float64)
+                         + np.asarray(translation, dtype=np.float64)).tolist()
+    return moved
+
+
+def offset_hand_joints(joint_positions, hand, palm, translation,
+                       rpy_deg=(0.0, 0.0, 0.0)):
+    """骨格の差し出した手 (手首と手の点) を ``offset_palm`` と同じに動かした
+    コピー (表示と人体との距離の検証用)。"""
+    rot = rpy_matrix(*[math.radians(v) for v in rpy_deg])
+    center = np.asarray(palm['position'], dtype=np.float64)
+    shift = np.asarray(translation, dtype=np.float64)
+    moved = {}
+    for name, p in joint_positions.items():
+        if (name.startswith((hand + 'Hand', hand + 'PalmModel'))
+                or name == hand + 'Wrist'):
+            q = np.asarray(p, dtype=np.float64)
+            moved[name] = (rot @ (q - center) + center + shift).tolist()
+        else:
+            moved[name] = p
+    return moved
+
+
+def palm_in_base(palm_world, base_pose):
+    """world の掌を、台車の姿勢 ``base_pose`` ``[x, y, yaw]`` の系へ。"""
+    rot = _rz(base_pose[2]).T
+    return spik.transform_palm(
+        palm_world, rot, -rot @ np.array([base_pose[0], base_pose[1], 0.0]))
+
+
+def base_residual(target_pose, actual_pose,
+                  angle_tolerance=BASE_ANGLE_TOLERANCE):
+    """実機ノードの ``_measure_base_residual`` と同じ目標までの残差 (今の台車の
+    系の ``[dx, dy, dyaw]``)。向きは許容内なら直さない。"""
+    target = np.asarray(target_pose, dtype=np.float64).copy()
+    yaw_error = scan_matching.wrap_angle(target[2] - actual_pose[2])
+    if abs(yaw_error) <= angle_tolerance:
+        target[2] = actual_pose[2]
+    return np.asarray(scan_matching.relative(actual_pose, target))
+
+
+def fold_move(residual):
+    """残差から、押し込みで動かす量 (許容内なら 0) と、織り込めるか。"""
+    distance = math.hypot(residual[0], residual[1])
+    within = (distance <= BASE_POSITION_TOLERANCE
+              and abs(residual[2]) <= BASE_ANGLE_TOLERANCE)
+    ok = distance <= FOLD_MAX_POSITION and abs(residual[2]) <= FOLD_MAX_ANGLE
+    return (np.zeros(3) if within else np.asarray(residual, dtype=np.float64)
+            ), ok
+
+
+def clearance_scale(margin_at, scales=CLEARANCE_SCALES):
+    """``margin_at(scale)`` (台車のずらしをその割合にしたときの人体との距離の
+    余裕) で縮める割合を決める (実機ノードの ``_clearance_scale`` と同じ)。
+    ``(割合 or None, 余裕)``。"""
+    margins = []
+    for scale in scales:
+        margin = margin_at(scale)
+        if margin >= 0.0:
+            return scale, margin
+        margins.append((margin, scale))
+    best_margin, best_scale = max(margins)
+    if best_margin > margin_at(0.0):
+        return best_scale, best_margin
+    return None, best_margin
+
+
+def plan_palm_base_shift(palm, expected_position, hover_wp, base_error,
+                         planned_palm, margin_fn):
+    """検出した掌 ``palm`` (台車の系) が計画 (``expected_position``) から水平に
+    ``PALM_SHIFT_MIN`` 以上ずれていれば、台車を寄せる量 (台車の系の xy、z=0)
+    を人体との距離の検証で縮めて決める (動かさない)。
+
+    ``margin_fn(waypoint, hand_shift)`` は hover の waypoint と、差し出した手を
+    計画の系で ``hand_shift`` (xy) 動かした骨格での人体との距離の余裕。
+    ``base_error`` は台車の hover 目標からのずれ (計画の系、None なら 0)。
+    ``(shift or None, record)``。``record['reason']`` は 'small'/'clearance'/
+    'scaled_small'/'shift'。
+    """
+    shift = np.asarray(palm['position'], dtype=np.float64) - expected_position
+    shift[2] = 0.0
+    distance = float(np.linalg.norm(shift))
+    record = dict(event='press_in_base_shift', distance=distance,
+                  shift=[float(v) for v in shift[:2]], applied=False)
+    if distance < PALM_SHIFT_MIN:
+        record['reason'] = 'small'
+        return None, record
+    wanted = shift.copy()
+    actual_wp = hover_wp
+    if base_error is not None and planned_palm is not None:
+        actual = scan_matching.compose(wp_pose(hover_wp), base_error)
+        actual_wp = dict(hover_wp, base_position=[actual[0], actual[1], 0.0],
+                         base_yaw=float(actual[2]))
+        to_plan = _rz(actual[2])[:2, :2]
+        palm_plan = actual[:2] + to_plan @ np.asarray(
+            palm['position'], dtype=np.float64)[:2]
+        hand_shift = palm_plan - np.asarray(
+            planned_palm['position'], dtype=np.float64)[:2]
+        record.update(base_error=[float(v) for v in base_error],
+                      hand_shift=[float(v) for v in hand_shift])
+    else:
+        to_plan = _rz(hover_wp['base_yaw'])[:2, :2]
+        hand_shift = to_plan @ wanted[:2]
+
+    def margin_at(scale):
+        shift_plan = to_plan @ (wanted[:2] * scale)
+        moved = dict(actual_wp, base_position=[
+            actual_wp['base_position'][0] + float(shift_plan[0]),
+            actual_wp['base_position'][1] + float(shift_plan[1]), 0.0])
+        return margin_fn(moved, hand_shift)
+
+    scale, margin = clearance_scale(margin_at)
+    if scale is None:
+        record.update(reason='clearance', clearance_margin=margin)
+        return None, record
+    shift = wanted * scale
+    record.update(scale=scale, clearance_margin=margin)
+    if float(np.linalg.norm(shift)) < PALM_SHIFT_MIN / 2:
+        record['reason'] = 'scaled_small'
+        return None, record
+    record['reason'] = 'shift'
+    return shift, record
+
+
+def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
+                  palm_now, base_move, base_error=None, margin_fn=None):
+    """台車がまだ ``base_move`` (今の台車の系) だけ動いていない前提で、検出した
+    掌 ``palm_now`` (今の台車の系) から押し込みを解き直す。
+
+    掌を動いた後の台車の系へ移し、掌の水平のずれを台車で寄せる分
+    (``margin_fn`` があれば ``plan_palm_base_shift``) も ``base_move`` に足して
+    から ``spik.refine_post_process`` で解く。
+
+    Returns: ``dict(press_waypoints (hover の次から) or None, base_move,
+    info (refine_post_process の結果), shift_record, observed (計画の系の掌))``。
+    解けなければ ``base_move`` は寄せる分を足さない元の値。
+    """
+    place_at(robot, joint_names, hover_wp)
+    base_rot = robot.base_link.worldrot().copy()
+    base_pos = robot.base_link.worldpos().copy()
+    expected_position = base_rot.T @ (
+        np.asarray(planned_palm['position'], dtype=np.float64) - base_pos)
+    move = np.asarray(base_move, dtype=np.float64)
+    move_rot = _rz(move[2])
+    move_pos = np.array([move[0], move[1], 0.0])
+    palm = spik.transform_palm(palm_now, move_rot.T, -move_rot.T @ move_pos)
+    shift_record = None
+    pending = None
+    if margin_fn is not None:
+        shift, shift_record = plan_palm_base_shift(
+            palm, expected_position, hover_wp, base_error, planned_palm,
+            margin_fn)
+        if shift is not None:
+            palm = dict(palm, position=[
+                float(v) for v in np.asarray(palm['position']) - shift])
+            pending = scan_matching.compose(move, [shift[0], shift[1], 0.0])
+    place_at(robot, joint_names, hover_wp)
+    observed = spik.transform_palm(palm, base_rot, base_pos)
+    info = spik.refine_post_process(
+        robot, result['robot_arm'], observed, result['turn_deg'],
+        result['post_process'],
+        planned_palm=(planned_palm if 'x_axis' in planned_palm else None))
+    press = None
+    if info['post_process'] is not None:
+        press = build_press_in_waypoints(hover_wp, joint_names,
+                                         info['post_process'])
+        if pending is not None:
+            move = np.asarray(pending, dtype=np.float64)
+    return dict(press_waypoints=press, base_move=move, info=info,
+                shift_record=shift_record, observed=observed)
+
+
+def hover_clearance_margin(robot, joint_names, waypoint, joint_positions,
+                           offered_hand, verification_pairs,
+                           torso_surface_offset, hand_shift=None):
+    """``waypoint`` の、骨格 ``joint_positions`` に対する人体との距離の余裕
+    (実機ノードの ``_hover_clearance_margin`` と同じ)。"""
+    import plan_handshake_motion as phm
+    frozen = joint_positions
+    if hand_shift is not None:
+        moved = np.array([hand_shift[0], hand_shift[1], 0.0])
+        frozen = {
+            name: ((np.asarray(p, dtype=np.float64) + moved).tolist()
+                   if name.startswith((offered_hand + 'Hand',
+                                       offered_hand + 'PalmModel'))
+                   or name == offered_hand + 'Wrist' else p)
+            for name, p in frozen.items()}
+    collision_joints = spik.shift_torso_joints_from_surface(
+        frozen, (0.0, 0.0), torso_surface_offset)
+    return float(phm.verify_human_clearance(
+        robot, joint_names, [waypoint], verification_pairs,
+        phm.build_obstacle_cache(collision_joints), hand=offered_hand,
+        robot_arm=spik.DEFAULT_ROBOT_ARM[offered_hand])[0])
+
+
+# ---------------------------------------------------------------------------
+# 時間づけと差し替え
+# ---------------------------------------------------------------------------
+
+def max_velocities(joint_names, joints_by_name, controlled=None):
+    """``joint_names`` の順の速度上限 (× VEL_LIMIT_RATIO)。"""
+    return et.joint_max_velocities(
+        [joints_by_name[name] for name in joint_names], controlled)
+
+
+def limited_times(waypoints, max_vel, with_base=True,
+                  min_time=et.MIN_SEGMENT_TIME):
+    """``waypoints`` (先頭が動き始め) の区間ごとの時間 (len - 1 個)。"""
+    angles = np.array([wp['joint_angle_vector'] for wp in waypoints],
+                      dtype=np.float64)
+    base = (np.asarray(et.base_trajectory_points(waypoints))[1:]
+            if with_base else None)
+    return et.limited_time_list(np.diff(angles, axis=0), max_vel, base,
+                                [min_time] * (len(waypoints) - 1))
+
+
+def point_velocities(angles, times):
+    """点 (len(times) + 1 個) の速度 (skrobot・execution_timing と同じ規則)。"""
+    angles = np.asarray(angles, dtype=np.float64)
+    return et.point_velocities(np.diff(angles, axis=0),
+                               np.asarray(times, dtype=np.float64))
+
+
+def fit_bridge(start_position, start_velocity, angles, times, max_vel,
+               max_iterations=50):
+    """差し替え: t_s の古い軌道の状態 (``start_position``・``start_velocity``)
+    から ``angles`` (新しいゴールの点) へつなぐときの、区間の時間と点の速度。
+
+    ``times`` は [start -> angles[0], angles[0] -> angles[1], ...] の時間の
+    下限 (``limited_times`` などで決めたもの)。コントローラは最初の区間を
+    (start_position, start_velocity) から (angles[0], 点の速度) への 3 次
+    スプラインで動かすので、その区間の速度・加速度が上限に収まるまで延ばす。
+    Returns: ``(times, velocities (angles と同じ形), 最初の区間の上限比)``。
+    """
+    times = np.asarray(times, dtype=np.float64).copy()
+    path = np.vstack([np.asarray(start_position, dtype=np.float64),
+                      np.asarray(angles, dtype=np.float64)])
+    max_vel = np.asarray(max_vel, dtype=np.float64)
+    ratio = 0.0
+    for _ in range(max_iterations):
+        vel = et.point_velocities(np.diff(path, axis=0), times)
+        vel[0] = np.asarray(start_velocity, dtype=np.float64)
+        delta = (path[1] - path[0])[None, :]
+        peak_v, peak_a = et.hermite_peaks(
+            delta, times[:1], np.vstack([vel[0], vel[1]]))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = float(np.nanmax(np.concatenate([
+                peak_v[0] / max_vel,
+                np.sqrt(peak_a[0] / (max_vel / et.ACCEL_TIME))])))
+        if not np.isfinite(ratio) or ratio <= 1.0:
+            break
+        times[0] *= math.sqrt(ratio)
+    vel = et.point_velocities(np.diff(path, axis=0), times)
+    return times, vel[1:], ratio
+
+
+def splice_in_dwell(track, t_s, t_hover, hover_angles, new_angles,
+                    new_times, max_vel):
+    """手前の hover -> hover のゆっくりした区間の途中 ``t_s`` で差し替える
+    ゴール: [hover (予定の ``t_hover`` に着く), ``new_angles`` (押し込み)]。
+
+    ``track`` は送った腕の軌道 (``HermiteTrack``、時刻は同じ基準)。t_s の
+    状態から hover までのつなぎを ``fit_bridge`` で上限に収める (延びたら
+    hover に着くのも遅れる)。``new_times`` は hover -> new_angles の区間の
+    時間。Returns: ``(angles, velocities, times, 上限比)`` (angles の先頭が
+    hover、times の先頭が t_s から hover まで)。
+    """
+    position, velocity = track.state(t_s)
+    angles = [np.asarray(hover_angles, dtype=np.float64)] + [
+        np.asarray(a, dtype=np.float64) for a in new_angles]
+    times = [max(t_hover - t_s, et.MIN_SEGMENT_TIME)] + list(new_times)
+    times, velocities, ratio = fit_bridge(position, velocity, angles, times,
+                                          max_vel)
+    return angles, velocities, times, ratio
+
+
+class HermiteTrack(object):
+    """点・速度・区間の時間から、コントローラと同じ 3 次エルミートで時刻の
+    姿勢を引く (表示ツールの再生用)。先頭の点が時刻 ``t0``。"""
+
+    def __init__(self, points, velocities, times, t0=0.0):
+        self.points = np.asarray(points, dtype=np.float64)
+        self.velocities = np.asarray(velocities, dtype=np.float64)
+        self.times = np.asarray(times, dtype=np.float64)
+        self.t0 = float(t0)
+        self.starts = self.t0 + np.concatenate(
+            [[0.0], np.cumsum(self.times)[:-1]])
+        self.end = self.t0 + float(np.sum(self.times))
+
+    def state(self, t):
+        if len(self.times) == 0 or t <= self.t0:
+            return self.points[0].copy(), self.velocities[0].copy()
+        if t >= self.end:
+            return self.points[-1].copy(), np.zeros_like(self.points[-1])
+        k = int(np.searchsorted(self.starts, t, side='right') - 1)
+        h = self.times[k]
+        tau = t - self.starts[k]
+        p0, p1 = self.points[k], self.points[k + 1]
+        v0, v1 = self.velocities[k], self.velocities[k + 1]
+        a = (v0 + v1) / h ** 2 - 2.0 * (p1 - p0) / h ** 3
+        b = 3.0 * (p1 - p0) / h ** 2 - (2.0 * v0 + v1) / h
+        return (p0 + v0 * tau + b * tau ** 2 + a * tau ** 3,
+                v0 + 2.0 * b * tau + 3.0 * a * tau ** 2)
+
+    def spliced(self, t_s, points, velocities, times):
+        """``t_s`` で差し替えた軌道 (t_s までは自分、t_s の状態から ``points``
+        へ)。"""
+        p, v = self.state(t_s)
+        keep = int(np.searchsorted(self.starts, t_s, side='right'))
+        head_points = list(self.points[:keep]) + [p]
+        head_vel = list(self.velocities[:keep]) + [v]
+        head_times = list(self.times[:keep - 1]) + [
+            t_s - self.starts[keep - 1]] if keep >= 1 else []
+        return HermiteTrack(
+            head_points + list(points), head_vel + list(velocities),
+            head_times + list(times), self.t0)
