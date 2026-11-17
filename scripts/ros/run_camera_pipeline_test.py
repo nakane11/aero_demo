@@ -288,6 +288,11 @@ PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
 # --press-in-base-shift: 検出し直した掌が計画から水平にこれ以上ずれていたら、
 # 腕だけで吸収せず先にその分だけ台車を寄せる。
 PRESS_IN_BASE_SHIFT_MIN = 0.06  # [m]
+# --press-in-fold-correction: hover で止まって台車を直さず、残差を測るだけにして
+# 押し込み区間の先頭で (腕は hover のまま) 止まらずに動かす。残差がこれを超えたら
+# 従来どおり止まって直す。実機 10/21〜22 で 1 回目の残差は最大 10cm。
+PRESS_IN_FOLD_MAX_POSITION = 0.12  # [m]
+PRESS_IN_FOLD_MAX_ANGLE = math.radians(10.0)  # [rad]
 # 接近の螺旋〜押し込み直前、首は差し出し手の掌を向く。候補は直前位置からこの距離
 # 以内・score 以上のみ。
 HAND_FOLLOW_MAX_JUMP = 0.25  # [m]
@@ -3086,7 +3091,27 @@ class HandshakePipelineNode(object):
             self._send_head_to_waypoint(
                 display_waypoints[reach_boundary - 1], joint_names)
 
-        if self.args.base_correction != 'none':
+        robot_arm = result['robot_arm']
+        hover_wp = display_waypoints[reach_boundary - 1]
+        fold = None
+        if (self.args.press_in_fold_correction
+                and reach_boundary < len(display_waypoints)
+                and self.args.press_in_refine
+                and self.args.base_correction != 'none'
+                and start_odom_coords is not None
+                and final_traj_point is not None):
+            fold = self._prepare_folded_press(
+                start_odom_coords, final_traj_point, ref_scan,
+                exclude_centers, palm_anchor, hover_wp, joint_names,
+                robot_arm, wait_head=head_to_hover or hand_followed)
+            if fold is not None and not fold['ok']:
+                # ずれが大きいときは従来どおり止まって直す (手は検出し直す)。
+                fold = None
+                self._set_activity(STAGE_BASE_CORRECTION)
+                self._correct_base_residual(
+                    start_odom_coords, final_traj_point, ref_scan=ref_scan,
+                    exclude_centers=exclude_centers, palm_anchor=palm_anchor)
+        elif self.args.base_correction != 'none':
             # 終盤のずらし後に残ったスリップを直す (目標は掌を計画どおり見る位置
             # なので終盤のずらしは戻さない)。
             self._set_activity(STAGE_BASE_CORRECTION)
@@ -3101,29 +3126,35 @@ class HandshakePipelineNode(object):
                           settle_time, drift[0] * 1e3,
                           math.degrees(drift[1])))
 
-        robot_arm = result['robot_arm']
-        self._set_activity(STAGE_HOVER_SETTLE)
-        self._wait_joint_settle(
-            'hover', display_waypoints[reach_boundary - 1], joint_names,
-            robot_arm)
-        self._end_hand_follow()
-        if head_to_hover or hand_followed:
-            self.ri.wait_interpolation(controller_type='head_controller')
+        if fold is None:
+            self._set_activity(STAGE_HOVER_SETTLE)
+            self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
+            self._end_hand_follow()
+            if head_to_hover or hand_followed:
+                self.ri.wait_interpolation(controller_type='head_controller')
 
         if reach_boundary < len(display_waypoints):
             press_waypoints = display_waypoints[reach_boundary - 1:]
             if self.args.press_in_refine:
                 self._set_activity(STAGE_PRESS_REFINE)
                 base_error = None
-                if self.args.press_in_base_shift:
+                if fold is None and self.args.press_in_base_shift:
                     base_error = self._hover_base_error(
                         start_odom_coords, final_traj_point, ref_scan,
                         exclude_centers)
                 refined = self._refine_press_in(
                     press_waypoints[0], joint_names, result,
-                    base_error=base_error)
+                    base_error=base_error, fold=fold)
                 if refined is not None:
                     press_waypoints = [press_waypoints[0]] + refined
+            if fold is not None:
+                press_waypoints = self._fold_base_move(
+                    press_waypoints, fold['base_move'])
+                self._log_debug(dict(
+                    event='press_in_fold',
+                    base_move=[float(v) for v in fold['base_move']],
+                    residual=[float(v) for v in fold['residual']],
+                    stop_time=time.time() - fold['start_time']))
             if hand_followed:
                 press_waypoints = self._hold_neck(
                     press_waypoints, joint_names)
@@ -3484,12 +3515,13 @@ class HandshakePipelineNode(object):
         apply_waypoint_pose(self.robot, joint_names, [waypoint], 0)
 
     def _detect_offered_palm(self, offered_hand, expected_position,
-                             expected_normal):
+                             expected_normal, hand_frames=None):
         """``PRESS_IN_REFINE_FRAMES`` 枚で差し出し手を検出し直し、
         ``(palm (今の base_link 系) or None, hand_frames, distances, candidates)``
-        を返す。"""
-        hand_frames = self._collect_hand_frames(
-            PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+        を返す。``hand_frames`` を渡せばそれを使う (集め直さない)。"""
+        if hand_frames is None:
+            hand_frames = self._collect_hand_frames(
+                PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
         joint_positions, distances, candidates, camera_position = \
             self._select_offered_hand(hand_frames, offered_hand,
                                       expected_position, expected_normal)
@@ -3518,6 +3550,47 @@ class HandshakePipelineNode(object):
         あれば、台車は実際の姿勢に置き、手は台車のずれを除いた分だけ動かす
         (無ければ台車は hover 目標どおりとみなし、ずれは全部手の移動とみなす)。
         """
+        shift, record = self._plan_palm_base_shift(
+            palm, offered_hand, expected_position, hover_wp=hover_wp,
+            joint_names=joint_names, base_error=base_error,
+            planned_palm=planned_palm)
+        if shift is None:
+            return palm
+        distance = record['distance']
+        sec, = self._limited_time_list(
+            None, [[shift[0], shift[1], 0.0]], [BASE_CORRECTION_MIN_TIME])
+        before = self._odom_pose(self.ri.odom)
+        self._send_base_trajectory([[shift[0], shift[1], 0.0]], [sec],
+                                   wait=True)
+        settle_time, _ = self._wait_odom_settle(BASE_CORRECTION_SETTLE_TIMEOUT)
+        moved = scan_matching.relative(before, self._odom_pose(self.ri.odom))
+        detected, _, _, _ = self._detect_offered_palm(
+            offered_hand, expected_position, expected_normal)
+        redetected = detected is not None
+        if not redetected:
+            detected = dict(palm, position=[
+                float(v) for v in np.asarray(palm['position']) - shift])
+        residual = np.asarray(detected['position']) - expected_position
+        record.update(applied=True, time=sec, settle_time=settle_time,
+                      odom_moved=[float(v) for v in moved],
+                      redetected=redetected,
+                      residual=[float(v) for v in residual])
+        self._log_debug(record)
+        print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm ずれていた'
+              'ため、台車を ({:+.3f}m, {:+.3f}m) 寄せてから押し込み姿勢を補正'
+              'します (odom 上の移動 {:+.3f}m, {:+.3f}m、寄せた後の掌のずれ '
+              '{:.0f}mm)。'.format(
+                  distance * 1e3, shift[0], shift[1], moved[0], moved[1],
+                  float(np.linalg.norm(residual[:2])) * 1e3))
+        return detected
+
+    def _plan_palm_base_shift(self, palm, offered_hand, expected_position,
+                              hover_wp=None, joint_names=None,
+                              base_error=None, planned_palm=None):
+        """``_shift_base_to_palm`` の台車を寄せる量 (今の台車の系の xy、z=0) を
+        決める (動かさない)。寄せないときは ``(None, None)`` (記録はここで
+        ログに出す)、寄せるときは ``(shift, record)`` (``record`` の
+        ``distance`` は掌の水平のずれ [m]。ログは呼び出し側で出す)。"""
         shift = np.asarray(palm['position'], dtype=np.float64) - expected_position
         shift[2] = 0.0
         distance = float(np.linalg.norm(shift))
@@ -3525,7 +3598,7 @@ class HandshakePipelineNode(object):
                       shift=[float(v) for v in shift[:2]], applied=False)
         if distance < PRESS_IN_BASE_SHIFT_MIN:
             self._log_debug(record)
-            return palm
+            return None, None
         if hover_wp is not None:
             wanted = shift.copy()
             actual_wp = hover_wp
@@ -3561,45 +3634,30 @@ class HandshakePipelineNode(object):
                 print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
                       'ずれていたが、台車を寄せると人に近づきすぎるため腕だけで'
                       '補正します。'.format(distance * 1e3))
-                return palm
+                return None, None
             record.update(scale=scale, clearance_margin=margin)
             if float(np.linalg.norm(shift)) < PRESS_IN_BASE_SHIFT_MIN / 2:
                 self._log_debug(record)
-                return palm
-        sec, = self._limited_time_list(
-            None, [[shift[0], shift[1], 0.0]], [BASE_CORRECTION_MIN_TIME])
-        before = self._odom_pose(self.ri.odom)
-        self._send_base_trajectory([[shift[0], shift[1], 0.0]], [sec],
-                                   wait=True)
-        settle_time, _ = self._wait_odom_settle(BASE_CORRECTION_SETTLE_TIMEOUT)
-        moved = scan_matching.relative(before, self._odom_pose(self.ri.odom))
-        detected, _, _, _ = self._detect_offered_palm(
-            offered_hand, expected_position, expected_normal)
-        redetected = detected is not None
-        if not redetected:
-            detected = dict(palm, position=[
-                float(v) for v in np.asarray(palm['position']) - shift])
-        residual = np.asarray(detected['position']) - expected_position
-        record.update(applied=True, time=sec, settle_time=settle_time,
-                      odom_moved=[float(v) for v in moved],
-                      redetected=redetected,
-                      residual=[float(v) for v in residual])
-        self._log_debug(record)
-        print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm ずれていた'
-              'ため、台車を ({:+.3f}m, {:+.3f}m) 寄せてから押し込み姿勢を補正'
-              'します (odom 上の移動 {:+.3f}m, {:+.3f}m、寄せた後の掌のずれ '
-              '{:.0f}mm)。'.format(
-                  distance * 1e3, shift[0], shift[1], moved[0], moved[1],
-                  float(np.linalg.norm(residual[:2])) * 1e3))
-        return detected
+                return None, None
+        record['distance'] = distance
+        return shift, record
 
-    def _refine_press_in(self, hover_wp, joint_names, result, base_error=None):
+    def _refine_press_in(self, hover_wp, joint_names, result, base_error=None,
+                         fold=None):
         """hover 到達後に手を検出し直して押し込み姿勢を解き直し、押し込み区間の
         waypoint (``hover_wp`` の次以降) を返す (失敗なら None)。
 
         検出した掌を「台車が hover 目標にいる」前提で計画時の座標系に移すので、
         台車のスリップと手の動きの両方を腕で吸収する。``base_error``
         (``_hover_base_error``) は台車を寄せるときの人体との距離の検証に使う。
+
+        ``fold`` (``_execute_with_scan`` の押し込みに台車の補正を織り込む流れ):
+        ``dict(base_move=[dx, dy, dyaw], hand_frames=..., base_error=...)``。
+        台車はまだ ``base_move`` (今の台車の系) だけ動いていない前提で、動いた
+        後の台車から見た掌で解く。手の水平のずれを台車で寄せる分
+        (``_plan_palm_base_shift``) も動かさずに ``base_move`` に足し、
+        ``fold['base_move']`` を書き換える (解けなければ元のまま)。``hand_frames``
+        があればそのフレームで検出する。
         """
         t0 = time.time()
         with self._lock:
@@ -3615,13 +3673,49 @@ class HandshakePipelineNode(object):
         expected_position = base_rot.T @ (
             np.asarray(planned_palm['position']) - base_pos)
         expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
+        move_rot = move_pos = pending_move = None
+        if fold is not None:
+            # 補正の移動 (今の台車の系) の剛体変換。動いた後の系 -> 今の系。
+            move = np.asarray(fold['base_move'], dtype=np.float64)
+            c, s = math.cos(move[2]), math.sin(move[2])
+            move_rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            move_pos = np.array([move[0], move[1], 0.0])
         palm, hand_frames, distances, candidates = self._detect_offered_palm(
-            offered_hand, expected_position, expected_normal)
+            offered_hand,
+            expected_position if fold is None
+            else move_rot @ expected_position + move_pos,
+            expected_normal if fold is None else move_rot @ expected_normal,
+            hand_frames=None if fold is None else fold.get('hand_frames'))
+        if palm is not None and fold is not None:
+            # 動いた後の台車の系へ。
+            palm = spik.transform_palm(palm, move_rot.T,
+                                       -move_rot.T @ move_pos)
         if palm is not None and self.args.press_in_base_shift:
-            palm = self._shift_base_to_palm(
-                palm, offered_hand, expected_position, expected_normal,
-                hover_wp=hover_wp, joint_names=joint_names,
-                base_error=base_error, planned_palm=planned_palm)
+            if fold is None:
+                palm = self._shift_base_to_palm(
+                    palm, offered_hand, expected_position, expected_normal,
+                    hover_wp=hover_wp, joint_names=joint_names,
+                    base_error=base_error, planned_palm=planned_palm)
+            else:
+                shift, shift_record = self._plan_palm_base_shift(
+                    palm, offered_hand, expected_position, hover_wp=hover_wp,
+                    joint_names=joint_names, base_error=fold.get('base_error'),
+                    planned_palm=planned_palm)
+                if shift is not None:
+                    palm = dict(palm, position=[
+                        float(v) for v in np.asarray(palm['position']) - shift])
+                    folded_move = scan_matching.compose(
+                        fold['base_move'], [shift[0], shift[1], 0.0])
+                    shift_record.update(
+                        applied='folded',
+                        base_move=[float(v) for v in folded_move])
+                    self._log_debug(shift_record)
+                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                          'ずれていたため、押し込みの前に台車を ({:+.3f}m, '
+                          '{:+.3f}m) 寄せます (止まらずに動かす)。'.format(
+                              shift_record['distance'] * 1e3, shift[0],
+                              shift[1]))
+                    pending_move = folded_move
         wait_time = time.time() - t0
         if palm is None:
             nearest = [c['distance'] for frame in candidates for c in frame
@@ -3692,6 +3786,8 @@ class HandshakePipelineNode(object):
                   if blend else '',
                   info['position_change'] * 1e3,
                   math.degrees(info['rotation_change']), wait_time, ik_time))
+        if pending_move is not None:
+            fold['base_move'] = pending_move
         return build_press_in_waypoints(
             hover_wp, joint_names, info['post_process'])
 
@@ -4758,6 +4854,142 @@ class HandshakePipelineNode(object):
                   match['rms'] * 1e3, match['inlier_ratio'], match_time))
         return scan_delta if ok else None
 
+    def _prepare_folded_press(self, start_odom_coords, final_traj_point,
+                              ref_scan, exclude_centers, palm_anchor,
+                              hover_wp, joint_names, robot_arm, wait_head):
+        """押し込みに台車の補正を織り込む流れの、hover 到着後の準備。
+
+        手の検出 (``PRESS_IN_REFINE_FRAMES`` 枚) を裏で始め、その間に odom の
+        停止・補正の目標までの残差の計測 (台車は動かさない)・腕と首の到着を
+        待つ。残差が許容内なら移動 0、``PRESS_IN_FOLD_MAX_*`` 以内ならその
+        残差を押し込み区間で動かす量 (``base_move``) にする。
+
+        Returns: ``dict(ok, base_move, residual, hand_frames, base_error,
+        start_time)``。``ok`` が False (残差が大きすぎる) なら従来どおり止まって
+        直す。
+        """
+        start_time = time.time()
+        self._set_activity(STAGE_PRESS_REFINE)
+        self._end_hand_follow()
+        frames = {}
+
+        def collect():
+            frames['frames'] = self._collect_hand_frames(
+                PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+
+        collector = threading.Thread(target=collect, name='press-in-frames')
+        collector.daemon = True
+        collector.start()
+
+        start_odom = self._odom_pose(start_odom_coords)
+        plan = np.asarray(final_traj_point, dtype=np.float64)
+        settle_time, drift = self._wait_odom_settle()
+        log_debug('[execute][correct] 接近区間の終了後に odom が止まるまで {:.2f}s '
+                  '(その間の移動 {:.1f}mm/{:.2f}deg)'.format(
+                      settle_time, drift[0] * 1e3, math.degrees(drift[1])))
+        residual = self._measure_base_residual(
+            start_odom, plan, ref_scan, exclude_centers, palm_anchor, 0)
+        self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
+        if wait_head:
+            self.ri.wait_interpolation(controller_type='head_controller')
+        collector.join()
+
+        error = residual['error']
+        distance = math.hypot(error[0], error[1])
+        within = (distance <= BASE_CORRECTION_POSITION_TOLERANCE
+                  and abs(error[2]) <= BASE_CORRECTION_ANGLE_TOLERANCE)
+        ok = (distance <= PRESS_IN_FOLD_MAX_POSITION
+              and abs(error[2]) <= PRESS_IN_FOLD_MAX_ANGLE)
+        base_move = np.zeros(3) if within else error.copy()
+        # 寄せる量の人体距離の検証に使う、補正後の台車の hover 目標からのずれ。
+        base_error = scan_matching.relative(plan, residual['target'])
+        record = dict(event='press_in_fold_prepare', ok=ok, within=within,
+                      residual=[float(v) for v in error],
+                      source=residual['source'],
+                      n_frames=len(frames.get('frames') or []),
+                      time=time.time() - start_time)
+        self._log_debug(record)
+        if not ok:
+            print('[execute][correct] 台車の残差 {:.3f}m / {:.1f}deg が押し込みに'
+                  '織り込める上限 ({:.2f}m / {:.0f}deg) を超えたため、止まって'
+                  '補正します。'.format(
+                      distance, math.degrees(abs(error[2])),
+                      PRESS_IN_FOLD_MAX_POSITION,
+                      math.degrees(PRESS_IN_FOLD_MAX_ANGLE)))
+        elif not within:
+            print('[execute][correct] 台車の残差 ({:+.3f}m, {:+.3f}m, {:+.1f}deg)'
+                  ' は押し込みの前に止まらずに直します。'.format(
+                      error[0], error[1], math.degrees(error[2])))
+        return dict(ok=ok, base_move=base_move, residual=error,
+                    hand_frames=frames.get('frames'), base_error=base_error,
+                    start_time=start_time)
+
+    @staticmethod
+    def _fold_base_move(press_waypoints, base_move):
+        return execution_timing.prepend_base_move(press_waypoints, base_move)
+
+    def _measure_base_residual(self, start_odom, plan, ref_scan,
+                               exclude_centers, palm_anchor, attempt,
+                               angle_tolerance=BASE_CORRECTION_ANGLE_TOLERANCE):
+        """台車を動かさずに、押し込み前の補正の目標までの残差を測る。
+
+        ``start_odom`` は区間先頭の odom の姿勢、``plan`` は接近区間の台車の
+        目標 (区間先頭基準 ``[dx, dy, dyaw]``)。実際の姿勢は ``ref_scan`` との
+        照合、だめなら順につないだ照合、どちらも無ければ odom。目標は
+        ``plan`` (向きは許容内なら今の向き)、``palm_anchor`` があればその掌を
+        計画どおりに見る位置。
+
+        Returns: ``dict(actual, target, error, source, yaw_error)``。``error`` は
+        今の台車の系の ``[dx, dy, dyaw]`` (この量だけ動けば目標に着く)。
+        """
+        odom_delta = scan_matching.relative(
+            start_odom, self._odom_pose(self.ri.odom))
+        actual, source = odom_delta, 'odom'
+        if ref_scan is not None:
+            scan_delta = self._match_scan(
+                ref_scan, odom_delta, exclude_centers, attempt, plan)
+            if scan_delta is not None:
+                actual, source = scan_delta, 'scan'
+            else:
+                # 大きく回った後は基準スキャンとの重なりが減って照合が通らない
+                # ことが多い (10/22 は 8 回中 5 回) ので、順につないだ照合を使う。
+                chained = self._chained_scan_delta(start_odom)
+                if chained is not None:
+                    actual, source = chained, 'scan_chain'
+                    slip = scan_matching.relative(odom_delta, chained)
+                    self._log_debug(dict(
+                        event='scan_correction', attempt=attempt,
+                        ok=True, chained=True,
+                        plan=[float(v) for v in plan],
+                        odom_delta=[float(v) for v in odom_delta],
+                        scan_delta=[float(v) for v in chained],
+                        slip=[float(v) for v in slip]))
+                    log_debug('[execute][scan] attempt={} 順につないだ照合'
+                              'で代用: 実際の移動 ({:+.3f}m, {:+.3f}m, '
+                              '{:+.1f}deg) -> スリップ ({:+.3f}m, '
+                              '{:+.3f}m, {:+.1f}deg)'.format(
+                                  attempt, chained[0], chained[1],
+                                  math.degrees(chained[2]), slip[0],
+                                  slip[1], math.degrees(slip[2])))
+        # 向きは許容を超えたときだけ直す (yaw の補正はキックで打ち消される)。
+        yaw_error = scan_matching.wrap_angle(plan[2] - actual[2])
+        target = np.asarray(plan, dtype=np.float64).copy()
+        if abs(yaw_error) <= angle_tolerance:
+            target[2] = actual[2]
+        if palm_anchor is not None:
+            target[:2] = in_motion_correction.palm_anchored_position(
+                palm_anchor[0], palm_anchor[1], target[2])
+        error = scan_matching.relative(actual, target)
+        log_debug('[execute][correct] attempt={} ({}基準{}) 目標までの残差 '
+                  '{:+.3f}m {:+.3f}m {:+.1f}deg (計画の向きとの差 {:+.1f}deg)'
+                  .format(attempt, source,
+                          '、掌に合わせる' if palm_anchor is not None else '',
+                          error[0], error[1], math.degrees(error[2]),
+                          math.degrees(yaw_error)))
+        return dict(actual=np.asarray(actual, dtype=np.float64),
+                    target=target, error=np.asarray(error, dtype=np.float64),
+                    source=source, yaw_error=yaw_error)
+
     def _correct_base_residual(
             self, start_odom_coords, final_traj_point, ref_scan=None,
             exclude_centers=None, palm_anchor=None,
@@ -4787,51 +5019,11 @@ class HandshakePipelineNode(object):
         err_norm = 0.0
         err_yaw = 0.0
         for attempt in range(max_attempts):
-            odom_delta = scan_matching.relative(
-                start_odom, self._odom_pose(self.ri.odom))
-            actual, source = odom_delta, 'odom'
-            if ref_scan is not None:
-                scan_delta = self._match_scan(
-                    ref_scan, odom_delta, exclude_centers, attempt, plan)
-                if scan_delta is not None:
-                    actual, source = scan_delta, 'scan'
-                else:
-                    # 大きく回った後は基準スキャンとの重なりが減って照合が通らない
-                    # ことが多い (10/22 は 8 回中 5 回) ので、順につないだ照合を使う。
-                    chained = self._chained_scan_delta(start_odom)
-                    if chained is not None:
-                        actual, source = chained, 'scan_chain'
-                        slip = scan_matching.relative(odom_delta, chained)
-                        self._log_debug(dict(
-                            event='scan_correction', attempt=attempt,
-                            ok=True, chained=True,
-                            plan=[float(v) for v in plan],
-                            odom_delta=[float(v) for v in odom_delta],
-                            scan_delta=[float(v) for v in chained],
-                            slip=[float(v) for v in slip]))
-                        log_debug('[execute][scan] attempt={} 順につないだ照合'
-                                  'で代用: 実際の移動 ({:+.3f}m, {:+.3f}m, '
-                                  '{:+.1f}deg) -> スリップ ({:+.3f}m, '
-                                  '{:+.3f}m, {:+.1f}deg)'.format(
-                                      attempt, chained[0], chained[1],
-                                      math.degrees(chained[2]), slip[0],
-                                      slip[1], math.degrees(slip[2])))
-            # 向きは許容を超えたときだけ直す (yaw の補正はキックで打ち消される)。
-            yaw_error = scan_matching.wrap_angle(plan[2] - actual[2])
-            target = plan.copy()
-            if abs(yaw_error) <= angle_tolerance:
-                target[2] = actual[2]
-            if palm_anchor is not None:
-                target[:2] = in_motion_correction.palm_anchored_position(
-                    palm_anchor[0], palm_anchor[1], target[2])
-            err_x, err_y, err_yaw = scan_matching.relative(actual, target)
+            residual = self._measure_base_residual(
+                start_odom, plan, ref_scan, exclude_centers, palm_anchor,
+                attempt, angle_tolerance)
+            err_x, err_y, err_yaw = residual['error']
             err_norm = math.hypot(err_x, err_y)
-            log_debug('[execute][correct] attempt={} ({}基準{}) 目標までの残差 '
-                  '{:+.3f}m {:+.3f}m {:+.1f}deg (計画の向きとの差 {:+.1f}deg)'
-                  .format(attempt, source,
-                          '、掌に合わせる' if palm_anchor is not None else '',
-                          err_x, err_y, math.degrees(err_yaw),
-                          math.degrees(yaw_error)))
 
             if err_norm <= position_tolerance and abs(err_yaw) <= angle_tolerance:
                 if attempt > 0:
@@ -5243,6 +5435,15 @@ def build_arg_parser():
         '--no-press-in-base-shift', dest='press_in_base_shift',
         action='store_false',
         help='押し込み直前の補正で台車を寄せず、腕だけで吸収する。')
+    parser.add_argument(
+        '--press-in-fold-correction', dest='press_in_fold_correction',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='hover で止まって台車を直さず、手の検出と同時に残差を測るだけに'
+             'して、押し込み区間の先頭で止まらずに直す (掌のずれで寄せる分も'
+             '同じ。残差が {:.0f}cm/{:.0f}deg を超えたら従来どおり止まって'
+             '直す。既定で有効、--no-press-in-fold-correction で従来の'
+             '流れ)。'.format(PRESS_IN_FOLD_MAX_POSITION * 100,
+                             math.degrees(PRESS_IN_FOLD_MAX_ANGLE)))
     parser.add_argument(
         '--no-approach-retarget', dest='approach_retarget',
         action='store_false',

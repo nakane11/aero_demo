@@ -227,6 +227,8 @@ def run(args):
     # 上限を外して必要な補正量を測る。
     spik.REFINE_MAX_POSITION_CHANGE = float('inf')
     spik.REFINE_MAX_ROTATION_CHANGE = float('inf')
+    if args.blend_major:
+        spik.REFINE_STAGE_MAJOR = False
     estimator = PeoplePoseEstimator(
         use_hand=True,
         min_detection_confidence=node_args.min_detection_confidence,
@@ -301,10 +303,12 @@ def run(args):
               t1 - t0, len(frames), refine_rec['reason']))
 
     records = []
+    variants = args.variants.split(',')
     for start in range(0, max(len(frames) - 2, 0), args.stride):
         group = frames[start:start + rcpt.PRESS_IN_REFINE_FRAMES]
         row = dict(start=start)
-        for key, variant in VARIANTS.items():
+        for key in variants:
+            variant = VARIANTS[key]
             palm, distances, flipped = select_hand(
                 palm_estimator, group, side, expected_position,
                 expected_normal, variant['max_distance'], variant['flip'])
@@ -317,6 +321,7 @@ def run(args):
                 robot, result['robot_arm'], observed, result['turn_deg'],
                 result['post_process'], planned_palm=planned_palm)
             row[key] = dict(
+                compute_time=info['compute_time'], legs=info.get('legs'),
                 reason=info['reason'], flipped=flipped, blend=info.get('blend'),
                 accepted=bool(
                     info['post_process'] is not None
@@ -329,17 +334,18 @@ def run(args):
                             - np.asarray(planned_palm['position'])).tolist())
         records.append(row)
         cells = []
-        for key in VARIANTS:
+        for key in variants:
             r = row[key]
-            cells.append('{:>8}:{:>26}'.format(key, '-' if r is None else
-                         '{}{}{}{} d{:3.0f} {:3.0f}mm/{:3.0f}deg'.format(
+            cells.append('{:>8}:{:>34}'.format(key, '-' if r is None else
+                         '{}{}{}{} d{:3.0f} {:3.0f}mm/{:3.0f}deg {:.2f}s'.format(
                              '*' if r['accepted'] else '', r['reason'],
                              '(F)' if r['flipped'] else '',
                              '(b{:.1f})'.format(r['blend'])
                              if r.get('blend') else '',
                              r['hand_distance'] * 1e3,
                              r['position_change'] * 1e3,
-                             r['rotation_change_deg'])))
+                             r['rotation_change_deg'],
+                             r['compute_time'])))
         print('  f{:03d} '.format(start) + ' '.join(cells), flush=True)
     if args.out:
         with open(args.out, 'w') as f:
@@ -364,6 +370,11 @@ def main():
                              '実機ノードと同じ)')
     parser.add_argument('--stride', type=int, default=3,
                         help='3 フレームの組をずらす間隔 [フレーム]')
+    parser.add_argument('--variants', default=','.join(VARIANTS),
+                        help='比べる手の選び方 (カンマ区切り、既定は全部)')
+    parser.add_argument('--blend-major', action='store_true',
+                        help='refine の解き直しを 11/17 以前の順 (向きの寄せ'
+                             'ごとに脚の段階) にする')
     parser.add_argument('--out', default=None, help='結果の JSON')
     parser.add_argument('--verbose', action='store_true',
                         help='フレームごとの手の候補を出す')

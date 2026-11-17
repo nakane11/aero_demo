@@ -111,6 +111,28 @@ def base_trajectory_points(waypoints):
     return points
 
 
+def prepend_base_move(waypoints, base_move, tolerance=1e-6):
+    """``waypoints`` (先頭が今の姿勢として送る waypoint) の前に、台車がまだ
+    ``base_move`` (今の台車の系の ``[dx, dy, dyaw]``) だけ動いていない同じ姿勢の
+    waypoint を足したリストを返す。``base_trajectory_points`` で送ると、腕は
+    先頭の姿勢のまま台車が ``base_move`` だけ動き、そのまま残りへ続く。
+    移動が無ければ ``waypoints`` をそのまま返す。"""
+    move = [float(v) for v in base_move]
+    if all(abs(v) <= tolerance for v in move):
+        return waypoints
+    first = waypoints[0]
+    x, y, yaw = (first['base_position'][0], first['base_position'][1],
+                 first['base_yaw'])
+    # 今の姿勢 = first ∘ move^-1。向きは折り返さない (base_trajectory_points は
+    # 向きの差で回す量を出す)。
+    now_yaw = yaw - move[2]
+    c, s = math.cos(now_yaw), math.sin(now_yaw)
+    now_x = x - (c * move[0] - s * move[1])
+    now_y = y - (s * move[0] + c * move[1])
+    now = dict(first, base_position=[now_x, now_y, 0.0], base_yaw=now_yaw)
+    return [now] + list(waypoints)
+
+
 def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
                       log=None):
     """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど

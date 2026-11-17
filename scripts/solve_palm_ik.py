@@ -178,6 +178,9 @@ REFINE_LEG_STAGES = (('fixed', True, None),
 # 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
 # 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
 REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
+# True: 脚の段階ごとに向きの寄せを順に試す (脚固定で寄せた解を、脚を動かす解より
+# 先に試す)。False: 向きの寄せごとに脚の段階を順に試す (11/17 以前)。
+REFINE_STAGE_MAJOR = True
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
 DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
@@ -2774,35 +2777,40 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     planned_angles = dict(zip(planned_post['joint_names'],
                               planned_post['joint_angle_vector']))
     blends = rotation_blends if planned_palm is not None else (0.0,)
-    post = None
-    reason = 'too_large'
-    legs = None
-    used = None
+    candidates = []
     for blend in blends:
         candidate = (palm if planned_palm is None
                      else blend_palm_rotation(palm, planned_palm, blend))
         target_rot, _, rotation = changes(candidate)
-        if rotation > REFINE_MAX_ROTATION_CHANGE:
-            continue
-        reason = 'ik_failed'
-        for legs, fix_legs, leg_range in leg_stages:
-            stage = dict(fix_legs=fix_legs, leg_range=leg_range)
-            post = solve_press_in(robot, robot_arm, candidate, target_rot,
-                                  arm_only_fallback=False,
-                                  skip_unreachable=True, **stage)
-            if post is not None:
-                reason = 'ok'
-                break
-            # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
-            for link in robot.head.link_list:
-                if link.joint.name in planned_angles:
-                    link.joint.joint_angle(planned_angles[link.joint.name])
-            post = solve_press_in(robot, robot_arm, candidate, target_rot,
-                                  gaze=False, skip_unreachable=True, **stage)
-            if post is not None:
-                reason = 'ok_arm_only'
-                break
+        if rotation <= REFINE_MAX_ROTATION_CHANGE:
+            candidates.append((blend, candidate, target_rot))
+    post = None
+    reason = 'too_large' if not candidates else 'ik_failed'
+    legs = None
+    used = None
+    # 脚の段階を外側に回す (脚を固定したまま向きを寄せた解を、脚を動かす解より
+    # 先に試す)。実機 10/21〜22 の補正は全部脚固定で解け、向きを寄せた 6 回は
+    # 検出した向きで脚を動かす段階まで失敗してから解けていた (IK 0.7〜1.4 秒)。
+    order = ([(stage, c) for stage in leg_stages for c in candidates]
+             if REFINE_STAGE_MAJOR else
+             [(stage, c) for c in candidates for stage in leg_stages])
+    for (legs, fix_legs, leg_range), (blend, candidate, target_rot) in order:
+        stage = dict(fix_legs=fix_legs, leg_range=leg_range)
+        post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                              arm_only_fallback=False,
+                              skip_unreachable=True, **stage)
         if post is not None:
+            reason = 'ok'
+            used = blend
+            break
+        # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
+        for link in robot.head.link_list:
+            if link.joint.name in planned_angles:
+                link.joint.joint_angle(planned_angles[link.joint.name])
+        post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                              gaze=False, skip_unreachable=True, **stage)
+        if post is not None:
+            reason = 'ok_arm_only'
             used = blend
             break
     info.update(post_process=post, reason=reason,
