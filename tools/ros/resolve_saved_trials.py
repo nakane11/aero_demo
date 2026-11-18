@@ -120,10 +120,14 @@ def resolve_trial(planner, args, data_dir, name, attempt):
     start_base_pose = None
     if getattr(args, 'pre_move', False):
         # ノードの --pre-move と同じ待機点から解く。
+        max_distance = args.pre_move_max_distance
+        if args.pre_move_max_time > 0:
+            max_distance = min(max_distance, rcpt.pre_move_distance_for_time(
+                args.pre_move_max_time))
         end = rcpt.pre_move_target(
             palms[offered_hand]['position'],
             spik.human_standing_xy(joint_positions), args.pre_move_standoff,
-            max_distance=args.pre_move_max_distance)
+            max_distance=max_distance)
         distance = float(np.linalg.norm(end[:2]))
         record['pre_move_distance'] = distance
         if distance >= rcpt.PRE_MOVE_MIN_DISTANCE:
@@ -132,10 +136,17 @@ def resolve_trial(planner, args, data_dir, name, attempt):
     planned = planner.plan(joint_positions, palms, offered_hand, attempt,
                            start_base_pose=start_base_pose)
     result, motion = planned['result'], planned['motion']
+    # time は計画が返るまで (--early-approach なら横並び移動の前まで)。
+    record['time'] = time.time() - t0
+    early = planned.get('transition_early')
+    if early is not None and motion is not None:
+        # ノードが実行中に裏で解く横並び移動 (寄せなし) をここで続けて解く。
+        t1 = time.time()
+        motion['transition'], _ = planner.plan_transition_early(early)
+        record['early_transition_time'] = time.time() - t1
     record.update(
         hand=offered_hand, robot_arm=planned['robot_arm'],
-        stage=trial_stage(result, motion),
-        time=time.time() - t0)
+        stage=trial_stage(result, motion))
     post = result.get('post_process') or {}
     if post.get('partial'):
         record.update(partial_press=True,
@@ -259,6 +270,8 @@ def main():
     my_args, node_argv = parser.parse_known_args()
     rcpt.sbs.apply_human_arm_arguments(my_args)
     args = rcpt.build_arg_parser().parse_args(node_argv)
+    # ノードの main と同じく lead-in の形を引数に合わせる。
+    rcpt.phm.LEAD_IN_BLEND = bool(args.lead_in_blend)
 
     planner = rcpt.HandshakePlanner(args)
     spik.attach_camera_optical_coords(planner.robot)

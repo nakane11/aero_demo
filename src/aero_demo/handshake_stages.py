@@ -38,6 +38,7 @@ STAGE_DONE = ('実行を終了しました', 'RESET で最初から')
 STAGE_ERROR = ('実行中にエラーが起きました', '端末のログを確認してください')
 # 裏の計算 (状態の補足に出す)。
 BACKGROUND_TRANSITION_REFINE = '裏で横並びの寄せを計算中'
+BACKGROUND_TRANSITION_EARLY = '裏で横並び移動を計算中'
 
 # ロボットの状態 (番号はこの順に 1 から) と、それにまとめる処理。
 STATE_GROUPS = (

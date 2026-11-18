@@ -18,8 +18,9 @@ import numpy as np
 MIN_SEGMENT_TIME = 1.0 / 15.0
 
 # 台車の速度上限。実機の aero_base_link.yaml の max_velocity と一致させること。
-BASE_MAX_VEL = 0.3  # [m/s] 実機の base_link_x/y の max_velocity
-BASE_MAX_ANGVEL = 1.0  # [rad/s] 実機の base_link_pan の max_velocity
+# 2026-11-18 にロボット本体側を 0.3 -> 0.40 m/s・1.0 -> 1.2 rad/s に変更。
+BASE_MAX_VEL = 0.40  # [m/s] 実機の base_link_x/y の max_velocity
+BASE_MAX_ANGVEL = 1.2  # [rad/s] 実機の base_link_pan の max_velocity
 
 # 指令で使う速度上限の割合。3 次スプライン瞬間速度の最大がこの割合になるよう
 # 区間の時間を決める (limited_time_list)。
