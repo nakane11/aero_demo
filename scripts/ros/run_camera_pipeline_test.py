@@ -531,7 +531,8 @@ def log_debug(text):
 
 def log_debug_event(record):
     """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
-    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
+    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False,
+                                      default=_json_default))
 
 
 def motion_verified(motion):
@@ -2036,8 +2037,15 @@ class HandshakePipelineNode(object):
             threading.Thread(target=self._nod_head, daemon=True).start()
         self._pre_move = None
         if self.args.pre_move and self.ri is not None:
-            self._start_pre_move(joint_positions, palms[offered_hand],
-                                 handshake_t0)
+            try:
+                self._start_pre_move(joint_positions, palms[offered_hand],
+                                     handshake_t0)
+            except Exception as exc:  # noqa: BLE001  (先に動かせなくても計画は続ける)
+                print('[pre-move][WARN] 台車を先に動かす処理で例外が起きました '
+                      '({!r})。{}'.format(
+                          exc, '台車は待機点へ向かっています。'
+                          if self._pre_move is not None
+                          else '台車は動かさずに計画します。'))
         # 以降は骨格・計画とも今の base_link 系なので、実機の姿勢もここを原点に出す。
         real_pose_ref = self._lookup_odom_from_base(rospy.Time.from_sec(stamp))
         with self._lock:
@@ -2649,7 +2657,7 @@ class HandshakePipelineNode(object):
                   time.time() - handshake_t0, distance,
                   self._pre_move['duration']))
         log_debug_event(dict(
-            event='pre_move', end=end, distance=distance,
+            event='pre_move', end=[float(v) for v in end], distance=distance,
             duration=self._pre_move['duration'],
             since_offer=time.time() - handshake_t0))
 
