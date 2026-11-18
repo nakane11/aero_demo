@@ -482,9 +482,21 @@ def log_debug(text):
 
 
 
+def _json_default(value):
+    """numpy の値 (np.bool_ など) を JSON に書ける形にする。ログの 1 行で実行の
+    スレッドが落ちないように (11/18 の偽のコントローラでの再生で、押し込み前の
+    記録の np.bool_ で実行が止まった)。"""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return repr(value)
+
+
 def log_debug_event(record):
     """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
-    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
+    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False,
+                                      default=_json_default))
 
 
 def motion_verified(motion):
@@ -5107,11 +5119,33 @@ class HandshakePipelineNode(object):
             差し替える。今の手先より後ろの点 (hover など) は飛ばす
             (``nsp.press_entry``)。Returns: ``(台車の押し込みを始める壁時計の
             時刻, 台車の点列, 区間の時間, 上限比, 入る点)``、間に合わなければ
-            None。"""
-            t_s = time.time() + nsp.SPLICE_LEAD - send_time
+            None。
+
+            計算の後に開始時刻までの余裕が ``nsp.SPLICE_MIN_MARGIN`` を切ったら、
+            かかった時間だけ開始時刻を遅らせて計算し直す。"""
             t_hover = no_stop['t_hover'] - send_time
-            if t_s > t_hover - 0.05:
-                return None
+            lead = nsp.SPLICE_LEAD
+            for attempt in range(nsp.SPLICE_ATTEMPTS):
+                compute_start = time.time()
+                t_s = compute_start + lead - send_time
+                if t_s > t_hover - 0.05:
+                    return None
+                plan = plan_splice(press_wps, now_wp, target, t_s, t_hover)
+                margin = send_time + t_s - time.time()
+                if margin >= nsp.SPLICE_MIN_MARGIN:
+                    break
+                lead = time.time() - compute_start + nsp.SPLICE_LEAD
+            angles, vels, all_times, ratio, entry, base_points = plan
+            self._send_arm_splice(
+                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
+                all_times)
+            splice_info.update(attempts=attempt + 1, margin=float(margin),
+                               lead=float(lead),
+                               sent_margin=float(send_time + t_s
+                                                 - time.time()))
+            return send_time + t_s, base_points, list(all_times), ratio, entry
+
+        def plan_splice(press_wps, now_wp, target, t_s, t_hover):
             q_s, _ = old_track.state(t_s)
             by_name = dict(zip(names, q_s))
             current_wp = dict(now_wp, joint_angle_vector=[
@@ -5139,10 +5173,9 @@ class HandshakePipelineNode(object):
                 times[0] = max(times[0], t_hover - t_s)
             angles, vels, all_times, ratio = nsp.splice_at_entry(
                 old_track, t_s, avs, times, max_vel)
-            self._send_arm_splice(
-                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
-                all_times)
-            return send_time + t_s, base_points, list(all_times), ratio, entry
+            return angles, vels, all_times, ratio, entry, base_points
+
+        splice_info = {}
 
         if not fold['ok']:
             # 織り込めない大きなずれ: 腕を hover で止めて従来どおり直す。
@@ -5183,6 +5216,11 @@ class HandshakePipelineNode(object):
                 [now_wp] + list(press_wps[1:]))[1:]
             press_start, times, ratio, entry = (
                 no_stop['t_hover'], no_stop['press_times'], None, 0)
+        # 腕が hover を通る時刻の予定からの遅れ (差し替えたときは、差し替えの
+        # 時刻から hover までの区間の後)。
+        hover_delay = float(
+            (press_start + (times[0] if spliced is not None else 0.0))
+            - no_stop['t_hover']) if entry == 0 else None
         # 台車の押し込み (ずれの補正を含む) を、腕が hover を通る時刻 (hover を
         # 飛ばすときは差し替えの時刻) から。
         wait = press_start - time.time()
@@ -5194,8 +5232,8 @@ class HandshakePipelineNode(object):
         record = dict(
             event='no_stop_press', spliced=spliced is not None, entry=entry,
             refined=refined is not None, in_time=in_time,
-            hover_delay=float(press_start - no_stop['t_hover']),
-            bridge_ratio=ratio,
+            hover_delay=hover_delay,
+            bridge_ratio=ratio, splice=splice_info or None,
             base_move=[float(v) for v in fold['base_move']],
             residual=[float(v) for v in fold['residual']],
             decision_before_hover=float(no_stop['t_hover'] - decided_at),
@@ -5208,8 +5246,7 @@ class HandshakePipelineNode(object):
                   else 'は計画どおり' + ('' if in_time else ' (間に合わず)'),
                   fold['base_move'][0], fold['base_move'][1],
                   math.degrees(fold['base_move'][2]),
-                  'hover の遅れ {:.2f}s'.format(
-                      press_start - no_stop['t_hover']) if entry == 0
+                  'hover の遅れ {:.2f}s'.format(hover_delay) if entry == 0
                   else '手先が hover より前にいたので押し込みの {} 点目へ直接'
                        '入った'.format(entry)))
         self._wait_body_interpolation()

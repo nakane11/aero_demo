@@ -57,8 +57,15 @@ ENTRY_AHEAD = 0.005
 # 向きとの cos がこれ未満なら逆向きとみなしてほかの向き (turn) で計画し直す。
 APPROACH_DIRECTION_POINTS = 6
 REVERSE_APPROACH_COS = 0.0
-# 差し替えのゴールを、開始時刻 (hover を通る時刻) のこれ以上前に送る [s]。
+# 差し替えの開始時刻を、計算を始める時刻のこれだけ後にする [s]。
 SPLICE_LEAD = 0.15
+# 計算の後、送る時点で開始時刻までこれだけ残っていなければ、かかった時間だけ
+# 開始時刻を遅らせて計算し直す [s] (5 つのコントローラへの送信と通信の分)。
+# 11/18 の偽のコントローラでの再生で、計算が 0.15 秒を超えてゴールが開始時刻の
+# 0.08 秒後に届いた (実機の JTC は今の状態からつなぐので跳ばないが、つなぎの
+# 区間が縮んで速くなる)。
+SPLICE_MIN_MARGIN = 0.05
+SPLICE_ATTEMPTS = 3
 # 台車のずれの許容 (これ以内なら動かさない) と、押し込みに織り込む上限。
 BASE_POSITION_TOLERANCE = 0.025  # [m]
 BASE_ANGLE_TOLERANCE = math.radians(5.0)  # [rad]
@@ -271,7 +278,7 @@ def fold_move(residual):
               and abs(residual[2]) <= BASE_ANGLE_TOLERANCE)
     ok = distance <= FOLD_MAX_POSITION and abs(residual[2]) <= FOLD_MAX_ANGLE
     return (np.zeros(3) if within else np.asarray(residual, dtype=np.float64)
-            ), ok
+            ), bool(ok)
 
 
 def clearance_scale(margin_at, scales=CLEARANCE_SCALES):
