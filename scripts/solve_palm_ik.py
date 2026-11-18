@@ -178,6 +178,9 @@ REFINE_LEG_STAGES = (('fixed', True, None),
 # 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
 # 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
 REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
+# True: 脚の段階ごとに向きの寄せを順に試す (脚固定で寄せた解を、脚を動かす解より
+# 先に試す)。False: 向きの寄せごとに脚の段階を順に試す (11/17 以前)。
+REFINE_STAGE_MAJOR = True
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
 DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
@@ -2774,35 +2777,40 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     planned_angles = dict(zip(planned_post['joint_names'],
                               planned_post['joint_angle_vector']))
     blends = rotation_blends if planned_palm is not None else (0.0,)
-    post = None
-    reason = 'too_large'
-    legs = None
-    used = None
+    candidates = []
     for blend in blends:
         candidate = (palm if planned_palm is None
                      else blend_palm_rotation(palm, planned_palm, blend))
         target_rot, _, rotation = changes(candidate)
-        if rotation > REFINE_MAX_ROTATION_CHANGE:
-            continue
-        reason = 'ik_failed'
-        for legs, fix_legs, leg_range in leg_stages:
-            stage = dict(fix_legs=fix_legs, leg_range=leg_range)
-            post = solve_press_in(robot, robot_arm, candidate, target_rot,
-                                  arm_only_fallback=False,
-                                  skip_unreachable=True, **stage)
-            if post is not None:
-                reason = 'ok'
-                break
-            # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
-            for link in robot.head.link_list:
-                if link.joint.name in planned_angles:
-                    link.joint.joint_angle(planned_angles[link.joint.name])
-            post = solve_press_in(robot, robot_arm, candidate, target_rot,
-                                  gaze=False, skip_unreachable=True, **stage)
-            if post is not None:
-                reason = 'ok_arm_only'
-                break
+        if rotation <= REFINE_MAX_ROTATION_CHANGE:
+            candidates.append((blend, candidate, target_rot))
+    post = None
+    reason = 'too_large' if not candidates else 'ik_failed'
+    legs = None
+    used = None
+    # 脚の段階を外側に回す (脚を固定したまま向きを寄せた解を、脚を動かす解より
+    # 先に試す)。実機 10/21〜22 の補正は全部脚固定で解け、向きを寄せた 6 回は
+    # 検出した向きで脚を動かす段階まで失敗してから解けていた (IK 0.7〜1.4 秒)。
+    order = ([(stage, c) for stage in leg_stages for c in candidates]
+             if REFINE_STAGE_MAJOR else
+             [(stage, c) for c in candidates for stage in leg_stages])
+    for (legs, fix_legs, leg_range), (blend, candidate, target_rot) in order:
+        stage = dict(fix_legs=fix_legs, leg_range=leg_range)
+        post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                              arm_only_fallback=False,
+                              skip_unreachable=True, **stage)
         if post is not None:
+            reason = 'ok'
+            used = blend
+            break
+        # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
+        for link in robot.head.link_list:
+            if link.joint.name in planned_angles:
+                link.joint.joint_angle(planned_angles[link.joint.name])
+        post = solve_press_in(robot, robot_arm, candidate, target_rot,
+                              gaze=False, skip_unreachable=True, **stage)
+        if post is not None:
+            reason = 'ok_arm_only'
             used = blend
             break
     info.update(post_process=post, reason=reason,
@@ -2893,8 +2901,11 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             facing_yaw_weight=DEFAULT_FACING_YAW_WEIGHT,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
-                            placement_joint_positions=None):
-    """バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
+                            placement_joint_positions=None,
+                            excluded_turns=()):
+    """``excluded_turns`` (向きの添字の集合) の候補は使わない。
+
+    バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
     (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、ロボットの差し出す腕の肘から先と
     差し出した手まわりの組だけ ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が
     解け、自己干渉と、肘から先 x 手まわり以外の人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) を
@@ -2957,10 +2968,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                     base_pose, facing))
         return cost
 
-    # 収束した候補をコスト昇順に (同着は添字順)。
+    # 収束した候補をコスト昇順に (同着は添字順)。除く向きの候補は使わない。
+    excluded_turns = set(excluded_turns or ())
     candidates = sorted(
         ((candidate_cost(candidate_index), candidate_index)
-         for candidate_index, ok in enumerate(success_flags) if ok),
+         for candidate_index, ok in enumerate(success_flags)
+         if ok and candidate_index // attempts_per_pose
+         not in excluded_turns),
         key=lambda item: (item[0], item[1]))
 
     # 人体の障害物と表面サンプルは候補ループの外で 1 回だけ作る。
@@ -3205,7 +3219,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     n_turn_candidates=None,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
-                    placement_joint_positions=None):
+                    placement_joint_positions=None,
+                    excluded_turns=()):
     """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉を回避する
     バッチ IK (jax) で解き、``pick_verified_candidate`` で 1 つ選ぶ。
 
@@ -3308,7 +3323,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         front_offset_weight=front_offset_weight,
         facing_yaw_weight=facing_yaw_weight,
         hover_human_clearance=hover_human_clearance,
-        placement_joint_positions=placement_joint_positions)
+        placement_joint_positions=placement_joint_positions,
+        excluded_turns=excluded_turns)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
