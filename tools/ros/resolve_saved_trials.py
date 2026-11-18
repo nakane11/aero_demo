@@ -117,13 +117,37 @@ def resolve_trial(planner, args, data_dir, name, attempt):
         return record
     # 乱数の消費が前の試行の解き直し回数に依存しないよう試行ごとに固定する。
     np.random.seed(zlib.crc32(name.encode()))
+    start_base_pose = None
+    if getattr(args, 'pre_move', False):
+        # ノードの --pre-move と同じ待機点から解く。
+        end = rcpt.pre_move_target(
+            palms[offered_hand]['position'],
+            spik.human_standing_xy(joint_positions), args.pre_move_standoff,
+            max_distance=args.pre_move_max_distance)
+        distance = float(np.linalg.norm(end[:2]))
+        record['pre_move_distance'] = distance
+        if distance >= rcpt.PRE_MOVE_MIN_DISTANCE:
+            start_base_pose = end
     t0 = time.time()
-    planned = planner.plan(joint_positions, palms, offered_hand, attempt)
+    planned = planner.plan(joint_positions, palms, offered_hand, attempt,
+                           start_base_pose=start_base_pose)
     result, motion = planned['result'], planned['motion']
     record.update(
         hand=offered_hand, robot_arm=planned['robot_arm'],
         stage=trial_stage(result, motion),
         time=time.time() - t0)
+    post = result.get('post_process') or {}
+    if post.get('partial'):
+        record.update(partial_press=True,
+                      press_reached=post['press_reached'],
+                      press_remaining=post['press_remaining'])
+    if motion is not None and motion.get('lead_in_waypoints'):
+        lead_in = [wp['base_position'][:2]
+                   for wp in motion['lead_in_waypoints']]
+        record['lead_in_length'] = float(sum(
+            np.linalg.norm(np.subtract(b, a))
+            for a, b in zip(lead_in, lead_in[1:] + [
+                motion['waypoints'][0]['base_position'][:2]])))
     if motion is not None:
         record['motion_kind'] = motion['kind']
         record['motion_min_distance'] = float(
