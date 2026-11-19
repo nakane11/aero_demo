@@ -63,7 +63,8 @@ DEFAULT_N_WAYPOINTS = 20
 # waypoint 間の時間刻み [秒] (コスト正規化用。実機の速度ではない)。
 DEFAULT_DT = 0.2
 
-DEFAULT_MAX_ITERATIONS = 60
+# 軌道最適化の反復の上限。MFIX_MAX_ITERATIONS で変える (import 時に読む)。
+DEFAULT_MAX_ITERATIONS = spik.env_int('MFIX_MAX_ITERATIONS', 60)
 
 # 干渉コストが働き始める距離 [m] (人体 / 自己干渉)。
 DEFAULT_COLLISION_ACTIVATION_DISTANCE = spik.DEFAULT_COLLISION_MARGIN
@@ -1332,6 +1333,8 @@ def main():
     sbs.GOAL_LEG_RISE = args.goal_leg_rise
     sbs.GOAL_CROUCH_WEIGHT = args.goal_crouch_weight
     sbs.GOAL_BOW_WEIGHT = args.goal_bow_weight
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ時間の内訳を測る (無ければ何もしない)
 
     files = json_io.iter_json_files(args.input_dir)
     if not files and args.wait_file is None:
@@ -1398,7 +1401,10 @@ def main():
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     n_transition = n_transition_verified = 0
+    initial_state = spik.robot_state(robot)
     for i, path in enumerate(files):
+        # 結果が前に処理した人によらないよう、ロボットの状態を決め直す (R7)。
+        spik.restore_robot_state(robot, initial_state)
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))
         if (not handshake.get('target') or not handshake.get('solved')

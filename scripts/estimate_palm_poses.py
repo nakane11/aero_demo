@@ -81,6 +81,15 @@ STILLNESS_WINDOW = 0.5  # [s]
 STILLNESS_MAX_DISPLACEMENT = 0.05  # [m]
 # 履歴のサンプル間隔がこれを超えたら履歴を捨てる [s]。
 STILLNESS_MAX_GAP = 0.4
+# 静止判定ありのとき、推定深度の平面 (from_model_depth) の掌では確定せず、深度の
+# 平面の掌のフレームを待つ上限 [s] (スコアと静止がそろってから数える)。超えたら
+# 推定深度の掌のまま確定する。推定深度の掌は深度の掌と向きが 20〜40° 食い違い、
+# 掌が横向き・指先が下向きに出て hover が解けないことが多い (develop の
+# docs/unified_solver/O_report.md)。feature/closer-time-budget では差し出しの
+# 確定を早める (--offer-fast-stillness-window) のを優先し、既定は待たない (0、
+# ユーザー判断 11/19)。環境変数 MFIX_OFFER_DEPTH_PALM_WAIT か
+# --offer-depth-palm-wait で待つ。
+DEPTH_PALM_WAIT = float(os.environ.get('MFIX_OFFER_DEPTH_PALM_WAIT', '0'))
 
 # 欠測関節の補完に使う人体比。
 _TORSO_PER_SHOULDER_WIDTH = 1.25
@@ -251,7 +260,8 @@ class OfferedHandSelector(object):
                  stillness_max_displacement=STILLNESS_MAX_DISPLACEMENT,
                  stillness_max_gap=STILLNESS_MAX_GAP,
                  fast_stillness_window=None,
-                 fast_stillness_score=None):
+                 fast_stillness_score=None,
+                 depth_palm_wait=DEPTH_PALM_WAIT):
         """
         Parameters
         ----------
@@ -272,6 +282,9 @@ class OfferedHandSelector(object):
             ``fast_stillness_window`` 秒 (``stillness_window`` より短く) 続けば
             確定する。閾値ぎりぎりの手 (逆の手の一時的なスコアなど) は
             ``stillness_window`` のまま。どちらかが None なら使わない。
+        depth_palm_wait : float
+            静止判定ありのとき、推定深度の平面の掌で確定せずに深度の平面の掌を
+            待つ上限 [s]。0.0 以下なら待たない。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -298,12 +311,16 @@ class OfferedHandSelector(object):
         self.fast_stillness_score = (
             None if fast_stillness_score is None
             else float(fast_stillness_score))
+        self.depth_palm_wait = float(depth_palm_wait)
         # 掌位置の履歴 [(t, position), ...] (t 昇順)。
         self._palm_history = {'R': [], 'L': []}
+        # スコアと静止がそろい続けている始めの時刻 (側ごと、そろっていなければ None)。
+        self._ready_since = {'R': None, 'L': None}
 
     def reset_stillness(self):
         """掌の静止判定の履歴を捨てる (人物が入れ替わったとき等)."""
         self._palm_history = {'R': [], 'L': []}
+        self._ready_since = {'R': None, 'L': None}
 
     def select(self, joint_positions, palms, t=None):
         """差し出している手を判定する.
@@ -362,19 +379,57 @@ class OfferedHandSelector(object):
         if len(candidates) == 2:
             margin = abs(scores['R'] - scores['L'])
         side = None
+        ready = None
+        depth_wait = None
         if candidates:
             best = max(candidates, key=lambda s: candidates[s])
             # 静止していなければ見送る。
             if (candidates[best] >= self.score_min
                     and self._still_enough(still[best], still_duration[best],
                                            candidates[best])):
-                side = best
+                ready = best
+                side, depth_wait = self._wait_depth_palm(
+                    best, palms[best], t)
+        for s in ('R', 'L'):
+            if s != ready:
+                self._ready_since[s] = None
         ambiguous = bool(side is not None and margin is not None
                          and margin < self.ambiguous_margin)
         return dict(side=side, scores=scores, features=features,
                     margin=margin, ambiguous=ambiguous, veto=veto,
                     distance=distance, still=still,
-                    still_duration=still_duration)
+                    still_duration=still_duration, depth_wait=depth_wait)
+
+    def _wait_depth_palm(self, side, palm, t):
+        """スコアと静止がそろった ``side`` を確定してよいかを返す.
+
+        推定深度の平面の掌 (``from_model_depth``) なら、そろってから
+        ``depth_palm_wait`` 秒までは見送って深度の平面の掌を待つ (掌は丸めず、
+        確定はそのフレームの掌のまま)。静止判定なしのときは待たない。
+
+        Returns
+        -------
+        (side or None, dict or None)
+            dict は ``waited`` [s] (そろってからの時間)、``model_depth``、
+            ``timeout`` (上限で推定深度の掌のまま確定)。
+        """
+        if (t is None or self.stillness_window <= 0.0
+                or self.depth_palm_wait <= 0.0):
+            return side, None
+        t = float(t)
+        since = self._ready_since[side]
+        if since is None or t < since:
+            since = self._ready_since[side] = t
+        waited = t - since
+        model_depth = bool(palm.get('from_model_depth'))
+        info = dict(waited=waited, model_depth=model_depth, timeout=False)
+        if not model_depth:
+            return side, info
+        # 1e-6 は浮動小数点誤差ぶん。
+        if waited >= self.depth_palm_wait - 1e-6:
+            info['timeout'] = True
+            return side, info
+        return None, info
 
     def _still_enough(self, still, still_duration, score):
         """静止判定を通るか (静止判定なしの側 ``still`` = None は通す)。スコアが
@@ -541,6 +596,11 @@ def format_offer_scores(selection, score_min):
             if still_duration.get(side) is not None:
                 text += '(静止{:.2f}s)'.format(still_duration[side])
             parts.append(text)
+    depth_wait = selection.get('depth_wait')
+    if (selection['side'] is None and depth_wait is not None
+            and depth_wait['model_depth']):
+        parts.append('推定深度の掌のため深度の掌を待機中 ({:.2f}s)'.format(
+            depth_wait['waited']))
     return ', '.join(parts)
 
 

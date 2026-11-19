@@ -19,15 +19,19 @@ import base64
 import collections
 import copy
 import json
+import glob
+import hashlib
 import math
 import multiprocessing
 import os
+import pickle
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from urllib.parse import urlparse
 
 import cv2
@@ -310,8 +314,17 @@ OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
 # やり直せるようにする (処理の途中では止めないので少し超えることがある)。
 # 合成 (solve_palm_ik.py・plan_handshake_motion.py) と同じ値。
 PLAN_TIME_LIMIT = spik.PLAN_TIME_LIMIT
+# 計画の時間の上限で切れたことを専用の失敗の原因 (``_failure_cause`` の 'timeout') にし、
+# 専用の発話 (--speech-timeout-fail-text) をする (develop J23、J_report 9.13 の 1)。
+# 環境変数 MFIX_PLAN_TIMEOUT_CAUSE=0 で前の形 (接近の途中で干渉・横並び移動の失敗と同じ扱い)。
+PLAN_TIMEOUT_CAUSE = os.environ.get('MFIX_PLAN_TIMEOUT_CAUSE', '1') == '1'
 
 PRESS_IN_REFINE_FRAMES = 3
+# hover で押し込みを解き直した後、その区間の自己干渉・人体距離・前腕の距離を計画時と
+# 同じ基準で測り、ログに出す (動きは止めない、数えるだけ。develop V_report 8.6)。
+# 環境変数 MFIX_PRESS_IN_REFINE_CHECK=0 で測らない。
+PRESS_IN_REFINE_CHECK = os.environ.get(
+    'MFIX_PRESS_IN_REFINE_CHECK', '1') == '1'
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は掌甲を取り違えて法線が反転することがあるので score と法線角の両方で弾く。
@@ -432,6 +445,12 @@ def face_point(joint_positions):
         return (np.asarray(ears[0], dtype=np.float64)[:3]
                 + np.asarray(ears[1], dtype=np.float64)[:3]) / 2.0
     return None
+
+
+# master-fixes の「横並び移動の可動域の判定 (B2、超えたら横並び移動をしない)」は
+# 取り込まない (ユーザー判断 11/19)。押し込みの解き直しの差は _execute_transition
+# で終点へ向けて 0 に戻し計画用ロボットの可動域に収め、押し込み後の姿勢から
+# 解き直せればそれを使う (--transition-delta・--transition-resolve)。
 
 
 def project_base_point(frame, point):
@@ -685,14 +704,98 @@ class _DeferredSolver(object):
         return getattr(self._solver, name)
 
 
+# 試行ごとに差し出した掌から乱数の種を決める (J0 の案 3)。'0' で前の形 (種を決めず、前の試行の
+# 乱数の続きで計画する)。
+PALM_SEED = os.environ.get('MFIX_PALM_SEED', '1') != '0'
+
+
+def _palm_seed(palm):
+    """掌 (位置・軸) から決める numpy の乱数の種 (0.1 mm・1e-4 に丸めた値の crc32)。"""
+    values = [v for name in ('position', 'x_axis', 'y_axis')
+              for v in (palm.get(name) or [])]
+    # + 0.0 で丸めた -0.0 を 0.0 にそろえる。
+    return zlib.crc32((np.round(np.asarray(values, dtype=np.float64), 4) + 0.0).tobytes())
+
+
 def _optimizer_warmup_child(args):
     """軌道最適化の準備を行う別プロセスの本体 (spawn)。JAX の永続キャッシュへ
     書くだけでよい。GIL 回避のため別プロセス。"""
     args = copy.copy(args)
     args.side_by_side_approach = 'sync'  # 寄せ用の別モデルは作らない
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ (無ければ何もしない)
     planner = HandshakePlanner(args)
     phm.arms_down_angles(planner.robot, planner.robot.joint_list)
-    planner.warmup(batch_ik=False)
+    planner.warmup(batch_ik=False, hover_pose_cache=True, child=True)
+    qprof.dump()  # multiprocessing の子は atexit を通らない
+
+
+# 軌道最適化の準備の子プロセスは hover の IK を解かず、前の起動で同じ子が解いた押し込み
+# 姿勢 (handshake) をファイルから読む (develop Q R6、Q_report 2.8)。軌道最適化の形は
+# 姿勢に依らないので、姿勢は永続キャッシュを温めるための入力にすぎない。鍵 (scripts と
+# src/aero_demo のコード・jax/jaxlib/skrobot の版と skrobot のコード・装置・hover に効く
+# 引数) が変わったら今までどおり解いて保存する。環境変数 MFIX_WARMUP_POSE_CACHE=0 で使わない。
+WARMUP_POSE_CACHE = os.environ.get('MFIX_WARMUP_POSE_CACHE', '1') == '1'
+_WARMUP_POSE_ARGS = ('attempts_per_pose', 'base_x_range', 'base_y_range',
+                     'base_yaw_range', 'collision_verify_model',
+                     'max_iterations', 'human_front_distance',
+                     'press_in_forearm_clearance',
+                     'motion_collision_verify_tolerance', 'n_waypoints')
+
+
+def _warmup_pose_path(args, robot_arm):
+    """子プロセスの warmup の押し込み姿勢のファイル (鍵が名前)。永続キャッシュの
+    場所が決まっていなければ None。"""
+    cache_dir = os.environ.get('JAX_COMPILATION_CACHE_DIR')
+    if not cache_dir:
+        return None
+    import jax
+    import jaxlib
+    import skrobot
+    skrobot_dir = os.path.dirname(os.path.abspath(skrobot.__file__))
+    files = sorted(
+        glob.glob(os.path.join(_SCRIPTS_DIR, '*.py'))
+        + glob.glob(os.path.join(_PKG_SRC_DIR, 'aero_demo', '*.py'))
+        + [os.path.abspath(__file__)])
+    skrobot_files = sorted(glob.glob(
+        os.path.join(skrobot_dir, '**', '*.py'), recursive=True))
+    digest = hashlib.sha256()
+    for root, paths in ((_SCRIPTS_DIR, files), (skrobot_dir, skrobot_files)):
+        for path in paths:
+            digest.update(os.path.relpath(path, root).encode())
+            with open(path, 'rb') as f:
+                digest.update(hashlib.sha256(f.read()).digest())
+    if os.path.exists(args.collision_pairs):
+        with open(args.collision_pairs, 'rb') as f:
+            digest.update(hashlib.sha256(f.read()).digest())
+    digest.update(json.dumps(dict(
+        arm=robot_arm,
+        versions=dict(jax=jax.__version__, jaxlib=jaxlib.__version__,
+                      skrobot=getattr(skrobot, '__version__', None)),
+        platform=jax.default_backend(),
+        args={name: getattr(args, name, None) for name in _WARMUP_POSE_ARGS}),
+        sort_keys=True, default=str).encode())
+    base = os.path.abspath(cache_dir).rstrip(os.sep)
+    return os.path.join(base + '_warmup_pose', digest.hexdigest() + '.pkl')
+
+
+def _load_warmup_pose(path):
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError):
+        return None
+
+
+def _save_warmup_pose(path, handshake):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = '{}.{}.tmp'.format(path, os.getpid())
+        with open(tmp, 'wb') as f:
+            pickle.dump(handshake, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print('[warmup] 押し込み姿勢を保存できませんでした: {!r}'.format(e))
 
 
 def _final_lateral(transition):
@@ -762,6 +865,9 @@ def _transition_worker_main(args, conn, stop):
     robot = planner.robot
     spik.attach_camera_optical_coords(robot)
     phm.arms_down_angles(robot, robot.joint_list)
+    # R7: このプロセスの準備の後の状態を取り、計画ごとの始めに戻す (結果が前の
+    # 計画の角度・リンクの座標の丸めの履歴によらないように)。
+    initial_state = spik.robot_state(robot)
     while True:
         try:
             message = conn.recv()
@@ -781,10 +887,13 @@ def _transition_worker_main(args, conn, stop):
                                     planner.base_limits)
             finally:
                 np.random.set_state(state)
+            spik.restore_robot_state(robot, initial_state)
+            initial_state = spik.robot_state(robot)
             conn.send(('warmed', time.time() - t0))
             continue
         _, job_id, job = message
         stop.clear()
+        spik.restore_robot_state(robot, initial_state)
         try:
             if job.get('kind') == 'resolve':
                 transition = _resolve_transition(robot, planner, job, stop)
@@ -1011,7 +1120,8 @@ class HandshakePlanner(object):
             robot, self.args.collision_verify_model)
         return robot, pairs
 
-    def warmup(self, background_optimizer=False, batch_ik=True):
+    def warmup(self, background_optimizer=False, batch_ik=True,
+               hover_pose_cache=False, child=False):
         """左右の腕で IK と軌道最適化をダミー目標で解き、JAX のトレース・
         コンパイルを済ませる。
 
@@ -1019,11 +1129,16 @@ class HandshakePlanner(object):
         ``background_optimizer`` なら軌道最適化は別プロセス
         (``_optimizer_warmup_child``) で行い、最適化が要る計画だけが完了を待つ。
         ``batch_ik=False`` は横並び移動のバッチ IK の準備を省く。
+        ``hover_pose_cache`` は軌道最適化の入力の押し込み姿勢を保存したファイル
+        から読み、あれば hover の IK を解かない (子プロセス用)。``child`` は
+        軌道最適化の準備の子プロセス: 完了の行を本体の「[warmup] 完了しました」と
+        別の文言にする (再生・起動の道具はその行で本体の完了を待つ)。
         """
         random_state = np.random.get_state()
         np.random.seed(self._WARMUP_SEED)
         try:
-            self._warmup_body(background_optimizer, batch_ik)
+            self._warmup_body(background_optimizer, batch_ik,
+                              hover_pose_cache, child)
         finally:
             np.random.set_state(random_state)
 
@@ -1087,9 +1202,12 @@ class HandshakePlanner(object):
                          daemon=True).start()
         self._optimizer_process = process
 
-    def _warmup_body(self, background_optimizer=False, batch_ik=True):
+    def _warmup_body(self, background_optimizer=False, batch_ik=True,
+                     hover_pose_cache=False, child=False):
         """``warmup`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
+        hover_pose_cache = (hover_pose_cache and not batch_ik
+                            and WARMUP_POSE_CACHE)
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
         warmup_t0 = time.time()
@@ -1109,28 +1227,43 @@ class HandshakePlanner(object):
         for robot_arm, label in (('l', '左'), ('r', '右')):
             hand = robot_arm_to_hand[robot_arm]
             t0 = time.time()
-            picked, _, _ = spik.solve_person_ik(
-                self.robot, self._WARMUP_PALM, hand, robot_arm,
-                collision_obstacles,
-                attempts_per_pose=args.attempts_per_pose,
-                base_limits=self.base_limits,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions={},
-                verification_pairs=self.verification_pairs)
-            log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
-                label, time.time() - t0))
-            if picked is None:
-                print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
-                      '軌道最適化のトレースはスキップします。'.format(label))
-                continue
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
-            handshake = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, self.base_limits,
-                post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
-            self._pin_warmup_fixed_joints(robot_arm, handshake)
+            pose_path = (_warmup_pose_path(args, robot_arm)
+                         if hover_pose_cache else None)
+            handshake = _load_warmup_pose(pose_path) if pose_path else None
+            if handshake is not None:
+                # IK (skrobot の JaxBackend) がプロセスを倍精度にするのを
+                # 省くので、本体と同じ倍精度でコンパイルされるよう先に切り替える。
+                import jax
+                jax.config.update('jax_enable_x64', True)
+                print('[warmup] {}腕: 保存した押し込み姿勢を使い、hover の IK を'
+                      '省きます。'.format(label))
+            else:
+                picked, _, _ = spik.solve_person_ik(
+                    self.robot, self._WARMUP_PALM, hand, robot_arm,
+                    collision_obstacles,
+                    attempts_per_pose=args.attempts_per_pose,
+                    base_limits=self.base_limits,
+                    self_collision=self.collision_pairs is not None,
+                    collision_pairs=self.collision_pairs,
+                    joint_positions={},
+                    verification_pairs=self.verification_pairs)
+                log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
+                    label, time.time() - t0))
+                if picked is None:
+                    print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
+                          '軌道最適化のトレースはスキップします。'.format(label))
+                    continue
+                turn_index, angle_vector, base_pose, post_process_result = \
+                    picked
+                rots = spik.palm_to_target_rots(
+                    self._WARMUP_PALM, hand, robot_arm)
+                handshake = spik.solved_result(
+                    self.robot, robot_arm, rots[turn_index],
+                    turn_index, angle_vector, base_pose, self.base_limits,
+                    post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
+                self._pin_warmup_fixed_joints(robot_arm, handshake)
+                if pose_path:
+                    _save_warmup_pose(pose_path, handshake)
             if not background_optimizer:
                 self._optimizer_warmup_job(
                     self.robot, self.motion_verification_pairs, robot_arm,
@@ -1151,6 +1284,14 @@ class HandshakePlanner(object):
                         self.refine_collision_pairs, self.base_limits)
                 log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
                           .format(label, time.time() - t0))
+        # R7: 計画ごとにこの状態へ戻す (結果が前の試行の角度・リンクの座標の丸めの履歴によらないように)。
+        self._initial_state = spik.robot_state(self.robot)
+        self._refine_initial_state = (None if self.refine_robot is None
+                                      else spik.robot_state(self.refine_robot))
+        if child:
+            print('[warmup] (子プロセス) 軌道最適化のトレース・コンパイルが'
+                  '済みました ({:.1f} 秒)。'.format(time.time() - warmup_t0))
+            return
         if self._worker_ok() and batch_ik:
             t0 = time.time()
             ok = self.worker.wait_warmup(WORKER_WARMUP_TIMEOUT)
@@ -1162,6 +1303,11 @@ class HandshakePlanner(object):
             time.time() - warmup_t0,
             '軌道最適化の準備は別プロセスで続けています。'
             if self._optimizer_process is not None else ''))
+
+    def _restore_refine_robot(self):
+        """裏の計画のロボットを warmup の後の状態に戻す (R7、裏スレッドから呼ぶ)。"""
+        if getattr(self, '_refine_initial_state', None) is not None:
+            spik.restore_robot_state(self.refine_robot, self._refine_initial_state)
 
     def _stage(self, text):
         if self.on_stage is not None:
@@ -1181,6 +1327,9 @@ class HandshakePlanner(object):
         robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
         palm = palms[offered_hand]
         plan_t0 = time.time()
+        if getattr(self, '_initial_state', None) is not None:
+            # R7: 前の試行の角度・リンクの座標の丸めの履歴を持ち越さない。
+            spik.restore_robot_state(self.robot, self._initial_state)
         time_limit = getattr(args, 'plan_time_limit', PLAN_TIME_LIMIT)
         deadline = (plan_t0 + time_limit
                     if time_limit is not None and time_limit > 0 else None)
@@ -1191,6 +1340,14 @@ class HandshakePlanner(object):
             print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) を過ぎたため、'
                   '{}をしません。'.format(attempt, time_limit, stage))
             return True
+
+        def mark_timed_out(result, stage):
+            # 時間切れを専用の原因 (``_failure_cause`` の 'timeout') にする。
+            # ``stage`` は切れた段 (develop J23)。
+            result['plan_timed_out'] = True
+            result.setdefault('plan_timeout_stage', stage)
+            print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) で {} が切れました '
+                  '(時間切れ)。'.format(attempt, time_limit, stage))
 
         offset = spik.human_translation_offset(
             joint_positions, front_distance=args.human_front_distance)
@@ -1340,12 +1497,16 @@ class HandshakePlanner(object):
             # 押し込み姿勢まで解けたら軌道計画する (untranslate の前に行う)。
             motion = None
             if result['solved'] and result.get('post_process') is None:
-                print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
-                      'かったため、軌道計画をしません。'.format(attempt))
+                # 落ちた段 (押し込み区間の IK・脚の整え・押し付け/視線 IK など) を、
+                # 最後の候補選びの数で出す。
+                print('[motion] 試行{}: 押し込み姿勢が解けなかったため ({})、'
+                      '軌道計画をしません。'.format(
+                          attempt, spik.press_fail_summary()
+                          or '落ちた段は不明'))
             elif result['solved'] and out_of_time('軌道計画'):
                 # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
                 # 実行しない。
-                result['plan_timed_out'] = True
+                mark_timed_out(result, '軌道計画の前')
             elif result['solved']:
                 motion_args = copy.copy(args)
                 motion_args.collision_verify_tolerance = \
@@ -1368,6 +1529,11 @@ class HandshakePlanner(object):
                         float(d) for d in motion['waypoint_min_distances']],
                     kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
                     compute_time=motion['compute_time']))
+                if (not motion_verified(motion) and deadline is not None
+                        and time.time() >= deadline):
+                    # 接近の軌道が通らないまま締め切りを過ぎた (残りの候補を
+                    # 試していない)。
+                    mark_timed_out(result, '接近の軌道')
             return result, motion, limits, x_margin, gate_transition
 
         def plan_transition_for(result, motion, gate_transition):
@@ -1412,6 +1578,9 @@ class HandshakePlanner(object):
                                 else max(0.0, deadline - time.time())))
             if transition is not None:
                 motion['transition'] = transition
+                if not transition['verified'] and transition.get('timed_out'):
+                    # 横並び移動 (確保の経路) が締め切りで切れた。
+                    mark_timed_out(result, '横並び移動')
                 if (self.refine_robot is not None
                         and transition['verified']):
                     # 平行移動後の座標系のまま渡す (untranslate は破壊的)。
@@ -1503,7 +1672,9 @@ class HandshakePlanner(object):
             base_x_standing_margin=x_margin,
             placement=placement,
             collision_ik_time=collision_ik_time,
-            candidate_selection_time=candidate_selection_time))
+            candidate_selection_time=candidate_selection_time,
+            plan_timed_out=bool(result.get('plan_timed_out')),
+            plan_timeout_stage=result.get('plan_timeout_stage')))
         if not result['solved']:
             print('[result] 試行{} ({}手/{}腕): IK 失敗 ({:.1f} 秒)。'.format(
                 attempt, offered_hand, robot_arm,
@@ -1533,6 +1704,9 @@ class HandshakePlanner(object):
         """``plan`` が返した ``transition_early`` の横並び移動 (寄せなし) を裏の
         ロボット (``self.refine_robot``) で解き、``(base_link 系の transition,
         寄せの裏の計画の job or None)`` を返す (裏スレッド用)。"""
+        # R7: refine_robot を使う処理の始めに、同じスレッドで戻す
+        # (呼び出し元が _refine_lock で 1 つずつにしている)。
+        self._restore_refine_robot()
         transition = sbs.plan_transition(
             self.refine_robot, job['robot_arm'], job['hand'], job['post'],
             job['turn_deg'], job['translated_joints'],
@@ -1565,6 +1739,7 @@ class HandshakePlanner(object):
             if message[0] == 'stopped':
                 raise sbs.TransitionStopped()
             raise RuntimeError('別プロセス: {}'.format(message[2]))
+        self._restore_refine_robot()
         transition = sbs.refine_transition(
             self.refine_robot, job['robot_arm'], job['hand'], job['post'],
             job['turn_deg'], job['translated_joints'],
@@ -1642,7 +1817,8 @@ class HandshakePipelineNode(object):
             fast_stillness_window=(
                 args.offer_fast_stillness_window
                 if args.offer_fast_stillness_window > 0 else None),
-            fast_stillness_score=args.offer_fast_stillness_score)
+            fast_stillness_score=args.offer_fast_stillness_score,
+            depth_palm_wait=args.offer_depth_palm_wait)
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
         self._joint_smoother = skeleton_filters.OneEuroFilter(
@@ -2503,6 +2679,7 @@ class HandshakePipelineNode(object):
             return
         palms, offer_check = self._correct_mirrored_offer(
             palms, offered_hand, stamp)
+        offer_check['depth_wait'] = selection.get('depth_wait')
         # Hands の照合で外向きに裏返した場合は戻す。
         palms = self._correct_outward_palms(palms, joint_positions)
         # 首の追従の指令送信中でないときに止める (うなずきが打ち切られないよう)。
@@ -2626,6 +2803,11 @@ class HandshakePipelineNode(object):
                              offered_hand=offered_hand))
         if offer_check is not None:
             self._log_debug(offer_check)
+            depth_wait = offer_check.get('depth_wait')
+            if depth_wait is not None and depth_wait['timeout']:
+                print('[ARMED][WARN] {:.1f} 秒待っても深度の平面の掌が取れなかった'
+                      'ため、推定深度の平面の掌で確定しました (向きの誤差が大きい'
+                      'ことがあります)。'.format(depth_wait['waited']))
             if offer_check['mirrored']:
                 print('[ARMED][WARN] Hands が {} フレーム中 {} フレームで逆の手'
                       'と判定したため、掌と甲を取り違えているとみなして{}手の'
@@ -2639,6 +2821,9 @@ class HandshakePipelineNode(object):
                   .format(offered_hand, medial))
             self._log_debug(dict(event='outward_palm_flip', side=offered_hand,
                                  medial_before_flip=medial))
+        if PALM_SEED:
+            # 試行ごとに乱数の種を差し出した掌から決める (同じ掌なら同じ計画。J0 の案 3)。
+            np.random.seed(_palm_seed(palms[offered_hand]))
         pre_move = self._pre_move
         start_base_pose = None if pre_move is None else pre_move['end']
         planned = self.planner.plan(
@@ -2700,8 +2885,9 @@ class HandshakePipelineNode(object):
                   '--auto-execute でも実機を動かしません。'.format(
                       (motion.get('transition') or {}).get('reason')))
         if result['solved'] and not has_post_process:
-            print('[execute] 後処理 (押し付け/視線 IK) が解けず押し込み区間が'
-                  'ないため、--auto-execute でも実機を動かしません。')
+            print('[execute] 押し込み姿勢が解けず ({}) 押し込み区間が'
+                  'ないため、--auto-execute でも実機を動かしません。'.format(
+                      spik.press_fail_summary() or '落ちた段は不明'))
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -2741,6 +2927,12 @@ class HandshakePipelineNode(object):
         """
         args = self.args
         cause = self._failure_cause(result, motion)
+        if cause == 'timeout':
+            print('[advice] 試行{}: 計画の時間の上限で切れたため ({})、手の出し方は'
+                  '助言しません。'.format(attempt, result.get('plan_timeout_stage')))
+            self._log_debug(dict(event='advice', person=attempt, cause=cause,
+                                 stage=result.get('plan_timeout_stage')))
+            return args.speech_timeout_fail_text
         if cause == 'approach':
             print('[advice] 試行{}: 接近の途中で干渉したため、手の出し方は'
                   '助言しません。'.format(attempt))
@@ -2771,8 +2963,11 @@ class HandshakePipelineNode(object):
     @staticmethod
     def _failure_cause(result, motion,
                        near_hand_fraction=FAILURE_NEAR_HAND_FRACTION):
-        """実機を動かせなかった原因を ``ik``/``no_press``/``near_hand``
-        (干渉 NG が押し込み付近だけ)/``approach`` に分類する。"""
+        """実機を動かせなかった原因を ``timeout`` (計画の時間の上限で切れた。
+        ``plan_timeout_stage`` に段)/``ik``/``no_press``/``near_hand``
+        (干渉 NG が押し込み付近だけ)/``approach``/``transition`` に分類する。"""
+        if PLAN_TIMEOUT_CAUSE and result.get('plan_timed_out'):
+            return 'timeout'
         if not result['solved']:
             return 'ik'
         if result.get('post_process') is None:
@@ -2849,6 +3044,7 @@ class HandshakePipelineNode(object):
                 event='transition_refine', person=job['attempt'],
                 verified=transition['verified'],
                 fraction=transition['fraction'],
+                partial_fraction=transition.get('partial_fraction'),
                 palm_facing=transition.get('palm_facing'),
                 approach_lateral=approach.get('lateral_after'),
                 approach_waypoints=approach.get('n_waypoints'),
@@ -4966,9 +5162,134 @@ class HandshakePipelineNode(object):
             fold['base_move'] = folded['base_move']
             fold['ik_time'] = ik_time
             fold['target_position'] = info['post_process']['target_position']
-            return folded['press_waypoints']
-        return build_press_in_waypoints(
-            hover_wp, joint_names, info['post_process'])
+            refined = folded['press_waypoints']
+        else:
+            refined = build_press_in_waypoints(
+                hover_wp, joint_names, info['post_process'])
+        if PRESS_IN_REFINE_CHECK:
+            try:
+                self._log_refined_press_in_check(
+                    refined, joint_names, offered_hand,
+                    result['robot_arm'], observed)
+            except Exception as e:  # noqa: BLE001 (数えるだけ、実行は止めない)
+                log_debug('[execute][refine-check] 失敗: {!r}'.format(e))
+        return refined
+
+    def _log_refined_press_in_check(self, waypoints, joint_names, offered_hand,
+                                    robot_arm, palm):
+        """解き直した押し込みの区間 ``waypoints`` (hover の次から押し込み後まで、
+        計画の base_link 系) の自己干渉・人体距離・前腕の距離を、計画時の候補選び
+        (``spik.pick_verified_candidate`` の押し込み区間の確かめ) と同じ基準で測り、
+        ログに 1 行 (``[execute][refine-check]``、決まった書式) と JSON
+        (``press_in_refine_check``) で出す。動きは止めない (数えるだけ)。
+
+        人体は差し出し時の骨格 (``_frozen_joint_positions``) を体表面からずらした
+        もの、前腕・手の甲は検出し直した掌 ``palm`` で作る。ロボットの姿勢は
+        測った後に戻す。"""
+        t0 = time.time()
+        with self._lock:
+            frozen = self._frozen_joint_positions
+        collision_joints = (spik.shift_torso_joints_from_surface(
+            frozen, (0.0, 0.0), self.args.torso_surface_offset)
+            if frozen else None)
+        obstacle_links, obstacle_samples = phm.build_obstacle_cache(
+            collision_joints)
+        source = self.verification_pairs
+
+        def subset(keep, pairs):
+            if pairs is None:
+                return None
+            kept = [pair for pair in pairs if keep(pair)]
+            if isinstance(pairs, spik.VerificationPairs):
+                return pairs.with_pairs(kept)
+            return kept
+
+        self_pairs = subset(lambda pair: not isinstance(pair[1], int), source)
+        clearance_source = (None if source is None
+                            else spik.human_clearance_pairs(source))
+        press_groups = spik.offered_hand_clearance_groups(
+            clearance_source, offered_hand, robot_arm,
+            spik.PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
+        forearm_clearance = spik.PRESS_IN_FOREARM_CLEARANCE
+        forearm_pairs = forearm_obs = None
+        elbow = (collision_joints or {}).get('{}Elbow'.format(offered_hand))
+        wrist = (collision_joints or {}).get('{}Wrist'.format(offered_hand))
+        if (forearm_clearance is not None and clearance_source is not None
+                and elbow is not None and wrist is not None
+                and 'x_axis' in palm):
+            forearm_pairs = spik.forearm_clearance_pairs(
+                clearance_source, robot_arm)
+            forearm_obs = spik.forearm_obstacles(
+                elbow, wrist, palm['position'], spik.palm_rotation(palm))
+        tolerance = spik.DEFAULT_COLLISION_VERIFY_TOLERANCE
+        saved_av = self.robot.angle_vector().copy()
+        saved_coords = self.robot.copy_worldcoords()
+        # 各項目の最悪の値と、その点 (1 始まり)。
+        worst = dict(self_=(float('inf'), None), human=(float('inf'), None),
+                     forearm=(float('inf'), None))
+        human_part = None
+        try:
+            for k, wp in enumerate(waypoints):
+                phm._apply_waypoint(self.robot, joint_names, wp)
+                if self_pairs is not None:
+                    dist = spik.collision_pairs_min_distance(
+                        self.robot, self_pairs, collision_joints,
+                        obstacle_links=obstacle_links,
+                        obstacle_samples=obstacle_samples)
+                    dist = min(dist, spik.other_hand_base_clearance(
+                        self.robot, robot_arm))
+                    if dist < worst['self_'][0]:
+                        worst['self_'] = (float(dist), k + 1)
+                if press_groups and obstacle_links:
+                    index, margin, _, _ = spik.grouped_clearance_shortfall(
+                        self.robot, press_groups, obstacle_links)
+                    if index is not None and margin < worst['human'][0]:
+                        worst['human'] = (float(margin), k + 1)
+                        human_part = spik.human_obstacle_names()[index]
+                if forearm_pairs:
+                    clearances = spik.human_obstacle_clearances(
+                        self.robot, forearm_pairs, forearm_obs,
+                        cull_distance=forearm_clearance)
+                    margin = min(clearances.get(i, float('inf'))
+                                 for i in (0, 1)) - forearm_clearance
+                    if margin < worst['forearm'][0]:
+                        worst['forearm'] = (float(margin), k + 1)
+        finally:
+            self.robot.angle_vector(saved_av)
+            self.robot.newcoords(saved_coords)
+        failed = []
+        if worst['self_'][0] < -tolerance:
+            failed.append('self')
+        if worst['human'][0] < 0.0:
+            failed.append('human')
+        if worst['forearm'][0] < 0.0:
+            failed.append('forearm')
+        check_time = time.time() - t0
+
+        def fmt(item):
+            value, k = worst[item]
+            return ('na' if k is None
+                    else '{:+.4f}@{}'.format(value, k))
+
+        # 数える用の決まった書式 (key=value、値は m、@ の後は点の番号 1 始まり)。
+        print('[execute][refine-check] ok={} failed={} self={} human={} '
+              'human_part={} forearm={} n={} time={:.3f}s'.format(
+                  int(not failed), ','.join(failed) or '-', fmt('self_'),
+                  fmt('human'), human_part or '-', fmt('forearm'),
+                  len(waypoints), check_time))
+        self._log_debug(dict(
+            event='press_in_refine_check', ok=not failed, failed=failed,
+            self_min=(None if worst['self_'][1] is None
+                      else worst['self_'][0]),
+            self_index=worst['self_'][1],
+            human_margin=(None if worst['human'][1] is None
+                          else worst['human'][0]),
+            human_index=worst['human'][1], human_part=human_part,
+            forearm_margin=(None if worst['forearm'][1] is None
+                            else worst['forearm'][0]),
+            forearm_index=worst['forearm'][1],
+            n_waypoints=len(waypoints), time=check_time,
+            has_skeleton=bool(frozen)))
 
     @staticmethod
     def _planar_matrix(x, y, yaw):
@@ -6811,6 +7132,11 @@ def build_arg_parser():
         help='差し出し手と判定するスコアの閾値 (合成骨格は {:.2f})。'
             .format(epp.OFFER_SCORE_MIN))
     parser.add_argument(
+        '--offer-depth-palm-wait', type=float, default=epp.DEPTH_PALM_WAIT,
+        help='差し出し手の掌が推定深度の平面のときに確定を見送り、深度の平面の掌を'
+             '待つ上限 [s] (スコアと静止がそろってから数える。0 以下で待たない。'
+             '既定は環境変数 MFIX_OFFER_DEPTH_PALM_WAIT、無ければ 0)。')
+    parser.add_argument(
         '--max-person-distance', type=float, default=3.0,
         help='人物からロボット手先までの距離 [m] の上限 (超えたら候補から外す、0 以下で無効)。')
     parser.add_argument(
@@ -7098,6 +7424,12 @@ def build_arg_parser():
         default='ごめんなさい、横に並ぶ道が見つかりませんでした。'
                 'もう一度手を出してください',
         help='横並び移動が解けず実機を動かせなかったときの発話。')
+    parser.add_argument(
+        '--speech-timeout-fail-text', type=str,
+        default='ごめんなさい、考えるのに時間がかかってしまいました。'
+                'もう一度手を出してください',
+        help='計画の時間の上限 (--plan-time-limit) で切れて実機を動かせなかった'
+             'ときの発話 (MFIX_PLAN_TIMEOUT_CAUSE=0 なら使わない)。')
     parser.add_argument(
         '--side-by-side-segment-time', type=float, default=0.2,
         help='横並び移動の 1 区間にかける最短時間 [秒]。')
@@ -7390,6 +7722,8 @@ def main():
         check_robot_clock_offset(auto_sync=args.clock_sync)
 
     rospy.init_node('run_camera_pipeline_test')
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ時間の内訳を測る (無ければ何もしない)
     node = HandshakePipelineNode(args)
 
     # ハンドの握るサービスが起動時にあるか確認 (無ければ以後は待たない)。

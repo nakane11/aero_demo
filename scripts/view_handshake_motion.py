@@ -54,6 +54,7 @@ from solve_palm_ik import build_collision_verification_pairs  # noqa: E402
 from solve_palm_ik import human_body_obstacles  # noqa: E402
 from solve_palm_ik import human_translation_offset  # noqa: E402
 from solve_palm_ik import load_skeleton_json as load_joint_positions  # noqa: E402,E501
+from solve_palm_ik import low_palm_press_shape  # noqa: E402
 from solve_palm_ik import press_in_target_position  # noqa: E402
 from solve_palm_ik import translate_joint_positions  # noqa: E402
 
@@ -393,9 +394,11 @@ def main():
             return
         palm = dict(position=handshake['palm_position'],
                     y_axis=handshake['palm_normal'])
-        points = np.array([
-            press_in_target_position(palm, np.asarray(post['target_rot']), u)
-            for u in np.linspace(0.0, 1.0, 31)], dtype=np.float32)
+        with low_palm_press_shape(bool(post.get('low_palm_press'))):
+            points = np.array([
+                press_in_target_position(
+                    palm, np.asarray(post['target_rot']), u)
+                for u in np.linspace(0.0, 1.0, 31)], dtype=np.float32)
         press_in_line[0] = viewer._server.scene.add_line_segments(
             '/press_in_target_path',
             points=np.stack([points[:-1], points[1:]], axis=1),

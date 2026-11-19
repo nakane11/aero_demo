@@ -21,11 +21,14 @@ random_palm_poses/ -> random_handshake_poses/)
 """
 
 import argparse
+import collections
+import contextlib
 import itertools
 import json
 import math
 import os
 import sys
+import threading
 import time
 import zlib
 
@@ -107,11 +110,28 @@ DEFAULT_BASE_X_RANGE = (HUMAN_FRONT_DISTANCE - BASE_X_MOVABLE_HALF_RANGE,
 DEFAULT_BASE_Y_RANGE = (-BASE_Y_MOVABLE_HALF_RANGE, BASE_Y_MOVABLE_HALF_RANGE)
 DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 
-# 1 目標姿勢あたりの初期値の数 (0 番目は seed_arm_pose、残りは一様乱数)。
-DEFAULT_ATTEMPTS_PER_POSE = 512
 
-# 干渉回避付きバッチ IK の反復回数・収束閾値。
-DEFAULT_COLLISION_IK_STOP = 80
+
+def env_int(name, default):
+    """環境変数 ``name`` の整数 (無ければ ``default``)。反復・初期値の数のつまみ (MFIX_*) を測るため。
+    import 時に読むので、ノードの子プロセス・run_pipeline_test の子プロセスにも同じ値が届く。"""
+    value = os.environ.get(name, '')
+    return int(value) if value.strip() else default
+
+
+def env_optional_int(name, default):
+    """``env_int`` と同じで、'none' なら None。"""
+    value = os.environ.get(name, '').strip()
+    if not value:
+        return default
+    return None if value.lower() == 'none' else int(value)
+
+
+# 1 目標姿勢あたりの初期値の数 (0 番目は seed_arm_pose、残りは一様乱数)。MFIX_ATTEMPTS_PER_POSE で変える。
+DEFAULT_ATTEMPTS_PER_POSE = env_int('MFIX_ATTEMPTS_PER_POSE', 512)
+
+# 干渉回避付きバッチ IK の反復回数・収束閾値。反復は MFIX_COLLISION_IK_STOP で変える。
+DEFAULT_COLLISION_IK_STOP = env_int('MFIX_COLLISION_IK_STOP', 80)
 DEFAULT_COLLISION_IK_THRE = 0.03  # [m]
 DEFAULT_COLLISION_IK_RTHRE = math.radians(8.0)  # [rad]
 
@@ -165,7 +185,8 @@ PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
 # 後処理判定の腕 IK (ヤコビアン法、干渉回避・台車なし) の反復回数・収束閾値。
-DEFAULT_POST_PROCESS_IK_STOP = 40
+# 反復は MFIX_POST_PROCESS_IK_STOP で変える。
+DEFAULT_POST_PROCESS_IK_STOP = env_int('MFIX_POST_PROCESS_IK_STOP', 40)
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
@@ -175,6 +196,20 @@ REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
 # 最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる角度 [rad] or None)。
 REFINE_LEG_STAGES = (('fixed', True, None),
                      ('limited', False, math.radians(8.0)))
+# 最終補正の 'fixed' の段で脚を固定する角度 (develop V4 案 1、V_report 8.1)。'planned' は計画の押し込み後の脚
+# (押し込みの区間で hover から計画の押し込み後への関節の補間を IK の初期値にし、押し込み後は脚をその角度に固定)、
+# 'hover' は hover の脚のまま (前の形。脚が計画と違うまま腰で合わせるので、押し込みの区間で腰ピッチが計画と違う
+# 向きに大きく動く)。
+REFINE_FIXED_LEGS = os.environ.get('MFIX_REFINE_FIXED_LEGS', 'planned')
+if REFINE_FIXED_LEGS not in ('planned', 'hover'):
+    raise ValueError('MFIX_REFINE_FIXED_LEGS は planned か hover です: {}'.format(
+        REFINE_FIXED_LEGS))
+# 最終補正の 'limited' の段 (脚を hover から ±leg_range) で、腰を上げない側の制限 (_pin_leg_floor) の基準を幅で
+# 狭めた後の可動域にし、両側とも ±leg_range を上限にする (True)。False は前の形: 元の可動域を基準に点ごとに
+# 掛け直すので、腰が上がる側は 1 点ごとに LEG_RISE_PIN_TOLERANCE (0.40 rad) まで動け、±8° が効かない
+# (inventory B10。80b96f2 で ±8° の段を入れたのと同じコミットで許容を 1e-6 から広げたための食い違い)。
+# 押し込みの計画 (leg_range なし) は変わらない。MFIX_PIN_LEG_NARROW=0 で前の形。
+PIN_LEG_NARROW = os.environ.get('MFIX_PIN_LEG_NARROW', '1') != '0'
 # 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
 # 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
 REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
@@ -183,10 +218,15 @@ REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
 REFINE_STAGE_MAJOR = True
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
-DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
+# MFIX_POST_PROCESS_MAX_CANDIDATES で変える ('none' で無制限)。
+DEFAULT_POST_PROCESS_MAX_CANDIDATES = env_optional_int(
+    'MFIX_POST_PROCESS_MAX_CANDIDATES', None)
 
 # 後処理判定の視線 IK (首 3 関節、rotation_mask='xy') の反復回数・収束閾値。
-DEFAULT_POST_PROCESS_GAZE_IK_STOP = 40
+# 反復は MFIX_POST_PROCESS_GAZE_IK_STOP で変える (無ければ MFIX_POST_PROCESS_IK_STOP と同じ。
+# 最終補正 (refine_post_process) は視線も腕と同じ反復で解くため)。
+DEFAULT_POST_PROCESS_GAZE_IK_STOP = env_int('MFIX_POST_PROCESS_GAZE_IK_STOP',
+                                            DEFAULT_POST_PROCESS_IK_STOP)
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 # 腕と視線の同時 IK が解けないときは腕だけで押し込み、首だけで掌へ向け直す。
 # 視線のずれがこれ未満なら採用する。
@@ -509,19 +549,109 @@ def press_in_final_position(palm, target_rot):
             + press_in_slide_direction(palm, target_rot) * PRESS_IN_ADVANCE)
 
 
+LOW_PALM_PRESS_DEFAULT_SHAPE = (0.95, 0.05, 0.10)
+
+
+def _parse_low_palm_press(value):
+    """``MFIX_LOW_PALM_PRESS`` の値を ``(いつ, (H, 長さ, 浮き))`` に ('0'・空なら None)。
+
+    ``'late'`` (既定)・``'late:<H>:<長さ>:<浮き>'`` は既定の形で押し込み後まで解けないときだけ低い掌の形で
+    解き直す。``'1'``・``'short:<H>:<長さ>:<浮き>'`` は前の J28 (条件に入れば初めから低い掌の形)。
+    """
+    if value in ('', '0'):
+        return None
+    if value == '1':
+        return 'early', LOW_PALM_PRESS_DEFAULT_SHAPE
+    if value == 'late':
+        return 'late', LOW_PALM_PRESS_DEFAULT_SHAPE
+    parts = value.split(':')
+    if len(parts) != 4 or parts[0] not in ('short', 'late'):
+        raise ValueError('MFIX_LOW_PALM_PRESS は late・1・0・short:<H>:<長さ>:<浮き>・'
+                         'late:<H>:<長さ>:<浮き> のどれかです: {}'.format(value))
+    return ('early' if parts[0] == 'short' else 'late',
+            tuple(float(v) for v in parts[1:]))
+
+
+# 低い掌で滑らせる向きが縦に近いとき (滑らせる向きの上下成分が LOW_PALM_SLIDE_UP を超えて hover が掌の下に
+# なり、かつ既定の形の hover の高さが H [m] 未満) だけ、縦の滑らせを <長さ> [m] に縮め、法線の浮きを <浮き> [m]
+# にする (develop J28、J_report 9.19〜9.21)。押し込みの最終目標 (掌が重なる位置) は変えない。低い掌では掌の
+# 15 cm 下から指を上に向けて差し上げる形になり、手先が届かない・押し込みで脚が追いつかない。
+# 既定 (late) では条件に入っても先に既定の形で解き、押し込み後まで解けないときだけ低い掌の形で解き直す
+# (初めから低い形にすると試行22 の掌で横並び移動が上限 5 秒に収まらない、master_fixes/report_t22.md)。
+# 低い掌の形で解いた結果は post_process の 'low_palm_press' が True で、hover での解き直し
+# (refine_post_process) もその形で解く。MFIX_LOW_PALM_PRESS=1 で前の J28 (初めから低い形)、=0 で無効。
+_LOW_PALM_PRESS_SETTING = _parse_low_palm_press(
+    os.environ.get('MFIX_LOW_PALM_PRESS', 'late'))
+LOW_PALM_PRESS_MODE = (None if _LOW_PALM_PRESS_SETTING is None
+                       else _LOW_PALM_PRESS_SETTING[0])
+LOW_PALM_PRESS = (None if _LOW_PALM_PRESS_SETTING is None
+                  else _LOW_PALM_PRESS_SETTING[1])
+LOW_PALM_SLIDE_UP = 0.7
+# 'late' で低い掌の形を使う区間 (low_palm_press_shape の中) か。ノードの解き直しは別スレッドのことがあるので
+# スレッドごとに持つ。
+_LOW_PALM_STATE = threading.local()
+
+
+@contextlib.contextmanager
+def low_palm_press_shape(active=True):
+    """'late' のとき、この中だけ (``active`` が真なら) 低い掌の形を使う ('early'・無効では何もしない)。"""
+    previous = getattr(_LOW_PALM_STATE, 'active', False)
+    _LOW_PALM_STATE.active = bool(active)
+    try:
+        yield
+    finally:
+        _LOW_PALM_STATE.active = previous
+
+
+def _low_palm_shape_applies(palm, target_rot, slide=None):
+    """掌・向きが低い掌の形の条件 (縦の滑らせ・既定の形の hover の高さ < H) に入るか。"""
+    if LOW_PALM_PRESS is None:
+        return False
+    if slide is None:
+        slide = press_in_slide_direction(palm, target_rot)
+    if float(slide[2]) <= LOW_PALM_SLIDE_UP:
+        return False
+    normal = np.asarray(palm['y_axis'], dtype=np.float64)
+    final = press_in_final_position(palm, target_rot)
+    hover_z = float(final[2] - slide[2] * (PRESS_IN_SLIDE + PRESS_IN_ADVANCE)
+                    + normal[2] * PRESS_IN_LIFT)
+    return hover_z < LOW_PALM_PRESS[0]
+
+
+def low_palm_shape_differs(palm, target_rots):
+    """'late' の解き直しで形が変わる向きが ``target_rots`` に 1 つでもあるか。"""
+    return LOW_PALM_PRESS_MODE == 'late' and any(
+        _low_palm_shape_applies(palm, rot) for rot in target_rots)
+
+
+def press_in_shape(palm, target_rot):
+    """押し込みの形 ``(滑らせる向き, 長さ, 法線の浮き)``。既定は ``PRESS_IN_SLIDE``・``PRESS_IN_LIFT``、
+    ``LOW_PALM_PRESS`` の低い掌のとき ('late' は ``low_palm_press_shape`` の中だけ) 短い縦の滑らせ・
+    大きい浮きにする。"""
+    slide = press_in_slide_direction(palm, target_rot)
+    length = PRESS_IN_SLIDE
+    lift = PRESS_IN_LIFT
+    use = (LOW_PALM_PRESS_MODE == 'early'
+           or (LOW_PALM_PRESS_MODE == 'late'
+               and getattr(_LOW_PALM_STATE, 'active', False)))
+    if use and _low_palm_shape_applies(palm, target_rot, slide):
+        _, length, lift = LOW_PALM_PRESS
+    return slide, length, lift
+
+
 def press_in_target_position(palm, target_rot, u):
     """押し込み区間の手先目標位置 (``u``: 指先方向の進み、0 = hover、1 = 最終目標)。"""
     normal = np.asarray(palm['y_axis'], dtype=np.float64)
     final = press_in_final_position(palm, target_rot)
-    slide = press_in_slide_direction(palm, target_rot)
-    return (final - slide * (PRESS_IN_SLIDE + PRESS_IN_ADVANCE) * (1.0 - u)
-            + normal * PRESS_IN_LIFT * (1.0 - u ** PRESS_IN_CURVE_EXPONENT))
+    slide, length, lift = press_in_shape(palm, target_rot)
+    return (final - slide * (length + PRESS_IN_ADVANCE) * (1.0 - u)
+            + normal * lift * (1.0 - u ** PRESS_IN_CURVE_EXPONENT))
 
 
 def press_in_base_shift(palm, target_rot, u):
     """押し込み区間の進み ``u`` での台車の hover からの平行移動量 (z = 0)。"""
-    slide = press_in_slide_direction(palm, target_rot)
-    shift = (slide * (PRESS_IN_SLIDE + PRESS_IN_ADVANCE)
+    slide, length, _ = press_in_shape(palm, target_rot)
+    shift = (slide * (length + PRESS_IN_ADVANCE)
              * PRESS_IN_BASE_RATIO * u)
     shift[2] = 0.0
     return shift
@@ -1030,42 +1160,111 @@ def human_foot_segments(joint_positions):
 def human_body_obstacles(joint_positions):
     """骨格の関節位置から全身 (差し出した手・足を含む) の障害物 ``Cylinder`` のリストを作る。
     個数・順序は常に一定 (``human_obstacle_names``) で、欠けた部位はダミーで埋める。"""
+    return _human_body_obstacles(
+        joint_positions, _cylinder_between, _palm_obstacle,
+        _palm_obstacle_partial, _dummy_cylinder)
+
+
+def _human_body_obstacles(joint_positions, cylinder_between, palm_obstacle,
+                          palm_obstacle_partial, dummy_cylinder):
+    """``human_body_obstacles`` の本体。円柱を作る関数を引数で受け取る
+    (``human_body_obstacles_reused`` は同じ入力の円柱を使い回す関数を渡す)。"""
     joint_positions = _fill_missing_joints_straight_down(joint_positions)
     obstacles = []
     for name_a, name_b, default_radius in HUMAN_COLLISION_SEGMENTS:
         if name_a in joint_positions and name_b in joint_positions:
             radius = _torso_segment_radius(
                 name_a, name_b, default_radius, joint_positions)
-            obstacles.append(_cylinder_between(
+            obstacles.append(cylinder_between(
                 joint_positions[name_a], joint_positions[name_b], radius))
         else:
-            obstacles.append(_dummy_cylinder(default_radius))
+            obstacles.append(dummy_cylinder(default_radius))
     for side in ('R', 'L'):
         palm_names = ['{}Hand{}'.format(side, idx)
                      for idx in HAND_PALM_LANDMARKS]
         available = [joint_positions[name] for name in palm_names
                     if name in joint_positions]
         if len(available) == len(palm_names):
-            obstacles.append(_palm_obstacle(available))
+            obstacles.append(palm_obstacle(available))
         else:
-            partial = _palm_obstacle_partial(available)
+            partial = palm_obstacle_partial(available)
             obstacles.append(
                 partial if partial is not None
-                else _dummy_cylinder(HAND_PALM_RADIUS))
+                else dummy_cylinder(HAND_PALM_RADIUS))
         for base_idx, tip_idx in HAND_FINGER_LANDMARKS:
             base_name = '{}Hand{}'.format(side, base_idx)
             tip_name = '{}Hand{}'.format(side, tip_idx)
             if base_name in joint_positions and tip_name in joint_positions:
-                obstacles.append(_cylinder_between(
+                obstacles.append(cylinder_between(
                     joint_positions[base_name], joint_positions[tip_name],
                     HAND_FINGER_RADIUS))
             else:
-                obstacles.append(_dummy_cylinder(HAND_FINGER_RADIUS))
+                obstacles.append(dummy_cylinder(HAND_FINGER_RADIUS))
     # 足は既存の添字を変えないよう末尾に置く。
     for segment in human_foot_segments(joint_positions):
-        obstacles.append(_dummy_cylinder(FOOT_RADIUS) if segment is None
-                         else _cylinder_between(*segment))
+        obstacles.append(dummy_cylinder(FOOT_RADIUS) if segment is None
+                         else cylinder_between(*segment))
     return obstacles
+
+
+# 人体の障害物の円柱を、同じ入力 (端点・点・半径の値のバイト列) なら作り直さず
+# 使い回す (``human_body_obstacles_reused``)。横並び移動・寄せの検証
+# (``TransitionChecker``) は差し出した腕だけ動かした骨格で何度も作り直すので、
+# 胴・脚・頭・反対の腕は同じ円柱になる。値は作り直すのと同じ (同じ入力の同じ
+# 計算)。使い回した円柱は読むだけで、動かさないこと。
+_OBSTACLE_REUSE_CACHE = {}
+_OBSTACLE_REUSE_MAX = 20000
+_NONE = object()
+
+
+def _value_key(x):
+    a = np.asarray(x, dtype=np.float64)
+    return a.shape, a.tobytes()
+
+
+def _scalar_key(r):
+    return type(r).__name__, float(r).hex()
+
+
+def _obstacle_reused(key, make):
+    value = _OBSTACLE_REUSE_CACHE.get(key)
+    if value is None:
+        value = make()
+        if value is None:
+            value = _NONE
+        if len(_OBSTACLE_REUSE_CACHE) >= _OBSTACLE_REUSE_MAX:
+            _OBSTACLE_REUSE_CACHE.clear()
+        _OBSTACLE_REUSE_CACHE[key] = value
+    return None if value is _NONE else value
+
+
+def _cylinder_between_reused(p0, p1, radius):
+    return _obstacle_reused(
+        ('cyl', _value_key(p0), _value_key(p1), _scalar_key(radius)),
+        lambda: _cylinder_between(p0, p1, radius))
+
+
+def _palm_obstacle_reused(points):
+    return _obstacle_reused(('palm', _value_key(points)),
+                            lambda: _palm_obstacle(points))
+
+
+def _palm_obstacle_partial_reused(points):
+    return _obstacle_reused(('palm_partial', _value_key(points)),
+                            lambda: _palm_obstacle_partial(points))
+
+
+def _dummy_cylinder_reused(radius):
+    return _obstacle_reused(('dummy', _scalar_key(radius)),
+                            lambda: _dummy_cylinder(radius))
+
+
+def human_body_obstacles_reused(joint_positions):
+    """``human_body_obstacles`` と同じ値の円柱のリスト。円柱は同じ入力なら前に
+    作ったものを使い回す (読むだけの呼び出し元向け)。"""
+    return _human_body_obstacles(
+        joint_positions, _cylinder_between_reused, _palm_obstacle_reused,
+        _palm_obstacle_partial_reused, _dummy_cylinder_reused)
 
 
 def offered_hand_obstacle_indices(hand):
@@ -1111,6 +1310,15 @@ def forearm_obstacles(elbow, wrist, palm_pos, palm_rot):
     return [_cylinder_between(elbow, wrist, HUMAN_FOREARM_RADIUS),
             _cylinder_between(*hand_back_segment(wrist, palm_pos, palm_rot),
                               HUMAN_HAND_BACK_RADIUS)]
+
+
+def forearm_obstacles_reused(elbow, wrist, palm_pos, palm_rot):
+    """``forearm_obstacles`` と同じ値。円柱は同じ入力なら使い回す
+    (``human_body_obstacles_reused``)。"""
+    return [_cylinder_between_reused(elbow, wrist, HUMAN_FOREARM_RADIUS),
+            _cylinder_between_reused(
+                *hand_back_segment(wrist, palm_pos, palm_rot),
+                HUMAN_HAND_BACK_RADIUS)]
 
 
 def palm_rotation(palm):
@@ -2385,6 +2593,54 @@ def sync_leg_mimics(robot):
             joint.joint_angle(float(joint.joint_angle()))
 
 
+# 人ごと・計画ごとにロボットを warmup の後の状態へ戻し、リンクの座標を角度から作り直す (Q の R7)。
+# '0' で前の形 (戻さず、前に処理した人の角度・リンクの座標の丸めの履歴を持ち越す)。
+ROBOT_STATE_RESET = os.environ.get('MFIX_ROBOT_STATE_RESET', '1') != '0'
+
+
+def refresh_link_coords(robot):
+    """関節の角度はそのままに、各関節の子リンクの局所座標を角度 0 の形 (``default_coords``) から 1 回の回転
+    (直動は 1 回の平行移動) で作り直す。
+
+    skrobot は関節を前の角度との差で回すので、角度が同じでもリンクの座標の下位ビット (5e-8 程度) が
+    それまでの角度の通り道で変わる。作り直すと FK が関節の角度と根の座標だけで決まる (Q の R7)。"""
+    from skrobot.model.joint import LinearJoint, RotationalJoint
+    for link in robot.link_list:
+        joint = getattr(link, 'joint', None)
+        if not isinstance(joint, (RotationalJoint, LinearJoint)):
+            continue
+        child = joint.child_link
+        child.newcoords(joint.default_coords.copy_coords())
+        angle = joint.joint_angle()
+        if angle:
+            if isinstance(joint, RotationalJoint):
+                child.rotate(angle, joint.axis, skip_normalization=True)
+            else:
+                child.translate(angle * joint.axis)
+
+
+def robot_state(robot):
+    """``restore_robot_state`` で戻すロボットの状態 (根の座標と、全関節の角度をそのままの値で)。"""
+    from skrobot.model.joint import LinearJoint, RotationalJoint
+    angles = [(link.joint, link.joint.joint_angle()) for link in robot.link_list
+              if isinstance(getattr(link, 'joint', None), (RotationalJoint, LinearJoint))]
+    return robot.copy_worldcoords(), angles
+
+
+def restore_robot_state(robot, state):
+    """``robot_state`` の状態に戻し、リンクの座標を角度から作り直す。人ごとの計算の始めに呼び、
+    結果が前に処理した人 (角度の引き継ぎ・リンクの座標の丸めの履歴) によらないようにする (R7)。
+    ``MFIX_ROBOT_STATE_RESET=0`` なら何もしない。"""
+    if not ROBOT_STATE_RESET or state is None:
+        return
+    coords, angles = state
+    robot.newcoords(coords.copy_worldcoords())
+    # 値は保存したそのもの (可動域の切り詰め・ミミックのフックを通さない。リンクの座標は下で作り直す)。
+    for joint, angle in angles:
+        joint._joint_angle = angle
+    refresh_link_coords(robot)
+
+
 def settle_legs(robot, target_coords, move_target, whole_body, stop, thre,
                 rthre):
     """脚を含む IK の直後に、ミミックを主関節に合わせ、脚を固定して腕・腰だけで
@@ -2574,11 +2830,13 @@ def _narrow_leg_limits(robot, limits, leg_range):
 def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
                    **kwargs):
     """``_solve_press_in`` を ``leg_rise`` (None なら ``PRESS_IN_LEG_RISE``) の
-    方針で解く。"""
+    方針で解く。脚の角度を ``posture_goal`` で決めるとき (``fix_legs`` と一緒) は、腰を上げない側の制限は
+    使わない (計画の押し込み後の脚へ動かすため)。"""
     global LAST_PRESS_IN_PARTIAL, LAST_PRESS_IN_FAILURE
     if leg_rise is None:
         leg_rise = PRESS_IN_LEG_RISE
-    if leg_rise == 'off':
+    if leg_rise == 'off' or (kwargs.get('posture_goal') is not None
+                             and kwargs.get('fix_legs')):
         return _solve_press_in(robot, robot_arm, palm, target_rot,
                                limit_legs=False, **kwargs)
     start_time = time.time()
@@ -2608,7 +2866,8 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
                     gaze_ik_rthre=DEFAULT_POST_PROCESS_GAZE_IK_RTHRE,
                     gaze=True, arm_only_fallback=True,
                     n_points=PRESS_IN_PATH_POINTS, limit_legs=False,
-                    fix_legs=False, leg_range=None, skip_unreachable=False):
+                    fix_legs=False, leg_range=None, skip_unreachable=False,
+                    posture_goal=None):
     """hover 姿勢の ``robot`` から押し込みの曲線 (``press_in_target_position``) を ``n_points`` 等分した
     手先目標を、途中は腕だけの IK、最終目標は ``solve_post_process`` で順に解く。
 
@@ -2620,18 +2879,29 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
     ``limit_legs``: 各点の IK の前に脚を直前の姿勢から腰が高くなる側へ動けないよう狭める。
     ``fix_legs``: 脚を IK で動かさない。``leg_range`` [rad]: 足首・膝を今の角度から両側にこの幅まで。
     ``skip_unreachable``: 先頭の点が可動域で届かないとき、届く点から始める (最終目標より手前のみ)。
+    ``posture_goal`` (``fix_legs`` のときだけ): 押し込み後の姿勢 ``{関節名: 角度}`` (計画の押し込み後)。関節を
+    hover からこの姿勢へ区間に沿って補間して各点の IK の初期値にし、途中の点は脚も IK で動かし、押し込み後は
+    この姿勢の脚に固定して解く。
     """
+    if not fix_legs:
+        posture_goal = None
     leg_limits = _leg_limits(robot)
-    # 狭める順は、幅 → 腰を上げない側 (後者が下限・上限の片側を上書きする)。
+    # 狭める順は、幅 → 腰を上げない側。腰を上げない側の基準 (pin_base) は、PIN_LEG_NARROW なら幅で狭めた後の
+    # 可動域 (両側とも幅の内)、そうでなければ元の可動域 (上がる側は幅を超えて LEG_RISE_PIN_TOLERANCE まで、
+    # 点ごとに掛け直す)。終わったら元の可動域に戻す。
+    pin_base = leg_limits
     if leg_range is not None:
         _narrow_leg_limits(robot, leg_limits, leg_range)
+        if PIN_LEG_NARROW:
+            pin_base = _leg_limits(robot)
     if limit_legs:
-        _pin_leg_floor(robot, leg_limits)
+        _pin_leg_floor(robot, pin_base)
     try:
         return _solve_press_in_path(
             robot, robot_arm, palm, target_rot, stop, thre, rthre,
             gaze_ik_stop, gaze_ik_rthre, gaze, arm_only_fallback, n_points,
-            leg_limits if limit_legs else None, fix_legs, skip_unreachable)
+            pin_base if limit_legs else None, fix_legs, skip_unreachable,
+            posture_goal)
     finally:
         _restore_leg_limits(robot, leg_limits)
 
@@ -2652,19 +2922,52 @@ LAST_PRESS_IN_PARTIAL = None
 # (pick_verified_candidate の partial_press_max_remaining の既定)。
 PARTIAL_PRESS_MAX_REMAINING = 0.08
 
+# 押し込みが解けなかった段 (``_solve_press_in_path`` の最後の失敗) と、候補選び (``pick_verified_candidate``)
+# で押し込みに落ちた候補の段ごとの数 (develop J25 のログの直し)。ログだけで結果は変えない。
+PRESS_IN_FAIL = {'stage': None}
+PICK_PRESS_FAILS = collections.Counter()
+PRESS_FAIL_LABELS = {
+    'press_ik': '押し込み区間の IK', 'settle': '押し込み区間の脚の整え',
+    'post': '押し込み後 (押し付け/視線 IK)',
+    'check': '押し込み区間の干渉・人との距離の確かめ', None: '段が不明'}
+
+
+def press_fail_summary(counter=None):
+    """``PICK_PRESS_FAILS`` (または ``counter``) を「段 N 候補、…」の文字列にする (無ければ '')。"""
+    counter = PICK_PRESS_FAILS if counter is None else counter
+    return '、'.join('{} {} 候補'.format(PRESS_FAIL_LABELS.get(k, k), n)
+                    for k, n in counter.most_common())
+
 
 def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                          rthre, gaze_ik_stop, gaze_ik_rthre, gaze,
                          arm_only_fallback, n_points, pin_limits,
-                         fix_legs=False, skip_unreachable=False):
+                         fix_legs=False, skip_unreachable=False,
+                         posture_goal=None):
     global LAST_PRESS_IN_FAILURE, LAST_PRESS_IN_PARTIAL
     LAST_PRESS_IN_FAILURE = None
     LAST_PRESS_IN_PARTIAL = None
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
     initial_coords = robot.copy_worldcoords()
+    if posture_goal is not None:
+        goal_angle_vector = initial_angle_vector.copy()
+        for i, joint in enumerate(robot.joint_list):
+            if joint.name in posture_goal:
+                goal_angle_vector[i] = posture_goal[joint.name]
+
+    def move_posture(u):
+        # develop V4 (案 1): 各点の IK の初期値を hover → posture_goal の関節の補間にする。押し込み後 (u = 1) は
+        # 脚をこの角度のまま固定して解く。
+        if posture_goal is None:
+            return
+        robot.angle_vector(initial_angle_vector
+                           + (goal_angle_vector - initial_angle_vector) * u)
+        sync_leg_mimics(robot)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
-    body_links = _body_link_list(whole_body, fix_legs)
+    # posture_goal があるときは、途中の点の脚は IK で動かす (脚を補間の角度に縛ると、腰の高さが合わず途中の点で
+    # 届かないことがある、V_report 8.1)。押し込み後だけ脚を固定する。
+    body_links = _body_link_list(whole_body, fix_legs and posture_goal is None)
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
     final_position = press_in_final_position(palm, target_rot)
     last_hand = [np.asarray(move_target.worldpos(), dtype=np.float64).copy()]
@@ -2697,6 +3000,7 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
     base_path = []
     for k in range(1, n_points):
         move_base(k / float(n_points))
+        move_posture(k / float(n_points))
         target_coords = Coordinates(
             pos=press_in_target_position(
                 palm, target_rot, k / float(n_points)).tolist(),
@@ -2715,6 +3019,9 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                 print('  [press-in] 押し込み区間の {}/{} 点目は届かないため、'
                       '飛ばします。'.format(k, n_points))
                 continue
+            print('  [press-in] 押し込み区間の {}/{} 点目 (u={:.3f}) の IK が解けない'
+                  .format(k, n_points, k / float(n_points)))
+            PRESS_IN_FAIL['stage'] = 'press_ik'
             LAST_PRESS_IN_FAILURE = dict(point=k, n_points=n_points,
                                          stage='ik')
             keep_partial()
@@ -2722,6 +3029,9 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
             return None
         if not settle_legs(robot, target_coords, move_target, whole_body, stop,
                            thre, rthre):
+            print('  [press-in] 押し込み区間の {}/{} 点目 (u={:.3f}) の脚の整えで解けない'
+                  .format(k, n_points, k / float(n_points)))
+            PRESS_IN_FAIL['stage'] = 'settle'
             LAST_PRESS_IN_FAILURE = dict(point=k, n_points=n_points,
                                          stage='settle')
             keep_partial()
@@ -2737,11 +3047,16 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
         base_path.append([float(v) for v in robot.base_link.worldpos()[:2]]
                          + [float(yaw)])
     move_base(1.0)
+    move_posture(1.0)
+    if ROBOT_STATE_RESET:
+        # R7: 押し込み後の確かめ (手先・視線の IK) がリンクの座標の丸めの履歴によらないように。
+        refresh_link_coords(robot)
     post = solve_post_process(
         robot, robot_arm, palm, target_rot, stop=stop, thre=thre,
         rthre=rthre, gaze_ik_stop=gaze_ik_stop, gaze_ik_rthre=gaze_ik_rthre,
         gaze=gaze, arm_only_fallback=arm_only_fallback, fix_legs=fix_legs)
     if post is None:
+        PRESS_IN_FAIL['stage'] = 'post'
         LAST_PRESS_IN_FAILURE = dict(point=n_points, n_points=n_points,
                                      stage='final')
         keep_partial()
@@ -2832,9 +3147,18 @@ def _rotation_angle_between(rot_a, rot_b):
 
 
 def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
-                        leg_stages=REFINE_LEG_STAGES, planned_palm=None,
-                        rotation_blends=REFINE_ROTATION_BLENDS,
-                        partial_press_max_remaining=None):
+                        **kwargs):
+    """``_refine_post_process`` を計画と同じ押し込みの形で解く (計画が低い掌の形で解けていれば
+    (``planned_post['low_palm_press']``) 低い掌の形)。"""
+    with low_palm_press_shape(bool(planned_post.get('low_palm_press'))):
+        return _refine_post_process(robot, robot_arm, palm, turn_deg,
+                                    planned_post, **kwargs)
+
+
+def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
+                         leg_stages=REFINE_LEG_STAGES, planned_palm=None,
+                         rotation_blends=REFINE_ROTATION_BLENDS,
+                         partial_press_max_remaining=None):
     """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終補正。
 
     ``robot`` は hover 目標の姿勢、``palm`` はそのワールド系、``planned_post`` は計画時の
@@ -2885,6 +3209,12 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
         return info
     planned_angles = dict(zip(planned_post['joint_names'],
                               planned_post['joint_angle_vector']))
+    # develop V4 (案 1): 脚を固定する段は、脚を計画の押し込み後の角度に固定する (hover の脚のままだと腰で合わせる
+    # ことになり、計画の押し込み後・横並び移動と脚・腰が大きく違う)。
+    posture_goal = None
+    if REFINE_FIXED_LEGS == 'planned':
+        posture_goal = {name: float(angle)
+                        for name, angle in planned_angles.items()}
     blends = rotation_blends if planned_palm is not None else (0.0,)
     candidates = []
     for blend in blends:
@@ -2904,7 +3234,8 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
              if REFINE_STAGE_MAJOR else
              [(stage, c) for c in candidates for stage in leg_stages])
     for (legs, fix_legs, leg_range), (blend, candidate, target_rot) in order:
-        stage = dict(fix_legs=fix_legs, leg_range=leg_range)
+        stage = dict(fix_legs=fix_legs, leg_range=leg_range,
+                     posture_goal=posture_goal if fix_legs else None)
         post = solve_press_in(robot, robot_arm, candidate, target_rot,
                               arm_only_fallback=False,
                               skip_unreachable=True, **stage)
@@ -3249,6 +3580,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
 
     fallback = None
     examined = 0
+    PICK_PRESS_FAILS.clear()
     for cost, candidate_index in candidates:
         if (post_process_max_candidates is not None
                 and examined >= post_process_max_candidates):
@@ -3277,17 +3609,20 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             record('hover_clearance')
             continue
         # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決め、hover・押し込みの両方に差し替える。
+        PRESS_IN_FAIL['stage'] = None
         post_result = solve_press_in(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop,
             thre=post_process_thre, rthre=post_process_rthre)
+        fail_stage = None
         press_failure = (None if post_result is not None
                          else LAST_PRESS_IN_FAILURE)
         partial = (LAST_PRESS_IN_PARTIAL if post_result is None
                    and partial_press_max_remaining is not None else None)
         if post_result is None:
-            print('  [press-in] {} の候補は押し込み区間の IK が解けません'
-                  'でした。'.format(label))
+            fail_stage = PRESS_IN_FAIL['stage']
+            print('  [press-in] {} の候補は押し込みが解けませんでした ({})。'.format(
+                label, PRESS_FAIL_LABELS.get(fail_stage, fail_stage)))
         if post_result is None or \
                 float(robot.waist_link.worldpos()[2]) >= hover_waist_z:
             robot.angle_vector(hover_av)
@@ -3330,6 +3665,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                 press_failure = dict(point=path_rejected_at[0] + 1,
                                      n_points=n_path, stage='verify')
                 post_result = None
+                fail_stage = 'check'
             else:
                 post_result = dict(
                     post_result,
@@ -3356,12 +3692,14 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             if first_passed is None:
                 first_passed = picked
             continue
+        PICK_PRESS_FAILS[fail_stage] += 1
         record('press_fail', hover_av=hover_av,
                base_pose=base_poses[candidate_index],
                press_failure=press_failure)
         print('  [post-process] {} の候補は干渉検証を通過した '
-              'が、後処理判定 (押し付け/視線 IK) には失敗したため、次に '
-              '曲げ量コストが低い候補を試します。'.format(label))
+              'が、後処理判定 ({}) には失敗したため、次に '
+              '曲げ量コストが低い候補を試します。'.format(
+                  label, PRESS_FAIL_LABELS.get(fail_stage, fail_stage)))
         if first_partial is None and partial is not None:
             # 行けるところまで押し込んで待つ姿勢 (最後まで押し込める候補が
             # 無いときに使う)。
@@ -3403,8 +3741,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     turn_index, angle_vector, base_pose, fallback_cost = fallback
     print('  [post-process] 調べた範囲の候補で後処理判定に全て失敗 '
           'した (または上限に達した) ため、turn={:.0f}deg '
-          '(bend_cost={:.4f}) の候補を後処理前の解として採用します。'
-          .format(turn_degs[turn_index], fallback_cost))
+          '(bend_cost={:.4f}) の候補を後処理前の解として採用します (落ちた段: {})。'
+          .format(turn_degs[turn_index], fallback_cost,
+                  press_fail_summary() or '-'))
     return (turn_index, angle_vector, base_pose, None)
 
 
@@ -3570,6 +3909,58 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  standing_x,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
                                  deadline=None, **kwargs):
+    """``_solve_person_ik_side_by_side`` を既定の押し込みの形で解き、押し込み後まで解けず
+    (``picked`` が None か後処理の結果が None)、低い掌の形で形が変わる向きがあれば ('late'、
+    ``LOW_PALM_PRESS``)、低い掌の形で解き直す。``deadline`` を過ぎていれば解き直さない。
+    解き直しで押し込み後まで解ければその結果 (後処理の結果の 'low_palm_press' が True)、解けなければ
+    既定の形の結果を返す。時間は両方の合計。返り値は ``_solve_person_ik_side_by_side`` と同じ。
+    """
+    # 解き直しを初めから低い形で解いたとき (MFIX_LOW_PALM_PRESS=1) と同じ乱数で解く。
+    random_state = np.random.get_state()
+    with low_palm_press_shape(False):
+        first = _solve_person_ik_side_by_side(
+            robot, palm, hand, robot_arm, collision_obstacles, base_limits,
+            standing_x, x_margins=x_margins, deadline=deadline, **kwargs)
+    picked = first[0]
+    if picked is not None and picked[3] is not None:
+        return first
+    rots = palm_to_target_rots(palm, hand, robot_arm)[
+        :kwargs.get('n_turn_candidates')]
+    if not low_palm_shape_differs(palm, rots):
+        return first
+    if deadline is not None and time.time() >= deadline:
+        print('  [low-palm] 計画の時間の上限を過ぎたため、低い掌の押し込みの形では'
+              '解き直しません。')
+        return first
+    print('  [low-palm] 既定の押し込みの形では押し込み後まで解けなかったため、'
+          '低い掌の形 (縦の滑らせ {:.2f} m・浮き {:.2f} m) で解き直します。'.format(
+              LOW_PALM_PRESS[1], LOW_PALM_PRESS[2]))
+    first_random_state = np.random.get_state()
+    np.random.set_state(random_state)
+    with low_palm_press_shape(True):
+        second = _solve_person_ik_side_by_side(
+            robot, palm, hand, robot_arm, collision_obstacles, base_limits,
+            standing_x, x_margins=x_margins, deadline=deadline, **kwargs)
+    collision_ik_time = first[1] + second[1]
+    candidate_selection_time = first[2] + second[2]
+    picked = second[0]
+    if picked is not None and picked[3] is not None:
+        picked[3]['low_palm_press'] = True
+        print('  [low-palm] 低い掌の形で押し込み後まで解けました。')
+        return (picked, collision_ik_time, candidate_selection_time,
+                second[3], second[4])
+    print('  [low-palm] 低い掌の形でも押し込み後まで解けませんでした。')
+    # 解き直さなかったとき (MFIX_LOW_PALM_PRESS=0) と同じ乱数で後を続ける。
+    np.random.set_state(first_random_state)
+    return (first[0], collision_ik_time, candidate_selection_time,
+            first[3], first[4])
+
+
+def _solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
+                                  collision_obstacles, base_limits,
+                                  standing_x,
+                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
+                                  deadline=None, **kwargs):
     """台車の x を ``standing_x ± x_margins`` の窓 (負は絞らない) に狭い順に絞って ``solve_person_ik`` を解き、
     後処理まで解けた最初の結果を返す。肩ヨーがねじれた解なら、次の有限の窓でねじれずに解ければそちらを返す。
     ``deadline`` (``time.time()`` の値) を過ぎたら次の窓を解かない。
@@ -3963,6 +4354,8 @@ def main():
                   args.input_dir))
         return
 
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ時間の内訳を測る (無ければ何もしない)
     np.random.seed(0)
     os.makedirs(args.output_dir, exist_ok=True)
     robot = Aero(use_hand=False)
@@ -4032,9 +4425,11 @@ def main():
     n_solved = 0
     n_total = 0
     n_not_target = 0
+    initial_state = robot_state(robot)
     for i, path in enumerate(files):
-        # 結果が処理順に依存しないよう、人物ごとにシードを決め直す。
+        # 結果が処理順に依存しないよう、人物ごとにシードとロボットの状態 (R7) を決め直す。
         np.random.seed(zlib.crc32(os.path.basename(path).encode()))
+        restore_robot_state(robot, initial_state)
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         palms = load_palm_json(path)
         human_hand = palms.get('offered_hand')
