@@ -103,10 +103,11 @@ LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 # lead-in の waypoint 間隔 (並進 / 回頭)。
 LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
-# True: lead-in は回りながら直進する。False: その場で回ってから直進する
-# (11/17 以前)。実機 13 試行の計画で接近が平均 11.4 -> 10.2 秒
-# (tools/analyze_approach_timing.py --lead-in-concurrent)。
-LEAD_IN_CONCURRENT = True
+# True なら lead-in で回頭と直進を同時に行う (False は回頭してから直進、
+# 11/17 以前)。実機 13 試行の計画で接近が平均 11.4 -> 10.2 秒
+# (tools/analyze_approach_timing.py --lead-in-concurrent)。実機ノードの
+# --lead-in-blend が書き換える (計画の検証と実行で同じ形にするため)。
+LEAD_IN_BLEND = True
 
 # 自己干渉の許容貫通量 [m]。
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
@@ -426,15 +427,18 @@ def approach_start_candidates(base_goal, human_xy, distance,
 
 
 def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
-                            start_joint_angles=None):
+                            start_joint_angles=None, blend=None):
     """初期台車姿勢から ``first_waypoint`` までの lead-in の waypoint 列
     (``first_waypoint`` 自身は含まない)。
 
-    ``LEAD_IN_CONCURRENT`` なら回りながら直進する (台車は全方向に動けるので、
-    回転と並進を同じ点数で一緒に補間する)。そうでなければその場回転してから
-    直進する。関節角は ``start_joint_angles`` (``{関節名: 角度}``、省略時は
-    終点のまま) から線形補間する。
+    ``blend`` (None なら ``LEAD_IN_BLEND``) が True なら回りながら直進する
+    (台車は全方向に動けるので、回転と並進を同じ点数で一緒に補間する)。
+    そうでなければその場回転してから直進する。関節角は
+    ``start_joint_angles`` (``{関節名: 角度}``、省略時は終点のまま) から
+    線形補間する。
     """
+    if blend is None:
+        blend = LEAD_IN_BLEND
     end_base = np.array([first_waypoint['base_position'][0],
                          first_waypoint['base_position'][1],
                          first_waypoint['base_yaw']])
@@ -442,11 +446,9 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
     delta = end_base - start_base
     n_rotate = int(math.ceil(abs(delta[2]) / LEAD_IN_ANGLE_STEP))
     n_translate = int(math.ceil(np.linalg.norm(delta[:2]) / LEAD_IN_STEP))
-    if LEAD_IN_CONCURRENT:
-        n = max(n_rotate, n_translate)
-        n_rotate = 0
-    else:
-        n = n_rotate + n_translate
+    if blend:
+        n_rotate, n_translate = 0, max(n_rotate, n_translate)
+    n = n_rotate + n_translate
     if n == 0:
         return []
     end_vec = np.asarray(first_waypoint['joint_angle_vector'],
@@ -460,15 +462,15 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
     waypoints = []
     for i in range(n):
         t = float(i) / n
-        if LEAD_IN_CONCURRENT:
-            base = start_base + delta * t
-        elif i < n_rotate:
+        if i < n_rotate:
             base = start_base + np.array(
                 [0.0, 0.0, delta[2] * float(i) / n_rotate])
         else:
             u = float(i - n_rotate) / n_translate
             base = np.array([start_base[0] + delta[0] * u,
-                             start_base[1] + delta[1] * u, end_base[2]])
+                             start_base[1] + delta[1] * u,
+                             start_base[2] + delta[2] * u if blend
+                             else end_base[2]])
         waypoints.append(dict(
             base_position=[float(base[0]), float(base[1]), 0.0],
             base_yaw=float(base[2]),

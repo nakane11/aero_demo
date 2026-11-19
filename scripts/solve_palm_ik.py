@@ -2575,6 +2575,7 @@ def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
                    **kwargs):
     """``_solve_press_in`` を ``leg_rise`` (None なら ``PRESS_IN_LEG_RISE``) の
     方針で解く。"""
+    global LAST_PRESS_IN_PARTIAL, LAST_PRESS_IN_FAILURE
     if leg_rise is None:
         leg_rise = PRESS_IN_LEG_RISE
     if leg_rise == 'off':
@@ -2584,8 +2585,14 @@ def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
     post = _solve_press_in(robot, robot_arm, palm, target_rot,
                            limit_legs=True, **kwargs)
     if post is None and leg_rise == 'fallback':
+        first =(LAST_PRESS_IN_PARTIAL, LAST_PRESS_IN_FAILURE)
         post = _solve_press_in(robot, robot_arm, palm, target_rot,
                                limit_legs=False, **kwargs)
+        # 途中までの経路は、最終目標に近い方を残す。
+        if post is None and first[0] is not None and (
+                LAST_PRESS_IN_PARTIAL is None
+                or first[0]['remaining'] < LAST_PRESS_IN_PARTIAL['remaining']):
+            LAST_PRESS_IN_PARTIAL, LAST_PRESS_IN_FAILURE = first
         if post is not None:
             post['leg_rise_fallback'] = True
     if post is not None:
@@ -2629,16 +2636,49 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
         _restore_leg_limits(robot, leg_limits)
 
 
+# 直前の _solve_press_in_path が失敗した点 (計測用): ``point`` は失敗した点
+# (1 から、``n_points`` は最終目標)、``stage`` は 'ik'・'settle'・'final'。
+# 成功したら None。
+LAST_PRESS_IN_FAILURE = None
+
+# 直前の _solve_press_in_path が失敗したとき、途中まで解けた経路: dict(
+# path (関節角のリスト、hover の次の点から)、base_path ([x, y, yaw] のリスト)、
+# hand_position (最後に解けた点の手先位置)、reached (進めた割合 0〜1)、
+# remaining (最終目標までの手先の距離 [m]))。成功したら None。
+LAST_PRESS_IN_PARTIAL = None
+
+# 押し込みが最後まで解けないとき、途中まで進んで人に押し込んでもらう姿勢
+# (行けるところまで) を採る、最終目標までの手先の距離の上限 [m]
+# (pick_verified_candidate の partial_press_max_remaining の既定)。
+PARTIAL_PRESS_MAX_REMAINING = 0.08
+
+
 def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                          rthre, gaze_ik_stop, gaze_ik_rthre, gaze,
                          arm_only_fallback, n_points, pin_limits,
                          fix_legs=False, skip_unreachable=False):
+    global LAST_PRESS_IN_FAILURE, LAST_PRESS_IN_PARTIAL
+    LAST_PRESS_IN_FAILURE = None
+    LAST_PRESS_IN_PARTIAL = None
     start_time = time.time()
     initial_angle_vector = robot.angle_vector().copy()
     initial_coords = robot.copy_worldcoords()
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     body_links = _body_link_list(whole_body, fix_legs)
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
+    final_position = press_in_final_position(palm, target_rot)
+    last_hand = [np.asarray(move_target.worldpos(), dtype=np.float64).copy()]
+    reached = [0.0]
+
+    def keep_partial():
+        # 失敗した点の手前まで解けた経路を残す (restore の前に呼ぶ)。
+        global LAST_PRESS_IN_PARTIAL
+        LAST_PRESS_IN_PARTIAL = dict(
+            path=[[float(v) for v in angle_vector] for angle_vector in path],
+            base_path=[list(b) for b in base_path],
+            hand_position=[float(v) for v in last_hand[0]],
+            reached=float(reached[0]),
+            remaining=float(np.linalg.norm(last_hand[0] - final_position)))
 
     def restore():
         # 狭めた可動域のままだと元の脚の角度を戻せない。
@@ -2675,13 +2715,22 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                 print('  [press-in] 押し込み区間の {}/{} 点目は届かないため、'
                       '飛ばします。'.format(k, n_points))
                 continue
+            LAST_PRESS_IN_FAILURE = dict(point=k, n_points=n_points,
+                                         stage='ik')
+            keep_partial()
             restore()
             return None
         if not settle_legs(robot, target_coords, move_target, whole_body, stop,
                            thre, rthre):
+            LAST_PRESS_IN_FAILURE = dict(point=k, n_points=n_points,
+                                         stage='settle')
+            keep_partial()
             restore()
             return None
         path.append(robot.angle_vector().copy())
+        last_hand[0] = np.asarray(move_target.worldpos(),
+                                  dtype=np.float64).copy()
+        reached[0] = k / float(n_points)
         if pin_limits is not None:
             _pin_leg_floor(robot, pin_limits)
         yaw, _, _ = matrix2ypr(robot.base_link.worldrot())
@@ -2693,6 +2742,9 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
         rthre=rthre, gaze_ik_stop=gaze_ik_stop, gaze_ik_rthre=gaze_ik_rthre,
         gaze=gaze, arm_only_fallback=arm_only_fallback, fix_legs=fix_legs)
     if post is None:
+        LAST_PRESS_IN_FAILURE = dict(point=n_points, n_points=n_points,
+                                     stage='final')
+        keep_partial()
         restore()
         return None
     final_angle_vector = robot.angle_vector()
@@ -2717,6 +2769,43 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
     post['press_in_base_path'] = base_path
     post['compute_time'] = time.time() - start_time
     return post
+
+
+def partial_press_post(robot, palm, target_rot, partial,
+                       max_remaining=PARTIAL_PRESS_MAX_REMAINING):
+    """押し込みが最後まで解けなかったときの途中までの経路 ``partial``
+    (``LAST_PRESS_IN_PARTIAL``) から、そこまで進んで人に押し込んでもらう姿勢を
+    ``solve_press_in`` の結果と同じ形の dict で返す (``partial`` が True)。
+
+    最後に解けた点が最終姿勢 (``joint_angle_vector``) になる。``target_position``
+    は人の掌が来てつなぐ位置 (その点の手先位置)、``press_target_position`` は
+    本来の押し込みの最終目標。経路が無い (hover の次の点も解けない) か、最終目標
+    まで ``max_remaining`` [m] を超えて残るなら None。
+    """
+    if partial is None or not partial['path'] \
+            or partial['remaining'] > max_remaining:
+        return None
+    path = partial['path']
+    bases = partial['base_path']
+    yaw = float(bases[-1][2])
+    return dict(
+        partial=True,
+        press_reached=float(partial['reached']),
+        press_remaining=float(partial['remaining']),
+        press_target_position=[
+            float(v) for v in press_in_final_position(palm, target_rot)],
+        hover_head=None,
+        target_position=list(partial['hand_position']),
+        target_rot=[[float(v) for v in row] for row in target_rot],
+        hand_position=list(partial['hand_position']),
+        base_position=[float(bases[-1][0]), float(bases[-1][1]), 0.0],
+        base_yaw=yaw,
+        joint_names=[j.name for j in robot.joint_list],
+        joint_angle_vector=list(path[-1]),
+        arm_only=False,
+        press_in_path=[list(v) for v in path[:-1]],
+        press_in_base_path=[list(b) for b in bases[:-1]],
+        compute_time=0.0)
 
 
 def blend_palm_rotation(palm, planned_palm, fraction):
@@ -2744,7 +2833,8 @@ def _rotation_angle_between(rot_a, rot_b):
 
 def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
                         leg_stages=REFINE_LEG_STAGES, planned_palm=None,
-                        rotation_blends=REFINE_ROTATION_BLENDS):
+                        rotation_blends=REFINE_ROTATION_BLENDS,
+                        partial_press_max_remaining=None):
     """hover 到達後、検出し直した掌 ``palm`` で押し込み姿勢を解き直す最終補正。
 
     ``robot`` は hover 目標の姿勢、``palm`` はそのワールド系、``planned_post`` は計画時の
@@ -2756,8 +2846,27 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     ('ok'/'ok_arm_only'/'too_large'/'ik_failed')/``legs`` (採用した段階)/``blend`` (採用した
     向きを寄せた割合)/``compute_time`` の dict を返す。``position_change``/``rotation_change`` は
     検出した掌そのものの計画時からの変化。
+
+    ``partial_press_max_remaining`` [m] を与えると、最後まで解けないとき、
+    途中まで進めて最終目標まで残りがこれ以内の押し込み (``partial_press_post``
+    の形) を返す (``reason`` は 'partial')。計画が途中まで (``planned_post`` の
+    ``partial``) のときの比べる位置は、本来の押し込みの最終目標。
     """
     start_time = time.time()
+    if planned_post.get('partial'):
+        planned_post = dict(
+            planned_post, target_position=planned_post['press_target_position'])
+    best_partial = [None]
+
+    def keep_partial(candidate, target_rot):
+        partial = LAST_PRESS_IN_PARTIAL
+        if partial_press_max_remaining is None or partial is None:
+            return
+        if best_partial[0] is None \
+                or partial['remaining'] < best_partial[0][0]['remaining']:
+            best_partial[0] = (partial, candidate, target_rot,
+                               robot.angle_vector().copy(),
+                               robot.copy_worldcoords())
 
     def changes(candidate):
         target_rot = palm_target_rot(candidate, turn_deg, robot_arm)
@@ -2803,6 +2912,7 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
             reason = 'ok'
             used = blend
             break
+        keep_partial(candidate, target_rot)
         # 首が可動域の端で視線 IK が収束しにくいので、首は計画時の角度にして腕だけ解き直す。
         for link in robot.head.link_list:
             if link.joint.name in planned_angles:
@@ -2813,6 +2923,14 @@ def refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
             reason = 'ok_arm_only'
             used = blend
             break
+        keep_partial(candidate, target_rot)
+    if post is None and best_partial[0] is not None:
+        partial, candidate, target_rot, _, _ = best_partial[0]
+        post = partial_press_post(robot, candidate, target_rot, partial,
+                                  max_remaining=partial_press_max_remaining)
+        if post is not None:
+            reason = 'partial'
+            legs = None
     info.update(post_process=post, reason=reason,
                 legs=legs if post is not None else None, blend=used,
                 compute_time=time.time() - start_time)
@@ -2902,7 +3020,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             hover_human_clearance=(
                                 DEFAULT_HOVER_HUMAN_CLEARANCE),
                             placement_joint_positions=None,
-                            excluded_turns=()):
+                            excluded_turns=(),
+                            collect=None, exhaustive=False, accept=None,
+                            partial_press_max_remaining=None):
     """``excluded_turns`` (向きの添字の集合) の候補は使わない。
 
     バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
@@ -2917,6 +3037,21 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
 
     ``(turn_index, angle_vector, base_pose, post_process_result)`` または None を返す。
     ``robot`` は最後に調べた候補の姿勢のままになる。
+
+    計測用: ``collect`` (list) を与えると、調べた候補ごとに結果の dict (``time``・
+    ``cost``・``outcome``・押し込みが失敗した点 ``press_failure`` など) を足す。
+    ``exhaustive`` が True なら、通った候補で止めずに残りも調べる (戻り値は
+    最初に通った候補で、既定と同じ)。
+
+    ``accept`` (``picked`` を受けて bool を返す関数) を与えると、押し込みまで
+    通った候補をさらにそれで判定し (例: 横並び移動が解けるか)、False なら次の
+    候補を調べる。どれも通らなければ、最初に押し込みまで通った候補の
+    ``post_process_result`` に ``accept_rejected=True`` を付けて返す。
+
+    ``partial_press_max_remaining`` [m] を与えると、最後まで押し込める候補が
+    無いとき、押し込みを途中まで進めて最終目標まで残りがこれ以内の最初の候補を
+    ``partial_press_post`` の形 (``partial`` が True) で返す (後処理前の解より
+    優先)。
     """
     turn_degs = turn_candidates_deg(hand, palm)
     bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
@@ -3072,9 +3207,11 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     def _press_in_path_rejected(path, bases, posture, label):
         # 押し込み区間の途中の姿勢 (差し出さない腕を差し替えたもの、台車は bases の [x, y, yaw]) を
         # 自己干渉と、肘から先 x 手まわり以外の人体距離で検証し、差し替えた関節角のリストを返す
-        # (通らなければ None)。
+        # (通らなければ None、通らなかった点 (0 から) を path_rejected_at[0] に)。
         replaced = []
+        path_rejected_at[0] = None
         for k, (angle_vector, base) in enumerate(zip(path, bases)):
+            path_rejected_at[0] = k
             robot.newcoords(Coordinates(
                 pos=[base[0], base[1], 0.0],
                 rot=rpy_matrix(base[2], 0.0, 0.0)))
@@ -3095,7 +3232,20 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             if _forearm_too_close(label, k):
                 return None
             replaced.append([float(v) for v in angle_vector])
+        path_rejected_at[0] = None
         return replaced
+
+    path_rejected_at = [None]
+    first_passed = None
+    first_rejected = None
+    first_partial = None
+
+    def record(outcome, **fields):
+        if collect is not None:
+            collect.append(dict(
+                time=time.time(), cost=float(cost),
+                candidate_index=int(candidate_index),
+                turn_index=int(turn_index), outcome=outcome, **fields))
 
     fallback = None
     examined = 0
@@ -3121,14 +3271,20 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                   'したが、事後検証で {:.4f} m 貫通 ({} x {}) していたため'
                   '棄却します。'.format(label, min_dist,
                                        *collision_pair_name(pair)))
+            record('hover_collision')
             continue
         if _too_close_to_human(early_hover_groups, label):
+            record('hover_clearance')
             continue
         # 押し込みを解き、腰が低い方の姿勢で差し出さない腕の姿勢を決め、hover・押し込みの両方に差し替える。
         post_result = solve_press_in(
             robot, robot_arm, palm, rots[turn_index],
             stop=post_process_ik_stop, gaze_ik_stop=post_process_ik_stop,
             thre=post_process_thre, rthre=post_process_rthre)
+        press_failure = (None if post_result is not None
+                         else LAST_PRESS_IN_FAILURE)
+        partial = (LAST_PRESS_IN_PARTIAL if post_result is None
+                   and partial_press_max_remaining is not None else None)
         if post_result is None:
             print('  [press-in] {} の候補は押し込み区間の IK が解けません'
                   'でした。'.format(label))
@@ -3139,6 +3295,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         if posture is None:
             print('  [other-arm] {} の候補は差し出さない手の指先が台車に'
                   'かからない腕の姿勢が無いため棄却します。'.format(label))
+            record('other_arm')
             continue
         # 押し込みで台車が動いているので hover の位置に戻す。
         robot.newcoords(base_poses[candidate_index])
@@ -3151,8 +3308,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
             print('  [collision-verify] {} の候補は差し出さない腕を差し替えた'
                   '姿勢で {:.4f} m 貫通 ({} x {}) していたため棄却します。'
                   .format(label, min_dist, *collision_pair_name(pair)))
+            record('other_arm_collision')
             continue
         if _too_close_to_human(other_arm_hover_groups, label):
+            record('other_arm_clearance')
             continue
         if fallback is None:
             fallback = (turn_index, hover_av, base_poses[candidate_index],
@@ -3167,6 +3326,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                     + [post_result['base_yaw']]],
                 posture, label)
             if replaced is None:
+                n_path = len(post_result['press_in_path']) + 1
+                press_failure = dict(point=path_rejected_at[0] + 1,
+                                     n_points=n_path, stage='verify')
                 post_result = None
             else:
                 post_result = dict(
@@ -3175,12 +3337,67 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                     joint_angle_vector=replaced[-1],
                     other_arm_posture=list(OTHER_ARM_POSTURES_DEG[posture]))
         if post_result is not None:
-            return (turn_index, hover_av, base_poses[candidate_index],
-                    post_result)
+            picked = (turn_index, hover_av, base_poses[candidate_index],
+                      post_result)
+            record('press_ok', hover_av=hover_av,
+                   base_pose=base_poses[candidate_index],
+                   post_result=post_result)
+            if accept is not None and not accept(picked):
+                print('  [post-process] {} の候補は押し込みまで通ったが、'
+                      '採否の判定 (横並び移動など) に通らないため、次の候補を'
+                      '試します。'.format(label))
+                if first_rejected is None:
+                    first_rejected = (turn_index, hover_av,
+                                      base_poses[candidate_index],
+                                      dict(post_result, accept_rejected=True))
+                continue
+            if not exhaustive:
+                return picked
+            if first_passed is None:
+                first_passed = picked
+            continue
+        record('press_fail', hover_av=hover_av,
+               base_pose=base_poses[candidate_index],
+               press_failure=press_failure)
         print('  [post-process] {} の候補は干渉検証を通過した '
               'が、後処理判定 (押し付け/視線 IK) には失敗したため、次に '
               '曲げ量コストが低い候補を試します。'.format(label))
+        if first_partial is None and partial is not None:
+            # 行けるところまで押し込んで待つ姿勢 (最後まで押し込める候補が
+            # 無いときに使う)。
+            pp = partial_press_post(robot, palm, rots[turn_index], partial,
+                                    max_remaining=partial_press_max_remaining)
+            if pp is None:
+                print('  [press-in] {} の候補は押し込みを {:.0f}% まで (最終目標'
+                      'まで {:.0f}mm) しか進められないため、途中まで進めて待つ'
+                      '候補にもしません。'.format(
+                          label, partial['reached'] * 100,
+                          partial['remaining'] * 1e3))
+            if pp is not None:
+                replaced = _press_in_path_rejected(
+                    pp['press_in_path'] + [pp['joint_angle_vector']],
+                    pp['press_in_base_path'] + [
+                        pp['base_position'][:2] + [pp['base_yaw']]],
+                    posture, label)
+                if replaced is not None:
+                    pp.update(press_in_path=replaced[:-1],
+                              joint_angle_vector=replaced[-1],
+                              other_arm_posture=list(
+                                  OTHER_ARM_POSTURES_DEG[posture]))
+                    first_partial = (turn_index, hover_av,
+                                     base_poses[candidate_index], pp)
+                    print('  [press-in] {} の候補は押し込みの {:.0f}% まで進め'
+                          'ます (最終目標まで {:.0f}mm)。最後まで押し込める候補が'
+                          '無ければ、ここまで進んで人の手を待ちます。'.format(
+                              label, pp['press_reached'] * 100,
+                              pp['press_remaining'] * 1e3))
 
+    if first_passed is not None:
+        return first_passed
+    if first_rejected is not None:
+        return first_rejected
+    if first_partial is not None:
+        return first_partial
     if fallback is None:
         return None
     turn_index, angle_vector, base_pose, fallback_cost = fallback
@@ -3220,7 +3437,9 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE,
                     collision_geometry=DEFAULT_IK_COLLISION_GEOMETRY,
                     placement_joint_positions=None,
-                    excluded_turns=()):
+                    excluded_turns=(),
+                    collect=None, exhaustive=False, accept=None,
+                    partial_press_max_remaining=None):
     """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉を回避する
     バッチ IK (jax) で解き、``pick_verified_candidate`` で 1 つ選ぶ。
 
@@ -3229,6 +3448,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     ``collision_joint_limit_margin_ratio`` はバッチ IK の間だけ適用。``n_turn_candidates`` は解く向きの数。
 
     ``(picked, collision_ik_time, candidate_selection_time)`` を返す (時間は秒)。
+    ``collect``・``exhaustive`` (計測用)・``accept``・
+    ``partial_press_max_remaining`` は ``pick_verified_candidate`` へ渡す。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -3324,7 +3545,9 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         facing_yaw_weight=facing_yaw_weight,
         hover_human_clearance=hover_human_clearance,
         placement_joint_positions=placement_joint_positions,
-        excluded_turns=excluded_turns)
+        excluded_turns=excluded_turns,
+        collect=collect, exhaustive=exhaustive, accept=accept,
+        partial_press_max_remaining=partial_press_max_remaining)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -3359,7 +3582,7 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
     collision_ik_time = candidate_selection_time = 0.0
     # 後処理まで通ってねじれていない解が無ければ、ねじれた解、それも無ければ
     # 最初に見つかった後処理前の解を返す。
-    chosen = fallback = twisted = None
+    chosen = fallback = twisted = rejected = partial = None
     for i, x_margin in enumerate(x_margins):
         if twisted is not None and x_margin < 0.0:
             break
@@ -3376,6 +3599,26 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
             base_limits=person_base_limits, **kwargs)
         collision_ik_time += ik_time
         candidate_selection_time += selection_time
+        if (picked is not None and picked[3] is not None
+                and picked[3].get('partial')):
+            # 途中までしか押し込めない。次の窓で最後まで押し込める解を探し、
+            # 無ければこれを返す。
+            if partial is None:
+                partial = (picked, person_base_limits, x_margin)
+            print('  [base-x] 立ち位置 ±{} m では押し込みが途中までしか解け'
+                  'ませんでした。'.format(
+                      x_margin if x_margin >= 0.0 else 'inf'))
+            continue
+        if (picked is not None and picked[3] is not None
+                and picked[3].get('accept_rejected')):
+            # 押し込みまで通ったが採否の判定 (accept) に通らなかった。次の窓を試し、
+            # どの窓でも通らなければこれを返す。
+            if rejected is None:
+                rejected = (picked, person_base_limits, x_margin)
+            print('  [base-x] 立ち位置 ±{} m では採否の判定に通る候補が'
+                  'ありませんでした。'.format(
+                      x_margin if x_margin >= 0.0 else 'inf'))
+            continue
         if picked is not None and picked[3] is not None:
             yaw = _twisted_shoulder_yaw_deg(robot, robot_arm, picked[1])
             if yaw is None:
@@ -3393,7 +3636,8 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
               .format(x_margin if x_margin >= 0.0 else 'inf',
                       '' if twisted is None else 'ねじれずに'))
     if chosen is None:
-        chosen = twisted or fallback or (picked, person_base_limits, x_margin)
+        chosen = (twisted or partial or rejected or fallback
+                  or (picked, person_base_limits, x_margin))
     picked, person_base_limits, x_margin = chosen
     return (picked, collision_ik_time, candidate_selection_time,
             person_base_limits, x_margin)
