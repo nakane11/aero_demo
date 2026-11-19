@@ -8,8 +8,10 @@
   動かしながら、台車を人と前後ずれ 0・同じ向きの位置へ動かし上体を起こす
   (移動先は台車も動かすバッチ IK、``solve_goal_candidates``)。腕は押し込み時と
   同じ解の枝に限る。waypoint は人の腕・握りの向き・台車を補間して解き直す。
-- 上半身 (body_link) は人の正面から ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と
-  同じ前方を見る (``forward_gaze_point``)。
+- 上半身 (body_link) は ``UPPER_BODY_REFERENCE`` (既定は台車の前方向) から
+  ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と同じ前方を見る (``forward_gaze_point``)。
+  移動先の台車の向きは人の正面から ``GOAL_YAW_MARGIN_DEG`` 以内で、前を向くのは
+  前進前のその場回転に任せる。
 - 段階 2: 人の腕・掌を動かさず台車だけを人の方へ寄せる (``plan_approach``)。
 
 人の腕は肩を動かさず、手首から先は押し込み時の手に対して剛体 (``HumanArm``)。
@@ -194,12 +196,16 @@ GOAL_BRANCH_JOINT_RANGE_DEG = 60.0
 GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 
 # --- 上半身・台車の向き・台車と脚の距離・寄せ (段階 2) ----------------------
-# 横並び (と寄せ) の間、上半身 (body_link の +x) を人の正面から
-# ±UPPER_BODY_LIMIT_DEG に収める。移動先は範囲外の候補を捨て、ずれの二乗に
+# 横並び (と寄せ) の間、上半身 (body_link の +x) を UPPER_BODY_REFERENCE の
+# 向きから ±UPPER_BODY_LIMIT_DEG に収める。'base' は台車の前方向 (前進前の
+# その場回転で台車が前を向いたとき、上半身も前を向く)、'human' は人の正面
+# (2026-11-19 まで)。移動先は範囲外の候補を捨て、ずれの二乗に
 # UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は、始点の
 # 上半身が範囲内 (UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす)
 # なら全体を、範囲外なら移動先だけを範囲に絞る (押し込み姿勢から出る途中の
 # 腰ヨーを絞ると、腕が掌に届かず経路が序盤で止まる)。
+UPPER_BODY_REFERENCES = ('base', 'human')
+UPPER_BODY_REFERENCE = 'base'
 UPPER_BODY_LIMIT_DEG = 20.0
 UPPER_BODY_WEIGHT = 100.0
 UPPER_BODY_START_SLACK_DEG = 3.0
@@ -214,8 +220,12 @@ REFINE_TIME_LIMIT = 10.0
 # 寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人だけ
 # GOAL_YAW_FALLBACK_DEG まで広げて解き直す (終点は GOAL_YAW_MARGIN_DEG
 # に収まるものだけ採る)。None なら広げない。
-GOAL_YAW_MARGIN_DEG = 20.0
-GOAL_YAW_FALLBACK_DEG = 30.0
+# 2026-11-19 まで 20 / 30 度 (上半身は人の正面基準)。45 度・上半身を台車の
+# 前方向基準にすると、実機 15 試行の計画で寄せ後の横の距離が平均 0.734 ->
+# 0.699 m (最大 0.86 -> 0.77 m)、寄せまでの計算が中央 4.1 -> 1.6 秒。代わりに
+# 前進前のその場回転が中央 16 -> 26 度 (最大 45 度) に増える。
+GOAL_YAW_MARGIN_DEG = 45.0
+GOAL_YAW_FALLBACK_DEG = None
 APPROACH_FALLBACK_LATERAL = 0.85
 
 # 人の掌の向きの候補 (``HumanArm.lowering`` の facing): 腕を下ろしきった
@@ -243,6 +253,18 @@ APPROACH_MAX_GOAL_TRIES = 6
 # そのときの目標 1 つあたりの初期値の数 (目標は 3 つとも同じ掌)。
 APPROACH_SINGLE_BATCH = True
 APPROACH_SINGLE_BATCH_ATTEMPTS = spik.env_int('MFIX_APPROACH_SINGLE_BATCH_ATTEMPTS', 128)
+# 寄せながら台車を人の正面へ回す (人の手は動かさず、回転の分は腕で受ける)。
+# 移動先の台車の向きを人の正面から ±APPROACH_END_YAW_DEG に絞り、前進前の
+# その場回転 (つないだ手が台車のまわりに弧を描いて前へ引かれる) を小さくする。
+# 回して寄せられなければ、向きを変えない寄せに戻す。
+APPROACH_TURN_TO_FRONT = True
+APPROACH_END_YAW_DEG = 10.0
+
+# 前進前のその場回転 (腕は止めたまま台車を人の正面へ回す) の後に、人の肩から
+# つないだ手までの距離がこれ [m] を超える移動先は捨てる (人の腕が伸びきって
+# 前へ引っ張られる)。None なら見ない。実機 15 試行の計画では、向き ±45° で
+# 回転後の距離が最大 0.68 m (0.60 m 超は 2 試行)。
+HUMAN_REACH_AFTER_TURN_MAX = 0.60
 
 # 移動先の候補のうち、経路まで試す数と、押し込み IK・検証まで試す数
 # (どちらも目標 1 つあたり)。
@@ -1435,9 +1457,13 @@ def _upper_body_limit(human_yaw):
 
 
 def upper_body_deviation(robot, human_yaw):
-    """上半身 (body_link の +x) の向きの、人の正面 ``human_yaw`` [rad] からの
-    ずれ [rad] (反時計回りが正)。"""
+    """上半身 (body_link の +x) の向きのずれ [rad] (反時計回りが正)。
+    ``UPPER_BODY_REFERENCE`` が 'base' なら台車 (base_link の +x) から、
+    'human' なら人の正面 ``human_yaw`` [rad] から。"""
     x = robot.body_link.worldrot()[:, 0]
+    if UPPER_BODY_REFERENCE == 'base':
+        b = robot.base_link.worldrot()[:, 0]
+        return _wrap(math.atan2(x[1], x[0]) - math.atan2(b[1], b[0]))
     return _wrap(math.atan2(x[1], x[0]) - human_yaw)
 
 
@@ -2145,6 +2171,22 @@ def wrist_limit_penalty(av, table):
     return total
 
 
+def reach_after_turn(robot, robot_arm, base, shoulder):
+    """``robot`` (台車 ``base`` = (x, y, yaw)、人の正面が +x の座標系に置いた
+    姿勢) を、腕を止めたまま台車の中心まわりに人の正面 (yaw 0) へ回したときの、
+    人の肩 ``shoulder`` からつないだ手までの距離 [m] (肩が無ければ 0)。"""
+    if shoulder is None:
+        return 0.0
+    hand = np.asarray(getattr(robot, '{}arm_end_coords'.format(
+        robot_arm)).worldpos(), dtype=np.float64)
+    c, s = math.cos(-base[2]), math.sin(-base[2])
+    dx, dy = hand[0] - base[0], hand[1] - base[1]
+    turned = np.array([base[0] + c * dx - s * dy, base[1] + s * dx + c * dy,
+                       hand[2]])
+    return float(np.linalg.norm(turned - np.asarray(shoulder,
+                                                    dtype=np.float64)))
+
+
 def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           translated_joints, collision_joints,
                           collision_pairs, base_limits,
@@ -2190,6 +2232,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     for name, p in translated_joints.items()}
     local_collision_joints = {name: to_local.transform_point(p)
                               for name, p in collision_joints.items()}
+    shoulder = local_joints.get('{}Shoulder'.format(hand))
     local_arms = [[to_local.transform_point(p) for p in arm]
                   for arm in lowered_arms]
     local_forearms = [
@@ -2248,6 +2291,10 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
             # 人の正面が +x の座標系なので、人の正面からのずれは yaw そのもの。
             upper_dev = upper_body_deviation(robot, 0.0)
             if abs(upper_dev) > upper_limit:
+                continue
+            if (HUMAN_REACH_AFTER_TURN_MAX is not None
+                    and reach_after_turn(robot, robot_arm, base, shoulder)
+                    > HUMAN_REACH_AFTER_TURN_MAX):
                 continue
             finger = finger_direction(end_coords.worldrot())
             xy = to_world.transform_point([base[0], base[1], 0.0])[:2]
@@ -3295,10 +3342,45 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
                   collision_pairs, base_limits, yaw_margin_deg=None,
                   target_lateral=APPROACH_TARGET_LATERAL, windows=None,
                   attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
-                  direct_below=None):
+                  direct_below=None, turn_to_front=None):
+    """``_plan_approach`` を、``turn_to_front`` (None なら
+    ``APPROACH_TURN_TO_FRONT``) なら台車を人の正面へ回しながら解き、寄せ
+    られなければ向きを変えずに解き直す。戻り値に ``turned`` (回したか) を
+    足す。"""
+    if turn_to_front is None:
+        turn_to_front = APPROACH_TURN_TO_FRONT
+    args = (robot, robot_arm, hand, post, turn_deg, last, translated_joints,
+            collision_joints, verification_pairs, collision_pairs,
+            base_limits)
+    kwargs = dict(yaw_margin_deg=yaw_margin_deg, target_lateral=target_lateral,
+                  windows=windows, attempts_per_pose=attempts_per_pose,
+                  direct_below=direct_below)
+    if turn_to_front:
+        out = _plan_approach(*args, turn=True, **kwargs)
+        if out['waypoints']:
+            out['turned'] = True
+            return out
+        reason = out['reason']
+        out = _plan_approach(*args, turn=False, **kwargs)
+        if not out['waypoints'] and reason:
+            out['reason'] = '回して: {} / 回さず: {}'.format(
+                reason, out['reason'])[:300]
+    else:
+        out = _plan_approach(*args, turn=False, **kwargs)
+    out['turned'] = False
+    return out
+
+
+def _plan_approach(robot, robot_arm, hand, post, turn_deg, last,
+                   translated_joints, collision_joints, verification_pairs,
+                   collision_pairs, base_limits, yaw_margin_deg=None,
+                   target_lateral=APPROACH_TARGET_LATERAL, windows=None,
+                   attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
+                   direct_below=None, turn=False):
     """横並びの終わり ``last`` (``plan_path`` の最後の waypoint) の姿勢から、
     人の腕・掌を動かさず、台車を横へ人の方へ寄せる waypoint (寄せ、段階 2)
-    を計画する。台車の向きは変えない。
+    を計画する。``turn`` なら台車を人の正面から ``APPROACH_END_YAW_DEG``
+    以内へ回しながら寄せ (回転は腕で受ける)、そうでなければ向きは変えない。
 
     寄せ後の横の距離が目標 ``target_lateral`` の窓 (``APPROACH_WINDOW_COUNT``
     個、近い方から) の移動先をバッチ IK で解き、``plan_path`` で経路を作る。
@@ -3319,6 +3401,13 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     facing = spik.human_facing_direction(translated_joints)
     left = np.array([-facing[1], facing[0]])
     side = 1.0 if hand == 'L' else -1.0
+    human_yaw = math.atan2(facing[1], facing[0])
+    end_limit = math.radians(APPROACH_END_YAW_DEG)
+    # 寄せの終わりの台車の向き (回すなら人の正面から end_limit 以内へ)。
+    goal_yaw = (human_yaw + max(-end_limit, min(end_limit, _wrap(
+        start[2] - human_yaw))) if turn else start[2])
+    # BasePath は yaw を線形に補間するので、始点から近い回り方の値にする。
+    goal_yaw = start[2] + _wrap(goal_yaw - start[2])
     palm0 = human_palm_from_press(post, turn_deg, robot_arm)
     real = HumanArm(translated_joints, hand, palm0, turn_deg, robot_arm)
     arm_pose = last['human_arm']
@@ -3350,7 +3439,8 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             base_limits, turn_degs=(0.0,), free_turn=GOAL_FREE_TURN,
             lowered_arms=[(real.shoulder, static.elbow)] * 3,
             max_waist_z=start_waist_z, branch_range_deg=100.0,
-            y_window=y_window, yaw_margin_deg=yaw_margin_deg,
+            y_window=y_window,
+            yaw_margin_deg=APPROACH_END_YAW_DEG if turn else yaw_margin_deg,
             attempts_per_pose=attempts,
             lowered_forearms=[(static.elbow, arm_pose['wrist'],
                                static.palm_pos, static.palm_rot)] * 3)[0]
@@ -3377,8 +3467,12 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             if tried >= APPROACH_MAX_GOAL_TRIES:
                 break
             _check_stop()
-            # 台車の向きは変えない
-            goal_base = np.array([goal_base[0], goal_base[1], start[2]])
+            # 回すなら移動先の向き (人の正面から end_limit 以内)、回さない
+            # なら向きは変えない
+            goal_base = np.array([
+                goal_base[0], goal_base[1],
+                start[2] + _wrap(goal_base[2] - start[2]) if turn
+                else start[2]])
             base_path = BasePath(start, goal_base)
             problem = checker.check_base_path(robot, goal_av, base_path,
                                               skeleton)
@@ -3423,6 +3517,7 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     # (移動先は決めない)。バッチ IK の結果より近ければ採る。
     goal = start.copy()
     goal[:2] = start[:2] - left * side * (lat0 - target_lateral)
+    goal[2] = goal_yaw
     batch_lat = (human_lateral(translated_joints, best[-1]['base_position'],
                                hand) if best is not None else lat0)
     if (lat0 - target_lateral >= APPROACH_MIN_GAIN
@@ -3775,7 +3870,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     なら回す量の小さい向き) を選ぶ。腕を下ろしきった掌が一番低い計画より
     ``LOWERED_HEIGHT_TOLERANCE`` を超えて高い計画は選ばない。台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG``
     で ``APPROACH_FALLBACK_LATERAL`` 以内に寄れなければ、
-    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は人の正面から
+    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は ``UPPER_BODY_REFERENCE`` から
     ``UPPER_BODY_LIMIT_DEG`` に収める。
 
     ``translated_joints``・``collision_joints``・``base_limits`` と戻り値は

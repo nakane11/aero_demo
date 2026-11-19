@@ -3177,6 +3177,12 @@ def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     ``partial``) のときの比べる位置は、本来の押し込みの最終目標。
     """
     start_time = time.time()
+    # skrobot は可動域の重み (joint_angle_limit_weight_maps) を前の IK から
+    # 持ち越すので、同じ入力でも前に解いた IK で解が変わる (実機 15 試行の
+    # 再計算で、検出した向きのまま解けたのが 10〜12 試行と揺れた)。空にして
+    # から解く。
+    if hasattr(robot, 'joint_angle_limit_weight_maps'):
+        robot.joint_angle_limit_weight_maps = {}
     if planned_post.get('partial'):
         planned_post = dict(
             planned_post, target_position=planned_post['press_target_position'])

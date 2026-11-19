@@ -895,6 +895,21 @@ def _transition_worker_main(args, conn, stop):
         stop.clear()
         spik.restore_robot_state(robot, initial_state)
         try:
+            if job.get('kind') == 'early':
+                # --early-approach の横並び移動 (寄せなし)。平行移動した系の
+                # まま返す (親が裏の計画の job に使ってから戻す)。
+                sbs._STOP.event = stop
+                try:
+                    transition = sbs.plan_transition(
+                        robot, job['robot_arm'], job['hand'], job['post'],
+                        job['turn_deg'], job['translated_joints'],
+                        job['collision_joints'], planner.verification_pairs,
+                        planner.collision_pairs, planner.base_limits,
+                        approach=False, time_limit=job['time_limit'])
+                finally:
+                    sbs._STOP.event = None
+                conn.send(('refine', job_id, transition))
+                continue
             if job.get('kind') == 'resolve':
                 transition = _resolve_transition(robot, planner, job, stop)
             else:
@@ -1703,16 +1718,33 @@ class HandshakePlanner(object):
     def plan_transition_early(self, job):
         """``plan`` が返した ``transition_early`` の横並び移動 (寄せなし) を裏の
         ロボット (``self.refine_robot``) で解き、``(base_link 系の transition,
-        寄せの裏の計画の job or None)`` を返す (裏スレッド用)。"""
-        # R7: refine_robot を使う処理の始めに、同じスレッドで戻す
-        # (呼び出し元が _refine_lock で 1 つずつにしている)。
-        self._restore_refine_robot()
-        transition = sbs.plan_transition(
-            self.refine_robot, job['robot_arm'], job['hand'], job['post'],
-            job['turn_deg'], job['translated_joints'],
-            job['collision_joints'], self.refine_verification_pairs,
-            self.refine_collision_pairs, self.base_limits, approach=False,
-            time_limit=self.args.early_approach_transition_time)
+        寄せの裏の計画の job or None)`` を返す (裏スレッド用)。
+
+        別プロセス (``start_worker``) があればそこで解く (実行中のスレッドとの
+        GIL の取り合いを避け、バッチ IK の準備も別プロセスで済んでいるため。
+        別プロセスがあると本体の refine_robot のバッチ IK は準備しない)。"""
+        transition = None
+        if self._worker_ok():
+            job_id = self.worker.submit(dict(
+                job, kind='early',
+                time_limit=self.args.early_approach_transition_time))
+            message = self.worker.wait(job_id)
+            if message is not None and message[0] == 'refine':
+                transition = message[2]
+            else:
+                print('[transition] 別プロセスで横並び移動を解けなかったため'
+                      '、このスレッドで解きます ({})。'.format(
+                          None if message is None else message[1:]))
+        if transition is None:
+            # R7: refine_robot を使う処理の始めに、同じスレッドで戻す
+            # (呼び出し元が _refine_lock で 1 つずつにしている)。
+            self._restore_refine_robot()
+            transition = sbs.plan_transition(
+                self.refine_robot, job['robot_arm'], job['hand'], job['post'],
+                job['turn_deg'], job['translated_joints'],
+                job['collision_joints'], self.refine_verification_pairs,
+                self.refine_collision_pairs, self.base_limits, approach=False,
+                time_limit=self.args.early_approach_transition_time)
         refine_job = None
         if transition['verified']:
             refine_job = dict(job, secured=copy.deepcopy(transition))
