@@ -842,7 +842,7 @@ def _resolve_transition(robot, planner, job, stop):
             job['translated_joints'], job['collision_joints'],
             planner.verification_pairs, planner.collision_pairs,
             planner.base_limits, approach=True, alt_arms=False,
-            time_limit=job['time_limit'])
+            time_limit=job['time_limit'], hint=job.get('hint'))
     finally:
         sbs._STOP.event = None
 
@@ -3165,13 +3165,23 @@ class HandshakePipelineNode(object):
             print('[transition] 裏の計画 (寄せ) がまだ終わっていないため、押し込み'
                   '後の姿勢からの横並び移動の解き直しはしません。')
             return
+        # 予備の解の掌の向き・下ろし方から試す (実機 8 試行のオフラインで、
+        # 解けた 5 試行の時間 平均 2.1 -> 1.3 秒、寄せ後 平均 0.71 -> 0.68 m)。
+        backup = self._backup_transition(motion)
+        hint = None
+        if (backup.get('verified') and backup.get('fraction', 0.0) >= 1.0
+                and backup.get('arm_deg') is not None):
+            hint = dict(palm_facing=backup.get('palm_facing'),
+                        arm_deg=float(backup['arm_deg']),
+                        abduction_deg=float(backup['abduction_deg']))
         payload = dict(
             job, kind='resolve',
             press_joints={name: float(angle) for name, angle in zip(
                 joint_names, press_wp['joint_angle_vector'])},
             press_base=[float(v) for v in press_wp['base_position'][:2]],
             press_yaw=float(press_wp['base_yaw']),
-            time_limit=self.args.transition_resolve_time_limit)
+            time_limit=self.args.transition_resolve_time_limit,
+            hint=hint if self.args.transition_resolve_hint else None)
         with self._lock:
             previous = self._resolve_jobs.get(id(motion))
         if previous is not None:
@@ -3183,6 +3193,17 @@ class HandshakePipelineNode(object):
                 np.asarray(press_wp['joint_angle_vector'], dtype=np.float64))
         print('[transition] 押し込み後の姿勢から横並び移動を別プロセスで解き直し'
               'ます。')
+
+    def _backup_transition(self, motion):
+        """押し込み後の解き直しが使えないときの予備の横並び移動: 裏の計画
+        (``transition_refined``) が確保済みの解以上に進めていればそれ、でなければ
+        確保済みの解 (無ければ空の dict)。"""
+        with self._lock:
+            refined = motion.get('transition_refined')
+            secured = motion.get('transition') or {}
+        return (refined if refined is not None and refined.get('verified')
+                and refined['fraction'] >= secured.get('fraction', 0.0)
+                else secured)
 
     def _resolved_transition_waypoints(self, motion, press_wp):
         """``_start_transition_resolve`` の解き直しを最大
@@ -3241,12 +3262,7 @@ class HandshakePipelineNode(object):
         # 予備 (裏の計画、使えなければ確保済みの解) より寄せ後が
         # RESOLVE_MAX_LATERAL_LOSS を超えて遠ければ予備を使う (ユーザー判断
         # 11/19: 近さを優先、予備は差を終点で 0 へ戻して足す)。
-        with self._lock:
-            refined = motion.get('transition_refined')
-            secured = motion.get('transition') or {}
-        backup = (refined if refined is not None and refined.get('verified')
-                  and refined['fraction'] >= secured.get('fraction', 0.0)
-                  else secured)
+        backup = self._backup_transition(motion)
         lateral = _final_lateral(transition)
         backup_lateral = _final_lateral(backup)
         record.update(lateral=lateral, backup_lateral=backup_lateral)
@@ -7505,6 +7521,11 @@ def build_arg_parser():
              '別プロセスで解き直し、横並び移動を始めるまでに解けていれば使う '
              '(--transition-worker のとき。解けなければ --transition-delta で'
              '差を足す)。既定で有効。')
+    parser.add_argument(
+        '--transition-resolve-hint', action=argparse.BooleanOptionalAction,
+        default=True,
+        help='押し込み後の解き直しを、予備 (裏の計画・確保済みの解) の掌の'
+             '向き・人の腕の下ろし方から試す。既定で有効。')
     parser.add_argument(
         '--transition-resolve-time-limit', type=float, default=6.0,
         help='押し込み後の解き直しの探索の上限 [秒] (過ぎたらそれまでの一番'
