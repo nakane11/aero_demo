@@ -101,6 +101,7 @@ from handshake_viewer_common import build_display_waypoints  # noqa: E402
 from handshake_viewer_common import build_press_in_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
+from handshake_viewer_common import display_transition  # noqa: E402
 from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
 from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
@@ -2584,6 +2585,18 @@ class HandshakePipelineNode(object):
         with self._lock:
             frozen = self._frozen_joint_positions
             waypoints = self._display_waypoints
+            n_transition = self._display_n_transition
+            motion = self._current_motion
+            if waypoints is not None and motion is not None:
+                # 横並び移動は計画の後に解ける・差し替わる (--early-approach・
+                # 裏の計画・押し込み後の解き直し) ので、出すたびに表示する
+                # 横並び移動 (人の腕付き) に付け替える。実行に使う
+                # ``self._display_waypoints`` は変えない。
+                tail = transition_waypoints(dict(
+                    transition=display_transition(motion),
+                    joint_names=motion['joint_names']))
+                waypoints = waypoints[:len(waypoints) - n_transition] + tail
+                n_transition = len(tail)
             payload = dict(
                 attempt=(self._attempt_count if frozen is not None else None),
                 skeleton=(None if frozen is None
@@ -2594,7 +2607,7 @@ class HandshakePipelineNode(object):
                 display_waypoints=waypoints,
                 n_prepend=self._display_n_prepend,
                 n_approach=self._display_n_approach,
-                n_transition=self._display_n_transition,
+                n_transition=n_transition,
                 real_pose_ref=self._real_pose_ref,
                 torso_surface_offset=self.args.torso_surface_offset)
             try:
