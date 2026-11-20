@@ -23,6 +23,7 @@ random_palm_poses/ -> random_handshake_poses/)
 import argparse
 import collections
 import contextlib
+import copy
 import itertools
 import json
 import math
@@ -855,6 +856,32 @@ OTHER_ARM_POSTURES_DEG = (
 # 差し出さない手 (指先を含む) と台車の箱の間に最低限空ける距離 [m]。
 OTHER_ARM_BASE_CLEARANCE = 0.02
 
+# 干渉形状を差し替えた指ありモデルの雛形 (読み込んだときの姿勢のまま、姿勢を変えない)。
+_HAND_MODEL_TEMPLATE = None
+_HAND_MODEL_LOCK = threading.Lock()
+
+
+def hand_model_template():
+    """干渉形状を差し替えた指ありモデルの雛形を返す (プロセスで 1 回だけ読み込む)。
+    姿勢を変えてはいけない。姿勢を変えるなら ``new_hand_model`` を使う。"""
+    global _HAND_MODEL_TEMPLATE
+    with _HAND_MODEL_LOCK:
+        if _HAND_MODEL_TEMPLATE is None:
+            from aero_demo.aero_urdf_setup import load_aero
+            model = load_aero(use_hand=True)
+            apply_collision_model(model)
+            _HAND_MODEL_TEMPLATE = model
+        return _HAND_MODEL_TEMPLATE
+
+
+def new_hand_model():
+    """干渉形状を差し替えた指ありモデルの新しいインスタンスを返す (雛形の複製。
+    URDF を読み直すより速く、読み込んだときの姿勢・形状と同じ)。"""
+    template = hand_model_template()
+    with _HAND_MODEL_LOCK:
+        return copy.deepcopy(template)
+
+
 # side ('r'/'l') -> 指ありモデルの手・指の表面サンプル (hand_yaw_link 座標系)
 _OTHER_HAND_POINTS_CACHE = {}
 
@@ -865,10 +892,8 @@ def other_hand_points(side):
     cached = _OTHER_HAND_POINTS_CACHE.get(side)
     if cached is not None:
         return cached
-    # 指ありモデルの読み込みが重いので左右まとめて作る。
-    from aero_demo.aero_urdf_setup import load_aero
-    model = load_aero(use_hand=True)
-    apply_collision_model(model)
+    # 左右まとめて作る。
+    model = new_hand_model()
     model.reset_pose()
     for s in ('r', 'l'):
         hand_yaw = getattr(model, '{}_hand_yaw_link'.format(s))
@@ -2175,9 +2200,8 @@ def hand_box_primitives(robot):
     cached = _HAND_BOX_CACHE.get(id(robot))
     if cached is not None:
         return cached
-    from aero_demo.aero_urdf_setup import load_aero
-    model = load_aero(use_hand=True)
-    apply_collision_model(model)
+    # 読み込んだときの姿勢で測る (読むだけなので雛形をそのまま使う)。
+    model = hand_model_template()
     movable = {joint.name for joint in robot.joint_list}
 
     def rigid_root(link):
@@ -2503,9 +2527,7 @@ def build_verification_pairs_for_model(
     if verify_model != 'hand':
         raise ValueError('verify_model は {} のどれかです: {!r}'.format(
             COLLISION_VERIFY_MODELS, verify_model))
-    from aero_demo.aero_urdf_setup import load_aero
-    model = load_aero(use_hand=True)
-    apply_collision_model(model)
+    model = new_hand_model()
     return VerificationPairs(
         build_collision_verification_pairs(model, 'r'), model)
 
