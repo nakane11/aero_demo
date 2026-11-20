@@ -12,11 +12,12 @@ IK・軌道の揺れを除くため、押し込みまでの結果 (横並び移�
       (ノードの既定の引数) で解き、横並び移動の job を保存する。
   collect-press --jobs J.pkl
       11/18・11/19 の実機の押し込み後の姿勢 (bag の /joint_states) から解き直す
-      job (ノードの --transition-resolve と同じ形、resolve_timing.py と同じ)。
+      job (ノードの押し込み後の解き直しと同じ形、resolve_timing.py と同じ)。
   run --jobs J.pkl --out OUT.json
       job ごとに、early: 確保 (寄せなし) -> 裏の計画 (寄せ、refine_transition)、
       resolve: 押し込み後の解き直し (寄せまで、掌の向きは全部) を解き、人の項と
-      一緒に記録する。案は環境変数 (SBS_COMFORT_*・SBS_ULNAR_MAX など) で選ぶ。
+      一緒に記録する (案を選ぶ環境変数 SBS_COMFORT_* などは 11/20 の整理で
+      無くなり、今の既定 (oskel) だけを解く)。
 """
 
 import argparse
@@ -49,7 +50,6 @@ spik, sbs = rcpt.spik, rcpt.sbs
 
 def make_planner(node_argv=()):
     args = rcpt.build_arg_parser().parse_args(list(node_argv))
-    rcpt.phm.LEAD_IN_BLEND = bool(args.lead_in_blend)
     planner = rcpt.HandshakePlanner(args)
     spik.attach_camera_optical_coords(planner.robot)
     if planner.refine_robot is not None:
@@ -77,18 +77,10 @@ def collect(dirs, out):
         if hand in ('L', 'R') and palms.get(hand) is not None:
             np.random.seed(zlib.crc32(name.encode()))
             start = None
-            if getattr(args, 'pre_move', False):
-                dist = args.pre_move_max_distance
-                if args.pre_move_max_time > 0:
-                    dist = min(dist, rcpt.pre_move_distance_for_time(
-                        args.pre_move_max_time))
-                end = rcpt.pre_move_target(
-                    palms[hand]['position'],
-                    spik.human_standing_xy(joint_positions),
-                    args.pre_move_standoff, max_distance=dist)
-                if float(np.linalg.norm(end[:2])) >= \
-                        rcpt.PRE_MOVE_MIN_DISTANCE:
-                    start = end
+            end = rcpt.pre_move_goal(palms[hand]['position'],
+                                     spik.human_standing_xy(joint_positions))
+            if float(np.linalg.norm(end[:2])) >= rcpt.PRE_MOVE_MIN_DISTANCE:
+                start = end
             planned = planner.plan(joint_positions, palms, hand, i + 1,
                                    start_base_pose=start)
             early = planned.get('transition_early')
@@ -199,7 +191,7 @@ def collect_press(out):
             executed_facing=(ex or {}).get('palm_facing'),
             job=dict(robot_arm=arm, hand=hand, post=new, turn_deg=turn,
                      translated_joints=tj, collision_joints=cj, offset=off,
-                     time_limit=args.transition_resolve_time_limit)))
+                     time_limit=rcpt.TRANSITION_RESOLVE_TIME_LIMIT)))
         print('[collect-press] {} {}'.format(trial, name), flush=True)
     with open(out, 'wb') as f:
         pickle.dump(jobs, f)
@@ -311,7 +303,7 @@ def run(jobs_path, out, only=None):
         if rec['kind'] == 'early':
             secured = sbs.plan_transition(
                 *common, approach=False,
-                time_limit=args.early_approach_transition_time)
+                time_limit=rcpt.EARLY_APPROACH_TRANSITION_TIME)
             r['secured'] = summarize(secured, job)
             r['secured']['wall'] = time.time() - t0
             executed = secured

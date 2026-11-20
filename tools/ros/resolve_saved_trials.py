@@ -118,25 +118,18 @@ def resolve_trial(planner, args, data_dir, name, attempt):
     # 乱数の消費が前の試行の解き直し回数に依存しないよう試行ごとに固定する。
     np.random.seed(zlib.crc32(name.encode()))
     start_base_pose = None
-    if getattr(args, 'pre_move', False):
-        # ノードの --pre-move と同じ待機点から解く。
-        max_distance = args.pre_move_max_distance
-        if args.pre_move_max_time > 0:
-            max_distance = min(max_distance, rcpt.pre_move_distance_for_time(
-                args.pre_move_max_time))
-        end = rcpt.pre_move_target(
-            palms[offered_hand]['position'],
-            spik.human_standing_xy(joint_positions), args.pre_move_standoff,
-            max_distance=max_distance)
-        distance = float(np.linalg.norm(end[:2]))
-        record['pre_move_distance'] = distance
-        if distance >= rcpt.PRE_MOVE_MIN_DISTANCE:
-            start_base_pose = end
+    # ノードと同じく、台車を先に動かした待機点から解く。
+    end = rcpt.pre_move_goal(palms[offered_hand]['position'],
+                             spik.human_standing_xy(joint_positions))
+    distance = float(np.linalg.norm(end[:2]))
+    record['pre_move_distance'] = distance
+    if distance >= rcpt.PRE_MOVE_MIN_DISTANCE:
+        start_base_pose = end
     t0 = time.time()
     planned = planner.plan(joint_positions, palms, offered_hand, attempt,
                            start_base_pose=start_base_pose)
     result, motion = planned['result'], planned['motion']
-    # time は計画が返るまで (--early-approach なら横並び移動の前まで)。
+    # time は計画が返るまで (横並び移動は接近中に解くのでその前まで)。
     record['time'] = time.time() - t0
     early = planned.get('transition_early')
     if early is not None and motion is not None:
@@ -270,8 +263,6 @@ def main():
     my_args, node_argv = parser.parse_known_args()
     rcpt.sbs.apply_human_arm_arguments(my_args)
     args = rcpt.build_arg_parser().parse_args(node_argv)
-    # ノードの main と同じく lead-in の形を引数に合わせる。
-    rcpt.phm.LEAD_IN_BLEND = bool(args.lead_in_blend)
 
     planner = rcpt.HandshakePlanner(args)
     spik.attach_camera_optical_coords(planner.robot)

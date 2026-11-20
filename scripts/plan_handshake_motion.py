@@ -63,8 +63,8 @@ DEFAULT_N_WAYPOINTS = 20
 # waypoint 間の時間刻み [秒] (コスト正規化用。実機の速度ではない)。
 DEFAULT_DT = 0.2
 
-# 軌道最適化の反復の上限。MFIX_MAX_ITERATIONS で変える (import 時に読む)。
-DEFAULT_MAX_ITERATIONS = spik.env_int('MFIX_MAX_ITERATIONS', 60)
+# 軌道最適化の反復の上限。
+DEFAULT_MAX_ITERATIONS = 60
 
 # 干渉コストが働き始める距離 [m] (人体 / 自己干渉)。
 DEFAULT_COLLISION_ACTIVATION_DISTANCE = spik.DEFAULT_COLLISION_MARGIN
@@ -106,8 +106,7 @@ LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
 # True なら lead-in で回頭と直進を同時に行う (False は回頭してから直進、
 # 11/17 以前)。実機 13 試行の計画で接近が平均 11.4 -> 10.2 秒
-# (tools/analyze_approach_timing.py --lead-in-concurrent)。実機ノードの
-# --lead-in-blend が書き換える (計画の検証と実行で同じ形にするため)。
+# (tools/analyze_approach_timing.py --lead-in-concurrent)。
 LEAD_IN_BLEND = True
 
 # 自己干渉の許容貫通量 [m]。

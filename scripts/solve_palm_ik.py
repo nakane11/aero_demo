@@ -112,27 +112,11 @@ DEFAULT_BASE_Y_RANGE = (-BASE_Y_MOVABLE_HALF_RANGE, BASE_Y_MOVABLE_HALF_RANGE)
 DEFAULT_BASE_YAW_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 
 
+# 1 目標姿勢あたりの初期値の数 (0 番目は seed_arm_pose、残りは一様乱数)。
+DEFAULT_ATTEMPTS_PER_POSE = 512
 
-def env_int(name, default):
-    """環境変数 ``name`` の整数 (無ければ ``default``)。反復・初期値の数のつまみ (MFIX_*) を測るため。
-    import 時に読むので、ノードの子プロセス・run_pipeline_test の子プロセスにも同じ値が届く。"""
-    value = os.environ.get(name, '')
-    return int(value) if value.strip() else default
-
-
-def env_optional_int(name, default):
-    """``env_int`` と同じで、'none' なら None。"""
-    value = os.environ.get(name, '').strip()
-    if not value:
-        return default
-    return None if value.lower() == 'none' else int(value)
-
-
-# 1 目標姿勢あたりの初期値の数 (0 番目は seed_arm_pose、残りは一様乱数)。MFIX_ATTEMPTS_PER_POSE で変える。
-DEFAULT_ATTEMPTS_PER_POSE = env_int('MFIX_ATTEMPTS_PER_POSE', 512)
-
-# 干渉回避付きバッチ IK の反復回数・収束閾値。反復は MFIX_COLLISION_IK_STOP で変える。
-DEFAULT_COLLISION_IK_STOP = env_int('MFIX_COLLISION_IK_STOP', 80)
+# 干渉回避付きバッチ IK の反復回数・収束閾値。
+DEFAULT_COLLISION_IK_STOP = 80
 DEFAULT_COLLISION_IK_THRE = 0.03  # [m]
 DEFAULT_COLLISION_IK_RTHRE = math.radians(8.0)  # [rad]
 
@@ -186,8 +170,7 @@ PRESS_IN_HUMAN_CLEARANCE = 0.05  # [m]
 POST_PROCESS_TARGET_HOVER_OFFSET = -0.01  # [m]
 
 # 後処理判定の腕 IK (ヤコビアン法、干渉回避・台車なし) の反復回数・収束閾値。
-# 反復は MFIX_POST_PROCESS_IK_STOP で変える。
-DEFAULT_POST_PROCESS_IK_STOP = env_int('MFIX_POST_PROCESS_IK_STOP', 40)
+DEFAULT_POST_PROCESS_IK_STOP = 40
 DEFAULT_POST_PROCESS_IK_THRE = 0.01  # [m]
 DEFAULT_POST_PROCESS_IK_RTHRE = math.radians(5.0)  # [rad]
 
@@ -197,20 +180,11 @@ REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
 # 最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる角度 [rad] or None)。
 REFINE_LEG_STAGES = (('fixed', True, None),
                      ('limited', False, math.radians(8.0)))
-# 最終補正の 'fixed' の段で脚を固定する角度 (develop V4 案 1、V_report 8.1)。'planned' は計画の押し込み後の脚
-# (押し込みの区間で hover から計画の押し込み後への関節の補間を IK の初期値にし、押し込み後は脚をその角度に固定)、
-# 'hover' は hover の脚のまま (前の形。脚が計画と違うまま腰で合わせるので、押し込みの区間で腰ピッチが計画と違う
-# 向きに大きく動く)。
-REFINE_FIXED_LEGS = os.environ.get('MFIX_REFINE_FIXED_LEGS', 'planned')
-if REFINE_FIXED_LEGS not in ('planned', 'hover'):
-    raise ValueError('MFIX_REFINE_FIXED_LEGS は planned か hover です: {}'.format(
-        REFINE_FIXED_LEGS))
-# 最終補正の 'limited' の段 (脚を hover から ±leg_range) で、腰を上げない側の制限 (_pin_leg_floor) の基準を幅で
-# 狭めた後の可動域にし、両側とも ±leg_range を上限にする (True)。False は前の形: 元の可動域を基準に点ごとに
-# 掛け直すので、腰が上がる側は 1 点ごとに LEG_RISE_PIN_TOLERANCE (0.40 rad) まで動け、±8° が効かない
-# (inventory B10。80b96f2 で ±8° の段を入れたのと同じコミットで許容を 1e-6 から広げたための食い違い)。
-# 押し込みの計画 (leg_range なし) は変わらない。MFIX_PIN_LEG_NARROW=0 で前の形。
-PIN_LEG_NARROW = os.environ.get('MFIX_PIN_LEG_NARROW', '1') != '0'
+# 最終補正の 'fixed' の段では、脚を計画の押し込み後の角度に固定する (develop V4 案 1、V_report 8.1。押し込みの
+# 区間で hover から計画の押し込み後への関節の補間を IK の初期値にし、押し込み後は脚をその角度に固定。hover の脚の
+# ままだと脚が計画と違うまま腰で合わせるので、押し込みの区間で腰ピッチが計画と違う向きに大きく動く)。
+# 最終補正の 'limited' の段 (脚を hover から ±leg_range) では、腰を上げない側の制限 (_pin_leg_floor) の基準を
+# 幅で狭めた後の可動域にし、両側とも ±leg_range を上限にする (inventory B10)。
 # 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
 # 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
 REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
@@ -219,15 +193,11 @@ REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
 REFINE_STAGE_MAJOR = True
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
-# MFIX_POST_PROCESS_MAX_CANDIDATES で変える ('none' で無制限)。
-DEFAULT_POST_PROCESS_MAX_CANDIDATES = env_optional_int(
-    'MFIX_POST_PROCESS_MAX_CANDIDATES', None)
+DEFAULT_POST_PROCESS_MAX_CANDIDATES = None
 
 # 後処理判定の視線 IK (首 3 関節、rotation_mask='xy') の反復回数・収束閾値。
-# 反復は MFIX_POST_PROCESS_GAZE_IK_STOP で変える (無ければ MFIX_POST_PROCESS_IK_STOP と同じ。
-# 最終補正 (refine_post_process) は視線も腕と同じ反復で解くため)。
-DEFAULT_POST_PROCESS_GAZE_IK_STOP = env_int('MFIX_POST_PROCESS_GAZE_IK_STOP',
-                                            DEFAULT_POST_PROCESS_IK_STOP)
+# 反復は腕と同じ (最終補正 (refine_post_process) は視線も腕と同じ反復で解くため)。
+DEFAULT_POST_PROCESS_GAZE_IK_STOP = DEFAULT_POST_PROCESS_IK_STOP
 DEFAULT_POST_PROCESS_GAZE_IK_RTHRE = math.radians(5.0)  # [rad]
 # 腕と視線の同時 IK が解けないときは腕だけで押し込み、首だけで掌へ向け直す。
 # 視線のずれがこれ未満なら採用する。
@@ -550,52 +520,25 @@ def press_in_final_position(palm, target_rot):
             + press_in_slide_direction(palm, target_rot) * PRESS_IN_ADVANCE)
 
 
-LOW_PALM_PRESS_DEFAULT_SHAPE = (0.95, 0.05, 0.10)
-
-
-def _parse_low_palm_press(value):
-    """``MFIX_LOW_PALM_PRESS`` の値を ``(いつ, (H, 長さ, 浮き))`` に ('0'・空なら None)。
-
-    ``'late'`` (既定)・``'late:<H>:<長さ>:<浮き>'`` は既定の形で押し込み後まで解けないときだけ低い掌の形で
-    解き直す。``'1'``・``'short:<H>:<長さ>:<浮き>'`` は前の J28 (条件に入れば初めから低い掌の形)。
-    """
-    if value in ('', '0'):
-        return None
-    if value == '1':
-        return 'early', LOW_PALM_PRESS_DEFAULT_SHAPE
-    if value == 'late':
-        return 'late', LOW_PALM_PRESS_DEFAULT_SHAPE
-    parts = value.split(':')
-    if len(parts) != 4 or parts[0] not in ('short', 'late'):
-        raise ValueError('MFIX_LOW_PALM_PRESS は late・1・0・short:<H>:<長さ>:<浮き>・'
-                         'late:<H>:<長さ>:<浮き> のどれかです: {}'.format(value))
-    return ('early' if parts[0] == 'short' else 'late',
-            tuple(float(v) for v in parts[1:]))
-
-
 # 低い掌で滑らせる向きが縦に近いとき (滑らせる向きの上下成分が LOW_PALM_SLIDE_UP を超えて hover が掌の下に
 # なり、かつ既定の形の hover の高さが H [m] 未満) だけ、縦の滑らせを <長さ> [m] に縮め、法線の浮きを <浮き> [m]
 # にする (develop J28、J_report 9.19〜9.21)。押し込みの最終目標 (掌が重なる位置) は変えない。低い掌では掌の
 # 15 cm 下から指を上に向けて差し上げる形になり、手先が届かない・押し込みで脚が追いつかない。
-# 既定 (late) では条件に入っても先に既定の形で解き、押し込み後まで解けないときだけ低い掌の形で解き直す
-# (初めから低い形にすると試行22 の掌で横並び移動が上限 5 秒に収まらない、master_fixes/report_t22.md)。
+# 条件に入っても先に既定の形で解き、押し込み後まで解けないときだけ低い掌の形で解き直す ('late'。
+# 初めから低い形にすると試行22 の掌で横並び移動が上限 5 秒に収まらない、master_fixes/report_t22.md)。
 # 低い掌の形で解いた結果は post_process の 'low_palm_press' が True で、hover での解き直し
-# (refine_post_process) もその形で解く。MFIX_LOW_PALM_PRESS=1 で前の J28 (初めから低い形)、=0 で無効。
-_LOW_PALM_PRESS_SETTING = _parse_low_palm_press(
-    os.environ.get('MFIX_LOW_PALM_PRESS', 'late'))
-LOW_PALM_PRESS_MODE = (None if _LOW_PALM_PRESS_SETTING is None
-                       else _LOW_PALM_PRESS_SETTING[0])
-LOW_PALM_PRESS = (None if _LOW_PALM_PRESS_SETTING is None
-                  else _LOW_PALM_PRESS_SETTING[1])
+# (refine_post_process) もその形で解く。
+# (H [m], <長さ> [m], <浮き> [m])。
+LOW_PALM_PRESS = (0.95, 0.05, 0.10)
 LOW_PALM_SLIDE_UP = 0.7
-# 'late' で低い掌の形を使う区間 (low_palm_press_shape の中) か。ノードの解き直しは別スレッドのことがあるので
+# 低い掌の形を使う区間 (low_palm_press_shape の中) か。ノードの解き直しは別スレッドのことがあるので
 # スレッドごとに持つ。
 _LOW_PALM_STATE = threading.local()
 
 
 @contextlib.contextmanager
 def low_palm_press_shape(active=True):
-    """'late' のとき、この中だけ (``active`` が真なら) 低い掌の形を使う ('early'・無効では何もしない)。"""
+    """この中だけ (``active`` が真なら) 低い掌の形を使う。"""
     previous = getattr(_LOW_PALM_STATE, 'active', False)
     _LOW_PALM_STATE.active = bool(active)
     try:
@@ -606,8 +549,6 @@ def low_palm_press_shape(active=True):
 
 def _low_palm_shape_applies(palm, target_rot, slide=None):
     """掌・向きが低い掌の形の条件 (縦の滑らせ・既定の形の hover の高さ < H) に入るか。"""
-    if LOW_PALM_PRESS is None:
-        return False
     if slide is None:
         slide = press_in_slide_direction(palm, target_rot)
     if float(slide[2]) <= LOW_PALM_SLIDE_UP:
@@ -620,21 +561,17 @@ def _low_palm_shape_applies(palm, target_rot, slide=None):
 
 
 def low_palm_shape_differs(palm, target_rots):
-    """'late' の解き直しで形が変わる向きが ``target_rots`` に 1 つでもあるか。"""
-    return LOW_PALM_PRESS_MODE == 'late' and any(
-        _low_palm_shape_applies(palm, rot) for rot in target_rots)
+    """低い掌の形での解き直しで形が変わる向きが ``target_rots`` に 1 つでもあるか。"""
+    return any(_low_palm_shape_applies(palm, rot) for rot in target_rots)
 
 
 def press_in_shape(palm, target_rot):
     """押し込みの形 ``(滑らせる向き, 長さ, 法線の浮き)``。既定は ``PRESS_IN_SLIDE``・``PRESS_IN_LIFT``、
-    ``LOW_PALM_PRESS`` の低い掌のとき ('late' は ``low_palm_press_shape`` の中だけ) 短い縦の滑らせ・
-    大きい浮きにする。"""
+    ``low_palm_press_shape`` の中で ``LOW_PALM_PRESS`` の低い掌のとき短い縦の滑らせ・大きい浮きにする。"""
     slide = press_in_slide_direction(palm, target_rot)
     length = PRESS_IN_SLIDE
     lift = PRESS_IN_LIFT
-    use = (LOW_PALM_PRESS_MODE == 'early'
-           or (LOW_PALM_PRESS_MODE == 'late'
-               and getattr(_LOW_PALM_STATE, 'active', False)))
+    use = getattr(_LOW_PALM_STATE, 'active', False)
     if use and _low_palm_shape_applies(palm, target_rot, slide):
         _, length, lift = LOW_PALM_PRESS
     return slide, length, lift
@@ -2615,9 +2552,8 @@ def sync_leg_mimics(robot):
             joint.joint_angle(float(joint.joint_angle()))
 
 
-# 人ごと・計画ごとにロボットを warmup の後の状態へ戻し、リンクの座標を角度から作り直す (Q の R7)。
-# '0' で前の形 (戻さず、前に処理した人の角度・リンクの座標の丸めの履歴を持ち越す)。
-ROBOT_STATE_RESET = os.environ.get('MFIX_ROBOT_STATE_RESET', '1') != '0'
+# 人ごと・計画ごとにロボットを warmup の後の状態へ戻し、リンクの座標を角度から作り直す (Q の R7、
+# ``restore_robot_state``)。
 
 
 def refresh_link_coords(robot):
@@ -2652,8 +2588,8 @@ def robot_state(robot):
 def restore_robot_state(robot, state):
     """``robot_state`` の状態に戻し、リンクの座標を角度から作り直す。人ごとの計算の始めに呼び、
     結果が前に処理した人 (角度の引き継ぎ・リンクの座標の丸めの履歴) によらないようにする (R7)。
-    ``MFIX_ROBOT_STATE_RESET=0`` なら何もしない。"""
-    if not ROBOT_STATE_RESET or state is None:
+    ``state`` が None なら何もしない。"""
+    if state is None:
         return
     coords, angles = state
     robot.newcoords(coords.copy_worldcoords())
@@ -2908,14 +2844,14 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
     if not fix_legs:
         posture_goal = None
     leg_limits = _leg_limits(robot)
-    # 狭める順は、幅 → 腰を上げない側。腰を上げない側の基準 (pin_base) は、PIN_LEG_NARROW なら幅で狭めた後の
-    # 可動域 (両側とも幅の内)、そうでなければ元の可動域 (上がる側は幅を超えて LEG_RISE_PIN_TOLERANCE まで、
-    # 点ごとに掛け直す)。終わったら元の可動域に戻す。
+    # 狭める順は、幅 → 腰を上げない側。腰を上げない側の基準 (pin_base) は、幅で狭めた後の可動域 (両側とも
+    # ±leg_range を上限にする。元の可動域を基準にすると、腰が上がる側は 1 点ごとに LEG_RISE_PIN_TOLERANCE
+    # まで動け ±leg_range が効かない、inventory B10)。押し込みの計画 (leg_range なし) は元の可動域。
+    # 終わったら元の可動域に戻す。
     pin_base = leg_limits
     if leg_range is not None:
         _narrow_leg_limits(robot, leg_limits, leg_range)
-        if PIN_LEG_NARROW:
-            pin_base = _leg_limits(robot)
+        pin_base = _leg_limits(robot)
     if limit_legs:
         _pin_leg_floor(robot, pin_base)
     try:
@@ -3070,9 +3006,8 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                          + [float(yaw)])
     move_base(1.0)
     move_posture(1.0)
-    if ROBOT_STATE_RESET:
-        # R7: 押し込み後の確かめ (手先・視線の IK) がリンクの座標の丸めの履歴によらないように。
-        refresh_link_coords(robot)
+    # R7: 押し込み後の確かめ (手先・視線の IK) がリンクの座標の丸めの履歴によらないように。
+    refresh_link_coords(robot)
     post = solve_post_process(
         robot, robot_arm, palm, target_rot, stop=stop, thre=thre,
         rthre=rthre, gaze_ik_stop=gaze_ik_stop, gaze_ik_rthre=gaze_ik_rthre,
@@ -3239,10 +3174,8 @@ def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
                               planned_post['joint_angle_vector']))
     # develop V4 (案 1): 脚を固定する段は、脚を計画の押し込み後の角度に固定する (hover の脚のままだと腰で合わせる
     # ことになり、計画の押し込み後・横並び移動と脚・腰が大きく違う)。
-    posture_goal = None
-    if REFINE_FIXED_LEGS == 'planned':
-        posture_goal = {name: float(angle)
-                        for name, angle in planned_angles.items()}
+    posture_goal = {name: float(angle)
+                    for name, angle in planned_angles.items()}
     blends = rotation_blends if planned_palm is not None else (0.0,)
     candidates = []
     for blend in blends:
@@ -3943,7 +3876,7 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
     解き直しで押し込み後まで解ければその結果 (後処理の結果の 'low_palm_press' が True)、解けなければ
     既定の形の結果を返す。時間は両方の合計。返り値は ``_solve_person_ik_side_by_side`` と同じ。
     """
-    # 解き直しを初めから低い形で解いたとき (MFIX_LOW_PALM_PRESS=1) と同じ乱数で解く。
+    # 解き直しは初めから低い形で解いたとき (前の J28) と同じ乱数で解く。
     random_state = np.random.get_state()
     with low_palm_press_shape(False):
         first = _solve_person_ik_side_by_side(
@@ -3978,7 +3911,7 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
         return (picked, collision_ik_time, candidate_selection_time,
                 second[3], second[4])
     print('  [low-palm] 低い掌の形でも押し込み後まで解けませんでした。')
-    # 解き直さなかったとき (MFIX_LOW_PALM_PRESS=0) と同じ乱数で後を続ける。
+    # 解き直さなかったときと同じ乱数で後を続ける。
     np.random.set_state(first_random_state)
     return (first[0], collision_ik_time, candidate_selection_time,
             first[3], first[4])

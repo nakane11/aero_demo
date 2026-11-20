@@ -26,7 +26,6 @@ import collections
 import contextlib
 import copy
 import math
-import os
 import threading
 import time
 import zlib
@@ -75,7 +74,7 @@ LOWERED_ARM_BATCH = 'per_angle'
 # と同じ数) は、確保する計画で横並びまで解けた人の時間が中央値で +0.5 秒延び、
 # 成功数は 128 と同じだった (2026-10-23)。
 GOAL_BUNDLE_FACINGS = True
-GOAL_BUNDLE_ATTEMPTS_PER_POSE = spik.env_int('MFIX_GOAL_BUNDLE_ATTEMPTS_PER_POSE', 128)
+GOAL_BUNDLE_ATTEMPTS_PER_POSE = 128
 # 段階 1 の下ろし方ごとの結果 (経路まで) を人ごとのキャッシュに置き、同じ人の
 # 計画で再利用する (実機ノードは、動く前に確保した計画で試した下ろし方を、
 # 動作中に裏で解く計画 refine_transition で解き直さない)。
@@ -131,12 +130,12 @@ LOWERED_FACING_ORDER_PALM_UP = ('forward', 'backward', 'natural', 'inward')
 GOAL_X_MARGIN = 0.05
 
 # 移動先のバッチ IK の目標 1 つあたりの初期値の数。
-GOAL_ATTEMPTS_PER_POSE = spik.env_int('MFIX_GOAL_ATTEMPTS_PER_POSE', 128)
+GOAL_ATTEMPTS_PER_POSE = 128
 
 # 横並び移動・寄せの移動先のバッチ IK (_batch_ik) の反復の上限。既定は 60 で、hover の
-# spik.DEFAULT_COLLISION_IK_STOP (80) より少ない。寄せの時間の大半はここ。
-# MFIX_SBS_COLLISION_IK_STOP=80 で前の形 (hover と同じ反復) に戻る。
-SBS_COLLISION_IK_STOP = spik.env_int('MFIX_SBS_COLLISION_IK_STOP', 60)
+# spik.DEFAULT_COLLISION_IK_STOP (80) より少ない。寄せの時間の大半はここ
+# (80 にすると前の形 (hover と同じ反復))。
+SBS_COLLISION_IK_STOP = 60
 
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
 # 上体の前後ずれ |ankle + knee| [rad]。
@@ -252,7 +251,7 @@ APPROACH_MAX_GOAL_TRIES = 6
 # 近い窓から順にその窓に入る候補を試す (窓ごとに解くと寄せ 1 回に 4〜5 回)。
 # そのときの目標 1 つあたりの初期値の数 (目標は 3 つとも同じ掌)。
 APPROACH_SINGLE_BATCH = True
-APPROACH_SINGLE_BATCH_ATTEMPTS = spik.env_int('MFIX_APPROACH_SINGLE_BATCH_ATTEMPTS', 128)
+APPROACH_SINGLE_BATCH_ATTEMPTS = 128
 # 寄せながら台車を人の正面へ回す (人の手は動かさず、回転の分は腕で受ける)。
 # 移動先の台車の向きを人の正面から ±APPROACH_END_YAW_DEG に絞り、前進前の
 # その場回転 (つないだ手が台車のまわりに弧を描いて前へ引かれる) を小さくする。
@@ -295,11 +294,10 @@ PLANNED_JOINT_STEP = math.radians(20.0)
 # かった扱い。裏の計画では確保した経路へ、どちらも無ければ横並び移動をしない)。
 # ユーザー決定 (11/17): 移動先まで最後まで (1.0) 解けた経路だけ通ったとする
 # (develop bfc768f の J23 の 2、UNIFIED_J23_FULL と同じ)。確保 (plan_transition)
-# と裏の計画 ① (refine_transition) の両方に効く。``MFIX_SBS_FULL=0`` で前の形
-# (0.3 進めば途中までで実行する)。
-SBS_FULL = os.environ.get('MFIX_SBS_FULL', '1') == '1'
-SBS_PARTIAL_MIN_FRACTION = 0.3  # 前の形の MIN_FRACTION
-MIN_FRACTION = 1.0 if SBS_FULL else SBS_PARTIAL_MIN_FRACTION
+# と裏の計画 ① (refine_transition) の両方に効く。
+MIN_FRACTION = 1.0
+# 前の形の MIN_FRACTION (この割合以上進めた経路を捨てたときにログで知らせる)。
+SBS_PARTIAL_MIN_FRACTION = 0.3
 
 # 人の腕の目安 (表示・ログ用、超えても止めない。reach <= 1 だけ止める)。
 # 肘は LUBA の最後の段階の始まり。手首の曲げ (合成) と押し込み時からの
@@ -350,10 +348,6 @@ HUMAN_WRIST_CHECK = 'hand_fixed'
 # 手首の目安も LUBA の最後の段階の始まり (撓屈 30・尺屈 20・掌屈 60・背屈 45)。
 HUMAN_WRIST_RADIAL_MAX_DEG = luba_limit('wrist_deviation', True)
 HUMAN_WRIST_ULNAR_MAX_DEG = luba_limit('wrist_deviation', False)
-# study/sbs-comfort: 尺屈の上限を環境変数で緩める (SBS_ULNAR_MAX [度])。
-_LUBA_WRIST_ULNAR_MAX_DEG = HUMAN_WRIST_ULNAR_MAX_DEG
-if os.environ.get('SBS_ULNAR_MAX'):
-    HUMAN_WRIST_ULNAR_MAX_DEG = float(os.environ['SBS_ULNAR_MAX'])
 HUMAN_WRIST_FLEX_MAX_DEG = luba_limit('wrist_flexion', True)
 HUMAN_WRIST_TWIST_MAX_DEG = LOWERED_TWIST_MAX_DEG
 HUMAN_TURN_CAP_DEG = 20.0
@@ -385,31 +379,18 @@ HUMAN_ARM_LIMITS_DEG = collections.OrderedDict(
     (key, (luba_limit(key, False), luba_limit(key, True)))
     for key in ('shoulder_flexion', 'shoulder_abduction', 'shoulder_rotation',
                 'elbow_flexion', 'pronation'))
-# study/sbs-comfort: 回内の上限を環境変数で緩める (SBS_PRONATION_MAX [度])。
-_LUBA_ARM_LIMITS_DEG = collections.OrderedDict(HUMAN_ARM_LIMITS_DEG)
-if os.environ.get('SBS_PRONATION_MAX'):
-    HUMAN_ARM_LIMITS_DEG['pronation'] = (
-        HUMAN_ARM_LIMITS_DEG['pronation'][0],
-        float(os.environ['SBS_PRONATION_MAX']))
 
 # --- 人の項 (develop の人の楽さの指標、study/sbs-comfort) --------------------
 # develop の人の項 (sbs_human_term = develop の goal_ik/human_palm.py の写し) の
 # 11 成分の 2 乗和を、人の掌 (位置・人の手の向き) から求めて使う。
-# SBS_COMFORT_SELECT: 計画を選ぶ鍵 (_result_key) で、寄せ後の横の距離の刻み
-#   ('tie' 2 cm、'bucket5' 5 cm) が同じなら人の項の小さい方 ('off' は今まで)。
-# SBS_COMFORT_ORDER=1: 下ろし方・掌の向きを、下ろしきった掌の人の項の小さい順
-#   に試す (今は上腕の低い組から、決まった向きの順)。
-# SBS_COMFORT_GATE: 上限を緩めたとき (SBS_ULNAR_MAX・SBS_PRONATION_MAX)、LUBA の
-#   上限を超える姿勢は人の項がこの値以下のときだけ許す (既定 inf = 見ない)。
-# 11/20 ユーザー決定: oskel (ORDER=1・SELECT=tie・ARM=skeleton) を既定にする。
-# 前の形は SBS_COMFORT_ORDER=0 SBS_COMFORT_SELECT=off。
-COMFORT_SELECT = os.environ.get('SBS_COMFORT_SELECT', 'tie')
-COMFORT_ORDER = os.environ.get('SBS_COMFORT_ORDER', '1') == '1'
-COMFORT_GATE = float(os.environ.get('SBS_COMFORT_GATE', 'inf'))
-# SBS_COMFORT_ARM: 人の項の関節角をどの腕で測るか。'develop' (既定) は develop と
-#   同じく掌から求め直す (手首は掌から 4.1 cm、肘は 2 リンクの規則)。'skeleton'
-#   (既定) は ctb の ``HumanArm`` の肘・手首 (下ろし方で決まる腕) をそのまま使う。
-COMFORT_ARM = os.environ.get('SBS_COMFORT_ARM', 'skeleton')
+# 11/20 ユーザー決定: 下ろし方・掌の向きを、下ろしきった掌の人の項の小さい順に
+# 試し、計画を選ぶ鍵 (``_result_key``) で寄せ後の横の距離が 2 cm 刻みで同じなら
+# 人の項の小さい方を選ぶ。
+# COMFORT_ARM: 人の項の関節角をどの腕で測るか。'skeleton' は ctb の
+#   ``HumanArm`` の肘・手首 (下ろし方で決まる腕) をそのまま使う。'develop' は
+#   develop と同じく掌から求め直す (手首は掌から 4.1 cm、肘は 2 リンクの規則。
+#   比べる道具が ``arm_mode`` で渡す)。
+COMFORT_ARM = 'skeleton'
 _COMFORT_PERSON = {}
 
 
@@ -479,9 +460,7 @@ def result_comfort(result, joints):
 def lowering_comfort(human_arm, lowering):
     """下ろし方 ``lowering`` の、下ろしきった掌 (握りの向きは押し込み時のまま、
     手首は下ろし方のとおり) の人の項の 2 乗和。"""
-    elbow = wrist = None
-    if COMFORT_ARM == 'skeleton':
-        elbow, wrist = human_arm.lowering_pose(lowering, 1.0)[:2]
+    elbow, wrist = human_arm.lowering_pose(lowering, 1.0)[:2]
     return comfort_total(human_arm.joints, human_arm.hand,
                          lowering['palm'][0], lowering['palm'][1],
                          elbow, wrist)[0]
@@ -616,7 +595,7 @@ def human_wrist_angles(elbow, wrist, hand_rot, hand, press_forearm,
         twist_deg=_twist_angle(press_forearm, press_normal, forearm, normal))
 
 
-def wrist_limits(press_angles, s=1.0, luba=False):
+def wrist_limits(press_angles, s=1.0):
     """押し込み時の手首の角度 ``press_angles`` から、腕を下ろす動きの割合
     ``s`` で許す範囲の dict (``flexion``/``deviation``/``twist`` の (下限,
     上限) [度])。押し込み時にすでに目安を超えている側は、押し込み時の値 +
@@ -634,8 +613,7 @@ def wrist_limits(press_angles, s=1.0, luba=False):
         flexion=bounds(press_angles['flexion_deg'], extension,
                        HUMAN_WRIST_FLEX_MAX_DEG),
         deviation=bounds(press_angles['deviation_deg'],
-                         _LUBA_WRIST_ULNAR_MAX_DEG if luba
-                         else HUMAN_WRIST_ULNAR_MAX_DEG,
+                         HUMAN_WRIST_ULNAR_MAX_DEG,
                          HUMAN_WRIST_RADIAL_MAX_DEG))
     if HUMAN_WRIST_TWIST_MAX_DEG is not None:
         limits['twist'] = bounds(press_angles['twist_deg'],
@@ -823,7 +801,7 @@ class HumanArm(object):
         self.press_joints = self.joint_angles(press_elbow, self.wrist0,
                                               self.palm_rot0)
         # 腕を下ろす動き (``lowering``・``lowering_pose``・``lowering_problem``)
-        # が使う値の鍵 (``LOWERING_REUSE``)。
+        # が使う値の鍵 (``_lowering_reused``)。
         self._reuse_sig = (hand,) + tuple(
             _arm_value_key(v) for v in (
                 self.shoulder, self.wrist0, self.upper, self.fore,
@@ -846,28 +824,14 @@ class HumanArm(object):
         ``HUMAN_ARM_CHECK_SAMPLES``) で腕の関節角度が目安 (``arm_limits``) を
         超えればその説明、超えなければ None。"""
         samples = samples or HUMAN_ARM_CHECK_SAMPLES
-        if LOWERING_REUSE:
-            return _lowering_reused(
-                ('problem', self._goal_key(lowering), samples, LOWERING_BATCH),
-                lambda: self._lowering_problem(lowering, samples),
-                lambda v: v)
-        return self._lowering_problem(lowering, samples)
-
-    def _lowering_problem(self, lowering, samples):
-        if LOWERING_BATCH:
-            return self._batch_lowering_problem(lowering, samples)
-        for k in range(1, samples + 1):
-            s = k / float(samples)
-            elbow, wrist, _, rot = self.lowering_pose(lowering, s)
-            problem = arm_violation(self.joint_angles(elbow, wrist, rot),
-                                    arm_limits(self.press_joints, s))
-            if problem is not None:
-                return problem
-        return None
+        return _lowering_reused(
+            ('problem', self._goal_key(lowering), samples),
+            lambda: self._batch_lowering_problem(lowering, samples),
+            lambda v: v)
 
     def _batch_lowering_problem(self, lowering, samples):
-        """``lowering_problem`` の、標本の点をまとめて計算する形
-        (``LOWERING_BATCH``)。式は 1 点ずつの形と同じで、点ごとの積を配列の積に
+        """``lowering_problem`` の、標本の点をまとめて計算する形。式は 1 点
+        ずつ ``lowering_pose`` で求めるのと同じで、点ごとの積を配列の積に
         しただけ。全ての点を計算してから、前の点から順に目安を見る。"""
         s_values = [k / float(samples) for k in range(1, samples + 1)]
         elbow, wrist, rot = self._batch_lowering_rot(lowering, s_values)
@@ -922,12 +886,9 @@ class HumanArm(object):
             bend_ = _rotation_between(fingers, np.array([1.0, 0.0, 0.0]))
             return fore0_, Rotation.from_matrix(bend_).as_rotvec()
 
-        if LOWERING_CACHE:
-            fore0, bend0 = _lowering_cached(
-                ('arm0', start_frame.tobytes(), float(start_flex),
-                 self.palm_rot0.tobytes()), start_parts)
-        else:
-            fore0, bend0 = start_parts()
+        fore0, bend0 = _lowering_cached(
+            ('arm0', start_frame.tobytes(), float(start_flex),
+             self.palm_rot0.tobytes()), start_parts)
         cos_f = np.array([math.cos(v) for v in flex])
         sin_f = np.array([math.sin(v) for v in flex])
         fa = cos_f[:, None] * ua + sin_f[:, None] * np.cross(n, ua)
@@ -1063,14 +1024,11 @@ class HumanArm(object):
             bend_ = _rotation_between(fingers, np.array([1.0, 0.0, 0.0]))
             return fore0_, Rotation.from_matrix(bend_).as_rotvec()
 
-        if LOWERING_CACHE:
-            # 出発の腕 (押し込み時) だけで決まる部分は、同じ値の入力なら同じ
-            # 結果なので使い回す。
-            fore0, bend0 = _lowering_cached(
-                ('arm0', np.asarray(start_frame, dtype=np.float64).tobytes(),
-                 float(start_flex), self.palm_rot0.tobytes()), start_parts)
-        else:
-            fore0, bend0 = start_parts()
+        # 出発の腕 (押し込み時) だけで決まる部分は、同じ値の入力なら同じ結果
+        # なので使い回す。
+        fore0, bend0 = _lowering_cached(
+            ('arm0', np.asarray(start_frame, dtype=np.float64).tobytes(),
+             float(start_flex), self.palm_rot0.tobytes()), start_parts)
         fa, fore = forearm(frame, flex)
         elbow = self.shoulder + self.upper * frame[:, 0]
         wrist = elbow + self.fore * fa
@@ -1091,15 +1049,13 @@ class HumanArm(object):
         回転行列)`` を含む) を返す。使えない向きなら None。"""
         if abduction_deg is None:
             abduction_deg = LOWERED_ARM_ABDUCTION_DEG
-        if LOWERING_REUSE:
-            return _lowering_reused(
-                ('lowering', self._reuse_sig) + tuple(
-                    _arm_value_key(v) for v in (arm_deg, abduction_deg,
-                                                facing, elbow_deg)),
-                lambda: self._lowering(arm_deg, abduction_deg, facing,
-                                       elbow_deg),
-                _copy_lowering)
-        return self._lowering(arm_deg, abduction_deg, facing, elbow_deg)
+        return _lowering_reused(
+            ('lowering', self._reuse_sig) + tuple(
+                _arm_value_key(v) for v in (arm_deg, abduction_deg,
+                                            facing, elbow_deg)),
+            lambda: self._lowering(arm_deg, abduction_deg, facing,
+                                   elbow_deg),
+            _copy_lowering)
 
     def _lowering(self, arm_deg, abduction_deg, facing, elbow_deg):
         start_frame, start_flex = self._press_arm_frame()
@@ -1156,12 +1112,10 @@ class HumanArm(object):
     def lowering_pose(self, goal, s):
         """``lowering`` の動きの割合 ``s`` (0: 押し込み時、1: 下ろしきった
         腕) の (肘, 手首, 掌の位置, 掌の回転行列)。"""
-        if LOWERING_REUSE:
-            return _lowering_reused(
-                ('pose', self._goal_key(goal), _arm_value_key(s)),
-                lambda: self._lowering_pose(goal, s),
-                lambda v: tuple(a.copy() for a in v))
-        return self._lowering_pose(goal, s)
+        return _lowering_reused(
+            ('pose', self._goal_key(goal), _arm_value_key(s)),
+            lambda: self._lowering_pose(goal, s),
+            lambda v: tuple(a.copy() for a in v))
 
     def _lowering_pose(self, goal, s):
         frame = _lowering_slerp(goal['start_frame'], goal['frame'], s)
@@ -1184,10 +1138,9 @@ class HumanArm(object):
 _DOWN = np.array([0.0, 0.0, -1.0])
 
 # 腕を下ろす動き (``HumanArm.lowering_pose``・``_arm``) の、同じ両端の Slerp と
-# 出発の腕だけで決まる部分を使い回す ('0' で毎回作る前の形)。値は毎回作るのと
-# 同じ (同じ入力の同じ計算)。鍵は入力の値 (バイト列)。develop の Q2
-# (UNIFIED_Q2_LOWERING_CACHE、04d89bf) と同じ。
-LOWERING_CACHE = os.environ.get('MFIX_LOWERING_CACHE', '1') == '1'
+# 出発の腕だけで決まる部分を使い回す。値は毎回作るのと同じ (同じ入力の同じ
+# 計算)。鍵は入力の値 (バイト列)。develop の Q2 (UNIFIED_Q2_LOWERING_CACHE、
+# 04d89bf) と同じ。
 _LOWERING_CACHE = {}
 _LOWERING_CACHE_MAX = 4096
 
@@ -1204,12 +1157,11 @@ def _lowering_cached(key, make):
 
 # 腕を下ろす動きの下ろし方 (``HumanArm.lowering``)・途中の腕
 # (``lowering_pose``)・人の腕の判定 (``lowering_problem``) を、同じ値の入力なら
-# 前の結果を使い回す ('0' で毎回計算する前の形)。横並び移動・寄せは 1 人の
+# 前の結果を使い回す。横並び移動・寄せは 1 人の
 # 計画で ``HumanArm`` を何度も作り直し、同じ押し込み時の腕から同じ 64 通りほどの
 # 下ろし方を毎回計算し直すので、人の腕 (肩・押し込み時の手首と掌・腕の長さ・
 # 正面・外向き) と下ろし方の値を鍵にして、``HumanArm`` をまたいで使い回す。
 # 値は計算し直すのと同じ (同じ入力の同じ計算)。配列は写しを返す。
-LOWERING_REUSE = os.environ.get('MFIX_LOWERING_REUSE', '1') == '1'
 _LOWERING_REUSE_CACHE = {}
 _LOWERING_REUSE_MAX = 20000
 _LOWERING_NONE = object()
@@ -1248,12 +1200,9 @@ def _copy_lowering(goal):
 
 
 def _lowering_slerp_of(a, b):
-    """``a`` から ``b`` (回転行列) への ``Slerp`` (``LOWERING_CACHE`` なら
-    使い回す)。"""
+    """``a`` から ``b`` (回転行列) への ``Slerp`` (使い回す)。"""
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
-    if not LOWERING_CACHE:
-        return Slerp([0.0, 1.0], Rotation.from_matrix([a, b]))
     return _lowering_cached(('slerp', a.tobytes(), b.tobytes()),
                             lambda: Slerp([0.0, 1.0],
                                           Rotation.from_matrix([a, b])))
@@ -1265,9 +1214,8 @@ def _lowering_slerp(a, b, s):
 
 
 # 腕を下ろす動きの人の腕の判定 (``HumanArm.lowering_problem``) を、標本の点
-# (10 点) をまとめた配列の計算にする ('0' で 1 点ずつ計算する前の形)。式は同じ。
-# develop の Q3 (UNIFIED_Q3_LOWERING_BATCH、b320f2d) と同じ。
-LOWERING_BATCH = os.environ.get('MFIX_LOWERING_BATCH', '1') == '1'
+# (10 点) をまとめた配列の計算にする (``_batch_lowering_problem``)。式は 1 点
+# ずつ計算するのと同じ。develop の Q3 (UNIFIED_Q3_LOWERING_BATCH、b320f2d) と同じ。
 
 
 def _dot_rows(a, b):
@@ -1757,16 +1705,14 @@ TRANSITION_HUMAN_CLEARANCE = 0.05
 
 # 横並び移動・寄せの検証 (``TransitionChecker``) で、人体の障害物の円柱
 # (``spik.human_body_obstacles``) と人の前腕・手の甲の円柱 (``forearm_obstacles``)
-# を、同じ入力なら作り直さず使い回す ('0' で毎回作る前の形)。差し出した腕だけ
-# 動かした骨格なので、胴・脚・頭・反対の腕は同じ円柱になる。値は同じ
-# (``spik.human_body_obstacles_reused``)。
-OBS_REUSE = os.environ.get('MFIX_OBS_REUSE', '1') == '1'
+# を、同じ入力なら作り直さず使い回す。差し出した腕だけ動かした骨格なので、
+# 胴・脚・頭・反対の腕は同じ円柱になる。値は同じ
+# (``spik.human_body_obstacles_reused``・``spik.forearm_obstacles_reused``)。
 
 # ``TransitionChecker`` の組 (自己干渉・人体・車輪の経路・前腕) を、同じ
-# ``verification_pairs``・手・腕なら前の検証器のものを使い回す ('0' で毎回
-# 分け直す前の形)。組は同じ中身で、距離計算の段取り (``spik._pair_plan``・
-# 表面の点の塊) も組に覚えられるので、作り直しが減る。
-CHECKER_REUSE = os.environ.get('MFIX_CHECKER_REUSE', '1') == '1'
+# ``verification_pairs``・手・腕なら前の検証器のものを使い回す。組は同じ中身で、
+# 距離計算の段取り (``spik._pair_plan``・表面の点の塊) も組に覚えられるので、
+# 作り直しが減る。
 # (id(verification_pairs), hand, robot_arm) -> (verification_pairs, 組...)。
 # verification_pairs を持っておくので id は使い回されない。
 _CHECKER_PAIRS_CACHE = {}
@@ -1774,10 +1720,8 @@ _CHECKER_PAIRS_CACHE_MAX = 64
 
 
 def _body_obstacles(joint_positions):
-    """検証用の人体の障害物 (``OBS_REUSE`` なら円柱を使い回す)。"""
-    if OBS_REUSE:
-        return spik.human_body_obstacles_reused(joint_positions)
-    return spik.human_body_obstacles(joint_positions)
+    """検証用の人体の障害物 (円柱を使い回す)。"""
+    return spik.human_body_obstacles_reused(joint_positions)
 
 
 class TransitionChecker(object):
@@ -1794,19 +1738,17 @@ class TransitionChecker(object):
         # 押し込み時の (前腕, 手の甲) までの距離 [m] (``set_press``)。
         self.press_forearm = None
         key = (id(verification_pairs), hand, robot_arm)
-        if CHECKER_REUSE:
-            cached = _CHECKER_PAIRS_CACHE.get(key)
-            if cached is not None and cached[0] is verification_pairs:
-                (_, self.self_pairs, self.clearance_pairs, self.base_pairs,
-                 self.forearm_pairs) = cached
-                return
+        cached = _CHECKER_PAIRS_CACHE.get(key)
+        if cached is not None and cached[0] is verification_pairs:
+            (_, self.self_pairs, self.clearance_pairs, self.base_pairs,
+             self.forearm_pairs) = cached
+            return
         self._make_pairs(robot_arm, hand, verification_pairs)
-        if CHECKER_REUSE:
-            if len(_CHECKER_PAIRS_CACHE) >= _CHECKER_PAIRS_CACHE_MAX:
-                _CHECKER_PAIRS_CACHE.clear()
-            _CHECKER_PAIRS_CACHE[key] = (
-                verification_pairs, self.self_pairs, self.clearance_pairs,
-                self.base_pairs, self.forearm_pairs)
+        if len(_CHECKER_PAIRS_CACHE) >= _CHECKER_PAIRS_CACHE_MAX:
+            _CHECKER_PAIRS_CACHE.clear()
+        _CHECKER_PAIRS_CACHE[key] = (
+            verification_pairs, self.self_pairs, self.clearance_pairs,
+            self.base_pairs, self.forearm_pairs)
 
     def _make_pairs(self, robot_arm, hand, verification_pairs):
         self.self_pairs = spik.self_collision_pairs(verification_pairs)
@@ -1859,8 +1801,7 @@ class TransitionChecker(object):
             return None
         clearances = spik.human_obstacle_clearances(
             robot, self.forearm_pairs,
-            (spik.forearm_obstacles_reused if OBS_REUSE
-             else forearm_obstacles)(
+            spik.forearm_obstacles_reused(
                 arm['elbow'], arm['wrist'], arm['palm_position'],
                 arm['palm_rot']),
             cull_distance=cull_distance)
@@ -1929,22 +1870,8 @@ def wrist_problem(human_arm, robot, arm, s, turn_deg):
     の組。``s`` は腕を下ろす動きの割合、``turn_deg`` は今の握りの向き。"""
     angles = human_arm.robot_hand_wrist(robot, arm)
     if HUMAN_WRIST_CHECK == 'hand_fixed':
-        problem = wrist_violation(
+        return angles, wrist_violation(
             angles, wrist_limits(human_arm.press_wrist, s))
-        if (problem is None and COMFORT_GATE < float('inf')
-                and wrist_violation(angles, wrist_limits(
-                    human_arm.press_wrist, s, luba=True)) is not None):
-            # 緩めた上限の中で LUBA の上限を超える: 人の項で許すかを決める。
-            end = getattr(robot, '{}arm_end_coords'.format(
-                human_arm.robot_arm))
-            total, _ = comfort_total(
-                human_arm.joints, human_arm.hand, arm['palm_position'],
-                hand_on_robot(end.worldrot(), human_arm.press_turn,
-                              human_arm.robot_arm))
-            if total > COMFORT_GATE:
-                problem = '人の項 {:.1f} (尺屈 {:.0f} 度)'.format(
-                    total, abs(angles['deviation_deg']))
-        return angles, problem
     if HUMAN_WRIST_CHECK == 'turn_cap':
         change = math.degrees(_wrap(math.radians(
             turn_deg - human_arm.press_turn)))
@@ -2463,21 +2390,9 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
 
 def _lowering_path_steps(human_arm, lowering, samples=20):
     """``lowering`` の動きの掌の道のり [m] と回転 [rad] (肩を中心に円弧で
-    下りるので、両端の差より長い)。"""
-    if PATH_STEPS_BATCH:
-        return _batch_lowering_path_steps(human_arm, lowering, samples)
-    return _lowering_path_steps_loop(human_arm, lowering, samples)
-
-
-# 経路の掌の道のり (``_lowering_path_steps``) の点をまとめて計算する ('0' で
-# 1 点ずつの前の形)。develop の Q3b の P3 (UNIFIED_Q3_PATH_STEPS_BATCH、
-# 450d4b1) と同じ。
-PATH_STEPS_BATCH = os.environ.get('MFIX_PATH_STEPS_BATCH', '1') == '1'
-
-
-def _batch_lowering_path_steps(human_arm, lowering, samples):
-    """``_lowering_path_steps`` の点をまとめた形。足し方 (前から順) と 1 区間
-    ごとの式は前の形と同じ。"""
+    下りるので、両端の差より長い)。点はまとめて計算する (develop の Q3b の P3
+    (UNIFIED_Q3_PATH_STEPS_BATCH、450d4b1) と同じ)。足し方 (前から順) と 1 区間
+    ごとの式は 1 点ずつの形 (``_lowering_path_steps_loop``) と同じ。"""
     if isinstance(human_arm, _StaticArm):
         # 掌は動かないので、どの区間も同じ値 (前の形と同じく区間の数だけ前から
         # 足す)。
@@ -2496,7 +2411,8 @@ def _batch_lowering_path_steps(human_arm, lowering, samples):
 
 
 def _lowering_path_steps_loop(human_arm, lowering, samples):
-    """``_lowering_path_steps`` の 1 点ずつの形 (前の形)。"""
+    """``_lowering_path_steps`` の 1 点ずつの形 (``batch_lowering_palms`` の
+    無い腕に使う)。"""
     poses = [human_arm.lowering_pose(lowering, k / float(samples))
              for k in range(samples + 1)]
     length = sum(np.linalg.norm(b[2] - a[2]) for a, b in zip(poses, poses[1:]))
@@ -2894,28 +2810,22 @@ def _low_arm_results(results):
 def _result_key(result, translated_joints, hand):
     """横並び移動の計画結果の良さの並べ替えの鍵 (小さいほど良い): 寄せまで
     進んだもの (寄せ後の横の距離、2 cm 刻み) > 横並びまで進んだもの (横の
-    距離) > 途中まで (進めた割合) > 失敗。同じなら ``PALM_FACING_ORDER`` の
-    先の向き。"""
+    距離、2 cm 刻み) > 途中まで (進めた割合) > 失敗。寄せ・横並びまで進んだ
+    ものは刻みが同じなら人の項の小さい方 (11/20 ユーザー決定)、それも同じなら
+    ``PALM_FACING_ORDER`` の先の向き。"""
     facing = result.get('palm_facing')
     phi = (PALM_FACING_ORDER.index(facing) if facing in PALM_FACING_ORDER
            else len(PALM_FACING_ORDER))
     approach = result.get('approach')
-    if COMFORT_SELECT in ('tie', 'bucket5'):
-        # study/sbs-comfort: 横の距離の刻みが同じなら人の項の小さい方。
-        step = 0.02 if COMFORT_SELECT == 'tie' else 0.05
-        comfort = result_comfort(result, translated_joints)
-        comfort = float('inf') if comfort is None else comfort
-        if approach and approach['n_waypoints']:
-            return (0, round(approach['lateral_after'] / step), comfort, phi)
-        if result['verified'] and result['fraction'] >= 1.0:
-            end = result['waypoints'][-1]['base_position']
-            return (1, round(human_lateral(translated_joints, end, hand)
-                             / step), comfort, phi)
+    step = 0.02
+    comfort = result_comfort(result, translated_joints)
+    comfort = float('inf') if comfort is None else comfort
     if approach and approach['n_waypoints']:
-        return (0, round(approach['lateral_after'] / 0.02), phi)
+        return (0, round(approach['lateral_after'] / step), comfort, phi)
     if result['verified'] and result['fraction'] >= 1.0:
         end = result['waypoints'][-1]['base_position']
-        return (1, human_lateral(translated_joints, end, hand), phi)
+        return (1, round(human_lateral(translated_joints, end, hand)
+                         / step), comfort, phi)
     if result['verified']:
         return (2, -result['fraction'], phi)
     return (3, 0.0, phi)
@@ -3375,9 +3285,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                     bundles.update(cache[bundle_key])
         else:
             batches = [lowerings for _, lowerings in ordered]
-        if COMFORT_ORDER:
-            # study/sbs-comfort: 下ろしきった掌の人の項の小さい順 (同じなら今の順)。
-            batches.sort(key=lambda b: lowering_comfort(human_arm, b[0]))
+        # 下ろしきった掌の人の項の小さい順 (同じなら上の順)。
+        batches.sort(key=lambda b: lowering_comfort(human_arm, b[0]))
         if hint_key is not None:
             # 予備の解の下ろし方を先頭に (残りは上の順のまま)。
             batches.sort(key=lambda b: lowering_key(b[0])[1:] != hint_key)
@@ -3388,7 +3297,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                   path_fractions=path_fractions)
     if best is None or best[1] < MIN_FRACTION:
         reason = ', '.join(sorted(set(reasons))) or None
-        if SBS_FULL and best is not None and best[1] > 0.0:
+        if best is not None and best[1] > 0.0:
             # 途中まで進めた経路を捨てた (MIN_FRACTION に届かない)。何割まで
             # 進めたかを理由の頭とログに残す (止まった理由は続く reasons)。
             result['partial_fraction'] = float(best[1])
@@ -3399,7 +3308,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 # 前の形なら途中までで実行していた経路だけログに出す。
                 print('[transition] 横並び移動の経路が移動先の {:.0f}% までしか'
                       '解けなかったため、この探索では通らなかった扱いにします '
-                      '(前の形 MFIX_SBS_FULL=0 なら途中までで実行していた)。'
+                      '(前の形なら途中までで実行していた)。'
                       .format(100.0 * best[1]))
         result.update(reason=reason, compute_time=time.time() - t0)
         return result
@@ -3724,7 +3633,7 @@ APPROACH_ALT_ARM_DEGS = (20.0, 40.0)
 APPROACH_ALT_ABDUCTIONS = (15.0, 30.0)
 APPROACH_ALT_ELBOWS = (30.0, 60.0)
 # 経路 (plan_path) まで試す移動先の数の上限。
-APPROACH_ALT_MAX_PATHS = spik.env_int('MFIX_APPROACH_ALT_MAX_PATHS', 6)
+APPROACH_ALT_MAX_PATHS = 6
 # 移動先のバッチ IK の初期値・腕の枝の基準: 'press' は押し込み姿勢、'stage1'
 # は段階 1 (と寄せ) の終点。腕の枝の範囲 [度] (GOAL_BRANCH_JOINT_RANGE_DEG と
 # 同じ意味)。腰を押し込み終了時より上げないか (GOAL_LEG_RISE と同じ)。
@@ -4060,7 +3969,8 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
             use_facing_variants=use_facing_variants, deadline=deadline)
     human_yaw = math.atan2(facing[1], facing[0])
     facings = PALM_FACING_ORDER if facings is None else tuple(facings)
-    if COMFORT_ORDER and approach:
+    if approach:
+        # 掌の向きを、下ろしきった掌の人の項の小さい順に試す。
         facings = comfort_facing_order(post, turn_deg, robot_arm, hand,
                                        translated_joints, facings)
     hint_facing = (hint or {}).get('palm_facing')
