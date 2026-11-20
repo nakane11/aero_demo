@@ -28,6 +28,8 @@ STAGE_PRESS_REFINE = ('押し込み直前の補正',
                       '人の手を検出し直し、押し込みの IK を解き直す')
 STAGE_PRESS_IN = ('押し込み', '指先を押し出しながら掌へ詰める')
 STAGE_GRASP = ('手を握っています', '')
+STAGE_PARTIAL_WAIT = ('手を合わせてもらうのを待っています',
+                      '行けるところまで押し込んで人の手を待つ')
 STAGE_TRANSITION_WAIT = ('横並び移動の開始待ち', '')
 STAGE_TRANSITION = ('横並び移動',
                     'つないだ手を体の横へ下ろしながら横並びへ (首は顔を追う)')
@@ -36,6 +38,7 @@ STAGE_DONE = ('実行を終了しました', 'RESET で最初から')
 STAGE_ERROR = ('実行中にエラーが起きました', '端末のログを確認してください')
 # 裏の計算 (状態の補足に出す)。
 BACKGROUND_TRANSITION_REFINE = '裏で横並びの寄せを計算中'
+BACKGROUND_TRANSITION_EARLY = '裏で横並び移動を計算中'
 
 # ロボットの状態 (番号はこの順に 1 から) と、それにまとめる処理。
 STATE_GROUPS = (

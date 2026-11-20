@@ -63,6 +63,7 @@ DEFAULT_N_WAYPOINTS = 20
 # waypoint 間の時間刻み [秒] (コスト正規化用。実機の速度ではない)。
 DEFAULT_DT = 0.2
 
+# 軌道最適化の反復の上限。
 DEFAULT_MAX_ITERATIONS = 60
 
 # 干渉コストが働き始める距離 [m] (人体 / 自己干渉)。
@@ -103,6 +104,10 @@ LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 # lead-in の waypoint 間隔 (並進 / 回頭)。
 LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
+# True なら lead-in で回頭と直進を同時に行う (False は回頭してから直進、
+# 11/17 以前)。実機 13 試行の計画で接近が平均 11.4 -> 10.2 秒
+# (tools/analyze_approach_timing.py --lead-in-concurrent)。
+LEAD_IN_BLEND = True
 
 # 自己干渉の許容貫通量 [m]。
 DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
@@ -422,13 +427,18 @@ def approach_start_candidates(base_goal, human_xy, distance,
 
 
 def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
-                            start_joint_angles=None):
+                            start_joint_angles=None, blend=None):
     """初期台車姿勢から ``first_waypoint`` までの lead-in の waypoint 列
     (``first_waypoint`` 自身は含まない)。
 
-    その場回転してから直進する。関節角は ``start_joint_angles``
-    (``{関節名: 角度}``、省略時は終点のまま) から線形補間する。
+    ``blend`` (None なら ``LEAD_IN_BLEND``) が True なら回りながら直進する
+    (台車は全方向に動けるので、回転と並進を同じ点数で一緒に補間する)。
+    そうでなければその場回転してから直進する。関節角は
+    ``start_joint_angles`` (``{関節名: 角度}``、省略時は終点のまま) から
+    線形補間する。
     """
+    if blend is None:
+        blend = LEAD_IN_BLEND
     end_base = np.array([first_waypoint['base_position'][0],
                          first_waypoint['base_position'][1],
                          first_waypoint['base_yaw']])
@@ -436,6 +446,8 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
     delta = end_base - start_base
     n_rotate = int(math.ceil(abs(delta[2]) / LEAD_IN_ANGLE_STEP))
     n_translate = int(math.ceil(np.linalg.norm(delta[:2]) / LEAD_IN_STEP))
+    if blend:
+        n_rotate, n_translate = 0, max(n_rotate, n_translate)
     n = n_rotate + n_translate
     if n == 0:
         return []
@@ -456,7 +468,9 @@ def build_lead_in_waypoints(initial_base_pose, first_waypoint, joint_names,
         else:
             u = float(i - n_rotate) / n_translate
             base = np.array([start_base[0] + delta[0] * u,
-                             start_base[1] + delta[1] * u, end_base[2]])
+                             start_base[1] + delta[1] * u,
+                             start_base[2] + delta[2] * u if blend
+                             else end_base[2]])
         waypoints.append(dict(
             base_position=[float(base[0]), float(base[1]), 0.0],
             base_yaw=float(base[2]),
@@ -1318,6 +1332,8 @@ def main():
     sbs.GOAL_LEG_RISE = args.goal_leg_rise
     sbs.GOAL_CROUCH_WEIGHT = args.goal_crouch_weight
     sbs.GOAL_BOW_WEIGHT = args.goal_bow_weight
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ時間の内訳を測る (無ければ何もしない)
 
     files = json_io.iter_json_files(args.input_dir)
     if not files and args.wait_file is None:
@@ -1384,7 +1400,10 @@ def main():
 
     n_optimized = n_verified = n_total = n_not_planned = 0
     n_transition = n_transition_verified = 0
+    initial_state = spik.robot_state(robot)
     for i, path in enumerate(files):
+        # 結果が前に処理した人によらないよう、ロボットの状態を決め直す (R7)。
+        spik.restore_robot_state(robot, initial_state)
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))
         if (not handshake.get('target') or not handshake.get('solved')

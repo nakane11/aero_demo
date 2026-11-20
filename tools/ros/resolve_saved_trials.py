@@ -117,13 +117,41 @@ def resolve_trial(planner, args, data_dir, name, attempt):
         return record
     # 乱数の消費が前の試行の解き直し回数に依存しないよう試行ごとに固定する。
     np.random.seed(zlib.crc32(name.encode()))
+    start_base_pose = None
+    # ノードと同じく、台車を先に動かした待機点から解く。
+    end = rcpt.pre_move_goal(palms[offered_hand]['position'],
+                             spik.human_standing_xy(joint_positions))
+    distance = float(np.linalg.norm(end[:2]))
+    record['pre_move_distance'] = distance
+    if distance >= rcpt.PRE_MOVE_MIN_DISTANCE:
+        start_base_pose = end
     t0 = time.time()
-    planned = planner.plan(joint_positions, palms, offered_hand, attempt)
+    planned = planner.plan(joint_positions, palms, offered_hand, attempt,
+                           start_base_pose=start_base_pose)
     result, motion = planned['result'], planned['motion']
+    # time は計画が返るまで (横並び移動は接近中に解くのでその前まで)。
+    record['time'] = time.time() - t0
+    early = planned.get('transition_early')
+    if early is not None and motion is not None:
+        # ノードが実行中に裏で解く横並び移動 (寄せなし) をここで続けて解く。
+        t1 = time.time()
+        motion['transition'], _ = planner.plan_transition_early(early)
+        record['early_transition_time'] = time.time() - t1
     record.update(
         hand=offered_hand, robot_arm=planned['robot_arm'],
-        stage=trial_stage(result, motion),
-        time=time.time() - t0)
+        stage=trial_stage(result, motion))
+    post = result.get('post_process') or {}
+    if post.get('partial'):
+        record.update(partial_press=True,
+                      press_reached=post['press_reached'],
+                      press_remaining=post['press_remaining'])
+    if motion is not None and motion.get('lead_in_waypoints'):
+        lead_in = [wp['base_position'][:2]
+                   for wp in motion['lead_in_waypoints']]
+        record['lead_in_length'] = float(sum(
+            np.linalg.norm(np.subtract(b, a))
+            for a, b in zip(lead_in, lead_in[1:] + [
+                motion['waypoints'][0]['base_position'][:2]])))
     if motion is not None:
         record['motion_kind'] = motion['kind']
         record['motion_min_distance'] = float(

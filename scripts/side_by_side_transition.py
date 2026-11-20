@@ -8,8 +8,10 @@
   動かしながら、台車を人と前後ずれ 0・同じ向きの位置へ動かし上体を起こす
   (移動先は台車も動かすバッチ IK、``solve_goal_candidates``)。腕は押し込み時と
   同じ解の枝に限る。waypoint は人の腕・握りの向き・台車を補間して解き直す。
-- 上半身 (body_link) は人の正面から ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と
-  同じ前方を見る (``forward_gaze_point``)。
+- 上半身 (body_link) は ``UPPER_BODY_REFERENCE`` (既定は台車の前方向) から
+  ``UPPER_BODY_LIMIT_DEG`` 以内、首は人と同じ前方を見る (``forward_gaze_point``)。
+  移動先の台車の向きは人の正面から ``GOAL_YAW_MARGIN_DEG`` 以内で、前を向くのは
+  前進前のその場回転に任せる。
 - 段階 2: 人の腕・掌を動かさず台車だけを人の方へ寄せる (``plan_approach``)。
 
 人の腕は肩を動かさず、手首から先は押し込み時の手に対して剛体 (``HumanArm``)。
@@ -130,6 +132,11 @@ GOAL_X_MARGIN = 0.05
 # 移動先のバッチ IK の目標 1 つあたりの初期値の数。
 GOAL_ATTEMPTS_PER_POSE = 128
 
+# 横並び移動・寄せの移動先のバッチ IK (_batch_ik) の反復の上限。既定は 60 で、hover の
+# spik.DEFAULT_COLLISION_IK_STOP (80) より少ない。寄せの時間の大半はここ
+# (80 にすると前の形 (hover と同じ反復))。
+SBS_COLLISION_IK_STOP = 60
+
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
 # 上体の前後ずれ |ankle + knee| [rad]。
 GOAL_FRONT_OFFSET_WEIGHT = 100.0
@@ -153,9 +160,6 @@ GOAL_BOW_WEIGHT = 0.0
 GOAL_LEG_RISE = 'strict'
 GOAL_LEG_RISE_MODES = ('off', 'strict', 'fallback')
 GOAL_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW  # [m]
-# 移動先の候補の腰の超過がこの量 [m] 以下なら、捨てずに脚を押し込み
-# 終了時の角度に直す。
-GOAL_LEG_RISE_REPAIR_MAX = 0.10
 # 経路の各 waypoint で、腰が直前より高くなってよい許容 [m]。
 PATH_LEG_RISE_TOLERANCE = spik.LEG_RISE_ALLOW
 
@@ -191,12 +195,16 @@ GOAL_BRANCH_JOINT_RANGE_DEG = 60.0
 GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 
 # --- 上半身・台車の向き・台車と脚の距離・寄せ (段階 2) ----------------------
-# 横並び (と寄せ) の間、上半身 (body_link の +x) を人の正面から
-# ±UPPER_BODY_LIMIT_DEG に収める。移動先は範囲外の候補を捨て、ずれの二乗に
+# 横並び (と寄せ) の間、上半身 (body_link の +x) を UPPER_BODY_REFERENCE の
+# 向きから ±UPPER_BODY_LIMIT_DEG に収める。'base' は台車の前方向 (前進前の
+# その場回転で台車が前を向いたとき、上半身も前を向く)、'human' は人の正面
+# (2026-11-19 まで)。移動先は範囲外の候補を捨て、ずれの二乗に
 # UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は、始点の
 # 上半身が範囲内 (UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす)
 # なら全体を、範囲外なら移動先だけを範囲に絞る (押し込み姿勢から出る途中の
 # 腰ヨーを絞ると、腕が掌に届かず経路が序盤で止まる)。
+UPPER_BODY_REFERENCES = ('base', 'human')
+UPPER_BODY_REFERENCE = 'base'
 UPPER_BODY_LIMIT_DEG = 20.0
 UPPER_BODY_WEIGHT = 100.0
 UPPER_BODY_START_SLACK_DEG = 3.0
@@ -211,8 +219,12 @@ REFINE_TIME_LIMIT = 10.0
 # 寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人だけ
 # GOAL_YAW_FALLBACK_DEG まで広げて解き直す (終点は GOAL_YAW_MARGIN_DEG
 # に収まるものだけ採る)。None なら広げない。
-GOAL_YAW_MARGIN_DEG = 20.0
-GOAL_YAW_FALLBACK_DEG = 30.0
+# 2026-11-19 まで 20 / 30 度 (上半身は人の正面基準)。45 度・上半身を台車の
+# 前方向基準にすると、実機 15 試行の計画で寄せ後の横の距離が平均 0.734 ->
+# 0.699 m (最大 0.86 -> 0.77 m)、寄せまでの計算が中央 4.1 -> 1.6 秒。代わりに
+# 前進前のその場回転が中央 16 -> 26 度 (最大 45 度) に増える。
+GOAL_YAW_MARGIN_DEG = 45.0
+GOAL_YAW_FALLBACK_DEG = None
 APPROACH_FALLBACK_LATERAL = 0.85
 
 # 人の掌の向きの候補 (``HumanArm.lowering`` の facing): 腕を下ろしきった
@@ -240,6 +252,18 @@ APPROACH_MAX_GOAL_TRIES = 6
 # そのときの目標 1 つあたりの初期値の数 (目標は 3 つとも同じ掌)。
 APPROACH_SINGLE_BATCH = True
 APPROACH_SINGLE_BATCH_ATTEMPTS = 128
+# 寄せながら台車を人の正面へ回す (人の手は動かさず、回転の分は腕で受ける)。
+# 移動先の台車の向きを人の正面から ±APPROACH_END_YAW_DEG に絞り、前進前の
+# その場回転 (つないだ手が台車のまわりに弧を描いて前へ引かれる) を小さくする。
+# 回して寄せられなければ、向きを変えない寄せに戻す。
+APPROACH_TURN_TO_FRONT = True
+APPROACH_END_YAW_DEG = 10.0
+
+# 前進前のその場回転 (腕は止めたまま台車を人の正面へ回す) の後に、人の肩から
+# つないだ手までの距離がこれ [m] を超える移動先は捨てる (人の腕が伸びきって
+# 前へ引っ張られる)。None なら見ない。実機 15 試行の計画では、向き ±45° で
+# 回転後の距離が最大 0.68 m (0.60 m 超は 2 試行)。
+HUMAN_REACH_AFTER_TURN_MAX = 0.60
 
 # 移動先の候補のうち、経路まで試す数と、押し込み IK・検証まで試す数
 # (どちらも目標 1 つあたり)。
@@ -266,8 +290,14 @@ PATH_JUMP_SUBDIVISIONS = (2, 3, 4)
 # ごとに 1 区間以上にもなるようにする。
 PLANNED_JOINT_STEP = math.radians(20.0)
 
-# 移動先までのうち進めた割合がこれに満たなければ、横並び移動はしない。
-MIN_FRACTION = 0.3
+# 移動先までのうち進めた割合がこれに満たなければ、横並び移動はしない (通らな
+# かった扱い。裏の計画では確保した経路へ、どちらも無ければ横並び移動をしない)。
+# ユーザー決定 (11/17): 移動先まで最後まで (1.0) 解けた経路だけ通ったとする
+# (develop bfc768f の J23 の 2、UNIFIED_J23_FULL と同じ)。確保 (plan_transition)
+# と裏の計画 ① (refine_transition) の両方に効く。
+MIN_FRACTION = 1.0
+# 前の形の MIN_FRACTION (この割合以上進めた経路を捨てたときにログで知らせる)。
+SBS_PARTIAL_MIN_FRACTION = 0.3
 
 # 人の腕の目安 (表示・ログ用、超えても止めない。reach <= 1 だけ止める)。
 # 肘は LUBA の最後の段階の始まり。手首の曲げ (合成) と押し込み時からの
@@ -349,6 +379,93 @@ HUMAN_ARM_LIMITS_DEG = collections.OrderedDict(
     (key, (luba_limit(key, False), luba_limit(key, True)))
     for key in ('shoulder_flexion', 'shoulder_abduction', 'shoulder_rotation',
                 'elbow_flexion', 'pronation'))
+
+# --- 人の項 (develop の人の楽さの指標、study/sbs-comfort) --------------------
+# develop の人の項 (sbs_human_term = develop の goal_ik/human_palm.py の写し) の
+# 11 成分の 2 乗和を、人の掌 (位置・人の手の向き) から求めて使う。
+# 11/20 ユーザー決定: 下ろし方・掌の向きを、下ろしきった掌の人の項の小さい順に
+# 試し、計画を選ぶ鍵 (``_result_key``) で寄せ後の横の距離が 2 cm 刻みで同じなら
+# 人の項の小さい方を選ぶ。
+# COMFORT_ARM: 人の項の関節角をどの腕で測るか。'skeleton' は ctb の
+#   ``HumanArm`` の肘・手首 (下ろし方で決まる腕) をそのまま使う。'develop' は
+#   develop と同じく掌から求め直す (手首は掌から 4.1 cm、肘は 2 リンクの規則。
+#   比べる道具が ``arm_mode`` で渡す)。
+COMFORT_ARM = 'skeleton'
+_COMFORT_PERSON = {}
+
+
+def comfort_total(joints, hand, palm_pos, hand_rot, elbow=None, wrist=None,
+                  arm_mode=None):
+    """人の掌 ``palm_pos``・人の手の向き ``hand_rot`` (列が指先・法線・指先 x
+    法線) の人の項 (develop の 11 成分) の ``(2 乗和, 成分の配列)``。
+    ``arm_mode`` (既定 ``COMFORT_ARM``) が 'skeleton' で ``elbow``・``wrist``
+    (世界座標) があれば、その腕で関節角を測る。"""
+    import sbs_human_term as ht
+    key = (id(joints), hand)
+    entry = _COMFORT_PERSON.get(key)
+    if entry is None or entry[0] is not joints:
+        p = {k: np.asarray(v, dtype=np.float64).reshape(-1)
+             for k, v in ht.person_values(joints, hand).items()}
+        p['palm_active'] = np.ones(1)
+        if len(_COMFORT_PERSON) > 256:
+            _COMFORT_PERSON.clear()
+        entry = (joints, p, ht.constants())
+        _COMFORT_PERSON[key] = entry
+    _, p, consts = entry
+    pos, rot = ht.canonical(np, np.asarray(palm_pos, dtype=np.float64),
+                            np.asarray(hand_rot, dtype=np.float64), p)
+    elbow_n = wrist_n = None
+    if ((arm_mode or COMFORT_ARM) == 'skeleton' and elbow is not None
+            and wrist is not None):
+        basis = p['human_basis'].reshape(3, 3)
+        length = p['human_length'][0]
+        elbow_n = basis @ (np.asarray(elbow, dtype=np.float64)
+                           - p['human_shoulder']) / length
+        wrist_n = basis @ (np.asarray(wrist, dtype=np.float64)
+                           - p['human_shoulder']) / length
+    e = np.asarray(ht.errors(np, pos, rot, p['human_ratio'][0], consts,
+                             elbow_n, wrist_n))
+    return float(np.sum(e * e)), e
+
+
+def comfort_hand_rot(palm_pos, palm_rot, turn_deg, press_turn, robot_arm):
+    """掌 (``HumanArm`` の掌の位置・回転) に握りの向き ``turn_deg`` で合わせた
+    ロボットの手に、押し込み時の握りの向き ``press_turn`` で付いた人の手の
+    向き (``wrist_angles_for_turns`` と同じ)。"""
+    palm = palm_from_frame(palm_pos, palm_rot)
+    return hand_on_robot(spik.palm_target_rot(palm, turn_deg, robot_arm),
+                         press_turn, robot_arm)
+
+
+def waypoint_comfort(joints, hand, wp, press_turn, robot_arm, arm_mode=None):
+    """横並び移動の waypoint ``wp`` の人の項 (2 乗和, 成分)。"""
+    arm = wp['human_arm']
+    return comfort_total(joints, hand, arm['palm_position'], comfort_hand_rot(
+        arm['palm_position'], np.asarray(arm['palm_rot']), wp['turn_deg'],
+        press_turn, robot_arm), arm.get('elbow'), arm.get('wrist'), arm_mode)
+
+
+def result_comfort(result, joints):
+    """横並びまで進んだ計画 ``result`` の終点の人の項 (2 乗和、無ければ None)。"""
+    if not (result.get('verified') and result.get('waypoints')
+            and result.get('robot_arm') and 'turn_before' in result):
+        return None
+    wp = result['waypoints'][-1]
+    if 'human_arm' not in wp:
+        return None
+    return waypoint_comfort(joints, result['hand'], wp, result['turn_before'],
+                            result['robot_arm'])[0]
+
+
+def lowering_comfort(human_arm, lowering):
+    """下ろし方 ``lowering`` の、下ろしきった掌 (握りの向きは押し込み時のまま、
+    手首は下ろし方のとおり) の人の項の 2 乗和。"""
+    elbow, wrist = human_arm.lowering_pose(lowering, 1.0)[:2]
+    return comfort_total(human_arm.joints, human_arm.hand,
+                         lowering['palm'][0], lowering['palm'][1],
+                         elbow, wrist)[0]
+
+
 _HUMAN_ARM_LABELS = dict(
     shoulder_flexion=('肩の屈曲', '肩の伸展'),
     shoulder_abduction=('肩の外転', '肩の内転'),
@@ -683,6 +800,12 @@ class HumanArm(object):
             self.press_forearm, self.palm_rot0[:, 1])
         self.press_joints = self.joint_angles(press_elbow, self.wrist0,
                                               self.palm_rot0)
+        # 腕を下ろす動き (``lowering``・``lowering_pose``・``lowering_problem``)
+        # が使う値の鍵 (``_lowering_reused``)。
+        self._reuse_sig = (hand,) + tuple(
+            _arm_value_key(v) for v in (
+                self.shoulder, self.wrist0, self.upper, self.fore,
+                self.outward, self.forward, self.palm_pos0, self.palm_rot0))
 
     def joint_angles(self, elbow, wrist, palm_rot):
         """肘 ``elbow``・手首 ``wrist``・掌 ``palm_rot`` の腕の関節角度
@@ -691,19 +814,99 @@ class HumanArm(object):
                                       np.asarray(palm_rot)[:, 1],
                                       self.forward, self.outward)
 
+    def _goal_key(self, goal):
+        return (self._reuse_sig,) + tuple(
+            _arm_value_key(goal[name]) for name in (
+                'start_frame', 'frame', 'start_flex', 'flex', 'twist'))
+
     def lowering_problem(self, lowering, samples=None):
         """下ろし方 ``lowering`` の途中 (``samples`` 点、既定
         ``HUMAN_ARM_CHECK_SAMPLES``) で腕の関節角度が目安 (``arm_limits``) を
         超えればその説明、超えなければ None。"""
         samples = samples or HUMAN_ARM_CHECK_SAMPLES
-        for k in range(1, samples + 1):
-            s = k / float(samples)
-            elbow, wrist, _, rot = self.lowering_pose(lowering, s)
-            problem = arm_violation(self.joint_angles(elbow, wrist, rot),
-                                    arm_limits(self.press_joints, s))
+        return _lowering_reused(
+            ('problem', self._goal_key(lowering), samples),
+            lambda: self._batch_lowering_problem(lowering, samples),
+            lambda v: v)
+
+    def _batch_lowering_problem(self, lowering, samples):
+        """``lowering_problem`` の、標本の点をまとめて計算する形。式は 1 点
+        ずつ ``lowering_pose`` で求めるのと同じで、点ごとの積を配列の積に
+        しただけ。全ての点を計算してから、前の点から順に目安を見る。"""
+        s_values = [k / float(samples) for k in range(1, samples + 1)]
+        elbow, wrist, rot = self._batch_lowering_rot(lowering, s_values)
+        palm_rot = rot @ self.palm_rot0
+        angles = _batch_joint_angles(self.shoulder, elbow, wrist,
+                                     palm_rot[:, :, 1], self.forward,
+                                     self.outward)
+        for s, ang in zip(s_values, angles):
+            problem = arm_violation(ang, arm_limits(self.press_joints, s))
             if problem is not None:
                 return problem
         return None
+
+    def _batch_lowering_frames(self, goal, s_values):
+        """``lowering_pose`` の上腕の組 (膨らませた後) の上腕の向き ua・蝶番軸
+        n ((S, 3)) と肘の曲げ (S 個) を点ごとにまとめたもの。"""
+        s = np.asarray(s_values, dtype=np.float64)
+        frames = _lowering_slerp_of(goal['start_frame'], goal['frame'])(
+            s).as_matrix()
+        ua = frames[:, :, 0]
+        n = frames[:, :, 1]
+        if LOWERED_BULGE_DEG > 0.0:
+            bulge = math.tan(math.radians(LOWERED_BULGE_DEG))
+            coef = np.array([math.sin(math.pi * v) * bulge for v in s_values])
+            ua = _unit_rows(ua + coef[:, None] * self.outward)
+            n = _unit_rows(n - _dot_rows(n, ua)[:, None] * ua)
+        flex = [goal['start_flex'] + (goal['flex'] - goal['start_flex']) * v
+                for v in s_values]
+        return ua, n, flex
+
+    def _batch_lowering_rot(self, goal, s_values):
+        """``lowering_pose(goal, s)`` の肘・手首と手の回転 (``_arm`` の
+        ``rot``、掌の回転行列は ``rot @ palm_rot0``) を ``s_values`` の点ごとに
+        まとめたもの ((S, 3)・(S, 3)・(S, 3, 3))。"""
+        ua, n, flex = self._batch_lowering_frames(goal, s_values)
+        ramp = [min(1.0, max(0.0, (v - LOWERED_TWIST_START)
+                             / max(1.0 - LOWERED_TWIST_START, 1e-6)))
+                for v in s_values]
+        twist = np.array([goal['twist'] * r for r in ramp])
+        straighten = np.array([LOWERED_WRIST_STRAIGHTEN * v
+                               for v in s_values])
+        # ``_arm`` と同じ。出発の腕の部分は ``_arm`` の使い回しと同じ鍵・同じ値。
+        start_frame = np.asarray(goal['start_frame'], dtype=np.float64)
+        start_flex = goal['start_flex']
+
+        def start_parts():
+            ua0, n0 = start_frame[:, 0], start_frame[:, 1]
+            fa0 = (math.cos(start_flex) * ua0
+                   + math.sin(start_flex) * np.cross(n0, ua0))
+            fore0_ = _arm_frame(fa0, n0)
+            fingers = fore0_.T @ self.palm_rot0[:, 0]
+            bend_ = _rotation_between(fingers, np.array([1.0, 0.0, 0.0]))
+            return fore0_, Rotation.from_matrix(bend_).as_rotvec()
+
+        fore0, bend0 = _lowering_cached(
+            ('arm0', start_frame.tobytes(), float(start_flex),
+             self.palm_rot0.tobytes()), start_parts)
+        cos_f = np.array([math.cos(v) for v in flex])
+        sin_f = np.array([math.sin(v) for v in flex])
+        fa = cos_f[:, None] * ua + sin_f[:, None] * np.cross(n, ua)
+        fore = np.stack([fa, n, np.cross(fa, n)], axis=2)
+        elbow = self.shoulder + self.upper * ua
+        wrist = elbow + self.fore * fa
+        bend = bend0[None, :] * straighten[:, None]
+        rot = (Rotation.from_rotvec(fa * twist[:, None]).as_matrix() @ fore
+               @ Rotation.from_rotvec(bend).as_matrix() @ fore0.T)
+        return elbow, wrist, rot
+
+    def batch_lowering_palms(self, goal, s_values):
+        """``lowering_pose(goal, s)`` の掌の位置 (S, 3) と回転行列 (S, 3, 3) を
+        ``s_values`` の点ごとにまとめて計算したもの。式は 1 点ずつの形と同じ。"""
+        _, wrist, rot = self._batch_lowering_rot(goal, s_values)
+        offset = self.palm_pos0 - self.wrist0
+        palm = wrist + np.stack([r @ offset for r in rot])
+        return palm, rot @ self.palm_rot0
 
     def arm_fraction(self, s):
         """経路の割合 ``s`` のときの腕を下ろす動きの割合。"""
@@ -814,15 +1017,23 @@ class HumanArm(object):
             fa = math.cos(flex_) * ua + math.sin(flex_) * np.cross(n, ua)
             return fa, _arm_frame(fa, n)
 
-        _, fore0 = forearm(start_frame, start_flex)
+        def start_parts():
+            _, fore0_ = forearm(start_frame, start_flex)
+            # 押し込み時の前腕の座標系で、指先を前腕の向き (+x) へ回す回転。
+            fingers = fore0_.T @ self.palm_rot0[:, 0]
+            bend_ = _rotation_between(fingers, np.array([1.0, 0.0, 0.0]))
+            return fore0_, Rotation.from_matrix(bend_).as_rotvec()
+
+        # 出発の腕 (押し込み時) だけで決まる部分は、同じ値の入力なら同じ結果
+        # なので使い回す。
+        fore0, bend0 = _lowering_cached(
+            ('arm0', np.asarray(start_frame, dtype=np.float64).tobytes(),
+             float(start_flex), self.palm_rot0.tobytes()), start_parts)
         fa, fore = forearm(frame, flex)
         elbow = self.shoulder + self.upper * frame[:, 0]
         wrist = elbow + self.fore * fa
-        # 押し込み時の前腕の座標系で、指先を前腕の向き (+x) へ回す回転。
-        fingers = fore0.T @ self.palm_rot0[:, 0]
-        bend = _rotation_between(fingers, np.array([1.0, 0.0, 0.0]))
-        bend = Rotation.from_matrix(bend).as_rotvec() * straighten
-        rot = (Rotation.from_rotvec(fa * twist).as_matrix() @ fore
+        bend = bend0 * straighten
+        rot =(Rotation.from_rotvec(fa * twist).as_matrix() @ fore
                @ Rotation.from_rotvec(bend).as_matrix() @ fore0.T)
         return (elbow, wrist, wrist + rot @ (self.palm_pos0 - self.wrist0),
                 rot @ self.palm_rot0)
@@ -838,6 +1049,15 @@ class HumanArm(object):
         回転行列)`` を含む) を返す。使えない向きなら None。"""
         if abduction_deg is None:
             abduction_deg = LOWERED_ARM_ABDUCTION_DEG
+        return _lowering_reused(
+            ('lowering', self._reuse_sig) + tuple(
+                _arm_value_key(v) for v in (arm_deg, abduction_deg,
+                                            facing, elbow_deg)),
+            lambda: self._lowering(arm_deg, abduction_deg, facing,
+                                   elbow_deg),
+            _copy_lowering)
+
+    def _lowering(self, arm_deg, abduction_deg, facing, elbow_deg):
         start_frame, start_flex = self._press_arm_frame()
         th = math.radians(arm_deg)
         ab = math.radians(abduction_deg)
@@ -892,8 +1112,13 @@ class HumanArm(object):
     def lowering_pose(self, goal, s):
         """``lowering`` の動きの割合 ``s`` (0: 押し込み時、1: 下ろしきった
         腕) の (肘, 手首, 掌の位置, 掌の回転行列)。"""
-        frame = Slerp([0.0, 1.0], Rotation.from_matrix(
-            [goal['start_frame'], goal['frame']]))([s]).as_matrix()[0]
+        return _lowering_reused(
+            ('pose', self._goal_key(goal), _arm_value_key(s)),
+            lambda: self._lowering_pose(goal, s),
+            lambda v: tuple(a.copy() for a in v))
+
+    def _lowering_pose(self, goal, s):
+        frame = _lowering_slerp(goal['start_frame'], goal['frame'], s)
         if LOWERED_BULGE_DEG > 0.0:
             # 途中で上腕を外へ膨らませる (両端は変えない)。
             ua = frame[:, 0] + (math.sin(math.pi * s)
@@ -911,6 +1136,169 @@ class HumanArm(object):
 
 
 _DOWN = np.array([0.0, 0.0, -1.0])
+
+# 腕を下ろす動き (``HumanArm.lowering_pose``・``_arm``) の、同じ両端の Slerp と
+# 出発の腕だけで決まる部分を使い回す。値は毎回作るのと同じ (同じ入力の同じ
+# 計算)。鍵は入力の値 (バイト列)。develop の Q2 (UNIFIED_Q2_LOWERING_CACHE、
+# 04d89bf) と同じ。
+_LOWERING_CACHE = {}
+_LOWERING_CACHE_MAX = 4096
+
+
+def _lowering_cached(key, make):
+    value = _LOWERING_CACHE.get(key)
+    if value is None:
+        value = make()
+        if len(_LOWERING_CACHE) >= _LOWERING_CACHE_MAX:
+            _LOWERING_CACHE.clear()
+        _LOWERING_CACHE[key] = value
+    return value
+
+
+# 腕を下ろす動きの下ろし方 (``HumanArm.lowering``)・途中の腕
+# (``lowering_pose``)・人の腕の判定 (``lowering_problem``) を、同じ値の入力なら
+# 前の結果を使い回す。横並び移動・寄せは 1 人の
+# 計画で ``HumanArm`` を何度も作り直し、同じ押し込み時の腕から同じ 64 通りほどの
+# 下ろし方を毎回計算し直すので、人の腕 (肩・押し込み時の手首と掌・腕の長さ・
+# 正面・外向き) と下ろし方の値を鍵にして、``HumanArm`` をまたいで使い回す。
+# 値は計算し直すのと同じ (同じ入力の同じ計算)。配列は写しを返す。
+_LOWERING_REUSE_CACHE = {}
+_LOWERING_REUSE_MAX = 20000
+_LOWERING_NONE = object()
+
+
+def _arm_value_key(x):
+    """値の鍵 (スカラーは float の 16 進表記 (-0.0 と 0.0 を分ける)、配列は
+    型・形・バイト列)。"""
+    if x is None or isinstance(x, str):
+        return x
+    if isinstance(x, (float, int)):
+        return float(x).hex()
+    a = np.asarray(x)
+    return a.dtype.str, a.shape, a.tobytes()
+
+
+def _lowering_reused(key, make, copy_value):
+    value = _LOWERING_REUSE_CACHE.get(key)
+    if value is None:
+        value = make()
+        if value is None:
+            value = _LOWERING_NONE
+        if len(_LOWERING_REUSE_CACHE) >= _LOWERING_REUSE_MAX:
+            _LOWERING_REUSE_CACHE.clear()
+        _LOWERING_REUSE_CACHE[key] = value
+    return None if value is _LOWERING_NONE else copy_value(value)
+
+
+def _copy_lowering(goal):
+    """``HumanArm.lowering`` の dict の写し (配列も写す)。"""
+    out = dict(goal)
+    for name in ('start_frame', 'frame'):
+        out[name] = np.array(goal[name], copy=True)
+    out['palm'] = tuple(np.array(v, copy=True) for v in goal['palm'])
+    return out
+
+
+def _lowering_slerp_of(a, b):
+    """``a`` から ``b`` (回転行列) への ``Slerp`` (使い回す)。"""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return _lowering_cached(('slerp', a.tobytes(), b.tobytes()),
+                            lambda: Slerp([0.0, 1.0],
+                                          Rotation.from_matrix([a, b])))
+
+
+def _lowering_slerp(a, b, s):
+    """``Slerp([0, 1], Rotation.from_matrix([a, b]))([s]).as_matrix()[0]``。"""
+    return _lowering_slerp_of(a, b)([s]).as_matrix()[0]
+
+
+# 腕を下ろす動きの人の腕の判定 (``HumanArm.lowering_problem``) を、標本の点
+# (10 点) をまとめた配列の計算にする (``_batch_lowering_problem``)。式は 1 点
+# ずつ計算するのと同じ。develop の Q3 (UNIFIED_Q3_LOWERING_BATCH、b320f2d) と同じ。
+
+
+def _dot_rows(a, b):
+    """行ごとの内積 (S,) (``b`` は (S, 3) か (3,))。"""
+    b = np.broadcast_to(b, a.shape)
+    return a[:, 0] * b[:, 0] + a[:, 1] * b[:, 1] + a[:, 2] * b[:, 2]
+
+
+def _unit_rows(v):
+    """行ごとの ``_unit``。"""
+    return v / np.maximum(np.sqrt(_dot_rows(v, v)), 1e-12)[:, None]
+
+
+def _rotation_between_rows(a, b):
+    """行ごとの ``_rotation_between`` (S, 3, 3)。"""
+    a, b = _unit_rows(a), _unit_rows(b)
+    axis = np.cross(a, b)
+    s = np.sqrt(_dot_rows(axis, axis))
+    c = _dot_rows(a, b)
+    small = s < 1e-9
+    angle = np.array([math.atan2(float(si), float(ci))
+                      for si, ci in zip(s, c)])
+    rotvec = axis / np.where(small, 1.0, s)[:, None] * angle[:, None]
+    rotvec[small] = 0.0
+    return Rotation.from_rotvec(rotvec).as_matrix()
+
+
+def _signed_angle_rows(a, b, axis):
+    """行ごとの ``_signed_angle`` [度] (S,)。"""
+    axis = _unit_rows(axis)
+    a = a - _dot_rows(a, axis)[:, None] * axis
+    b = b - _dot_rows(b, axis)[:, None] * axis
+    y = _dot_rows(np.cross(a, b), axis)
+    x = _dot_rows(a, b)
+    return np.array([math.degrees(math.atan2(float(yi), float(xi)))
+                     for yi, xi in zip(y, x)])
+
+
+def _batch_joint_angles(shoulder, elbow, wrist, normal, forward, outward):
+    """``human_arm_joint_angles`` を点 (行) ごとにまとめて計算したもの (点ごと
+    の OrderedDict のリスト)。"""
+    shoulder = np.asarray(shoulder, dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0])
+    f = _unit([forward[0], forward[1], 0.0])
+    o = np.asarray(outward, dtype=np.float64)
+    o = _unit(o - np.dot(o, f) * f - np.dot(o, up) * up)
+    elbow = np.asarray(elbow, dtype=np.float64)
+    ua = _unit_rows(elbow - shoulder)
+    fa = _unit_rows(np.asarray(wrist, dtype=np.float64) - elbow)
+    uf = _dot_rows(ua, f)
+    uu = _dot_rows(ua, up)
+    uo = _dot_rows(ua, o)
+    cos_elbow = _dot_rows(_unit_rows(ua), _unit_rows(fa))
+    carry = _rotation_between_rows(np.broadcast_to(_DOWN, ua.shape), ua)
+    neutral_fore = carry @ f
+    ext_sign = 1.0 if float(np.dot(np.cross(f, o), _DOWN)) > 0.0 else -1.0
+    medial = 1.0 if float(np.dot(np.cross(f, _DOWN), -o)) > 0.0 else -1.0
+    normal = np.asarray(normal, dtype=np.float64)
+    elbow_flex = [math.degrees(math.acos(float(np.clip(c, -1.0, 1.0))))
+                  for c in cos_elbow]
+    bent = np.array([e >= HUMAN_ARM_ROTATION_MIN_ELBOW_DEG
+                     for e in elbow_flex])
+    rotation = ext_sign * _signed_angle_rows(neutral_fore, fa, ua)
+    ref = medial * np.cross(fa, ua)
+    if not bent.all():
+        straight = ~bent
+        ref[straight] = (
+            _rotation_between_rows(ua[straight], fa[straight])
+            @ (medial * np.cross(neutral_fore[straight],
+                                 ua[straight]))[:, :, None])[:, :, 0]
+    pronation = -medial * _signed_angle_rows(ref, normal, fa)
+    out = []
+    for k in range(len(ua)):
+        sagittal = math.hypot(float(uf[k]), float(uu[k]))
+        flexion = (math.degrees(math.atan2(float(uf[k]), -float(uu[k])))
+                   if sagittal > 0.2 else 0.0)
+        abduction = math.degrees(math.asin(float(np.clip(uo[k], -1.0, 1.0))))
+        out.append(collections.OrderedDict([
+            ('shoulder_flexion', flexion), ('shoulder_abduction', abduction),
+            ('shoulder_rotation', float(rotation[k]) if bent[k] else None),
+            ('elbow_flexion', elbow_flex[k]),
+            ('pronation', float(pronation[k]))]))
+    return out
 
 
 def _arm_frame(axis, hinge):
@@ -1124,9 +1512,13 @@ def _upper_body_limit(human_yaw):
 
 
 def upper_body_deviation(robot, human_yaw):
-    """上半身 (body_link の +x) の向きの、人の正面 ``human_yaw`` [rad] からの
-    ずれ [rad] (反時計回りが正)。"""
+    """上半身 (body_link の +x) の向きのずれ [rad] (反時計回りが正)。
+    ``UPPER_BODY_REFERENCE`` が 'base' なら台車 (base_link の +x) から、
+    'human' なら人の正面 ``human_yaw`` [rad] から。"""
     x = robot.body_link.worldrot()[:, 0]
+    if UPPER_BODY_REFERENCE == 'base':
+        b = robot.base_link.worldrot()[:, 0]
+        return _wrap(math.atan2(x[1], x[0]) - math.atan2(b[1], b[0]))
     return _wrap(math.atan2(x[1], x[0]) - human_yaw)
 
 
@@ -1311,6 +1703,26 @@ def _aim_head(robot, gaze_point):
 # 横並び移動の検証で人体 (車輪と脚・足を含む) から空ける距離 [m]。
 TRANSITION_HUMAN_CLEARANCE = 0.05
 
+# 横並び移動・寄せの検証 (``TransitionChecker``) で、人体の障害物の円柱
+# (``spik.human_body_obstacles``) と人の前腕・手の甲の円柱 (``forearm_obstacles``)
+# を、同じ入力なら作り直さず使い回す。差し出した腕だけ動かした骨格なので、
+# 胴・脚・頭・反対の腕は同じ円柱になる。値は同じ
+# (``spik.human_body_obstacles_reused``・``spik.forearm_obstacles_reused``)。
+
+# ``TransitionChecker`` の組 (自己干渉・人体・車輪の経路・前腕) を、同じ
+# ``verification_pairs``・手・腕なら前の検証器のものを使い回す。組は同じ中身で、
+# 距離計算の段取り (``spik._pair_plan``・表面の点の塊) も組に覚えられるので、
+# 作り直しが減る。
+# (id(verification_pairs), hand, robot_arm) -> (verification_pairs, 組...)。
+# verification_pairs を持っておくので id は使い回されない。
+_CHECKER_PAIRS_CACHE = {}
+_CHECKER_PAIRS_CACHE_MAX = 64
+
+
+def _body_obstacles(joint_positions):
+    """検証用の人体の障害物 (円柱を使い回す)。"""
+    return spik.human_body_obstacles_reused(joint_positions)
+
 
 class TransitionChecker(object):
     """横並び移動の各姿勢の干渉検証 (自己干渉の貫通・人体からの距離)。
@@ -1323,6 +1735,22 @@ class TransitionChecker(object):
                  tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
         self.clearance = clearance
         self.tolerance = tolerance
+        # 押し込み時の (前腕, 手の甲) までの距離 [m] (``set_press``)。
+        self.press_forearm = None
+        key = (id(verification_pairs), hand, robot_arm)
+        cached = _CHECKER_PAIRS_CACHE.get(key)
+        if cached is not None and cached[0] is verification_pairs:
+            (_, self.self_pairs, self.clearance_pairs, self.base_pairs,
+             self.forearm_pairs) = cached
+            return
+        self._make_pairs(robot_arm, hand, verification_pairs)
+        if len(_CHECKER_PAIRS_CACHE) >= _CHECKER_PAIRS_CACHE_MAX:
+            _CHECKER_PAIRS_CACHE.clear()
+        _CHECKER_PAIRS_CACHE[key] = (
+            verification_pairs, self.self_pairs, self.clearance_pairs,
+            self.base_pairs, self.forearm_pairs)
+
+    def _make_pairs(self, robot_arm, hand, verification_pairs):
         self.self_pairs = spik.self_collision_pairs(verification_pairs)
         offered = spik.offered_hand_obstacle_indices(hand)
         source = spik.human_clearance_pairs(verification_pairs)
@@ -1345,8 +1773,6 @@ class TransitionChecker(object):
         # ロボットの差し出す腕の前腕・肘・手首と、人の前腕 (0)・手の甲 (1)
         # (``forearm_obstacles``) の組。
         self.forearm_pairs = spik.forearm_clearance_pairs(source, robot_arm)
-        # 押し込み時の (前腕, 手の甲) までの距離 [m] (``set_press``)。
-        self.press_forearm = None
 
     def set_press(self, robot, arm):
         """``robot`` の今の姿勢 (押し込み姿勢) と押し込み時の人の腕 ``arm``
@@ -1374,7 +1800,8 @@ class TransitionChecker(object):
         if not self.forearm_pairs:
             return None
         clearances = spik.human_obstacle_clearances(
-            robot, self.forearm_pairs, forearm_obstacles(
+            robot, self.forearm_pairs,
+            spik.forearm_obstacles_reused(
                 arm['elbow'], arm['wrist'], arm['palm_position'],
                 arm['palm_rot']),
             cull_distance=cull_distance)
@@ -1389,7 +1816,7 @@ class TransitionChecker(object):
         if not self.base_pairs:
             return None
         n = base_path.steps()
-        obstacles = spik.human_body_obstacles(joint_positions)
+        obstacles = _body_obstacles(joint_positions)
         names = spik.human_obstacle_names()
         for k in range(1, n + 1):
             _place(robot, av, base_path.at(k / float(n)))
@@ -1427,7 +1854,7 @@ class TransitionChecker(object):
             return None
         clearances = spik.human_obstacle_clearances(
             robot, self.clearance_pairs,
-            spik.human_body_obstacles(joint_positions),
+            _body_obstacles(joint_positions),
             cull_distance=self.clearance)
         if clearances:
             index = min(clearances, key=clearances.get)
@@ -1689,7 +2116,7 @@ def _batch_ik(robot, robot_arm, hand, targets, seed_av, collision_joints,
                 position_mask=True,
                 rotation_mask=(list(FREE_TURN_ROTATION_MASK) if free_turn
                                else True),
-                stop=spik.DEFAULT_COLLISION_IK_STOP,
+                stop=SBS_COLLISION_IK_STOP,
                 thre=spik.DEFAULT_COLLISION_IK_THRE,
                 rthre=spik.DEFAULT_COLLISION_IK_RTHRE,
                 initial_angles='current',
@@ -1792,6 +2219,22 @@ def wrist_limit_penalty(av, table):
     return total
 
 
+def reach_after_turn(robot, robot_arm, base, shoulder):
+    """``robot`` (台車 ``base`` = (x, y, yaw)、人の正面が +x の座標系に置いた
+    姿勢) を、腕を止めたまま台車の中心まわりに人の正面 (yaw 0) へ回したときの、
+    人の肩 ``shoulder`` からつないだ手までの距離 [m] (肩が無ければ 0)。"""
+    if shoulder is None:
+        return 0.0
+    hand = np.asarray(getattr(robot, '{}arm_end_coords'.format(
+        robot_arm)).worldpos(), dtype=np.float64)
+    c, s = math.cos(-base[2]), math.sin(-base[2])
+    dx, dy = hand[0] - base[0], hand[1] - base[1]
+    turned = np.array([base[0] + c * dx - s * dy, base[1] + s * dx + c * dy,
+                       hand[2]])
+    return float(np.linalg.norm(turned - np.asarray(shoulder,
+                                                    dtype=np.float64)))
+
+
 def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                           translated_joints, collision_joints,
                           collision_pairs, base_limits,
@@ -1837,6 +2280,7 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                     for name, p in translated_joints.items()}
     local_collision_joints = {name: to_local.transform_point(p)
                               for name, p in collision_joints.items()}
+    shoulder = local_joints.get('{}Shoulder'.format(hand))
     local_arms = [[to_local.transform_point(p) for p in arm]
                   for arm in lowered_arms]
     local_forearms = [
@@ -1892,17 +2336,13 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
                 continue
             # 指先の上下は台車の yaw に依らないので、解いた座標系のまま。
             _place(robot, av, base)
-            if max_waist_z is not None and GOAL_LEG_RISE != 'off':
-                # 腰が少しだけ高い候補は、脚を押し込み終了時の角度に直す。
-                rise = waist_height(robot) - max_waist_z
-                if (GOAL_LEG_RISE_TOLERANCE < rise
-                        <= GOAL_LEG_RISE_REPAIR_MAX):
-                    av = av.copy()
-                    av[ankle], av[knee] = seed[ankle], seed[knee]
-                    _place(robot, av, base)
             # 人の正面が +x の座標系なので、人の正面からのずれは yaw そのもの。
             upper_dev = upper_body_deviation(robot, 0.0)
             if abs(upper_dev) > upper_limit:
+                continue
+            if (HUMAN_REACH_AFTER_TURN_MAX is not None
+                    and reach_after_turn(robot, robot_arm, base, shoulder)
+                    > HUMAN_REACH_AFTER_TURN_MAX):
                 continue
             finger = finger_direction(end_coords.worldrot())
             xy = to_world.transform_point([base[0], base[1], 0.0])[:2]
@@ -1950,7 +2390,29 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
 
 def _lowering_path_steps(human_arm, lowering, samples=20):
     """``lowering`` の動きの掌の道のり [m] と回転 [rad] (肩を中心に円弧で
-    下りるので、両端の差より長い)。"""
+    下りるので、両端の差より長い)。点はまとめて計算する (develop の Q3b の P3
+    (UNIFIED_Q3_PATH_STEPS_BATCH、450d4b1) と同じ)。足し方 (前から順) と 1 区間
+    ごとの式は 1 点ずつの形 (``_lowering_path_steps_loop``) と同じ。"""
+    if isinstance(human_arm, _StaticArm):
+        # 掌は動かないので、どの区間も同じ値 (前の形と同じく区間の数だけ前から
+        # 足す)。
+        rot = human_arm.palm_rot
+        step = Rotation.from_matrix(rot @ rot.T).magnitude()
+        zero = np.linalg.norm(human_arm.palm_pos - human_arm.palm_pos)
+        return sum([zero] * samples), sum([step] * samples)
+    if not hasattr(human_arm, 'batch_lowering_palms'):
+        return _lowering_path_steps_loop(human_arm, lowering, samples)
+    pos, rot = human_arm.batch_lowering_palms(
+        lowering, [k / float(samples) for k in range(samples + 1)])
+    length = sum(np.linalg.norm(d) for d in pos[1:] - pos[:-1])
+    angle = sum(Rotation.from_matrix(
+        rot[1:] @ np.transpose(rot[:-1], (0, 2, 1))).magnitude())
+    return length, angle
+
+
+def _lowering_path_steps_loop(human_arm, lowering, samples):
+    """``_lowering_path_steps`` の 1 点ずつの形 (``batch_lowering_palms`` の
+    無い腕に使う)。"""
     poses = [human_arm.lowering_pose(lowering, k / float(samples))
              for k in range(samples + 1)]
     length = sum(np.linalg.norm(b[2] - a[2]) for a, b in zip(poses, poses[1:]))
@@ -2348,17 +2810,22 @@ def _low_arm_results(results):
 def _result_key(result, translated_joints, hand):
     """横並び移動の計画結果の良さの並べ替えの鍵 (小さいほど良い): 寄せまで
     進んだもの (寄せ後の横の距離、2 cm 刻み) > 横並びまで進んだもの (横の
-    距離) > 途中まで (進めた割合) > 失敗。同じなら ``PALM_FACING_ORDER`` の
-    先の向き。"""
+    距離、2 cm 刻み) > 途中まで (進めた割合) > 失敗。寄せ・横並びまで進んだ
+    ものは刻みが同じなら人の項の小さい方 (11/20 ユーザー決定)、それも同じなら
+    ``PALM_FACING_ORDER`` の先の向き。"""
     facing = result.get('palm_facing')
     phi = (PALM_FACING_ORDER.index(facing) if facing in PALM_FACING_ORDER
            else len(PALM_FACING_ORDER))
     approach = result.get('approach')
+    step = 0.02
+    comfort = result_comfort(result, translated_joints)
+    comfort = float('inf') if comfort is None else comfort
     if approach and approach['n_waypoints']:
-        return (0, round(approach['lateral_after'] / 0.02), phi)
+        return (0, round(approach['lateral_after'] / step), comfort, phi)
     if result['verified'] and result['fraction'] >= 1.0:
         end = result['waypoints'][-1]['base_position']
-        return (1, human_lateral(translated_joints, end, hand), phi)
+        return (1, round(human_lateral(translated_joints, end, hand)
+                         / step), comfort, phi)
     if result['verified']:
         return (2, -result['fraction'], phi)
     return (3, 0.0, phi)
@@ -2370,7 +2837,8 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                  attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
                  use_facing_variants=True, facings=None,
                  yaw_margin_deg=None, deadline=None, cache=None,
-                 bundle_facings=None, max_palm_z=None, bundle_first=True):
+                 bundle_facings=None, max_palm_z=None, bundle_first=True,
+                 hint=None):
     """押し込み姿勢 ``post`` (``solve_post_process`` の結果 dict、向き
     ``turn_deg``) から、つないだ手を人の体の横へ下ろしながら、ロボットも
     人と横並びになる位置・姿勢へ移る waypoint を計画する (段階 1)。
@@ -2391,6 +2859,11 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
     寄せを解かない計画用)。``max_palm_z`` [m] を与えると、下ろしきった掌が
     それより高い下ろし方は試さない。
 
+    ``hint`` (``arm_deg``・``abduction_deg``・``palm_facing`` の dict、
+    予備の解の下ろし方) を与えると、その上腕の角度を含む組・その下ろし方から
+    試す (押し込みを解き直した姿勢からの解き直し用。実機 8 試行で、解けた
+    5 試行の時間 平均 2.1 -> 1.3 秒、寄せ後 平均 0.71 -> 0.68 m)。
+
     Returns
     -------
     dict
@@ -2403,7 +2876,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         腕の目安の最大値)、``compute_time`` [秒]。
     """
     t0 = time.time()
-    result = dict(verified=False, waypoints=[], hand=hand,
+    result = dict(verified=False, waypoints=[], hand=hand, robot_arm=robot_arm,
                   joint_names=list(post['joint_names']), fraction=0.0,
                   x_margin=None, reason=None,
                   placement_before=None, placement_after=None,
@@ -2487,6 +2960,11 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             per_target=per_target)
 
     arm_problems = {}
+    # 手がかり (予備の解) の下ろし方 (上腕の角度, 脇の開き, 掌の向き)。
+    hint = hint or {}
+    hint_key = ((float(hint['arm_deg']), float(hint['abduction_deg']),
+                 hint.get('palm_facing'))
+                if hint.get('arm_deg') is not None else None)
 
     def arm_ok(lowering):
         """下ろし方 ``lowering`` の途中で人の肩・肘・前腕が目安に収まるか
@@ -2616,93 +3094,98 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 # 3 つとも同じ下ろし方なら、1 つの目標としてコストの安い順。
                 candidates = sorted(
                     [c[:4] + (0,) for c in candidates], key=lambda c: c[0])
-            tried = {}
-            checked = {}
-            for _, goal_av, goal_base, goal_turn, palm_index in candidates:
-                if (tried.get(palm_index, 0) >= MAX_GOAL_CANDIDATES
-                        or checked.get(palm_index, 0) >= MAX_GOAL_CHECKS):
-                    continue
-                if out_of_time():
-                    return True
-                lowering = lowerings[palm_index]
-                goal_palm = lowering['palm']
-                goal_arm = human_arm.pose(
-                    *goal_palm,
-                    elbow=human_arm.lowering_pose(lowering, 1.0)[0])
-                goal_skeleton = human_arm.skeleton(goal_arm)
-                # yaw を押し込み時から近い回り方の値にする。
-                goal_base = np.array([goal_base[0], goal_base[1],
-                                      start_base[2]
-                                      + _wrap(goal_base[2] - start_base[2])])
-                base_path = BasePath(start_base, goal_base, standing)
-                # 台車の経路で車輪が人の脚に近づく候補は、経路を計画する前に
-                # 外す (安く判定できるので ``checked`` には数えない)。
-                problem = checker.check_base_path(
-                    robot, goal_av, base_path, goal_skeleton)
-                if problem is not None:
-                    reasons.append(problem)
-                    continue
-                checked[palm_index] = checked.get(palm_index, 0) + 1
-                # 移動先の姿勢そのものを、首も含めて押し込み姿勢に解き直して
-                # 検証してから経路を解く。
-                goal_target = press_target(palm_from_frame(*goal_palm),
-                                           goal_turn, robot_arm)
-                _place(robot, goal_av, goal_base)
-                if not _press_ik(robot, robot_arm, goal_target, gaze_forward,
-                                 free_turn=free_turn):
-                    reasons.append('移動先で押し込み IK が解けない')
-                    continue
-                # 指先が上を向いた解は、握りの向きを指先が一番下を向く角度に固定して
-                # 解き直す (解けなければそのまま)。
-                if finger_z(robot, robot_arm) > GOAL_FINGER_DOWN_MAX_Z:
-                    before = robot.angle_vector().copy()
-                    before_z = finger_z(robot, robot_arm)
-                    down_target = press_target(
-                        palm_from_frame(*goal_palm),
-                        down_turn_deg(palm_from_frame(*goal_palm), robot_arm),
-                        robot_arm)
-                    if (not _press_ik(robot, robot_arm, down_target,
-                                      gaze_forward)
-                            or finger_z(robot, robot_arm) >= before_z):
-                        robot.angle_vector(before)
-                if free_turn:
-                    goal_turn = grip_turn_deg(robot, robot_arm,
-                                              palm_from_frame(*goal_palm))
-                # 人の手首が目安を超えるなら、収まる握りの向きで解き直す。
-                goal_turn, problem = fix_goal_wrist(
-                    robot, robot_arm, human_arm, goal_arm, *goal_palm,
-                    gaze_forward, goal_turn, aim_head=False)
-                if problem is None:
-                    # 腕と同時の視線 IK は首が大きく回せず解けないことがあるので、
-                    # 首だけで前へ向け直す (経路の首はここへ補間する)。首は手首に
-                    # 関係しないので、手首の判定に通ったものだけ。
-                    _aim_head(robot, gaze_forward)
-                    problem = checker.check(robot, goal_skeleton, goal_arm)
-                if problem is not None:
-                    reasons.append('移動先で{}'.format(problem.split(' ')[0]))
-                    continue
-                tried[palm_index] = tried.get(palm_index, 0) + 1
-                if (MAX_PATH_TRIES is not None
-                        and n_paths[0] >= MAX_PATH_TRIES):
-                    reasons.append('経路の試行回数が上限 ({}) に達した'.format(
-                        MAX_PATH_TRIES))
-                    return True
-                n_paths[0] += 1
-                waypoints, fraction, why = plan_path(
-                    robot, robot_arm, hand, turn_deg, goal_turn, human_arm,
-                    lowering, start_av, base_path,
-                    robot.angle_vector().copy(), checker,
-                    free_turn=free_turn)
-                path_fractions.append(round(float(fraction), 3))
-                if why is not None:
-                    reasons.append('経路の{}'.format(why))
-                record_path(waypoints, fraction, lowering, x_margin)
-                if fraction >= 1.0:
-                    n_paths_full[0] = n_paths[0]
-                    return True
             # 次の組 (握りの向き ±90 度) は、この組で移動先の IK が 1 つも解けなかった
             # ときだけ試す。
-            return False
+            return try_candidates(candidates, lowerings, x_margin)
+        return False
+
+    def try_candidates(candidates, lowerings, x_margin):
+        """移動先の候補 ``candidates`` を順に試す。横並びまで進めたか、時間・
+        経路の試行回数の上限なら True。"""
+        tried = {}
+        checked = {}
+        for _, goal_av, goal_base, goal_turn, palm_index in candidates:
+            if (tried.get(palm_index, 0) >= MAX_GOAL_CANDIDATES
+                    or checked.get(palm_index, 0) >= MAX_GOAL_CHECKS):
+                continue
+            if out_of_time():
+                return True
+            lowering = lowerings[palm_index]
+            goal_palm = lowering['palm']
+            goal_arm = human_arm.pose(
+                *goal_palm,
+                elbow=human_arm.lowering_pose(lowering, 1.0)[0])
+            goal_skeleton = human_arm.skeleton(goal_arm)
+            # yaw を押し込み時から近い回り方の値にする。
+            goal_base = np.array([goal_base[0], goal_base[1],
+                                  start_base[2]
+                                  + _wrap(goal_base[2] - start_base[2])])
+            base_path = BasePath(start_base, goal_base, standing)
+            # 台車の経路で車輪が人の脚に近づく候補は、経路を計画する前に
+            # 外す (安く判定できるので ``checked`` には数えない)。
+            problem = checker.check_base_path(
+                robot, goal_av, base_path, goal_skeleton)
+            if problem is not None:
+                reasons.append(problem)
+                continue
+            checked[palm_index] = checked.get(palm_index, 0) + 1
+            # 移動先の姿勢そのものを、首も含めて押し込み姿勢に解き直して
+            # 検証してから経路を解く。
+            goal_target = press_target(palm_from_frame(*goal_palm),
+                                       goal_turn, robot_arm)
+            _place(robot, goal_av, goal_base)
+            if not _press_ik(robot, robot_arm, goal_target, gaze_forward,
+                             free_turn=free_turn):
+                reasons.append('移動先で押し込み IK が解けない')
+                continue
+            # 指先が上を向いた解は、握りの向きを指先が一番下を向く角度に固定して
+            # 解き直す (解けなければそのまま)。
+            if finger_z(robot, robot_arm) > GOAL_FINGER_DOWN_MAX_Z:
+                before = robot.angle_vector().copy()
+                before_z = finger_z(robot, robot_arm)
+                down_target = press_target(
+                    palm_from_frame(*goal_palm),
+                    down_turn_deg(palm_from_frame(*goal_palm), robot_arm),
+                    robot_arm)
+                if (not _press_ik(robot, robot_arm, down_target,
+                                  gaze_forward)
+                        or finger_z(robot, robot_arm) >= before_z):
+                    robot.angle_vector(before)
+            if free_turn:
+                goal_turn = grip_turn_deg(robot, robot_arm,
+                                          palm_from_frame(*goal_palm))
+            # 人の手首が目安を超えるなら、収まる握りの向きで解き直す。
+            goal_turn, problem = fix_goal_wrist(
+                robot, robot_arm, human_arm, goal_arm, *goal_palm,
+                gaze_forward, goal_turn, aim_head=False)
+            if problem is None:
+                # 腕と同時の視線 IK は首が大きく回せず解けないことがあるので、
+                # 首だけで前へ向け直す (経路の首はここへ補間する)。首は手首に
+                # 関係しないので、手首の判定に通ったものだけ。
+                _aim_head(robot, gaze_forward)
+                problem = checker.check(robot, goal_skeleton, goal_arm)
+            if problem is not None:
+                reasons.append('移動先で{}'.format(problem.split(' ')[0]))
+                continue
+            tried[palm_index] = tried.get(palm_index, 0) + 1
+            if (MAX_PATH_TRIES is not None
+                    and n_paths[0] >= MAX_PATH_TRIES):
+                reasons.append('経路の試行回数が上限 ({}) に達した'.format(
+                    MAX_PATH_TRIES))
+                return True
+            n_paths[0] += 1
+            waypoints, fraction, why = plan_path(
+                robot, robot_arm, hand, turn_deg, goal_turn, human_arm,
+                lowering, start_av, base_path,
+                robot.angle_vector().copy(), checker,
+                free_turn=free_turn)
+            path_fractions.append(round(float(fraction), 3))
+            if why is not None:
+                reasons.append('経路の{}'.format(why))
+            record_path(waypoints, fraction, lowering, x_margin)
+            if fraction >= 1.0:
+                n_paths_full[0] = n_paths[0]
+                return True
         return False
 
     def facing_variants(arm_degs, abduction_deg, order=None):
@@ -2754,6 +3237,9 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
         if not groups or groups[-1][0] != arm_degs:
             groups.append((arm_degs, []))
         groups[-1][1].append(abduction_deg)
+    if hint_key is not None:
+        # 予備の解の上腕の角度を含む組から試す。
+        groups.sort(key=lambda g: hint_key[0] not in g[0])
     for arm_degs, abductions in groups:
         ordered = []
         for k, abduction_deg in enumerate(abductions):
@@ -2799,14 +3285,32 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                     bundles.update(cache[bundle_key])
         else:
             batches = [lowerings for _, lowerings in ordered]
+        # 下ろしきった掌の人の項の小さい順 (同じなら上の順)。
+        batches.sort(key=lambda b: lowering_comfort(human_arm, b[0]))
+        if hint_key is not None:
+            # 予備の解の下ろし方を先頭に (残りは上の順のまま)。
+            batches.sort(key=lambda b: lowering_key(b[0])[1:] != hint_key)
         if any(try_lowerings(lowerings) for lowerings in batches):
             break
     best = best[0]
     result.update(n_paths=n_paths[0], n_paths_full=n_paths_full[0],
                   path_fractions=path_fractions)
     if best is None or best[1] < MIN_FRACTION:
-        result.update(reason=', '.join(sorted(set(reasons))) or None,
-                      compute_time=time.time() - t0)
+        reason = ', '.join(sorted(set(reasons))) or None
+        if best is not None and best[1] > 0.0:
+            # 途中まで進めた経路を捨てた (MIN_FRACTION に届かない)。何割まで
+            # 進めたかを理由の頭とログに残す (止まった理由は続く reasons)。
+            result['partial_fraction'] = float(best[1])
+            head = '最後まで解けない (移動先の {:.0f}% まで)'.format(
+                100.0 * best[1])
+            reason = head if reason is None else head + ', ' + reason
+            if best[1] >= SBS_PARTIAL_MIN_FRACTION:
+                # 前の形なら途中までで実行していた経路だけログに出す。
+                print('[transition] 横並び移動の経路が移動先の {:.0f}% までしか'
+                      '解けなかったため、この探索では通らなかった扱いにします '
+                      '(前の形なら途中までで実行していた)。'
+                      .format(100.0 * best[1]))
+        result.update(reason=reason, compute_time=time.time() - t0)
         return result
     waypoints, fraction = best
     last = waypoints[-1]
@@ -2904,10 +3408,45 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
                   collision_pairs, base_limits, yaw_margin_deg=None,
                   target_lateral=APPROACH_TARGET_LATERAL, windows=None,
                   attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
-                  direct_below=None):
+                  direct_below=None, turn_to_front=None):
+    """``_plan_approach`` を、``turn_to_front`` (None なら
+    ``APPROACH_TURN_TO_FRONT``) なら台車を人の正面へ回しながら解き、寄せ
+    られなければ向きを変えずに解き直す。戻り値に ``turned`` (回したか) を
+    足す。"""
+    if turn_to_front is None:
+        turn_to_front = APPROACH_TURN_TO_FRONT
+    args = (robot, robot_arm, hand, post, turn_deg, last, translated_joints,
+            collision_joints, verification_pairs, collision_pairs,
+            base_limits)
+    kwargs = dict(yaw_margin_deg=yaw_margin_deg, target_lateral=target_lateral,
+                  windows=windows, attempts_per_pose=attempts_per_pose,
+                  direct_below=direct_below)
+    if turn_to_front:
+        out = _plan_approach(*args, turn=True, **kwargs)
+        if out['waypoints']:
+            out['turned'] = True
+            return out
+        reason = out['reason']
+        out = _plan_approach(*args, turn=False, **kwargs)
+        if not out['waypoints'] and reason:
+            out['reason'] = '回して: {} / 回さず: {}'.format(
+                reason, out['reason'])[:300]
+    else:
+        out = _plan_approach(*args, turn=False, **kwargs)
+    out['turned'] = False
+    return out
+
+
+def _plan_approach(robot, robot_arm, hand, post, turn_deg, last,
+                   translated_joints, collision_joints, verification_pairs,
+                   collision_pairs, base_limits, yaw_margin_deg=None,
+                   target_lateral=APPROACH_TARGET_LATERAL, windows=None,
+                   attempts_per_pose=GOAL_ATTEMPTS_PER_POSE,
+                   direct_below=None, turn=False):
     """横並びの終わり ``last`` (``plan_path`` の最後の waypoint) の姿勢から、
     人の腕・掌を動かさず、台車を横へ人の方へ寄せる waypoint (寄せ、段階 2)
-    を計画する。台車の向きは変えない。
+    を計画する。``turn`` なら台車を人の正面から ``APPROACH_END_YAW_DEG``
+    以内へ回しながら寄せ (回転は腕で受ける)、そうでなければ向きは変えない。
 
     寄せ後の横の距離が目標 ``target_lateral`` の窓 (``APPROACH_WINDOW_COUNT``
     個、近い方から) の移動先をバッチ IK で解き、``plan_path`` で経路を作る。
@@ -2928,6 +3467,13 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     facing = spik.human_facing_direction(translated_joints)
     left = np.array([-facing[1], facing[0]])
     side = 1.0 if hand == 'L' else -1.0
+    human_yaw = math.atan2(facing[1], facing[0])
+    end_limit = math.radians(APPROACH_END_YAW_DEG)
+    # 寄せの終わりの台車の向き (回すなら人の正面から end_limit 以内へ)。
+    goal_yaw = (human_yaw + max(-end_limit, min(end_limit, _wrap(
+        start[2] - human_yaw))) if turn else start[2])
+    # BasePath は yaw を線形に補間するので、始点から近い回り方の値にする。
+    goal_yaw = start[2] + _wrap(goal_yaw - start[2])
     palm0 = human_palm_from_press(post, turn_deg, robot_arm)
     real = HumanArm(translated_joints, hand, palm0, turn_deg, robot_arm)
     arm_pose = last['human_arm']
@@ -2959,7 +3505,8 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             base_limits, turn_degs=(0.0,), free_turn=GOAL_FREE_TURN,
             lowered_arms=[(real.shoulder, static.elbow)] * 3,
             max_waist_z=start_waist_z, branch_range_deg=100.0,
-            y_window=y_window, yaw_margin_deg=yaw_margin_deg,
+            y_window=y_window,
+            yaw_margin_deg=APPROACH_END_YAW_DEG if turn else yaw_margin_deg,
             attempts_per_pose=attempts,
             lowered_forearms=[(static.elbow, arm_pose['wrist'],
                                static.palm_pos, static.palm_rot)] * 3)[0]
@@ -2986,8 +3533,12 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
             if tried >= APPROACH_MAX_GOAL_TRIES:
                 break
             _check_stop()
-            # 台車の向きは変えない
-            goal_base = np.array([goal_base[0], goal_base[1], start[2]])
+            # 回すなら移動先の向き (人の正面から end_limit 以内)、回さない
+            # なら向きは変えない
+            goal_base = np.array([
+                goal_base[0], goal_base[1],
+                start[2] + _wrap(goal_base[2] - start[2]) if turn
+                else start[2]])
             base_path = BasePath(start, goal_base)
             problem = checker.check_base_path(robot, goal_av, base_path,
                                               skeleton)
@@ -3032,6 +3583,7 @@ def plan_approach(robot, robot_arm, hand, post, turn_deg, last,
     # (移動先は決めない)。バッチ IK の結果より近ければ採る。
     goal = start.copy()
     goal[:2] = start[:2] - left * side * (lat0 - target_lateral)
+    goal[2] = goal_yaw
     batch_lat = (human_lateral(translated_joints, best[-1]['base_position'],
                                hand) if best is not None else lat0)
     if (lat0 - target_lateral >= APPROACH_MIN_GAIN
@@ -3373,7 +3925,8 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                      use_facing_variants=True, approach=True, facings=None,
                      stop_lateral=APPROACH_STOP_LATERAL,
                      approach_kwargs=None,
-                     time_limit=None, max_palm_z=None, alt_arms=True):
+                     time_limit=None, max_palm_z=None, alt_arms=True,
+                     hint=None):
     """押し込み姿勢 ``post`` から、つないだ手を人の体の横へ下ろしながら
     ロボットも人と横並びになる位置・姿勢へ移り (段階 1、``_plan_stage1``)、
     さらに台車を人の方へ寄せる (段階 2、``plan_approach``) waypoint を計画する。
@@ -3384,7 +3937,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     なら回す量の小さい向き) を選ぶ。腕を下ろしきった掌が一番低い計画より
     ``LOWERED_HEIGHT_TOLERANCE`` を超えて高い計画は選ばない。台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG``
     で ``APPROACH_FALLBACK_LATERAL`` 以内に寄れなければ、
-    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は人の正面から
+    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は ``UPPER_BODY_REFERENCE`` から
     ``UPPER_BODY_LIMIT_DEG`` に収める。
 
     ``translated_joints``・``collision_joints``・``base_limits`` と戻り値は
@@ -3397,7 +3950,9 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     下ろしきった掌がそれより高い下ろし方は試さない (呼び出し元に、それより
     LOWERED_HEIGHT_TOLERANCE 低い計画があるとき)。``alt_arms`` が False
     なら、寄せで人の腕も変える案 (``APPROACH_ALT_ARMS``) を試さない (呼び出し
-    元で試すとき)。
+    元で試すとき)。``hint`` (予備の解の ``palm_facing``・``arm_deg``・
+    ``abduction_deg``) を与えると、その掌の向きから、その向きでは
+    その下ろし方から試す (``_plan_stage1``)。
     """
     t0 = time.time()
     cache = _person_cache(post, turn_deg, collision_joints, base_limits)
@@ -3414,6 +3969,15 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
             use_facing_variants=use_facing_variants, deadline=deadline)
     human_yaw = math.atan2(facing[1], facing[0])
     facings = PALM_FACING_ORDER if facings is None else tuple(facings)
+    if approach:
+        # 掌の向きを、下ろしきった掌の人の項の小さい順に試す。
+        facings = comfort_facing_order(post, turn_deg, robot_arm, hand,
+                                       translated_joints, facings)
+    hint_facing = (hint or {}).get('palm_facing')
+    if hint_facing in facings:
+        # 予備の解の掌の向きから試す (残りは上の順のまま)。
+        facings = (hint_facing,) + tuple(f for f in facings
+                                         if f != hint_facing)
     # 寄せまで解くなら向きごとに段階 1・2 を解いて比べる。寄せないなら段階 1 を
     # 1 回で解き、最初に横並びまで進んだところで止める。
     groups = ([(name,) for name in facings] if approach
@@ -3454,7 +4018,8 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
                     attempts_per_pose=attempts_per_pose,
                     facings=group, yaw_margin_deg=margin, deadline=deadline,
                     cache=cache, bundle_facings=PALM_FACING_ORDER,
-                    max_palm_z=palm_limit, bundle_first=approach)
+                    max_palm_z=palm_limit, bundle_first=approach,
+                    hint=hint if hint_facing in group else None)
                 result.update(yaw_margin=margin, approach=None)
                 if approach and result['verified'] \
                         and result['fraction'] >= 1.0 and not out_of_time():
@@ -3512,6 +4077,27 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
     best['timed_out'] = out_of_time()
     best['compute_time'] = time.time() - t0
     return best
+
+
+def comfort_facing_order(post, turn_deg, robot_arm, hand, translated_joints,
+                         facings):
+    """掌の向き ``facings`` を、その向きの下ろし方 (最初の上腕の組・脇の開き)
+    で下ろしきった掌の人の項の最小の小さい順に並べ替える (study/sbs-comfort)。
+    使えない向きは後ろ (今の順)。"""
+    palm = human_palm_from_press(post, turn_deg, robot_arm)
+    human_arm = HumanArm(translated_joints, hand, palm, turn_deg, robot_arm)
+    degs, _ = LOWERED_ARM_GROUPS[0]
+    abductions = sorted({ab for d, ab in LOWERED_ARM_GROUPS if d == degs})
+    score = {}
+    for name in facings:
+        values = []
+        for ab in abductions:
+            for deg in degs:
+                lw = human_arm.lowering(deg, ab, name)
+                if lw is not None:
+                    values.append(lowering_comfort(human_arm, lw))
+        score[name] = min(values) if values else float('inf')
+    return tuple(sorted(facings, key=lambda name: score[name]))
 
 
 def add_human_arm_arguments(parser):

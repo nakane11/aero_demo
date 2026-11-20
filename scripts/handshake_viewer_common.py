@@ -217,8 +217,10 @@ def apply_pose(robot, joint_names, angles, base):
         pos=[base[0], base[1], 0.0], rot=rpy_matrix(base[2], 0.0, 0.0)))
 
 
-def build_display_waypoints(motion, result):
+def build_display_waypoints(motion, result, transition=None):
     """接近経路の後ろに押し込み・横並び移動の waypoint を足す。
+
+    横並び移動は ``transition`` (None なら ``motion['transition']``)。
 
     Returns
     -------
@@ -232,8 +234,33 @@ def build_display_waypoints(motion, result):
         return waypoints, n_approach
     waypoints += build_press_in_waypoints(
         waypoints[-1], motion['joint_names'], post)
-    waypoints += transition_waypoints(motion)
+    waypoints += transition_waypoints(
+        motion if transition is None
+        else dict(transition=transition, joint_names=motion['joint_names']))
     return waypoints, n_approach
+
+
+# ``motion['transition_executed']`` の値と、実行した横並び移動のキー。
+EXECUTED_TRANSITION_KEYS = {'secured': 'transition',
+                            'refined': 'transition_refined',
+                            'resolved': 'transition_resolved'}
+
+
+def display_transition(motion):
+    """表示する横並び移動: 実行したもの (``transition_executed``) があれば
+    それ、なければ実行しそうなもの (裏の計画 ``transition_refined`` が確保
+    済みの ``transition`` 以上に進めていればそれ、でなければ ``transition``)。
+    無ければ None。"""
+    executed = EXECUTED_TRANSITION_KEYS.get(motion.get('transition_executed'))
+    if executed is not None and motion.get(executed):
+        return motion[executed]
+    secured = motion.get('transition')
+    refined = motion.get('transition_refined')
+    if refined and refined.get('verified') and (
+            not secured or not secured.get('verified')
+            or refined['fraction'] >= secured.get('fraction', 0.0)):
+        return refined
+    return secured
 
 
 def transition_waypoints(motion):

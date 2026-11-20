@@ -594,10 +594,11 @@ class Person(object):
         self.press_target = np.asarray(post['target_position'])
         # 押し込みの手先目標の曲線 (hover 目標 -> 最終目標)。
         palm_dict = dict(position=self.palm, y_axis=self.palm_normal)
-        self.press_curve = np.array([
-            spik.press_in_target_position(
-                palm_dict, np.asarray(post['target_rot']), u)
-            for u in np.linspace(0.0, 1.0, 31)])
+        with spik.low_palm_press_shape(bool(post.get('low_palm_press'))):
+            self.press_curve = np.array([
+                spik.press_in_target_position(
+                    palm_dict, np.asarray(post['target_rot']), u)
+                for u in np.linspace(0.0, 1.0, 31)])
 
         person = load_smpl_params(skeleton_path)
         root = np.array(person['root_pos'], dtype=np.float64)

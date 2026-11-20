@@ -53,6 +53,7 @@ from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
 from handshake_viewer_common import apply_pose  # noqa: E402
 from handshake_viewer_common import build_display_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
+from handshake_viewer_common import display_transition  # noqa: E402
 from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
 from handshake_viewer_common import set_link_visible  # noqa: E402
@@ -157,7 +158,7 @@ class Plan(object):
             return
         if display_waypoints is None:
             display_waypoints, n_approach = build_display_waypoints(
-                motion, result)
+                motion, result, display_transition(motion))
             n_transition = sum(1 for wp in display_waypoints
                                if wp.get('transition'))
             start_angles = dict(zip(
@@ -176,8 +177,10 @@ class Plan(object):
         self.timeline = PlanTimeline(
             display_waypoints, n_prepend, n_approach, n_transition,
             motion['joint_names'], joints)
-        transition = motion.get('transition') or {}
-        if transition.get('verified'):
+        # 人の腕は、表示する横並び移動 (実行した・実行しそうなもの) の押し込み
+        # 時の腕から動かす (押し込みを解き直した横並び移動は押し込み時の掌が違う)。
+        transition = display_transition(motion) or {}
+        if transition.get('verified') and transition.get('press_arm'):
             press_arm = transition['press_arm']
             self.human_arm = sbs.HumanArm(
                 joint_positions, transition['hand'], sbs.palm_from_frame(

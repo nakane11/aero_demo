@@ -81,6 +81,9 @@ STILLNESS_WINDOW = 0.5  # [s]
 STILLNESS_MAX_DISPLACEMENT = 0.05  # [m]
 # 履歴のサンプル間隔がこれを超えたら履歴を捨てる [s]。
 STILLNESS_MAX_GAP = 0.4
+# 推定深度の平面 (from_model_depth) の掌でも深度の平面の掌を待たずに確定する
+# (develop の O の待ちは入れない。差し出しの確定を早める
+# --offer-fast-stillness-window を優先、ユーザー判断 11/19)。
 
 # 欠測関節の補完に使う人体比。
 _TORSO_PER_SHOULDER_WIDTH = 1.25
@@ -249,7 +252,9 @@ class OfferedHandSelector(object):
                  down_finger_approach_ramp=DOWN_FINGER_APPROACH_RAMP,
                  stillness_window=STILLNESS_WINDOW,
                  stillness_max_displacement=STILLNESS_MAX_DISPLACEMENT,
-                 stillness_max_gap=STILLNESS_MAX_GAP):
+                 stillness_max_gap=STILLNESS_MAX_GAP,
+                 fast_stillness_window=None,
+                 fast_stillness_score=None):
         """
         Parameters
         ----------
@@ -265,6 +270,11 @@ class OfferedHandSelector(object):
             下向き指先のランプ (cos、ロボット側へ出た距離 [m])。``None`` なら無効。
         stillness_window : float
             0.0 以下なら静止判定をしない。
+        fast_stillness_window, fast_stillness_score : float or None
+            スコアが ``fast_stillness_score`` 以上の手は、静止が
+            ``fast_stillness_window`` 秒 (``stillness_window`` より短く) 続けば
+            確定する。閾値ぎりぎりの手 (逆の手の一時的なスコアなど) は
+            ``stillness_window`` のまま。どちらかが None なら使わない。
         """
         self.robot_position = (None if robot_position is None
                                else np.asarray(robot_position,
@@ -285,6 +295,12 @@ class OfferedHandSelector(object):
         self.stillness_window = float(stillness_window)
         self.stillness_max_displacement = float(stillness_max_displacement)
         self.stillness_max_gap = float(stillness_max_gap)
+        self.fast_stillness_window = (
+            None if fast_stillness_window is None
+            else float(fast_stillness_window))
+        self.fast_stillness_score = (
+            None if fast_stillness_score is None
+            else float(fast_stillness_score))
         # 掌位置の履歴 [(t, position), ...] (t 昇順)。
         self._palm_history = {'R': [], 'L': []}
 
@@ -353,7 +369,8 @@ class OfferedHandSelector(object):
             best = max(candidates, key=lambda s: candidates[s])
             # 静止していなければ見送る。
             if (candidates[best] >= self.score_min
-                    and still[best] is not False):
+                    and self._still_enough(still[best], still_duration[best],
+                                           candidates[best])):
                 side = best
         ambiguous = bool(side is not None and margin is not None
                          and margin < self.ambiguous_margin)
@@ -361,6 +378,18 @@ class OfferedHandSelector(object):
                     margin=margin, ambiguous=ambiguous, veto=veto,
                     distance=distance, still=still,
                     still_duration=still_duration)
+
+    def _still_enough(self, still, still_duration, score):
+        """静止判定を通るか (静止判定なしの側 ``still`` = None は通す)。スコアが
+        高い手は ``fast_stillness_window`` で足りる。"""
+        if still is None or still:
+            return True
+        if (self.fast_stillness_window is None
+                or self.fast_stillness_score is None
+                or score < self.fast_stillness_score):
+            return False
+        # 1e-6 は浮動小数点誤差ぶん。
+        return still_duration >= self.fast_stillness_window - 1e-6
 
     def _update_stillness(self, palms, t):
         """掌の位置を履歴に積み、``(still, still_duration)`` を返す."""

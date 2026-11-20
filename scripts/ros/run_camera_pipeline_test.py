@@ -19,15 +19,19 @@ import base64
 import collections
 import copy
 import json
+import glob
+import hashlib
 import math
 import multiprocessing
 import os
+import pickle
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from urllib.parse import urlparse
 
 import cv2
@@ -63,10 +67,12 @@ os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '0')
 from aero_demo import execution_timing  # noqa: E402
 from aero_demo import hand_offer_advice  # noqa: E402
 from aero_demo.handshake_stages import (  # noqa: E402
-    BACKGROUND_TRANSITION_REFINE, STAGE_ARMED, STAGE_ARMED_RETRY,
+    BACKGROUND_TRANSITION_EARLY, BACKGROUND_TRANSITION_REFINE, STAGE_ARMED,
+    STAGE_ARMED_RETRY,
     STAGE_BASE_CORRECTION, STAGE_DONE, STAGE_ERROR, STAGE_GRASP,
     STAGE_HOVER_SETTLE, STAGE_IDLE, STAGE_INITIAL_POSE, STAGE_LEAD_IN,
-    STAGE_NOD_WAIT, STAGE_PLAN_APPROACH, STAGE_PLAN_IK, STAGE_PLAN_TRANSITION,
+    STAGE_NOD_WAIT, STAGE_PARTIAL_WAIT, STAGE_PLAN_APPROACH, STAGE_PLAN_IK,
+    STAGE_PLAN_TRANSITION,
     STAGE_PRESS_IN, STAGE_PRESS_REFINE, STAGE_RESULT, STAGE_SPIRAL,
     STAGE_STARTING, STAGE_TRANSITION, STAGE_TRANSITION_WAIT,
     STAGE_WALK_FORWARD, numbered_title)
@@ -86,6 +92,7 @@ from aero_demo.ros_camera_utils import (  # noqa: E402
 import estimate_palm_poses as epp  # noqa: E402
 import solve_palm_ik as spik  # noqa: E402
 import plan_handshake_motion as phm  # noqa: E402
+import no_stop_press as nsp  # noqa: E402
 import side_by_side_transition as sbs  # noqa: E402
 from handshake_viewer_common import HUMAN_COLLISION_OBSTACLE_COLOR  # noqa: E402
 from handshake_viewer_common import apply_robot_pose as apply_result_pose  # noqa: E402,E501
@@ -94,6 +101,7 @@ from handshake_viewer_common import build_display_waypoints  # noqa: E402
 from handshake_viewer_common import build_press_in_waypoints  # noqa: E402
 from handshake_viewer_common import build_robot_collision_overlay  # noqa: E402
 from handshake_viewer_common import colliding_link_pairs  # noqa: E402
+from handshake_viewer_common import display_transition  # noqa: E402
 from handshake_viewer_common import collision_pairs_text as common_collision_pairs_text  # noqa: E402,E501
 from handshake_viewer_common import remove_joint_angle_gui  # noqa: E402
 from handshake_viewer_common import remove_obstacles_gui  # noqa: E402
@@ -120,6 +128,40 @@ ARM_INITIAL_POSE_MOVE_TIME = 10  # [秒] ARM 時に初期姿勢へ戻す時間
 # うなずきで下げる首ピッチ角 [deg] (neck_p_joint 既定 25 度から)。
 HEAD_NOD_PITCH_DEG = 40.0
 HEAD_NOD_MOVE_TIME = 0.5  # [秒] 下げる・戻すそれぞれの時間の下限
+
+# 差し出し手が決まったらすぐ (計画を待たずに)、腕を下ろしたまま台車だけ先に
+# 動かし、計画は待機点から解く。掌へ向かって直進し (向きは変えない)、掌と人の
+# 立ち位置のどちらにも PRE_MOVE_STANDOFF より近づかない点 (待機点) で止まる。
+# 接近開始位置の円 (最終台車位置と掌の距離 + 接近の上乗せ 0.3 m、多くは
+# 0.7〜0.9 m) の外側。移動量は PRE_MOVE_MAX_DISTANCE、所要時間は
+# PRE_MOVE_MAX_TIME で動ける距離まで (腕の動き出しを待たせない)。
+PRE_MOVE_STANDOFF = 1.1  # [m]
+PRE_MOVE_MAX_DISTANCE = 0.8  # [m]
+PRE_MOVE_MAX_TIME = 1.5  # [s]
+PRE_MOVE_MIN_DISTANCE = 0.05  # [m] これより短ければ動かさない
+PRE_MOVE_SEARCH_STEP = 0.01  # [m]
+
+# 接近の実行中に解く横並び移動 (寄せなし) の時間の上限 [秒]。接近 (約 10 秒)
+# の間に解き終えて押し込みの後に使う (押し込みの後までに解けなければ横並びに
+# ならずに終える)。
+EARLY_APPROACH_TRANSITION_TIME = 8.0
+
+# 押し込み後の姿勢から横並び移動 (寄せまで) を別プロセスで解き直す探索の上限
+# [秒] (過ぎたらそれまでの一番良い解)。横並び移動を始める時点で終わっていなけ
+# れば待たずに予備 (裏の計画・確保済みの解) を使う。
+TRANSITION_RESOLVE_TIME_LIMIT = 6.0
+
+# 差し出しの確定に要る掌の静止時間 [秒]。スコアが OFFER_FAST_STILLNESS_SCORE
+# 以上の手は OFFER_FAST_STILLNESS_WINDOW で確定する (閾値ぎりぎりの手は
+# epp.STILLNESS_WINDOW のまま)。2026-10-30〜11-18 の bag 12 回では、本物の
+# 差し出しの確定時のスコアは多くが 0.8 以上 (0.70〜0.87)、逆の手が一時的に
+# 閾値を超えたのは 0.69〜0.76 (0.3 秒だけにすると誤って確定)。
+OFFER_FAST_STILLNESS_WINDOW = 0.3
+OFFER_FAST_STILLNESS_SCORE = 0.8
+
+# 計画の時間の上限 (--plan-time-limit) で切れて実機を動かせなかったときの発話。
+SPEECH_TIMEOUT_FAIL_TEXT = ('ごめんなさい、考えるのに時間がかかってしまいました。'
+                            'もう一度手を出してください')
 
 # ARMED 中の首の動き (_head_tracking_loop)。人が見えれば光軸を体幹へ向け、
 # 見えなければ首ヨーを 0 -> ±HEAD_SCAN_YAW_DEG と往復して探す (端・中央で止まり
@@ -187,8 +229,12 @@ VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
 # (人が付いて歩ける速さにするため)、進む前の発話。
 WALK_FORWARD_DISTANCE = 1.5  # [m]
 WALK_FORWARD_MIN_TIME = 2.0  # [s]
-# 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。
-WALK_TURN_MIN_TIME = 3.0  # [s]
+# 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。手をつないだ人が
+# 付いて回れるよう WALK_TURN_RATE で、WALK_TURN_MIN_TIME〜WALK_TURN_MAX_TIME
+# かける (以前は角度によらず 3 秒。大きく回るときは以前より長くしない)。
+WALK_TURN_MIN_TIME = 1.0  # [s]
+WALK_TURN_MAX_TIME = 3.0  # [s]
+WALK_TURN_RATE = math.radians(20.0)  # [rad/s]
 WALK_TURN_TOLERANCE = math.radians(1.0)
 SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
@@ -278,8 +324,12 @@ OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
 # やり直せるようにする (処理の途中では止めないので少し超えることがある)。
 # 合成 (solve_palm_ik.py・plan_handshake_motion.py) と同じ値。
 PLAN_TIME_LIMIT = spik.PLAN_TIME_LIMIT
+# 計画の時間の上限で切れたことは専用の失敗の原因 (``_failure_cause`` の 'timeout') にし、
+# 専用の発話 (SPEECH_TIMEOUT_FAIL_TEXT) をする (develop J23、J_report 9.13 の 1)。
 
 PRESS_IN_REFINE_FRAMES = 3
+# hover で押し込みを解き直した後、その区間の自己干渉・人体距離・前腕の距離を計画時と
+# 同じ基準で測り、ログに出す (動きは止めない、数えるだけ。develop V_report 8.6)。
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は掌甲を取り違えて法線が反転することがあるので score と法線角の両方で弾く。
@@ -287,7 +337,32 @@ PRESS_IN_REFINE_MIN_HAND_SCORE = 0.8
 PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
 # --press-in-base-shift: 検出し直した掌が計画から水平にこれ以上ずれていたら、
 # 腕だけで吸収せず先にその分だけ台車を寄せる。
-PRESS_IN_BASE_SHIFT_MIN = 0.06  # [m]
+PRESS_IN_BASE_SHIFT_MIN = nsp.PALM_SHIFT_MIN  # [m]
+# hover で止まって台車を直さず、残差を測るだけにして
+# 押し込みに織り込む。残差がこれを超えたら従来どおり止まって直す。実機 10/21〜22
+# で 1 回目の残差は最大 10cm。
+PRESS_IN_FOLD_MAX_POSITION = nsp.FOLD_MAX_POSITION  # [m]
+PRESS_IN_FOLD_MAX_ANGLE = nsp.FOLD_MAX_ANGLE  # [rad]
+# 押し込み後の姿勢から解き直した横並び移動の寄せ後の
+# 横の距離が、予備 (裏の計画・確保済みの解) よりこれ [m] を超えて遠ければ
+# 予備を使う。
+RESOLVE_MAX_LATERAL_LOSS = 0.05
+# ノードの準備の終わりで、別プロセス (裏の計画) の準備を待つ上限 [秒]。
+WORKER_WARMUP_TIMEOUT = 60.0
+
+# 最後まで押し込める候補が無いとき、押し込みを行けるところまで進めて人の手を
+# 待つ (最終目標までの残りが spik.PARTIAL_PRESS_MAX_REMAINING 以内の候補、待つ
+# ときは PARTIAL_PRESS_SPEECH を発話)。人の掌がロボットの手先から
+# PARTIAL_ARRIVAL_DISTANCE 以内の検出が PARTIAL_ARRIVAL_COUNT 回続いたら手が
+# 来たとみなす。狙った掌から PARTIAL_REAIM_MIN_SHIFT 以上離れた検出が
+# PARTIAL_REAIM_COUNT 回続いたら、出し直したとみなして今の姿勢から手先を合わせ
+# 直す (押し込みの残りの上限 PARTIAL_PRESS_MAX_REMAINING より大きくして、
+# ロボットの手へ寄せる動きと区別する)。
+PARTIAL_PRESS_SPEECH = '手を合わせてください'
+PARTIAL_ARRIVAL_DISTANCE = 0.04  # [m]
+PARTIAL_ARRIVAL_COUNT = 2
+PARTIAL_REAIM_MIN_SHIFT = 0.10  # [m]
+PARTIAL_REAIM_COUNT = 2
 # 接近の螺旋〜押し込み直前、首は差し出し手の掌を向く。候補は直前位置からこの距離
 # 以内・score 以上のみ。
 HAND_FOLLOW_MAX_JUMP = 0.25  # [m]
@@ -306,22 +381,75 @@ VIEWER_CAMERA_JPEG_QUALITY = 70
 VIEWER_PANEL_MARGIN = 40
 
 
+def pre_move_target(palm_xy, human_xy, standoff,
+                    max_distance=PRE_MOVE_MAX_DISTANCE,
+                    step=PRE_MOVE_SEARCH_STEP):
+    """台車を先に動かす待機点 ``[x, y, yaw]`` (今の base_link 系、yaw は 0)。
+
+    掌 ``palm_xy`` へ向かって直進し、掌と人の立ち位置 ``human_xy`` (None なら
+    掌だけ) のどちらにも ``standoff`` より近づかない範囲で、最大
+    ``max_distance`` 進んだ点。既に近ければ原点 (動かない)。
+    """
+    palm_xy = np.asarray(palm_xy[:2], dtype=np.float64)
+    norm = float(np.linalg.norm(palm_xy))
+    if norm < 1e-6:
+        return np.zeros(3)
+    direction = palm_xy / norm
+    points = [palm_xy]
+    if human_xy is not None:
+        points.append(np.asarray(human_xy[:2], dtype=np.float64))
+    travel = 0.0
+    for t in np.arange(step, max_distance + 1e-9, step):
+        xy = direction * t
+        if any(float(np.linalg.norm(xy - p)) < standoff for p in points):
+            break
+        travel = float(t)
+    xy = direction * travel
+    return np.array([xy[0], xy[1], 0.0])
+
+
+def pre_move_distance_for_time(max_time, step=PRE_MOVE_SEARCH_STEP):
+    """1 区間の直進 (``_start_pre_move`` と同じ送り方) で ``max_time`` 秒以内に
+    動ける距離 [m] (``step`` 刻み)。"""
+    distance = 0.0
+    while True:
+        candidate = distance + step
+        sec = sum(execution_timing.limited_time_list(
+            None, None, [[candidate, 0.0, 0.0]], [MIN_SEGMENT_TIME]))
+        if sec > max_time:
+            return distance
+        distance = candidate
+
+
+def pre_move_goal(palm_position, human_xy):
+    """差し出しを確定したときに台車を先に動かす待機点 (``pre_move_target``、
+    移動量は ``PRE_MOVE_MAX_DISTANCE`` と ``PRE_MOVE_MAX_TIME`` で動ける距離の
+    小さい方まで)。"""
+    max_distance = min(PRE_MOVE_MAX_DISTANCE,
+                       pre_move_distance_for_time(PRE_MOVE_MAX_TIME))
+    return pre_move_target(palm_position, human_xy, PRE_MOVE_STANDOFF,
+                           max_distance=max_distance)
+
+
+def apply_base_max_vel(max_vel, max_angvel=None):
+    """台車の並進・回転の速度上限 (``--base-max-vel``・``--base-max-angvel``)
+    を、区間の時間の計算 (``execution_timing``) と接近中のずらしの上限に
+    反映する。"""
+    global BASE_MAX_VEL
+    BASE_MAX_VEL = float(max_vel)
+    execution_timing.BASE_MAX_VEL = float(max_vel)
+    if max_angvel is not None:
+        execution_timing.BASE_MAX_ANGVEL = float(max_angvel)
+
+
 def collision_pairs_text(colliding):
     """指先まで含めた事後検証であることを示す見出しを付けた干渉ペア表示。"""
     return common_collision_pairs_text(
         colliding, label='表示中の waypoint の事後検証 (指先まで含む)')
 
 
-def _json_default(value):
-    """``json.dumps`` で numpy の値を素の値にする。"""
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    raise TypeError('{} is not JSON serializable'.format(type(value)))
-
-
 def to_json(data):
+    # _json_default (下で定義) で numpy の値を素の値にする。
     return json.dumps(data, default=_json_default)
 
 
@@ -335,6 +463,12 @@ def face_point(joint_positions):
         return (np.asarray(ears[0], dtype=np.float64)[:3]
                 + np.asarray(ears[1], dtype=np.float64)[:3]) / 2.0
     return None
+
+
+# master-fixes の「横並び移動の可動域の判定 (B2、超えたら横並び移動をしない)」は
+# 取り込まない (ユーザー判断 11/19)。押し込みの解き直しの差は _execute_transition
+# で終点へ向けて 0 に戻し計画用ロボットの可動域に収め、押し込み後の姿勢から
+# 解き直せればそれを使う。
 
 
 def project_base_point(frame, point):
@@ -476,9 +610,21 @@ def log_debug(text):
 
 
 
+def _json_default(value):
+    """numpy の値 (np.bool_ など) を JSON に書ける形にする。ログの 1 行で実行の
+    スレッドが落ちないように (11/18 の偽のコントローラでの再生で、押し込み前の
+    記録の np.bool_ で実行が止まった)。"""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return repr(value)
+
+
 def log_debug_event(record):
     """デバッグ用 ``{"event": ...}`` を JSON 1 行でログファイルにだけ書く。"""
-    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False))
+    log_debug('[debug] ' + json.dumps(record, ensure_ascii=False,
+                                      default=_json_default))
 
 
 def motion_verified(motion):
@@ -500,7 +646,8 @@ def untranslate_result(result, offset):
         region['y_range'] = [v - dy for v in region['y_range']]
     post_process = result.get('post_process')
     if post_process:
-        for key in ('target_position', 'hand_position', 'base_position'):
+        for key in ('target_position', 'hand_position', 'base_position',
+                    'press_target_position'):
             if key in post_process and post_process[key] is not None:
                 post_process[key][0] -= dx
                 post_process[key][1] -= dy
@@ -527,6 +674,21 @@ def untranslate_motion(motion, offset):
             if arm.get(key) is not None:
                 arm[key][0] -= dx
                 arm[key][1] -= dy
+
+
+def log_transition_event(attempt, transition):
+    """横並び移動 (寄せなし) の計画の結果を画面とログに出す。"""
+    print('[transition] 試行{}: 横並び移動 {}'.format(
+        attempt, sbs.transition_summary(transition)))
+    log_debug_event(dict(
+        event='transition', person=attempt,
+        verified=transition['verified'],
+        fraction=transition['fraction'],
+        x_margin=transition['x_margin'],
+        placement_before=transition['placement_before'],
+        placement_after=transition['placement_after'],
+        reason=transition['reason'],
+        compute_time=transition['compute_time']))
 
 
 class _DeferredSolver(object):
@@ -560,14 +722,331 @@ class _DeferredSolver(object):
         return getattr(self._solver, name)
 
 
+def _palm_seed(palm):
+    """掌 (位置・軸) から決める numpy の乱数の種 (0.1 mm・1e-4 に丸めた値の crc32)。"""
+    values = [v for name in ('position', 'x_axis', 'y_axis')
+              for v in (palm.get(name) or [])]
+    # + 0.0 で丸めた -0.0 を 0.0 にそろえる。
+    return zlib.crc32((np.round(np.asarray(values, dtype=np.float64), 4) + 0.0).tobytes())
+
+
 def _optimizer_warmup_child(args):
     """軌道最適化の準備を行う別プロセスの本体 (spawn)。JAX の永続キャッシュへ
     書くだけでよい。GIL 回避のため別プロセス。"""
     args = copy.copy(args)
     args.side_by_side_approach = 'sync'  # 寄せ用の別モデルは作らない
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ (無ければ何もしない)
     planner = HandshakePlanner(args)
     phm.arms_down_angles(planner.robot, planner.robot.joint_list)
-    planner.warmup(batch_ik=False)
+    planner.warmup(batch_ik=False, hover_pose_cache=True, child=True)
+    qprof.dump()  # multiprocessing の子は atexit を通らない
+
+
+# 軌道最適化の準備の子プロセスは hover の IK を解かず、前の起動で同じ子が解いた押し込み
+# 姿勢 (handshake) をファイルから読む (develop Q R6、Q_report 2.8)。軌道最適化の形は
+# 姿勢に依らないので、姿勢は永続キャッシュを温めるための入力にすぎない。鍵 (scripts と
+# src/aero_demo のコード・jax/jaxlib/skrobot の版と skrobot のコード・装置・hover に効く
+# 引数) が変わったら今までどおり解いて保存する。
+_WARMUP_POSE_ARGS = ('attempts_per_pose', 'base_x_range', 'base_y_range',
+                     'base_yaw_range', 'collision_verify_model',
+                     'max_iterations', 'human_front_distance',
+                     'press_in_forearm_clearance',
+                     'motion_collision_verify_tolerance', 'n_waypoints')
+
+
+def _warmup_pose_path(args, robot_arm):
+    """子プロセスの warmup の押し込み姿勢のファイル (鍵が名前)。永続キャッシュの
+    場所が決まっていなければ None。"""
+    cache_dir = os.environ.get('JAX_COMPILATION_CACHE_DIR')
+    if not cache_dir:
+        return None
+    import jax
+    import jaxlib
+    import skrobot
+    skrobot_dir = os.path.dirname(os.path.abspath(skrobot.__file__))
+    files = sorted(
+        glob.glob(os.path.join(_SCRIPTS_DIR, '*.py'))
+        + glob.glob(os.path.join(_PKG_SRC_DIR, 'aero_demo', '*.py'))
+        + [os.path.abspath(__file__)])
+    skrobot_files = sorted(glob.glob(
+        os.path.join(skrobot_dir, '**', '*.py'), recursive=True))
+    digest = hashlib.sha256()
+    for root, paths in ((_SCRIPTS_DIR, files), (skrobot_dir, skrobot_files)):
+        for path in paths:
+            digest.update(os.path.relpath(path, root).encode())
+            with open(path, 'rb') as f:
+                digest.update(hashlib.sha256(f.read()).digest())
+    if os.path.exists(args.collision_pairs):
+        with open(args.collision_pairs, 'rb') as f:
+            digest.update(hashlib.sha256(f.read()).digest())
+    digest.update(json.dumps(dict(
+        arm=robot_arm,
+        versions=dict(jax=jax.__version__, jaxlib=jaxlib.__version__,
+                      skrobot=getattr(skrobot, '__version__', None)),
+        platform=jax.default_backend(),
+        args={name: getattr(args, name, None) for name in _WARMUP_POSE_ARGS}),
+        sort_keys=True, default=str).encode())
+    base = os.path.abspath(cache_dir).rstrip(os.sep)
+    return os.path.join(base + '_warmup_pose', digest.hexdigest() + '.pkl')
+
+
+def _load_warmup_pose(path):
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError):
+        return None
+
+
+def _save_warmup_pose(path, handshake):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = '{}.{}.tmp'.format(path, os.getpid())
+        with open(tmp, 'wb') as f:
+            pickle.dump(handshake, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print('[warmup] 押し込み姿勢を保存できませんでした: {!r}'.format(e))
+
+
+def _final_lateral(transition):
+    """横並び移動の計画の終点 (寄せの後) の人との横の距離 [m] (無ければ None)。"""
+    laterals = (transition or {}).get('laterals') or []
+    if laterals:
+        return float(laterals[-1])
+    approach = (transition or {}).get('approach') or {}
+    value = approach.get('lateral_after')
+    return None if value is None else float(value)
+
+
+def _resolve_transition(robot, planner, job, stop):
+    """押し込みを解き直した後の姿勢から、横並び移動 (寄せまで、掌の向きは
+    全部) を解き直す。
+
+    ``job`` は裏の計画の job (人の骨格などは平行移動した系) に、押し込みの
+    終点の関節角 ``press_joints`` ({関節名: 角度})・台車 ``press_base``
+    (計画の系の ``[x, y]``)・``press_yaw``・探索の上限 ``time_limit`` [秒] を
+    足したもの。押し込み姿勢 ``post`` の関節角・台車を置き換え、押し込み目標
+    (人の掌を逆算する元) をその姿勢の手先にする。"""
+    post = copy.deepcopy(job['post'])
+    offset = job['offset']
+    joints = job['press_joints']
+    post['joint_angle_vector'] = [
+        float(joints.get(name, angle))
+        for name, angle in zip(post['joint_names'],
+                               post['joint_angle_vector'])]
+    post['base_position'] = [float(job['press_base'][0]) + offset[0],
+                             float(job['press_base'][1]) + offset[1], 0.0]
+    post['base_yaw'] = float(job['press_yaw'])
+    sbs._place(robot, post['joint_angle_vector'],
+               [post['base_position'][0], post['base_position'][1],
+                post['base_yaw']])
+    end = getattr(robot, '{}arm_end_coords'.format(job['robot_arm']))
+    post['target_position'] = post['hand_position'] = [
+        float(v) for v in end.worldpos()]
+    post['target_rot'] = post['hand_rot'] = end.worldrot().tolist()
+    sbs._STOP.event = stop
+    try:
+        return sbs.plan_transition(
+            robot, job['robot_arm'], job['hand'], post, job['turn_deg'],
+            job['translated_joints'], job['collision_joints'],
+            planner.verification_pairs, planner.collision_pairs,
+            planner.base_limits, approach=True, alt_arms=False,
+            time_limit=job['time_limit'], hint=job.get('hint'))
+    finally:
+        sbs._STOP.event = None
+
+
+def _transition_worker_main(args, conn, stop):
+    """裏の計画 (横並び移動の寄せ ``refine_transition``) を解く別プロセスの
+    本体 (spawn)。実機ノードのスレッドで解くと GIL の取り合いで 2〜3 倍
+    遅くなるため。
+
+    受けるもの (``conn``): ('warmup', robot_arm, hand, angle_vector)、
+    ('job', job_id, job)、('quit',)。``job['kind']`` が 'resolve' なら
+    押し込み後の姿勢からの解き直し (``_resolve_transition``)、それ以外は
+    裏の計画 (寄せ)。返すもの: ('warmed', 秒)、
+    ('refine', job_id, transition)、('stopped', job_id)、
+    ('error', job_id, 説明)。``stop`` (multiprocessing.Event) が立つと今の
+    計算を打ち切る (次の job で下ろす)。
+    """
+    args = copy.copy(args)
+    args.side_by_side_approach = 'sync'  # 寄せ用の別モデルは作らず robot を使う
+    planner = HandshakePlanner(args)
+    robot = planner.robot
+    spik.attach_camera_optical_coords(robot)
+    phm.arms_down_angles(robot, robot.joint_list)
+    # R7: このプロセスの準備の後の状態を取り、計画ごとの始めに戻す (結果が前の
+    # 計画の角度・リンクの座標の丸めの履歴によらないように)。
+    initial_state = spik.robot_state(robot)
+    while True:
+        try:
+            message = conn.recv()
+        except (EOFError, OSError):
+            return
+        kind = message[0]
+        if kind == 'quit':
+            return
+        if kind == 'warmup':
+            _, robot_arm, hand, angle_vector = message
+            t0 = time.time()
+            state = np.random.get_state()
+            np.random.seed(HandshakePlanner._WARMUP_SEED)
+            try:
+                sbs.warmup_batch_ik(robot, robot_arm, hand, angle_vector,
+                                    planner.collision_pairs,
+                                    planner.base_limits)
+            finally:
+                np.random.set_state(state)
+            spik.restore_robot_state(robot, initial_state)
+            initial_state = spik.robot_state(robot)
+            conn.send(('warmed', time.time() - t0))
+            continue
+        _, job_id, job = message
+        stop.clear()
+        spik.restore_robot_state(robot, initial_state)
+        try:
+            if job.get('kind') == 'early':
+                # 接近中に解く横並び移動 (寄せなし)。平行移動した系の
+                # まま返す (親が裏の計画の job に使ってから戻す)。
+                sbs._STOP.event = stop
+                try:
+                    transition = sbs.plan_transition(
+                        robot, job['robot_arm'], job['hand'], job['post'],
+                        job['turn_deg'], job['translated_joints'],
+                        job['collision_joints'], planner.verification_pairs,
+                        planner.collision_pairs, planner.base_limits,
+                        approach=False, time_limit=job['time_limit'])
+                finally:
+                    sbs._STOP.event = None
+                conn.send(('refine', job_id, transition))
+                continue
+            if job.get('kind') == 'resolve':
+                transition = _resolve_transition(robot, planner, job, stop)
+            else:
+                transition = sbs.refine_transition(
+                    robot, job['robot_arm'], job['hand'], job['post'],
+                    job['turn_deg'], job['translated_joints'],
+                    job['collision_joints'], planner.verification_pairs,
+                    planner.collision_pairs, planner.base_limits,
+                    job['secured'], stop=stop)
+            untranslate_motion(dict(waypoints=[], transition=transition),
+                               job['offset'])
+            conn.send(('refine', job_id, transition))
+        except sbs.TransitionStopped:
+            conn.send(('stopped', job_id))
+        except Exception as e:  # noqa: BLE001 (親は確保済みの解で動ける)
+            conn.send(('error', job_id,
+                       '{}: {}'.format(type(e).__name__, e)))
+
+
+class TransitionWorker(object):
+    """``_transition_worker_main`` の別プロセスを持ち、計画を頼んで待つ。
+    1 度に動く計算は 1 つ (後から頼んだものは前のものが終わるまで待つ)。"""
+
+    def __init__(self, args):
+        context = multiprocessing.get_context('spawn')
+        self._conn, child = context.Pipe()
+        self._stop = context.Event()
+        self._process = context.Process(
+            target=_transition_worker_main, args=(args, child, self._stop),
+            name='transition-worker', daemon=True)
+        self._process.start()
+        child.close()
+        self._cond = threading.Condition()
+        self._results = {}   # job_id -> message
+        self._next_id = 0
+        self._running = None
+        self._send_lock = threading.Lock()
+        self.warmup_time = 0.0
+        self.warmed = 0          # 終わった準備 ('warmup') の数
+        self.warmup_requests = 0
+        threading.Thread(target=self._read, name='transition-worker-read',
+                         daemon=True).start()
+
+    def alive(self):
+        return self._process.is_alive()
+
+    def _read(self):
+        while True:
+            try:
+                message = self._conn.recv()
+            except (EOFError, OSError):
+                with self._cond:
+                    self._results[None] = ('dead',)
+                    self._cond.notify_all()
+                return
+            with self._cond:
+                if message[0] == 'warmed':
+                    self.warmup_time += message[1]
+                    self.warmed += 1
+                    log_debug('[warmup] 別プロセス: 横並び移動のバッチ IK '
+                              '{:.1f} 秒'.format(message[1]))
+                else:
+                    # refine・stopped・error はどれも job の最後。
+                    self._results[message[1]] = message
+                    if self._running == message[1]:
+                        self._running = None
+                self._cond.notify_all()
+
+    def _send(self, message):
+        with self._send_lock:
+            self._conn.send(message)
+
+    def warmup(self, robot_arm, hand, angle_vector):
+        self.warmup_requests += 1
+        self._send(('warmup', robot_arm, hand,
+                    np.asarray(angle_vector, dtype=np.float64)))
+
+    def wait_warmup(self, timeout):
+        """頼んだ準備が全部終わるまで待つ (終わっていれば True)。最初の人の
+        計画と CPU を取り合わないように、ノードの準備の終わりで待つ。"""
+        deadline = time.time() + timeout
+        with self._cond:
+            while self.warmed < self.warmup_requests:
+                if None in self._results or time.time() >= deadline:
+                    return False
+                self._cond.wait(0.1)
+        return True
+
+    def submit(self, job):
+        """``job`` (``HandshakePlanner.plan`` の ``transition_refine``) を頼み、
+        番号を返す。前に頼んだ計算が動いていれば止める。"""
+        with self._cond:
+            self._next_id += 1
+            job_id = self._next_id
+            if self._running is not None:
+                self._stop.set()
+            self._running = job_id
+        self._send(('job', job_id, job))
+        return job_id
+
+    def cancel(self, job_id):
+        """``job_id`` がまだ動いていれば止める。"""
+        with self._cond:
+            if self._running == job_id:
+                self._stop.set()
+
+    def wait(self, job_id, stop=None, timeout=None):
+        """``job_id`` の知らせ ('refine'・'stopped'・'error') を待って返し、
+        控えから消す。``stop`` (threading.Event) が立つか ``timeout`` 秒
+        過ぎたら None。"""
+        deadline = None if timeout is None else time.time() + timeout
+        with self._cond:
+            while True:
+                message = self._results.pop(job_id, None)
+                if message is not None:
+                    return message
+                if None in self._results:
+                    return ('error', job_id, '別プロセスが終了した')
+                if stop is not None and stop.is_set():
+                    return None
+                remaining = (0.05 if deadline is None
+                             else min(0.05, deadline - time.time()))
+                if remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
 
 
 class HandshakePlanner(object):
@@ -594,6 +1073,7 @@ class HandshakePlanner(object):
             spik.apply_press_in_forearm_argument(args)
         self.robot, self.verification_pairs = self._build_robot_and_pairs()
         self.motion_verification_pairs = self.verification_pairs
+        self._fk_robot()  # 計画の途中で作ると時間の上限に響くので先に作る
         # JIT キャッシュのためノードの寿命で使い回す。
         self._real_solver = create_solver(
             'jaxls', max_iterations=args.max_iterations, verbose=False)
@@ -610,7 +1090,10 @@ class HandshakePlanner(object):
         self.base_limits = [tuple(args.base_x_range),
                             tuple(args.base_y_range),
                             tuple(args.base_yaw_range)]
-        # 寄せ用の別モデル (IK で姿勢を書き換えるので共有できない)。
+        # 裏の計画を解く別プロセス (start_worker で始める、None ならスレッド)。
+        self.worker = None
+        # 寄せ用の別モデル (IK で姿勢を書き換えるので共有できない)。別プロセス
+        # が終了したときの代わりにも使う。
         self.refine_robot = None
         if self.side_by_side_approach == 'background':
             self.refine_robot, self.refine_verification_pairs = \
@@ -623,6 +1106,28 @@ class HandshakePlanner(object):
     @property
     def side_by_side_approach(self):
         return getattr(self.args, 'side_by_side_approach', 'sync')
+
+    def start_worker(self):
+        """裏の計画 (寄せ) を解く別プロセスを始める
+        (``--side-by-side-approach background`` のときだけ)。``warmup``
+        より前に呼ぶ (横並び移動のバッチ IK の準備を別プロセスへ頼むため)。"""
+        if self.side_by_side_approach != 'background':
+            return
+        self.worker = TransitionWorker(self.args)
+        print('[transition] 裏の計画 (寄せ) を別プロセスで解きます。')
+
+    def _worker_ok(self):
+        return self.worker is not None and self.worker.alive()
+
+    def _fk_robot(self):
+        """手先の位置を求めるだけの指なしロボット (計画用の ``self.robot`` の
+        状態を変えないため。初めて使うときに作る)。"""
+        robot = getattr(self, '_fk_robot_model', None)
+        if robot is None:
+            robot = Aero(use_hand=False)
+            spik.lock_fixed_joints(robot)
+            self._fk_robot_model = robot
+        return robot
 
     def _build_robot_and_pairs(self):
         """IK・軌道計画用の指なしロボットと、事後検証用の総当たりペアを作る。"""
@@ -639,7 +1144,8 @@ class HandshakePlanner(object):
             robot, self.args.collision_verify_model)
         return robot, pairs
 
-    def warmup(self, background_optimizer=False, batch_ik=True):
+    def warmup(self, background_optimizer=False, batch_ik=True,
+               hover_pose_cache=False, child=False):
         """左右の腕で IK と軌道最適化をダミー目標で解き、JAX のトレース・
         コンパイルを済ませる。
 
@@ -647,11 +1153,16 @@ class HandshakePlanner(object):
         ``background_optimizer`` なら軌道最適化は別プロセス
         (``_optimizer_warmup_child``) で行い、最適化が要る計画だけが完了を待つ。
         ``batch_ik=False`` は横並び移動のバッチ IK の準備を省く。
+        ``hover_pose_cache`` は軌道最適化の入力の押し込み姿勢を保存したファイル
+        から読み、あれば hover の IK を解かない (子プロセス用)。``child`` は
+        軌道最適化の準備の子プロセス: 完了の行を本体の「[warmup] 完了しました」と
+        別の文言にする (再生・起動の道具はその行で本体の完了を待つ)。
         """
         random_state = np.random.get_state()
         np.random.seed(self._WARMUP_SEED)
         try:
-            self._warmup_body(background_optimizer, batch_ik)
+            self._warmup_body(background_optimizer, batch_ik,
+                              hover_pose_cache, child)
         finally:
             np.random.set_state(random_state)
 
@@ -715,9 +1226,11 @@ class HandshakePlanner(object):
                          daemon=True).start()
         self._optimizer_process = process
 
-    def _warmup_body(self, background_optimizer=False, batch_ik=True):
+    def _warmup_body(self, background_optimizer=False, batch_ik=True,
+                     hover_pose_cache=False, child=False):
         """``warmup`` の本体 (乱数固定は呼び出し側が行う)。"""
         args = self.args
+        hover_pose_cache = hover_pose_cache and not batch_ik
         print('[warmup] 左右の腕の IK・軌道最適化トレースを事前に実行して '
               'います (数秒~数十秒かかります)...')
         warmup_t0 = time.time()
@@ -737,28 +1250,43 @@ class HandshakePlanner(object):
         for robot_arm, label in (('l', '左'), ('r', '右')):
             hand = robot_arm_to_hand[robot_arm]
             t0 = time.time()
-            picked, _, _ = spik.solve_person_ik(
-                self.robot, self._WARMUP_PALM, hand, robot_arm,
-                collision_obstacles,
-                attempts_per_pose=args.attempts_per_pose,
-                base_limits=self.base_limits,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions={},
-                verification_pairs=self.verification_pairs)
-            log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
-                label, time.time() - t0))
-            if picked is None:
-                print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
-                      '軌道最適化のトレースはスキップします。'.format(label))
-                continue
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            rots = spik.palm_to_target_rots(self._WARMUP_PALM, hand, robot_arm)
-            handshake = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, self.base_limits,
-                post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
-            self._pin_warmup_fixed_joints(robot_arm, handshake)
+            pose_path = (_warmup_pose_path(args, robot_arm)
+                         if hover_pose_cache else None)
+            handshake = _load_warmup_pose(pose_path) if pose_path else None
+            if handshake is not None:
+                # IK (skrobot の JaxBackend) がプロセスを倍精度にするのを
+                # 省くので、本体と同じ倍精度でコンパイルされるよう先に切り替える。
+                import jax
+                jax.config.update('jax_enable_x64', True)
+                print('[warmup] {}腕: 保存した押し込み姿勢を使い、hover の IK を'
+                      '省きます。'.format(label))
+            else:
+                picked, _, _ = spik.solve_person_ik(
+                    self.robot, self._WARMUP_PALM, hand, robot_arm,
+                    collision_obstacles,
+                    attempts_per_pose=args.attempts_per_pose,
+                    base_limits=self.base_limits,
+                    self_collision=self.collision_pairs is not None,
+                    collision_pairs=self.collision_pairs,
+                    joint_positions={},
+                    verification_pairs=self.verification_pairs)
+                log_debug('[warmup] {}腕: IK {:.1f} 秒'.format(
+                    label, time.time() - t0))
+                if picked is None:
+                    print('[warmup] {}腕: ダミー目標の IK が解けなかったため '
+                          '軌道最適化のトレースはスキップします。'.format(label))
+                    continue
+                turn_index, angle_vector, base_pose, post_process_result = \
+                    picked
+                rots = spik.palm_to_target_rots(
+                    self._WARMUP_PALM, hand, robot_arm)
+                handshake = spik.solved_result(
+                    self.robot, robot_arm, rots[turn_index],
+                    turn_index, angle_vector, base_pose, self.base_limits,
+                    post_process_result, 0.0, 0.0, hand, self._WARMUP_PALM)
+                self._pin_warmup_fixed_joints(robot_arm, handshake)
+                if pose_path:
+                    _save_warmup_pose(pose_path, handshake)
             if not background_optimizer:
                 self._optimizer_warmup_job(
                     self.robot, self.motion_verification_pairs, robot_arm,
@@ -770,24 +1298,50 @@ class HandshakePlanner(object):
                 sbs.warmup_batch_ik(
                     self.robot, robot_arm, hand, angle_vector,
                     self.collision_pairs, self.base_limits)
-                if self.refine_robot is not None:
+                if self._worker_ok():
+                    # 別プロセスが自分のモデルで準備する (待たない)。
+                    self.worker.warmup(robot_arm, hand, angle_vector)
+                elif self.refine_robot is not None:
                     sbs.warmup_batch_ik(
                         self.refine_robot, robot_arm, hand, angle_vector,
                         self.refine_collision_pairs, self.base_limits)
                 log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
                           .format(label, time.time() - t0))
+        # R7: 計画ごとにこの状態へ戻す (結果が前の試行の角度・リンクの座標の丸めの履歴によらないように)。
+        self._initial_state = spik.robot_state(self.robot)
+        self._refine_initial_state = (None if self.refine_robot is None
+                                      else spik.robot_state(self.refine_robot))
+        if child:
+            print('[warmup] (子プロセス) 軌道最適化のトレース・コンパイルが'
+                  '済みました ({:.1f} 秒)。'.format(time.time() - warmup_t0))
+            return
+        if self._worker_ok() and batch_ik:
+            t0 = time.time()
+            ok = self.worker.wait_warmup(WORKER_WARMUP_TIMEOUT)
+            log_debug('[warmup] 別プロセスの準備を {:.1f} 秒待ちました ({}、'
+                      'バッチ IK 計 {:.1f} 秒)。'.format(
+                          time.time() - t0, '完了' if ok else '未完了',
+                          self.worker.warmup_time))
         print('[warmup] 完了しました ({:.1f} 秒)。{}'.format(
             time.time() - warmup_t0,
             '軌道最適化の準備は別プロセスで続けています。'
             if self._optimizer_process is not None else ''))
 
+    def _restore_refine_robot(self):
+        """裏の計画のロボットを warmup の後の状態に戻す (R7、裏スレッドから呼ぶ)。"""
+        if getattr(self, '_refine_initial_state', None) is not None:
+            spik.restore_robot_state(self.refine_robot, self._refine_initial_state)
+
     def _stage(self, text):
         if self.on_stage is not None:
             self.on_stage(text)
 
-    def plan(self, joint_positions, palms, offered_hand, attempt):
+    def plan(self, joint_positions, palms, offered_hand, attempt,
+             start_base_pose=None):
         """差し出された掌 ``palms[offered_hand]`` に対して IK -> 軌道計画 ->
-        横並び移動を計画する (``attempt`` はログ用)。
+        横並び移動を計画する (``attempt`` はログ用)。``start_base_pose``
+        (``[x, y, yaw]``、base_link 系) を与えると、接近はその台車姿勢から始める
+        (台車を先に動かした待機点。None なら原点)。
 
         戻り値は dict(``result`` (base_link 系の IK 結果)、``motion`` (軌道。
         押し込み姿勢が解けなければ None)、``robot_arm``)。
@@ -796,6 +1350,9 @@ class HandshakePlanner(object):
         robot_arm = spik.DEFAULT_ROBOT_ARM[offered_hand]
         palm = palms[offered_hand]
         plan_t0 = time.time()
+        if getattr(self, '_initial_state', None) is not None:
+            # R7: 前の試行の角度・リンクの座標の丸めの履歴を持ち越さない。
+            spik.restore_robot_state(self.robot, self._initial_state)
         time_limit = getattr(args, 'plan_time_limit', PLAN_TIME_LIMIT)
         deadline = (plan_t0 + time_limit
                     if time_limit is not None and time_limit > 0 else None)
@@ -806,6 +1363,14 @@ class HandshakePlanner(object):
             print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) を過ぎたため、'
                   '{}をしません。'.format(attempt, time_limit, stage))
             return True
+
+        def mark_timed_out(result, stage):
+            # 時間切れを専用の原因 (``_failure_cause`` の 'timeout') にする。
+            # ``stage`` は切れた段 (develop J23)。
+            result['plan_timed_out'] = True
+            result.setdefault('plan_timeout_stage', stage)
+            print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) で {} が切れました '
+                  '(時間切れ)。'.format(attempt, time_limit, stage))
 
         offset = spik.human_translation_offset(
             joint_positions, front_distance=args.human_front_distance)
@@ -819,6 +1384,11 @@ class HandshakePlanner(object):
             [] if self.collision_pairs is None
             else spik.human_body_obstacles(collision_joints))
         refine_job = None
+        # 横並び移動 (寄せなし) を待たずに返し、接近の実行中に裏のロボット
+        # (refine_robot) で解く。裏のロボットが無ければ計画の中で解く。
+        early_approach = (self.refine_robot is not None
+                          and self.side_by_side_approach != 'sync')
+        early_job = None
 
         # 差し出し手の側・人の正面方向に合わせた台車の可動域。
         person_base_limits = self.base_limits
@@ -844,75 +1414,126 @@ class HandshakePlanner(object):
         standing_x = None if standing_xy is None else float(standing_xy[0])
 
         rots = spik.palm_to_target_rots(translated_palm, offered_hand, robot_arm)
-        self._stage(STAGE_PLAN_IK)
-        (picked, collision_ik_time, candidate_selection_time,
-         person_base_limits, x_margin) = \
-            spik.solve_person_ik_side_by_side(
-                self.robot, translated_palm, offered_hand, robot_arm,
-                collision_obstacles, person_base_limits, standing_x,
-                x_margins=args.base_x_standing_margins,
-                front_offset_weight=args.front_offset_weight,
-                facing_yaw_weight=args.facing_yaw_weight,
-                attempts_per_pose=args.attempts_per_pose,
-                self_collision=self.collision_pairs is not None,
-                collision_pairs=self.collision_pairs,
-                joint_positions=collision_joints,
-                placement_joint_positions=translated_joints,
-                verification_pairs=self.verification_pairs,
-                deadline=deadline)
+        base_limits_in = person_base_limits
+        human_xy = spik.human_standing_xy(translated_joints)
+        if human_xy is None:
+            human_xy = np.array([args.human_front_distance, 0.0])
+        turn_degs = spik.turn_candidates_deg(offered_hand, translated_palm)
 
-        if picked is None:
-            result = spik.unsolved_result(
-                self.robot, robot_arm, rots[-1],
-                person_base_limits, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        else:
-            turn_index, angle_vector, base_pose, post_process_result = picked
-            result = spik.solved_result(
-                self.robot, robot_arm, rots[turn_index],
-                turn_index, angle_vector, base_pose, person_base_limits,
-                post_process_result, collision_ik_time,
-                candidate_selection_time, offered_hand, translated_palm)
-        result['offered_hand'] = offered_hand
-        result['robot_arm'] = robot_arm
-        result['base_x_standing_margin'] = x_margin
+        def ik_and_motion(excluded_turns=()):
+            """IK と接近の軌道計画 (``excluded_turns`` の向きは使わない)。
+            Returns: ``(result, motion, 台車の可動域, x の窓)``。"""
+            self._stage(STAGE_PLAN_IK)
+            (picked, collision_ik_time, candidate_selection_time,
+             limits, x_margin) = \
+                spik.solve_person_ik_side_by_side(
+                    self.robot, translated_palm, offered_hand, robot_arm,
+                    collision_obstacles, base_limits_in, standing_x,
+                    x_margins=args.base_x_standing_margins,
+                    front_offset_weight=args.front_offset_weight,
+                    facing_yaw_weight=args.facing_yaw_weight,
+                    attempts_per_pose=args.attempts_per_pose,
+                    self_collision=self.collision_pairs is not None,
+                    collision_pairs=self.collision_pairs,
+                    joint_positions=collision_joints,
+                    placement_joint_positions=translated_joints,
+                    verification_pairs=self.verification_pairs,
+                    deadline=deadline, excluded_turns=excluded_turns,
+                    partial_press_max_remaining=(
+                        spik.PARTIAL_PRESS_MAX_REMAINING))
+            if picked is not None and picked[3] is not None \
+                    and picked[3].get('partial'):
+                print('[plan] 試行{}: 最後まで押し込める候補が無いため、押し込み'
+                      'を {:.0f}% まで進めて人の手を待ちます (最終目標まで '
+                      '{:.0f}mm)。'.format(
+                          attempt, picked[3]['press_reached'] * 100,
+                          picked[3]['press_remaining'] * 1e3))
+            if picked is None:
+                result = spik.unsolved_result(
+                    self.robot, robot_arm, rots[-1],
+                    limits, collision_ik_time,
+                    candidate_selection_time, offered_hand, translated_palm)
+            else:
+                turn_index, angle_vector, base_pose, post_process_result = \
+                    picked
+                result = spik.solved_result(
+                    self.robot, robot_arm, rots[turn_index],
+                    turn_index, angle_vector, base_pose, limits,
+                    post_process_result, collision_ik_time,
+                    candidate_selection_time, offered_hand, translated_palm)
+            result['offered_hand'] = offered_hand
+            result['robot_arm'] = robot_arm
+            result['base_x_standing_margin'] = x_margin
 
-        # 押し込み姿勢まで解けたら軌道計画する (untranslate の前に行う)。
-        motion = None
-        if result['solved'] and result.get('post_process') is None:
-            print('[motion] 試行{}: 押し込み姿勢 (押し付け/視線 IK) が解けな'
-                  'かったため、軌道計画をしません。'.format(attempt))
-        elif result['solved'] and out_of_time('軌道計画'):
-            # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
-            # 実行しない。
-            result['plan_timed_out'] = True
-        elif result['solved']:
-            human_xy = spik.human_standing_xy(translated_joints)
-            if human_xy is None:
-                human_xy = np.array([args.human_front_distance, 0.0])
-            motion_args = copy.copy(args)
-            motion_args.collision_verify_tolerance = \
-                args.motion_collision_verify_tolerance
-            initial_base_pose = np.array([offset[0], offset[1], 0.0])
-            self._stage(STAGE_PLAN_APPROACH)
-            motion = phm.plan_person_motion(
-                self.robot, robot_arm, result, collision_joints, human_xy,
-                motion_args, self.motion_verification_pairs, self.solver,
-                initial_base_pose=initial_base_pose, deadline=deadline)
-            log_debug_event(dict(
-                event='motion', person=attempt,
-                verified=motion['verified'],
-                lead_in_verified=motion['lead_in_verified'],
-                min_dist=float(min(motion['waypoint_min_distances'])),
-                waypoint_min_distances=[
-                    float(d) for d in motion['waypoint_min_distances']],
-                kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
-                compute_time=motion['compute_time']))
-            # 押し込み後に手を下ろしながら横並びになる区間 (実行可能なときだけ)。
-            if (result.get('post_process') is not None
-                    and motion_verified(motion)):
-                # background/off は寄せを解かず最初の解で止める (background は
-                # 移動中に refine_transition で解く)。
+            # 押し込み姿勢まで解けたら軌道計画する (untranslate の前に行う)。
+            motion = None
+            if result['solved'] and result.get('post_process') is None:
+                # 落ちた段 (押し込み区間の IK・脚の整え・押し付け/視線 IK など) を、
+                # 最後の候補選びの数で出す。
+                print('[motion] 試行{}: 押し込み姿勢が解けなかったため ({})、'
+                      '軌道計画をしません。'.format(
+                          attempt, spik.press_fail_summary()
+                          or '落ちた段は不明'))
+            elif result['solved'] and out_of_time('軌道計画'):
+                # 軌道なし (motion=None) は押し込み姿勢が解けないときと同じく
+                # 実行しない。
+                mark_timed_out(result, '軌道計画の前')
+            elif result['solved']:
+                motion_args = copy.copy(args)
+                motion_args.collision_verify_tolerance = \
+                    args.motion_collision_verify_tolerance
+                initial_base_pose = np.array([offset[0], offset[1], 0.0])
+                if start_base_pose is not None:
+                    initial_base_pose = initial_base_pose + np.asarray(
+                        start_base_pose, dtype=np.float64)
+                self._stage(STAGE_PLAN_APPROACH)
+                motion = phm.plan_person_motion(
+                    self.robot, robot_arm, result, collision_joints, human_xy,
+                    motion_args, self.motion_verification_pairs, self.solver,
+                    initial_base_pose=initial_base_pose, deadline=deadline)
+                log_debug_event(dict(
+                    event='motion', person=attempt,
+                    verified=motion['verified'],
+                    lead_in_verified=motion['lead_in_verified'],
+                    min_dist=float(min(motion['waypoint_min_distances'])),
+                    waypoint_min_distances=[
+                        float(d) for d in motion['waypoint_min_distances']],
+                    kind=phm.KIND_LABELS.get(motion['kind'], motion['kind']),
+                    compute_time=motion['compute_time']))
+                if (not motion_verified(motion) and deadline is not None
+                        and time.time() >= deadline):
+                    # 接近の軌道が通らないまま締め切りを過ぎた (残りの候補を
+                    # 試していない)。
+                    mark_timed_out(result, '接近の軌道')
+            return result, motion, limits, x_margin
+
+        def plan_transition_for(result, motion):
+            """押し込み後に手を下ろしながら横並びになる区間 (実行可能な
+            ときだけ) を計画して ``motion['transition']`` に入れ、``(裏の計画
+            の仕事, 接近中に解く横並び移動の仕事)`` (無ければ None) を返す。
+            ``self.robot`` は IK の解の姿勢のままであること (横並び移動の計画は
+            その姿勢から始める)。"""
+            if (motion is None or result.get('post_process') is None
+                    or not motion_verified(motion)):
+                return None, None
+            transition = None
+            job = early = None
+            if early_approach:
+                # 実行を始めてから裏で解く (平行移動後の座標系のまま渡す。
+                # result は untranslate で書き換わるので複製する)。
+                early = dict(
+                    attempt=attempt, robot_arm=robot_arm,
+                    hand=offered_hand,
+                    post=copy.deepcopy(result['post_process']),
+                    turn_deg=result['turn_deg'],
+                    translated_joints=copy.deepcopy(translated_joints),
+                    collision_joints=copy.deepcopy(collision_joints),
+                    offset=offset)
+                print('[transition] 試行{}: 横並び移動は接近の実行中に解き'
+                      'ます。'.format(attempt))
+            else:
+                # background/off は寄せを解かず最初の解で止める (background
+                # は移動中に refine_transition で解く)。
                 self._stage(STAGE_PLAN_TRANSITION)
                 transition = sbs.plan_transition(
                     self.robot, robot_arm, offered_hand,
@@ -923,11 +1544,15 @@ class HandshakePlanner(object):
                     approach=self.side_by_side_approach == 'sync',
                     time_limit=(None if deadline is None
                                 else max(0.0, deadline - time.time())))
+            if transition is not None:
                 motion['transition'] = transition
+                if not transition['verified'] and transition.get('timed_out'):
+                    # 横並び移動 (確保の経路) が締め切りで切れた。
+                    mark_timed_out(result, '横並び移動')
                 if (self.refine_robot is not None
                         and transition['verified']):
                     # 平行移動後の座標系のまま渡す (untranslate は破壊的)。
-                    refine_job = dict(
+                    job = dict(
                         attempt=attempt, robot_arm=robot_arm,
                         hand=offered_hand,
                         post=copy.deepcopy(result['post_process']),
@@ -935,17 +1560,64 @@ class HandshakePlanner(object):
                         translated_joints=copy.deepcopy(translated_joints),
                         collision_joints=copy.deepcopy(collision_joints),
                         secured=copy.deepcopy(transition), offset=offset)
-                print('[transition] 試行{}: 横並び移動 {}'.format(
-                    attempt, sbs.transition_summary(transition)))
-                log_debug_event(dict(
-                    event='transition', person=attempt,
-                    verified=transition['verified'],
-                    fraction=transition['fraction'],
-                    x_margin=transition['x_margin'],
-                    placement_before=transition['placement_before'],
-                    placement_after=transition['placement_after'],
-                    reason=transition['reason'],
-                    compute_time=transition['compute_time']))
+                log_transition_event(attempt, transition)
+            return job, early
+
+        def approach_cos(result, motion):
+            """接近とすべらせる向きの cos。計画用のロボット (``self.robot``) は
+            触らず、手先を求める専用のロボットで計算する (IK の後は脚の連動
+            関節のリンクが関節角とずれたままで、姿勢を入れ直すと横並び移動の
+            計画の結果が変わるため)。"""
+            if motion is None or not motion_verified(motion):
+                return None
+            return nsp.approach_slide_cos(
+                self._fk_robot(), motion['joint_names'], motion['waypoints'],
+                result, translated_palm)
+
+        def complete(motion):
+            # 横並び移動を接近の実行中に解くなら、接近まで通れば揃う。
+            return (motion is not None and motion_verified(motion)
+                    and (early_approach
+                         or (motion.get('transition') or {}).get('verified')))
+
+        result, motion, person_base_limits, x_margin = ik_and_motion()
+        refine_job, early_job = plan_transition_for(result, motion)
+        cos = approach_cos(result, motion)
+        if cos is not None:
+            log_debug('[plan] 試行{}: 接近とすべらせる向きの cos {:+.2f} (向き '
+                      '{:+.0f}deg)'.format(attempt, cos, result['turn_deg']))
+        if (cos is not None and cos < nsp.REVERSE_APPROACH_COS
+                and not out_of_time('逆向きの接近を避ける計画し直し')):
+            # 手先が人の指先の側から来て、掌を越えた手首の側の hover から折り
+            # 返してすべらせる向き。ほかの向き (turn) で横並び移動まで計画し
+            # 直し、向きがそろって最初の計画と同じ段階まで通れば採用する。
+            retry = ik_and_motion(excluded_turns={
+                int(np.argmin([abs(d - result['turn_deg'])
+                               for d in turn_degs]))})
+            retry_cos = approach_cos(retry[0], retry[1])
+            retry_jobs = (None, None)
+            if retry_cos is not None and retry_cos >= nsp.REVERSE_APPROACH_COS:
+                retry_jobs = plan_transition_for(retry[0], retry[1])
+            adopted = (retry_cos is not None
+                       and retry_cos >= nsp.REVERSE_APPROACH_COS
+                       and (complete(retry[1]) or not complete(motion)))
+            print('[plan] 試行{}: 接近がすべらせる向きと逆 (cos {:+.2f}) のため'
+                  '向き {:+.0f}deg を除いて計画し直しました: {}。'.format(
+                      attempt, cos, result['turn_deg'],
+                      '採用 (cos {:+.2f}、向き {:+.0f}deg)'.format(
+                          retry_cos, retry[0]['turn_deg']) if adopted
+                      else '採用しない ({})'.format(
+                          '軌道計画まで通らない' if retry_cos is None
+                          else 'cos {:+.2f}'.format(retry_cos)
+                          if retry_cos < nsp.REVERSE_APPROACH_COS
+                          else '横並び移動まで通らない')))
+            log_debug_event(dict(
+                event='reverse_approach', person=attempt, cos=cos,
+                turn_deg=result['turn_deg'], retry_cos=retry_cos,
+                retry_turn_deg=retry[0].get('turn_deg'), adopted=adopted))
+            if adopted:
+                result, motion, person_base_limits, x_margin = retry
+                refine_job, early_job = retry_jobs
 
         placement = (spik.base_placement_metrics(
             translated_joints, result['base_position'], result['base_yaw'])
@@ -955,6 +1627,8 @@ class HandshakePlanner(object):
         if motion is not None:
             untranslate_motion(motion, offset)
 
+        collision_ik_time = result['collision_ik_time']
+        candidate_selection_time = result['candidate_selection_time']
         log_debug_event(dict(
             event='result', person=attempt, offered_hand=offered_hand,
             robot_arm=robot_arm, solved=result['solved'],
@@ -963,7 +1637,9 @@ class HandshakePlanner(object):
             base_x_standing_margin=x_margin,
             placement=placement,
             collision_ik_time=collision_ik_time,
-            candidate_selection_time=candidate_selection_time))
+            candidate_selection_time=candidate_selection_time,
+            plan_timed_out=bool(result.get('plan_timed_out')),
+            plan_timeout_stage=result.get('plan_timeout_stage')))
         if not result['solved']:
             print('[result] 試行{} ({}手/{}腕): IK 失敗 ({:.1f} 秒)。'.format(
                 attempt, offered_hand, robot_arm,
@@ -987,13 +1663,65 @@ class HandshakePlanner(object):
         print('[plan] 試行{}: 計画全体 {:.1f} 秒。'.format(
             attempt, time.time() - plan_t0))
         return dict(result=result, motion=motion, robot_arm=robot_arm,
-                    transition_refine=refine_job)
+                    transition_refine=refine_job, transition_early=early_job)
+
+    def plan_transition_early(self, job):
+        """``plan`` が返した ``transition_early`` の横並び移動 (寄せなし) を裏の
+        ロボット (``self.refine_robot``) で解き、``(base_link 系の transition,
+        寄せの裏の計画の job or None)`` を返す (裏スレッド用)。
+
+        別プロセス (``start_worker``) があればそこで解く (実行中のスレッドとの
+        GIL の取り合いを避け、バッチ IK の準備も別プロセスで済んでいるため。
+        別プロセスがあると本体の refine_robot のバッチ IK は準備しない)。"""
+        transition = None
+        if self._worker_ok():
+            job_id = self.worker.submit(dict(
+                job, kind='early',
+                time_limit=EARLY_APPROACH_TRANSITION_TIME))
+            message = self.worker.wait(job_id)
+            if message is not None and message[0] == 'refine':
+                transition = message[2]
+            else:
+                print('[transition] 別プロセスで横並び移動を解けなかったため'
+                      '、このスレッドで解きます ({})。'.format(
+                          None if message is None else message[1:]))
+        if transition is None:
+            # R7: refine_robot を使う処理の始めに、同じスレッドで戻す
+            # (呼び出し元が _refine_lock で 1 つずつにしている)。
+            self._restore_refine_robot()
+            transition = sbs.plan_transition(
+                self.refine_robot, job['robot_arm'], job['hand'], job['post'],
+                job['turn_deg'], job['translated_joints'],
+                job['collision_joints'], self.refine_verification_pairs,
+                self.refine_collision_pairs, self.base_limits, approach=False,
+                time_limit=EARLY_APPROACH_TRANSITION_TIME)
+        refine_job = None
+        if transition['verified']:
+            refine_job = dict(job, secured=copy.deepcopy(transition))
+        log_transition_event(job['attempt'], transition)
+        untranslate_motion(dict(waypoints=[], transition=transition),
+                           job['offset'])
+        return transition, refine_job
 
     def refine_transition(self, job, stop=None):
         """``plan`` が返した ``transition_refine`` の横並び移動を、寄せ (段階 2) と
         掌の向きで良くして解き、base_link 系に戻す (裏スレッド用。
         ``self.refine_robot`` のみ使う)。``stop`` (``threading.Event``) が立つと
-        ``sbs.TransitionStopped`` を投げて打ち切る。"""
+        ``sbs.TransitionStopped`` を投げて打ち切る。
+
+        別プロセス (``start_worker``) があればそこで解く。"""
+        if self._worker_ok():
+            job_id = self.worker.submit(job)
+            message = self.worker.wait(job_id, stop=stop)
+            if message is None:
+                self.worker.cancel(job_id)
+                raise sbs.TransitionStopped()
+            if message[0] == 'refine':
+                return message[2]
+            if message[0] == 'stopped':
+                raise sbs.TransitionStopped()
+            raise RuntimeError('別プロセス: {}'.format(message[2]))
+        self._restore_refine_robot()
         transition = sbs.refine_transition(
             self.refine_robot, job['robot_arm'], job['hand'], job['post'],
             job['turn_deg'], job['translated_joints'],
@@ -1036,6 +1764,10 @@ class HandshakePipelineNode(object):
         # IK・軌道計画 (IK は指なし、画面は指ありの display_robot)。
         self.planner = HandshakePlanner(args)
         self.robot = self.planner.robot
+        # 計画用ロボットの可動域 (IK が一時的に狭める前の値、実行時に使う)。
+        self._planning_limits = {
+            joint.name: (float(joint.min_angle), float(joint.max_angle))
+            for joint in self.robot.joint_list}
         self.verification_pairs = self.planner.verification_pairs
         self.motion_verification_pairs = \
             self.planner.motion_verification_pairs
@@ -1062,7 +1794,9 @@ class HandshakePipelineNode(object):
         self.offered_hand_selector = epp.OfferedHandSelector(
             robot_position=self.robot_position,
             score_min=args.offer_score_min,
-            max_distance=max_distance)
+            max_distance=max_distance,
+            fast_stillness_window=OFFER_FAST_STILLNESS_WINDOW,
+            fast_stillness_score=OFFER_FAST_STILLNESS_SCORE)
         self.palm_estimator = epp.PalmPoseEstimator(self.offered_hand_selector)
 
         self._joint_smoother = skeleton_filters.OneEuroFilter(
@@ -1093,6 +1827,9 @@ class HandshakePipelineNode(object):
         self._last_failure = None
         self._nod_done = threading.Event()
         self._nod_done.set()
+        # 台車を先に動かしたとき の dict(end=待機点 [x, y, yaw]
+        # (差し出し時の base_link 系)、sent_time、start_odom)。動かさなければ None。
+        self._pre_move = None
         self._initial_pose_done = threading.Event()
         self._initial_pose_done.set()
         # 首の追従の指令とうなずきの開始を排他にする (_head_tracking_loop)。
@@ -1141,6 +1878,13 @@ class HandshakePipelineNode(object):
         self._refine_lock = threading.Lock()  # 寄せの裏の計画を 1 つずつ
         # 動いている裏の計画を止める合図 (id(motion) -> threading.Event)。
         self._refine_stops = {}
+        # 押し込み後の姿勢からの解き直し用:
+        # id(motion) -> 裏の計画の job、id(motion) -> (別プロセスの番号, 頼んだ時刻)。
+        self._transition_jobs = {}
+        self._resolve_jobs = {}
+        # 接近の実行中に解いている横並び移動: id(motion) ->
+        # 解き終わったら set する Event。
+        self._early_transitions = {}
         # 保存した軌道の JSON のパス (id(motion) -> パス、_resave_motion 用)。
         self._motion_paths = {}
         self._collision_pairs_text = ''   # 指ありでの事後検証結果
@@ -1166,6 +1910,9 @@ class HandshakePipelineNode(object):
         self._viewer_camera_time = 0.0
         self._activity_panel_content = None
 
+        # 裏の計画を別プロセスで解く (スレッドで解くと GIL の取り合いで 2〜3 倍
+        # 遅い。別プロセスが落ちたらスレッドで解く)。
+        self.planner.start_worker()
         self.planner.warmup(
             background_optimizer=args.background_optimizer_warmup)
 
@@ -1255,8 +2002,14 @@ class HandshakePipelineNode(object):
         self.info_sub = rospy.Subscriber(
             args.camera_info_topic, CameraInfo, self._on_camera_info,
             queue_size=1)
-        color_sub = message_filters.Subscriber(args.color_topic, Image)
-        depth_sub = message_filters.Subscriber(args.depth_topic, Image)
+        # 既定の購読は待ち行列が無制限で、処理が追いつかないと古い画像を順に
+        # 処理する (2026-11-18 の bag で撮影から判定まで 0.45〜0.65 秒) ので、
+        # 待ち行列を 1 にして古い画像を捨てる。
+        sub_kwargs = dict(queue_size=1, buff_size=2 ** 26)
+        color_sub = message_filters.Subscriber(args.color_topic, Image,
+                                               **sub_kwargs)
+        depth_sub = message_filters.Subscriber(args.depth_topic, Image,
+                                               **sub_kwargs)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub], queue_size=5, slop=0.1)
         self.sync.registerCallback(self._on_frame)
@@ -1777,6 +2530,18 @@ class HandshakePipelineNode(object):
         with self._lock:
             frozen = self._frozen_joint_positions
             waypoints = self._display_waypoints
+            n_transition = self._display_n_transition
+            motion = self._current_motion
+            if waypoints is not None and motion is not None:
+                # 横並び移動は計画の後に解ける・差し替わる (
+                # 裏の計画・押し込み後の解き直し) ので、出すたびに表示する
+                # 横並び移動 (人の腕付き) に付け替える。実行に使う
+                # ``self._display_waypoints`` は変えない。
+                tail = transition_waypoints(dict(
+                    transition=display_transition(motion),
+                    joint_names=motion['joint_names']))
+                waypoints = waypoints[:len(waypoints) - n_transition] + tail
+                n_transition = len(tail)
             payload = dict(
                 attempt=(self._attempt_count if frozen is not None else None),
                 skeleton=(None if frozen is None
@@ -1787,7 +2552,7 @@ class HandshakePipelineNode(object):
                 display_waypoints=waypoints,
                 n_prepend=self._display_n_prepend,
                 n_approach=self._display_n_approach,
-                n_transition=self._display_n_transition,
+                n_transition=n_transition,
                 real_pose_ref=self._real_pose_ref,
                 torso_surface_offset=self.args.torso_surface_offset)
             try:
@@ -1912,7 +2677,21 @@ class HandshakePipelineNode(object):
             if self.ri is not None:
                 self._nod_done.clear()
         if self.ri is not None:
-            threading.Thread(target=self._nod_head, daemon=True).start()
+            # 差し出した手を見てから顔へ戻す。
+            look_at = palms[offered_hand]['position']
+            threading.Thread(target=self._nod_head, args=(look_at,),
+                             daemon=True).start()
+        self._pre_move = None
+        if self.ri is not None:
+            try:
+                self._start_pre_move(joint_positions, palms[offered_hand],
+                                     handshake_t0)
+            except Exception as exc:  # noqa: BLE001  (先に動かせなくても計画は続ける)
+                print('[pre-move][WARN] 台車を先に動かす処理で例外が起きました '
+                      '({!r})。{}'.format(
+                          exc, '台車は待機点へ向かっています。'
+                          if self._pre_move is not None
+                          else '台車は動かさずに計画します。'))
         # 以降は骨格・計画とも今の base_link 系なので、実機の姿勢もここを原点に出す。
         real_pose_ref = self._lookup_odom_from_base(rospy.Time.from_sec(stamp))
         with self._lock:
@@ -2026,20 +2805,34 @@ class HandshakePipelineNode(object):
                   .format(offered_hand, medial))
             self._log_debug(dict(event='outward_palm_flip', side=offered_hand,
                                  medial_before_flip=medial))
+        # 試行ごとに乱数の種を差し出した掌から決める (同じ掌なら同じ計画。J0 の案 3)。
+        np.random.seed(_palm_seed(palms[offered_hand]))
+        pre_move = self._pre_move
+        start_base_pose = None if pre_move is None else pre_move['end']
         planned = self.planner.plan(
-            joint_positions, palms, offered_hand, attempt)
+            joint_positions, palms, offered_hand, attempt,
+            start_base_pose=start_base_pose)
         result, motion = planned['result'], planned['motion']
         palm = palms[offered_hand]
         if motion is not None and planned.get('transition_refine'):
             self._start_transition_refine(planned['transition_refine'],
                                           motion)
+        if motion is not None and planned.get('transition_early'):
+            self._start_early_transition(planned['transition_early'], motion)
 
         if motion is not None:
             display_waypoints, n_approach = build_display_waypoints(
                 motion, result)
             initial_pos = self._initial_base_coords.worldpos()
+            lead_in_start = [initial_pos[0], initial_pos[1], 0.0]
+            if start_base_pose is not None:
+                # 先に動かした台車の待機点から (表示の系は差し出し時の base_link
+                # 系と同じ向き)。
+                lead_in_start = [
+                    lead_in_start[i] + float(start_base_pose[i])
+                    for i in range(3)]
             prepend_waypoints = phm.build_lead_in_waypoints(
-                [initial_pos[0], initial_pos[1], 0.0],
+                lead_in_start,
                 motion['waypoints'][0], motion['joint_names'],
                 start_joint_angles=dict(zip(
                     self._initial_joint_names,
@@ -2075,8 +2868,9 @@ class HandshakePipelineNode(object):
                   '--auto-execute でも実機を動かしません。'.format(
                       (motion.get('transition') or {}).get('reason')))
         if result['solved'] and not has_post_process:
-            print('[execute] 後処理 (押し付け/視線 IK) が解けず押し込み区間が'
-                  'ないため、--auto-execute でも実機を動かしません。')
+            print('[execute] 押し込み姿勢が解けず ({}) 押し込み区間が'
+                  'ないため、--auto-execute でも実機を動かしません。'.format(
+                      spik.press_fail_summary() or '落ちた段は不明'))
         if display_waypoints is not None:
             self._set_waypoint_slider_range(len(display_waypoints) - 1)
         else:
@@ -2096,8 +2890,14 @@ class HandshakePipelineNode(object):
             speech = self._failure_speech(
                 attempt, result, motion, joint_positions, palm, offered_hand)
             if args.auto_execute:
+                # 台車を先に動かしていれば、出し直しの判定の基準の掌を待機点の
+                # 系へ移す (そのままだと台車が動いた分を手が動いたとみなす)。
                 self._last_failure = (
-                    offered_hand, palm, self._say(speech, wait=True))
+                    offered_hand, self._palm_in_pre_move_frame(palm),
+                    self._say(speech, wait=True))
+                # 次の差し出しは台車が止まってから受け付ける (骨格の系がずれない
+                # よう)。
+                self._wait_pre_move()
                 return 'failed'
         return 'solved'
 
@@ -2110,6 +2910,12 @@ class HandshakePipelineNode(object):
         """
         args = self.args
         cause = self._failure_cause(result, motion)
+        if cause == 'timeout':
+            print('[advice] 試行{}: 計画の時間の上限で切れたため ({})、手の出し方は'
+                  '助言しません。'.format(attempt, result.get('plan_timeout_stage')))
+            self._log_debug(dict(event='advice', person=attempt, cause=cause,
+                                 stage=result.get('plan_timeout_stage')))
+            return SPEECH_TIMEOUT_FAIL_TEXT
         if cause == 'approach':
             print('[advice] 試行{}: 接近の途中で干渉したため、手の出し方は'
                   '助言しません。'.format(attempt))
@@ -2140,8 +2946,11 @@ class HandshakePipelineNode(object):
     @staticmethod
     def _failure_cause(result, motion,
                        near_hand_fraction=FAILURE_NEAR_HAND_FRACTION):
-        """実機を動かせなかった原因を ``ik``/``no_press``/``near_hand``
-        (干渉 NG が押し込み付近だけ)/``approach`` に分類する。"""
+        """実機を動かせなかった原因を ``timeout`` (計画の時間の上限で切れた。
+        ``plan_timeout_stage`` に段)/``ik``/``no_press``/``near_hand``
+        (干渉 NG が押し込み付近だけ)/``approach``/``transition`` に分類する。"""
+        if result.get('plan_timed_out'):
+            return 'timeout'
         if not result['solved']:
             return 'ik'
         if result.get('post_process') is None:
@@ -2173,6 +2982,9 @@ class HandshakePipelineNode(object):
             for previous in self._refine_stops.values():
                 previous.set()
             self._refine_stops[id(motion)] = stop
+            # 押し込み後の解き直し (_start_transition_resolve) が使う (最新の人だけ)。
+            self._transition_jobs = {id(motion): job}
+            self._resolve_jobs = {}
 
         def run():
             try:
@@ -2215,6 +3027,7 @@ class HandshakePipelineNode(object):
                 event='transition_refine', person=job['attempt'],
                 verified=transition['verified'],
                 fraction=transition['fraction'],
+                partial_fraction=transition.get('partial_fraction'),
                 palm_facing=transition.get('palm_facing'),
                 approach_lateral=approach.get('lateral_after'),
                 approach_waypoints=approach.get('n_waypoints'),
@@ -2259,11 +3072,156 @@ class HandshakePipelineNode(object):
 
     def _record_executed_transition(self, motion, which):
         """実行した横並び移動 (``which``: 'secured' = ``transition``、
-        'refined' = ``transition_refined``) を ``motion`` と保存した JSON に
-        残す。"""
+        'refined' = ``transition_refined``、'resolved' =
+        ``transition_resolved``) を ``motion`` と保存した JSON に残す。"""
         with self._lock:
             motion['transition_executed'] = which
         self._resave_motion(motion)
+
+    def _start_transition_resolve(self, motion, press_wp, joint_names):
+        """押し込みを解き直した姿勢 ``press_wp`` が
+        決まったら、そこから横並び移動 (寄せまで、掌の向きは全部) を別プロセス
+        で解き直し始める (結果は ``_resolved_transition_waypoints``)。
+
+        計画の押し込み姿勢から解いた横並び移動に解き直しの関節角の差を足すと
+        (``_execute_transition``)、途中の姿勢は干渉・人の腕の楽さを確かめて
+        いない。解き直しは実機の 8 試行の押し込み後の姿勢で 5 試行が解け、
+        寄せまで 3〜6 秒 (押し込みの解き直しから横並び移動の開始まで 5.8〜9.8
+        秒)。裏の計画 (寄せ) がまだ動いていれば、その結果を予備に残すため
+        解き直さない。"""
+        worker = self.planner.worker
+        if worker is None or not worker.alive():
+            return
+        with self._lock:
+            job = self._transition_jobs.get(id(motion))
+            running = id(motion) in self._refine_stops
+        if job is None:
+            return
+        if running:
+            print('[transition] 裏の計画 (寄せ) がまだ終わっていないため、押し込み'
+                  '後の姿勢からの横並び移動の解き直しはしません。')
+            return
+        # 予備の解の掌の向き・下ろし方から試す (実機 8 試行のオフラインで、
+        # 解けた 5 試行の時間 平均 2.1 -> 1.3 秒、寄せ後 平均 0.71 -> 0.68 m)。
+        backup = self._backup_transition(motion)
+        hint = None
+        if (backup.get('verified') and backup.get('fraction', 0.0) >= 1.0
+                and backup.get('arm_deg') is not None):
+            hint = dict(palm_facing=backup.get('palm_facing'),
+                        arm_deg=float(backup['arm_deg']),
+                        abduction_deg=float(backup['abduction_deg']))
+        payload = dict(
+            job, kind='resolve',
+            press_joints={name: float(angle) for name, angle in zip(
+                joint_names, press_wp['joint_angle_vector'])},
+            press_base=[float(v) for v in press_wp['base_position'][:2]],
+            press_yaw=float(press_wp['base_yaw']),
+            time_limit=TRANSITION_RESOLVE_TIME_LIMIT, hint=hint)
+        with self._lock:
+            previous = self._resolve_jobs.get(id(motion))
+        if previous is not None:
+            worker.cancel(previous[0])
+        job_id = worker.submit(payload)
+        with self._lock:
+            self._resolve_jobs[id(motion)] = (
+                job_id, time.time(),
+                np.asarray(press_wp['joint_angle_vector'], dtype=np.float64))
+        print('[transition] 押し込み後の姿勢から横並び移動を別プロセスで解き直し'
+              'ます。')
+
+    def _backup_transition(self, motion):
+        """押し込み後の解き直しが使えないときの予備の横並び移動: 裏の計画
+        (``transition_refined``) が確保済みの解以上に進めていればそれ、でなければ
+        確保済みの解 (無ければ空の dict)。"""
+        with self._lock:
+            refined = motion.get('transition_refined')
+            secured = motion.get('transition') or {}
+        return (refined if refined is not None and refined.get('verified')
+                and refined['fraction'] >= secured.get('fraction', 0.0)
+                else secured)
+
+    def _resolved_transition_waypoints(self, motion, press_wp):
+        """``_start_transition_resolve`` の解き直しが横並びまで解けていればその
+        waypoint、でなければ None (呼び出し元は裏の計画・確保済みの解に差を
+        足して使う)。解き直しを始めた押し込みの姿勢が実行した ``press_wp``
+        と違えば (行けるところまで押し込んで待つ間の合わせ直しなど) 使わない。"""
+        with self._lock:
+            entry = self._resolve_jobs.pop(id(motion), None)
+        if entry is None:
+            return None
+        job_id, t0, start_av = entry
+        worker = self.planner.worker
+        if start_av.shape != np.shape(press_wp['joint_angle_vector']) or \
+                np.max(np.abs(start_av - np.asarray(
+                    press_wp['joint_angle_vector']))) > 1e-6:
+            worker.cancel(job_id)
+            print('[execute] 押し込みの姿勢が解き直しを始めた後に変わったため、'
+                  '解き直した横並び移動は使いません。')
+            self._log_debug(dict(event='transition_resolve', used=False,
+                                 reason='press_changed',
+                                 elapsed=time.time() - t0))
+            return None
+        # 終わっていなければ待たない (予備に差を足す方で動く)。
+        message = worker.wait(job_id, timeout=0.0)
+        record = dict(event='transition_resolve', elapsed=time.time() - t0)
+        if message is None or message[0] != 'refine':
+            worker.cancel(job_id)
+            reason = ('間に合わない' if message is None
+                      else '打ち切り' if message[0] == 'stopped'
+                      else message[2])
+            print('[execute] 押し込み後の姿勢からの横並び移動の解き直しは使い'
+                  'ません ({}、{:.1f} 秒)。'.format(reason, record['elapsed']))
+            record.update(used=False, reason=reason)
+            self._log_debug(record)
+            return None
+        transition = message[2]
+        with self._lock:
+            motion['transition_resolved'] = transition
+        approach = transition.get('approach') or {}
+        ok = bool(transition.get('verified')
+                  and transition.get('fraction', 0.0) >= 1.0)
+        record.update(
+            used=ok, verified=bool(transition.get('verified')),
+            fraction=transition.get('fraction'),
+            palm_facing=transition.get('palm_facing'),
+            approach_lateral=approach.get('lateral_after'),
+            compute_time=transition.get('compute_time'),
+            reason=None if ok else transition.get('reason'))
+        if not ok:
+            self._log_debug(record)
+            print('[execute] 押し込み後の姿勢から横並びまで解けませんでした '
+                  '({})。'.format(str(transition.get('reason'))[:200]))
+            self._resave_motion(motion)
+            return None
+        # 予備 (裏の計画、使えなければ確保済みの解) より寄せ後が
+        # RESOLVE_MAX_LATERAL_LOSS を超えて遠ければ予備を使う (ユーザー判断
+        # 11/19: 近さを優先、予備は差を終点で 0 へ戻して足す)。
+        backup = self._backup_transition(motion)
+        lateral = _final_lateral(transition)
+        backup_lateral = _final_lateral(backup)
+        record.update(lateral=lateral, backup_lateral=backup_lateral)
+        if (lateral is not None and backup_lateral is not None
+                and backup.get('verified')
+                and lateral > backup_lateral + RESOLVE_MAX_LATERAL_LOSS):
+            print('[execute] 押し込み後の姿勢から解き直した横並び移動は寄せ後が'
+                  '{:.2f}m で、予備の {:.2f}m より遠いため予備を使います。'.format(
+                      lateral, backup_lateral))
+            record['used'] = False
+            record['reason'] = 'farther'
+            self._log_debug(record)
+            self._resave_motion(motion)
+            return None
+        self._log_debug(record)
+        self._record_executed_transition(motion, 'resolved')
+        print('[execute] 押し込み後の姿勢から解き直した横並び移動を使います '
+              '(掌は {}、寄せ {}、{:.1f} 秒)。'.format(
+                  transition.get('palm_facing'),
+                  '横 {:.2f} -> {:.2f} m'.format(
+                      approach['lateral_before'], approach['lateral_after'])
+                  if approach.get('n_waypoints') else 'なし',
+                  record['elapsed']))
+        return transition_waypoints(dict(
+            transition=transition, joint_names=motion['joint_names']))
 
     def _resave_motion(self, motion):
         """``_save_attempt`` で保存した ``motion`` の JSON を、今の内容で
@@ -2284,11 +3242,81 @@ class HandshakePipelineNode(object):
 
     def _execution_verified(self, motion):
         """実機で実行してよい軌道か。接近・押し込みが検証に通り、横並び
-        移動も解けていること。"""
+        移動も解けていること (接近の実行中に解いている間は、
+        接近・押し込みだけで実行してよい)。"""
         if not motion_verified(motion):
             return False
-        transition = motion.get('transition')
+        with self._lock:
+            pending = self._early_transitions.get(id(motion))
+            transition = motion.get('transition')
+        if pending is not None and not pending.is_set():
+            return True
         return bool(transition and transition.get('verified'))
+
+    def _start_early_transition(self, job, motion):
+        """接近の実行中に、横並び移動 (寄せなし) を裏スレッドで解き、
+        ``motion['transition']`` に入れる。解けたら寄せの裏の計画も続けて
+        始める。寄せの裏の計画と同じ ``_refine_lock`` で 1 つずつ行う。"""
+        done = threading.Event()
+        with self._lock:
+            self._early_transitions[id(motion)] = done
+            # 前の人の寄せの裏の計画が残っていれば止める (同じロックを待つため)。
+            for previous in self._refine_stops.values():
+                previous.set()
+
+        def run():
+            transition = refine_job = None
+            try:
+                with self._refine_lock:
+                    t0 = time.time()
+                    self._set_background_activity(
+                        BACKGROUND_TRANSITION_EARLY)
+                    try:
+                        transition, refine_job = \
+                            self.planner.plan_transition_early(job)
+                    finally:
+                        self._set_background_activity(None)
+                print('[transition] 試行{}: 実行中に横並び移動を {:.1f} 秒で'
+                      '解きました ({})。'.format(
+                          job['attempt'], time.time() - t0,
+                          '検証 OK' if transition['verified'] else '解けず'))
+            except Exception as e:  # noqa: BLE001 (押し込みまでは続ける)
+                print('[transition] 試行{}: 実行中の横並び移動の計画が失敗しま'
+                      'した ({}: {})。'.format(
+                          job['attempt'], type(e).__name__, e))
+            finally:
+                with self._lock:
+                    if transition is not None:
+                        motion['transition'] = transition
+                done.set()
+            self._resave_motion(motion)
+            if refine_job is not None:
+                self._start_transition_refine(refine_job, motion)
+
+        threading.Thread(target=run, name='transition-early',
+                         daemon=True).start()
+
+    def _wait_early_transition(self, motion):
+        """接近の実行中に解いている横並び移動を待ち、実行する
+        waypoint (解けなければ空) を返す。実行中に解いていなければ None。"""
+        with self._lock:
+            pending = self._early_transitions.get(id(motion))
+        if pending is None:
+            return None
+        if not pending.is_set():
+            self._set_activity(STAGE_TRANSITION_WAIT)
+            t0 = time.time()
+            pending.wait()
+            print('[execute] 横並び移動の計画を {:.1f} 秒待ちました。'.format(
+                time.time() - t0))
+        with self._lock:
+            waypoints = transition_waypoints(motion)
+            # id は使い回されうるので、待ち終えたら外す。
+            self._early_transitions.pop(id(motion), None)
+        if not waypoints:
+            print('[execute] 横並び移動が解けなかったため、押し込みで終えます '
+                  '。')
+        return waypoints
 
     def _save_attempt(self, joint_positions, palms, result, motion):
         """試行の骨格/掌/IK 結果/軌道を JSON で保存する (``--save-dir``、無ければ
@@ -2447,13 +3475,19 @@ class HandshakePipelineNode(object):
         self.ri.wait_interpolation()
         print('[ARM] 腕・首を初期姿勢に戻しました。')
 
-    def _nod_head(self):
+    def _nod_head(self, look_at=None):
         """首を ``HEAD_NOD_PITCH_DEG`` まで下げて初期角度に戻す。終わったら (失敗しても)
         ``self._nod_done`` を set する。``head_controller`` のみに送り腕のゴールは
-        打ち切らない。"""
+        打ち切らない。``look_at`` (base_link 系の点の掌) が
+        あれば、下げるときはその点を見る (向けなければ通常のうなずき)。"""
         try:
             current_av = np.asarray(self.ri.angle_vector(), dtype=np.float64)
             joint_list = self.real_robot.joint_list
+            look_av = None
+            if look_at is not None:
+                # 視線のロボットは首の追従と共有 (追従は止めてあるが念のため)。
+                with self._head_lock:
+                    look_av = self._neck_toward(current_av, look_at)
             neck_index = joint_list.index(self.real_robot.neck_p_joint)
             initial_angle = dict(zip(
                 self._initial_joint_names,
@@ -2465,6 +3499,8 @@ class HandshakePipelineNode(object):
                     self.real_robot.neck_y_joint)] = tracking_yaw
             down_av = current_av.copy()
             down_av[neck_index] = np.deg2rad(HEAD_NOD_PITCH_DEG)
+            if look_av is not None:
+                down_av = look_av
             up_av = current_av.copy()
             up_av[neck_index] = initial_angle
             time_list = self._limited_time_list(
@@ -2473,14 +3509,121 @@ class HandshakePipelineNode(object):
             self.ri.angle_vector_sequence(
                 [down_av, up_av], time_list, controller_type='head_controller')
             self.ri.wait_interpolation(controller_type='head_controller')
-            log_debug('[nod] 首を {:.0f} 度まで下げて {:.0f} 度に戻しました '
-                  '({:.2f} 秒)。'.format(HEAD_NOD_PITCH_DEG,
-                                        np.rad2deg(initial_angle),
-                                        sum(time_list)))
+            log_debug('[nod] 首を {} {:.0f} 度まで下げて {:.0f} 度に戻しました '
+                  '({:.2f} 秒)。'.format(
+                      '差し出した手へ向けて' if look_av is not None else '',
+                      np.rad2deg(down_av[neck_index]),
+                      np.rad2deg(initial_angle), sum(time_list)))
         except Exception as exc:  # noqa: BLE001  (うなずけなくても握手の実行は止めない)
             print('[nod] うなずきに失敗しました ({})。'.format(exc))
         finally:
             self._nod_done.set()
+
+    def _neck_toward(self, current_av, target):
+        """実機の関節角 ``current_av`` の首 (ヨー・ピッチ) だけを、カメラ光軸が
+        ``target`` (base_link 系) を向くように変えた関節角。視線のロボットが無い・
+        首ヨーの可動域の外なら None。"""
+        gaze_robot = self._gaze_robot
+        if gaze_robot is None:
+            return None
+        joint_list = self.real_robot.joint_list
+        index = {joint.name: i for i, joint in enumerate(joint_list)}
+        for joint in gaze_robot.joint_list:
+            if joint.name in index:
+                joint.joint_angle(current_av[index[joint.name]])
+        target = np.asarray(target, dtype=np.float64)
+        if not self._seed_neck_yaw(gaze_robot, target):
+            return None
+        spik._reaim_gaze(gaze_robot, spik.camera_optical_coords(gaze_robot),
+                         target, HEAD_TRACK_IK_STOP, HEAD_TRACK_IK_RTHRE)
+        av = np.asarray(current_av, dtype=np.float64).copy()
+        av[index[self.real_robot.neck_y_joint.name]] = \
+            gaze_robot.neck_y_joint.joint_angle()
+        av[index[self.real_robot.neck_p_joint.name]] = \
+            gaze_robot.neck_p_joint.joint_angle()
+        av[index[self.real_robot.neck_r_joint.name]] = \
+            spik.NECK_ROLL_FIXED_ANGLE
+        return av
+
+    def _start_pre_move(self, joint_positions, palm, handshake_t0):
+        """差し出し手が決まったらすぐ、腕・首はそのままで台車だけ待機点
+        (``pre_move_target``) へ動かし始める (完了は待たない)。計画は待機点から
+        解き、実行は台車が止まってから始める。動かす量が
+        ``PRE_MOVE_MIN_DISTANCE`` 未満なら動かさない (``self._pre_move`` は None)。"""
+        end = pre_move_goal(palm['position'],
+                            spik.human_standing_xy(joint_positions))
+        distance = float(np.linalg.norm(end[:2]))
+        if distance < PRE_MOVE_MIN_DISTANCE:
+            print('[pre-move] 既に人の手に近い (待機点まで {:.2f} m) ため、'
+                  '台車は先に動かしません。'.format(distance))
+            return
+        points = [[float(end[0]), float(end[1]), 0.0]]
+        time_list = self._limited_time_list(None, points, [MIN_SEGMENT_TIME])
+        start_odom = self.ri.odom
+        self._send_base_trajectory(points, time_list, wait=False)
+        self._pre_move = dict(end=end, start_odom=start_odom,
+                              sent_time=time.time(),
+                              duration=float(sum(time_list)))
+        print('[pre-move] 差し出しから {:.2f} 秒で台車を待機点へ動かし始め'
+              'ました ({:.2f} m、{:.1f} 秒)。'.format(
+                  time.time() - handshake_t0, distance,
+                  self._pre_move['duration']))
+        log_debug_event(dict(
+            event='pre_move', end=[float(v) for v in end], distance=distance,
+            duration=self._pre_move['duration'],
+            since_offer=time.time() - handshake_t0))
+
+    def _wait_pre_move(self):
+        """先に動かした台車 (``self._pre_move``) が止まるまで待ち、待機点との
+        ずれ (odom) をログに出す。"""
+        pre_move = self._pre_move
+        if pre_move is None or pre_move.get('done'):
+            return
+        t0 = time.time()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        pre_move['done'] = True
+        x0, y0, yaw0 = self._odom_pose(pre_move['start_odom'])
+        x1, y1, yaw1 = self._odom_pose(self.ri.odom)
+        c, s = math.cos(yaw0), math.sin(yaw0)
+        dx, dy = x1 - x0, y1 - y0
+        actual = np.array([c * dx + s * dy, -s * dx + c * dy])
+        error = float(np.linalg.norm(actual - pre_move['end'][:2]))
+        print('[pre-move] 待機点に着きました (止まるまで待った時間 {:.2f} 秒、'
+              '待機点とのずれ {:.0f} mm、向き {:.1f} 度)。'.format(
+                  time.time() - t0, error * 1e3,
+                  math.degrees(math.atan2(math.sin(yaw1 - yaw0),
+                                          math.cos(yaw1 - yaw0)))))
+
+    def _palm_in_pre_move_frame(self, palm):
+        """掌 ``palm`` (差し出し時の base_link 系) を待機点の台車の系へ移した
+        コピー (先に動かしていなければそのまま)。"""
+        if self._pre_move is None or palm is None:
+            return palm
+        moved = dict(palm)
+        position = np.asarray(palm['position'], dtype=np.float64).copy()
+        position[:2] = self._to_pre_move_frame(position[:2])
+        moved['position'] = position.tolist()
+        yaw = float(self._pre_move['end'][2])
+        c, s = math.cos(yaw), math.sin(yaw)
+        for key in ('x_axis', 'y_axis', 'z_axis', 'normal'):
+            if palm.get(key) is None:
+                continue
+            v = np.asarray(palm[key], dtype=np.float64).copy()
+            v[:2] = [c * v[0] + s * v[1], -s * v[0] + c * v[1]]
+            moved[key] = v.tolist()
+        return moved
+
+    def _to_pre_move_frame(self, xy):
+        """差し出し時の base_link 系の水平位置 ``xy`` (n, 2) を、待機点の台車の系へ
+        移す (先に動かしていなければそのまま)。"""
+        xy = np.asarray(xy, dtype=np.float64)
+        if self._pre_move is None:
+            return xy
+        end = self._pre_move['end']
+        c, s = math.cos(end[2]), math.sin(end[2])
+        rel = xy - end[:2]
+        return np.stack([c * rel[..., 0] + s * rel[..., 1],
+                         -s * rel[..., 0] + c * rel[..., 1]], axis=-1)
 
     def _head_tracking_allowed(self):
         """首の追従・見渡しの指令を送ってよいか (ARMED で、復帰・うなずきが終わっている)。"""
@@ -2883,6 +4026,16 @@ class HandshakePipelineNode(object):
         return (base_rot.T @ (np.asarray(planned_palm['position']) - base_pos),
                 base_rot.T @ np.asarray(planned_palm['y_axis']))
 
+    def _planning_joint_limits(self, joint_names):
+        """``joint_names`` 順の計画用ロボット (``restrict_waist_range``・
+        ``restrict_neck_range``・``restrict_leg_range`` などを掛けたもの) の
+        下限・上限 [rad]。実機用の ``real_robot`` は URDF のままの可動域
+        (waist_p 34.95° など、実機では届かない) なので使わない。"""
+        unlimited = (-np.inf, np.inf)
+        lower, upper = zip(*[self._planning_limits.get(name, unlimited)
+                             for name in joint_names])
+        return np.array(lower), np.array(upper)
+
     def _neck_indices(self, joint_names):
         """``joint_names`` の中の首 (ヨー・ピッチ・ロール) の添字。"""
         neck_names = {self.real_robot.neck_y_joint.name,
@@ -2950,6 +4103,8 @@ class HandshakePipelineNode(object):
         if not self._nod_done.wait(timeout=10.0):
             print('[execute] うなずきが 10 秒以内に終わらなかったため、'
                   '待たずに実行します。')
+        # 先に動かした台車が待機点 (計画の始点) に着いてから実行する。
+        self._wait_pre_move()
 
         joint_names = motion['joint_names']
         # [:reach_boundary] が接近区間 (末尾が hover 目標)、[reach_boundary-1:]
@@ -2977,8 +4132,9 @@ class HandshakePipelineNode(object):
             with self._lock:
                 frozen = self._frozen_joint_positions
             if frozen:
-                exclude_centers = np.array(
-                    [p[:2] for p in frozen.values()], dtype=np.float64)
+                # 基準スキャンは待機点で取るので、その系へ移す。
+                exclude_centers = self._to_pre_move_frame(np.array(
+                    [p[:2] for p in frozen.values()], dtype=np.float64))
             if ref_scan is not None and self.args.scan_odometry:
                 scan_odometry_stop = self._start_scan_odometry(
                     ref_scan, ref_msg, exclude_centers)
@@ -3058,10 +4214,31 @@ class HandshakePipelineNode(object):
 
         self._tail_correction = None
         tail_stop = threading.Event()
+        no_stop = None
+        # 止まらない押し込み: 台車は手前の hover で先に着き、腕は hover へ伸び
+        # 続ける間に手を検出し直して押し込みを解き直し、軌道を差し替える。
+        # 途中までの押し込み (partial) は人の手を待つので、止まらない押し込み
+        # にはしない (通常の流れで _wait_partial_press を通す)。
+        if (reach_boundary < len(display_waypoints)
+                and self.args.press_in_refine
+                and self.args.base_correction != 'none'
+                and not (result.get('post_process') or {}).get('partial')):
+            no_stop = self._plan_no_stop(display_waypoints, reach_boundary,
+                                         joint_names, result)
         self._set_activity(STAGE_LEAD_IN)
-        start_odom_coords, final_traj_point = self._execute_waypoint_segment(
-            display_waypoints[:reach_boundary], joint_names,
-            on_sent=on_approach_sent)
+        if no_stop is not None:
+            # 止まらない押し込みの接近は首も計画の角度で送る。
+            start_odom_coords, final_traj_point = self._send_no_stop_approach(
+                no_stop, joint_names, on_sent=on_approach_sent)
+        else:
+            start_odom_coords, final_traj_point = \
+                self._execute_waypoint_segment(
+                    display_waypoints[:reach_boundary], joint_names,
+                    on_sent=on_approach_sent,
+                    # 送信直後から首は顔 (螺旋以降は掌) を追う。
+                    # 接近のゴールの首は今の角度のまま (首を計画の角度へ戻す
+                    # のを待たずに動き出す)。
+                    neck_from_current=self._gaze_robot is not None)
         tail_stop.set()
         for timer in follow_timers:
             timer.cancel()
@@ -3086,7 +4263,40 @@ class HandshakePipelineNode(object):
             self._send_head_to_waypoint(
                 display_waypoints[reach_boundary - 1], joint_names)
 
-        if self.args.base_correction != 'none':
+        robot_arm = result['robot_arm']
+        hover_wp = display_waypoints[reach_boundary - 1]
+        fold = None
+        press_done = None
+        self._press_motion_end = None
+        if no_stop is not None:
+            press_done = self._run_no_stop_press(
+                no_stop, start_odom_coords, final_traj_point, ref_scan,
+                exclude_centers, palm_anchor, joint_names, result,
+                hand_followed,
+                resolve_motion=motion)
+            if press_done is None:
+                # 腕は hover で止めた。従来どおり止まって台車を直す。
+                self._set_activity(STAGE_BASE_CORRECTION)
+                self._correct_base_residual(
+                    start_odom_coords, final_traj_point, ref_scan=ref_scan,
+                    exclude_centers=exclude_centers, palm_anchor=palm_anchor)
+        elif (reach_boundary < len(display_waypoints)
+                and self.args.press_in_refine
+                and self.args.base_correction != 'none'
+                and start_odom_coords is not None
+                and final_traj_point is not None):
+            fold = self._prepare_folded_press(
+                start_odom_coords, final_traj_point, ref_scan,
+                exclude_centers, palm_anchor, hover_wp, joint_names,
+                robot_arm, wait_head=head_to_hover or hand_followed)
+            if fold is not None and not fold['ok']:
+                # ずれが大きいときは従来どおり止まって直す (手は検出し直す)。
+                fold = None
+                self._set_activity(STAGE_BASE_CORRECTION)
+                self._correct_base_residual(
+                    start_odom_coords, final_traj_point, ref_scan=ref_scan,
+                    exclude_centers=exclude_centers, palm_anchor=palm_anchor)
+        elif self.args.base_correction != 'none':
             # 終盤のずらし後に残ったスリップを直す (目標は掌を計画どおり見る位置
             # なので終盤のずらしは戻さない)。
             self._set_activity(STAGE_BASE_CORRECTION)
@@ -3101,44 +4311,84 @@ class HandshakePipelineNode(object):
                           settle_time, drift[0] * 1e3,
                           math.degrees(drift[1])))
 
-        robot_arm = result['robot_arm']
-        self._set_activity(STAGE_HOVER_SETTLE)
-        self._wait_joint_settle(
-            'hover', display_waypoints[reach_boundary - 1], joint_names,
-            robot_arm)
-        self._end_hand_follow()
-        if head_to_hover or hand_followed:
-            self.ri.wait_interpolation(controller_type='head_controller')
+        if fold is None and press_done is None:
+            self._set_activity(STAGE_HOVER_SETTLE)
+            self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
+            self._end_hand_follow()
+            if head_to_hover or hand_followed:
+                self.ri.wait_interpolation(controller_type='head_controller')
 
-        if reach_boundary < len(display_waypoints):
+        if press_done is not None:
+            press_waypoints = press_done
+        elif reach_boundary < len(display_waypoints):
             press_waypoints = display_waypoints[reach_boundary - 1:]
+            refined = None
+            self._refined_post = None
             if self.args.press_in_refine:
                 self._set_activity(STAGE_PRESS_REFINE)
                 base_error = None
-                if self.args.press_in_base_shift:
+                if fold is None and self.args.press_in_base_shift:
                     base_error = self._hover_base_error(
                         start_odom_coords, final_traj_point, ref_scan,
                         exclude_centers)
                 refined = self._refine_press_in(
                     press_waypoints[0], joint_names, result,
-                    base_error=base_error)
+                    base_error=base_error, fold=fold)
                 if refined is not None:
                     press_waypoints = [press_waypoints[0]] + refined
+            if fold is not None:
+                press_waypoints = self._fold_base_move(
+                    press_waypoints, fold['base_move'])
+                self._log_debug(dict(
+                    event='press_in_fold',
+                    base_move=[float(v) for v in fold['base_move']],
+                    residual=[float(v) for v in fold['residual']],
+                    stop_time=time.time() - fold['start_time']))
             if hand_followed:
                 press_waypoints = self._hold_neck(
                     press_waypoints, joint_names)
+            # 横並び移動は接近中に解くのでまだ解いていないことがある
+            # (裏の計画の job が無ければ _start_transition_resolve は何もしない)。
+            if self.args.press_in_refine and refined is not None:
+                self._start_transition_resolve(
+                    motion, press_waypoints[-1], joint_names)
             self._set_hand_tracking(False)
             self._set_activity(STAGE_PRESS_IN)
             self._execute_waypoint_segment(press_waypoints, joint_names)
+            self._press_motion_end = time.time()
             self._wait_joint_settle(
                 '押し込み終了', press_waypoints[-1], joint_names,
                 robot_arm)
+            press_post = result.get('post_process')
+            if refined is not None and self._refined_post is not None:
+                press_post = self._refined_post
+            if press_post is not None and press_post.get('partial'):
+                # 途中まで押し込んだ: 人の手が来るまで待つ (待ちの打ち切り・
+                # 腕を下ろす動作は入れない)。
+                started = press_waypoints[-1]
+                press_waypoints = self._wait_partial_press(
+                    press_waypoints, joint_names, result, press_post)
+                if press_waypoints is None:
+                    return
+                # 握って待つ時間は、人の手が来て握ったところから数える。
+                self._press_motion_end = None
+                if press_waypoints[-1] is not started:
+                    # 合わせ直した姿勢から解き直す (間に合わなければ差を足す)。
+                    self._start_transition_resolve(
+                        motion, press_waypoints[-1], joint_names)
 
         if reach_boundary < len(display_waypoints):
             self._set_activity(STAGE_GRASP)
             self._set_hand_grasp(True)
         self._say(self.args.speech_done_text)
-        press_end_time = time.time()
+        # 握って待つ時間 (--side-by-side-delay) は押し込みの指令が終わった時刻
+        # から数える (腕の追いつき待ちもこの中に入れる)。
+        press_end_time = (self._press_motion_end
+                          if self._press_motion_end is not None
+                          else time.time())
+        early_waypoints = self._wait_early_transition(motion)
+        if early_waypoints is not None:
+            transition_waypoints_ = early_waypoints
         do_transition = (transition_waypoints_
                          and reach_boundary < len(display_waypoints))
 
@@ -3146,19 +4396,35 @@ class HandshakePipelineNode(object):
                 and reach_boundary < len(display_waypoints)):
             duration = self.args.grasp_capture_duration
             if do_transition:
-                duration = min(duration, self.args.side_by_side_delay)
-            self._capture_grasp_images(
-                press_waypoints[-1], joint_names, result, duration)
+                # 握って待つ残りの時間の中で撮る。
+                duration = min(duration, press_end_time
+                               + self.args.side_by_side_delay - time.time())
+            if duration > 0:
+                self._capture_grasp_images(
+                    press_waypoints[-1], joint_names, result, duration)
 
         if do_transition:
             self._set_activity(STAGE_TRANSITION_WAIT)
             wait = press_end_time + self.args.side_by_side_delay - time.time()
             if wait > 0:
                 rospy.sleep(wait)
-            transition_waypoints_ = self._refined_transition_waypoints(
-                motion, transition_waypoints_)
+            # 押し込み後の姿勢から解き直せていればそれ (差は足さない)、
+            # でなければ裏の計画・確保済みの解に押し込みの解き直しの差を足す。
+            planned_press_wp = display_waypoints[-1]
+            resolved = self._resolved_transition_waypoints(
+                motion, press_waypoints[-1])
+            if resolved is not None:
+                with self._lock:
+                    stop = self._refine_stops.get(id(motion))
+                if stop is not None:
+                    stop.set()
+                transition_waypoints_ = resolved
+                planned_press_wp = press_waypoints[-1]
+            else:
+                transition_waypoints_ = self._refined_transition_waypoints(
+                    motion, transition_waypoints_)
             self._execute_transition(
-                press_waypoints[-1], display_waypoints[-1],
+                press_waypoints[-1], planned_press_wp,
                 transition_waypoints_, joint_names, robot_arm,
                 hold_neck=hand_followed)
             self._walk_forward(WALK_FORWARD_DISTANCE)
@@ -3167,12 +4433,12 @@ class HandshakePipelineNode(object):
 
     def _walk_forward(self, distance):
         """横並びの後、手をつないだまま台車だけを ``distance`` [m] 前 (台車の
-        +x) へ進める。腕・脚には指令を送らず横並びの姿勢のまま、進む前に
-        ``SPEECH_WALK_FORWARD_TEXT`` を発話し終わるまで待つ。首は顔を追わず
-        正面 (首の関節を全て 0) へ向ける。"""
+        +x) へ進める。腕・脚には指令を送らず横並びの姿勢のまま、前進の向きへ
+        回りながら ``SPEECH_WALK_FORWARD_TEXT`` を発話し、発話し終わってから
+        進む。首は顔を追わず正面 (首の関節を全て 0) へ向ける。"""
         self._set_activity(STAGE_WALK_FORWARD)
-        self._turn_to_walk_heading()
         spoken = self._say(SPEECH_WALK_FORWARD_TEXT, wait=True)
+        self._turn_to_walk_heading()
         spoken.wait(SPEECH_RESULT_TIMEOUT)
         point = [float(distance), 0.0, 0.0]
         sec, = self._limited_time_list(
@@ -3204,7 +4470,10 @@ class HandshakePipelineNode(object):
                       'しません'.format(math.degrees(dyaw)))
             return
         point = [0.0, 0.0, dyaw]
-        sec, = self._limited_time_list(None, [point], [WALK_TURN_MIN_TIME])
+        sec, = self._limited_time_list(
+            None, [point], [min(WALK_TURN_MAX_TIME,
+                                max(WALK_TURN_MIN_TIME,
+                                    abs(dyaw) / WALK_TURN_RATE))])
         print('[execute] 前進の向きへその場で {:+.1f}deg 回転します ({:.1f} 秒)。'
               .format(math.degrees(dyaw), sec))
         self._send_base_trajectory([point], [sec], wait=True)
@@ -3221,18 +4490,46 @@ class HandshakePipelineNode(object):
         """押し込み後の横並び移動を実行する。
 
         押し込みを解き直した関節角の差 (``press_wp`` - ``planned_press_wp``) を
-        各 waypoint に足し、各区間は ``--side-by-side-segment-time`` 秒以上かける。
+        (1 - k/N) 倍して各 waypoint に足し、終点で 0 (計画どおり) にする。
+        各区間は ``--side-by-side-segment-time`` 秒以上かける (11/19 までは全
+        waypoint に同じ差を足していたが、解き直しの IK は手先が 10cm 程度しか
+        違わなくても肘・腰を数十度変えるので、腕を下ろした姿勢に同じ差を足すと
+        終点の手先が計画から実機 16 試行の中央 12cm・最大 33cm ずれていた)。
+        差を足した角度は計画用ロボットの可動域 (``restrict_waist_range`` など
+        実機で届く範囲) に収める。
         """
         delta = (np.asarray(press_wp['joint_angle_vector'])
                  - np.asarray(planned_press_wp['joint_angle_vector']))
         if hold_neck:
             # 押し込みの首の差 (手の追従による) は横並びの首に足さない。
             delta[self._neck_indices(joint_names)] = 0.0
-        segment = [press_wp] + [
-            dict(wp, joint_angle_vector=[
-                float(v) for v in np.asarray(wp['joint_angle_vector'])
-                + delta])
-            for wp in waypoints]
+        lower, upper = self._planning_joint_limits(joint_names)
+        segment = [press_wp]
+        clipped = {}
+        n = len(waypoints)
+        for k, wp in enumerate(waypoints, 1):
+            scale = 1.0 - float(k) / n
+            shifted = np.asarray(wp['joint_angle_vector']) + scale * delta
+            limited = np.clip(shifted, lower, upper)
+            for i in np.flatnonzero(np.abs(limited - shifted) > 1e-9):
+                name = joint_names[i]
+                excess = math.degrees(shifted[i] - limited[i])
+                if abs(excess) > abs(clipped.get(name, 0.0)):
+                    clipped[name] = excess
+            segment.append(dict(wp, joint_angle_vector=[
+                float(v) for v in limited]))
+        if clipped:
+            log_debug('[execute][transition] 押し込みの解き直しの差を足すと可動域'
+                      'を超えるため収めました: {}'.format(', '.join(
+                          '{} {:+.1f}deg'.format(name, excess)
+                          for name, excess in sorted(clipped.items()))))
+        largest = sorted(
+            ((abs(math.degrees(v)), name) for name, v in zip(joint_names, delta)
+             if abs(v) > math.radians(1.0)), reverse=True)[:4]
+        log_debug('[execute][transition] 押し込みの解き直しの差 (終点で 0 へ'
+                  '戻す): {}'.format(
+                      ', '.join('{} {:.0f}deg'.format(name, v)
+                                for v, name in largest) or '1deg 以下'))
         self._say(self.args.speech_transition_text)
         self._set_activity(STAGE_TRANSITION)
         print('[execute] 手を下ろしながら横並びの位置へ移動します '
@@ -3484,12 +4781,13 @@ class HandshakePipelineNode(object):
         apply_waypoint_pose(self.robot, joint_names, [waypoint], 0)
 
     def _detect_offered_palm(self, offered_hand, expected_position,
-                             expected_normal):
+                             expected_normal, hand_frames=None):
         """``PRESS_IN_REFINE_FRAMES`` 枚で差し出し手を検出し直し、
         ``(palm (今の base_link 系) or None, hand_frames, distances, candidates)``
-        を返す。"""
-        hand_frames = self._collect_hand_frames(
-            PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
+        を返す。``hand_frames`` を渡せばそれを使う (集め直さない)。"""
+        if hand_frames is None:
+            hand_frames = self._collect_hand_frames(
+                PRESS_IN_REFINE_FRAMES, PRESS_IN_REFINE_TIMEOUT)
         joint_positions, distances, candidates, camera_position = \
             self._select_offered_hand(hand_frames, offered_hand,
                                       expected_position, expected_normal)
@@ -3518,54 +4816,13 @@ class HandshakePipelineNode(object):
         あれば、台車は実際の姿勢に置き、手は台車のずれを除いた分だけ動かす
         (無ければ台車は hover 目標どおりとみなし、ずれは全部手の移動とみなす)。
         """
-        shift = np.asarray(palm['position'], dtype=np.float64) - expected_position
-        shift[2] = 0.0
-        distance = float(np.linalg.norm(shift))
-        record = dict(event='press_in_base_shift',
-                      shift=[float(v) for v in shift[:2]], applied=False)
-        if distance < PRESS_IN_BASE_SHIFT_MIN:
-            self._log_debug(record)
+        shift, record = self._plan_palm_base_shift(
+            palm, offered_hand, expected_position, hover_wp=hover_wp,
+            joint_names=joint_names, base_error=base_error,
+            planned_palm=planned_palm)
+        if shift is None:
             return palm
-        if hover_wp is not None:
-            wanted = shift.copy()
-            actual_wp = hover_wp
-            if base_error is not None and planned_palm is not None:
-                # 計画の系の実際の台車の姿勢と、そこから見た掌。
-                actual = scan_matching.compose(
-                    [hover_wp['base_position'][0],
-                     hover_wp['base_position'][1], hover_wp['base_yaw']],
-                    base_error)
-                actual_wp = dict(
-                    hover_wp, base_position=[actual[0], actual[1], 0.0],
-                    base_yaw=float(actual[2]))
-                to_plan = self._planar_matrix(0.0, 0.0, actual[2])[:2, :2]
-                palm_plan = actual[:2] + to_plan @ np.asarray(
-                    palm['position'], dtype=np.float64)[:2]
-                hand_shift = palm_plan - np.asarray(
-                    planned_palm['position'], dtype=np.float64)[:2]
-                record.update(base_error=[float(v) for v in base_error],
-                              hand_shift=[float(v) for v in hand_shift])
-            else:
-                # hover の台車系のずれを計画の系へ。
-                to_plan = self._planar_matrix(
-                    0.0, 0.0, hover_wp['base_yaw'])[:2, :2]
-                hand_shift = to_plan @ wanted[:2]
-            scale, margin = self._clearance_scale(
-                lambda s: to_plan @ (wanted[:2] * s), actual_wp, joint_names,
-                offered_hand, hand_shift)
-            if scale is not None:
-                shift = wanted * scale
-            else:
-                record.update(reason='clearance', clearance_margin=margin)
-                self._log_debug(record)
-                print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
-                      'ずれていたが、台車を寄せると人に近づきすぎるため腕だけで'
-                      '補正します。'.format(distance * 1e3))
-                return palm
-            record.update(scale=scale, clearance_margin=margin)
-            if float(np.linalg.norm(shift)) < PRESS_IN_BASE_SHIFT_MIN / 2:
-                self._log_debug(record)
-                return palm
+        distance = record['distance']
         sec, = self._limited_time_list(
             None, [[shift[0], shift[1], 0.0]], [BASE_CORRECTION_MIN_TIME])
         before = self._odom_pose(self.ri.odom)
@@ -3593,17 +4850,175 @@ class HandshakePipelineNode(object):
                   float(np.linalg.norm(residual[:2])) * 1e3))
         return detected
 
-    def _refine_press_in(self, hover_wp, joint_names, result, base_error=None):
+    def _plan_palm_base_shift(self, palm, offered_hand, expected_position,
+                              hover_wp=None, joint_names=None,
+                              base_error=None, planned_palm=None):
+        """``_shift_base_to_palm`` の台車を寄せる量 (今の台車の系の xy、z=0) を
+        決める (動かさない)。寄せないときは ``(None, None)`` (記録はここで
+        ログに出す)、寄せるときは ``(shift, record)`` (``record`` の
+        ``distance`` は掌の水平のずれ [m]。ログは呼び出し側で出す)。"""
+        def margin_fn(waypoint, hand_shift):
+            if hover_wp is None:
+                return float('inf')
+            return self._hover_clearance_margin(
+                waypoint, joint_names, offered_hand, hand_shift=hand_shift)
+
+        shift, record = nsp.plan_palm_base_shift(
+            palm, expected_position,
+            hover_wp if hover_wp is not None else dict(
+                base_position=[0.0, 0.0, 0.0], base_yaw=0.0),
+            base_error, planned_palm, margin_fn)
+        if shift is None:
+            self._log_debug(record)
+            if record['reason'] == 'clearance':
+                print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                      'ずれていたが、台車を寄せると人に近づきすぎるため腕だけで'
+                      '補正します。'.format(record['distance'] * 1e3))
+            return None, None
+        return shift, record
+
+    def _partial_press_reference(self, waypoint, joint_names, robot_arm,
+                                 palm):
+        """``waypoint`` の姿勢に台車がいるとみなした今の base_link 系での、
+        ロボットの手先位置と、狙った掌 ``palm`` (計画の系) の位置・法線。"""
+        self._place_robot_at_waypoint(joint_names, waypoint)
+        base = self.robot.base_link
+        rot = base.worldrot().copy()
+        pos = base.worldpos().copy()
+        hand = np.asarray(getattr(
+            self.robot, '{}arm_end_coords'.format(robot_arm)).worldpos())
+        return (rot.T @ (hand - pos),
+                rot.T @ (np.asarray(palm['position'], dtype=np.float64) - pos),
+                rot.T @ np.asarray(palm['y_axis'], dtype=np.float64))
+
+    def _wait_partial_press(self, press_waypoints, joint_names, result, post):
+        """行けるところまで押し込んだ姿勢 (``press_waypoints[-1]``) で人の手を
+        待ち、手が来たら (人の掌がロボットの手先から
+        ``PARTIAL_ARRIVAL_DISTANCE`` 以内) 実行した押し込みの waypoint 列を返す。
+
+        待ちの打ち切りや腕を下ろす動作は入れない (RESET か終了で抜ける)。人が手を
+        別の場所へ出し直したら (狙った掌から ``PARTIAL_REAIM_MIN_SHIFT`` 以上)、
+        腕を上げたまま今の姿勢から手先を合わせ直す (``_refine_press_in``)。
+        合わせ直しで最後まで押し込めたら、そこで返す。
+        """
+        robot_arm = result['robot_arm']
+        offered_hand = result['offered_hand']
+        with self._lock:
+            target_palm = self._current_palm
+        if self._refined_palm is not None:
+            target_palm = self._refined_palm
+        current = list(press_waypoints)
+        self._set_activity(STAGE_PARTIAL_WAIT)
+        print('[execute][partial] 押し込みを {:.0f}% まで進めました (最終目標まで'
+              ' {:.0f}mm)。人の手が来るのを待ちます。'.format(
+                  post.get('press_reached', 0.0) * 100,
+                  post.get('press_remaining', 0.0) * 1e3))
+        self._log_debug(dict(event='partial_press_wait',
+                             reached=post.get('press_reached'),
+                             remaining=post.get('press_remaining')))
+        self._say(PARTIAL_PRESS_SPEECH)
+        t0 = time.time()
+        arrived = moved = 0
+        n_reaim = 0
+        while not rospy.is_shutdown() and self.state != 'idle':
+            hand_pos, expected_pos, expected_normal = \
+                self._partial_press_reference(current[-1], joint_names,
+                                              robot_arm, target_palm)
+            frames = self._collect_hand_frames(PRESS_IN_REFINE_FRAMES,
+                                               PRESS_IN_REFINE_TIMEOUT)
+            joints, _, _, camera = self._select_offered_hand(
+                frames, offered_hand, expected_pos, expected_normal)
+            palm = None
+            if joints is not None:
+                palm = self.palm_estimator.estimate_palm(
+                    joints, offered_hand, camera, expected_normal)
+            if palm is None:
+                arrived = moved = 0
+                continue
+            position = np.asarray(palm['position'], dtype=np.float64)
+            gap = float(np.linalg.norm(position - hand_pos))
+            shift = float(np.linalg.norm(position - expected_pos))
+            if gap <= PARTIAL_ARRIVAL_DISTANCE:
+                arrived += 1
+                moved = 0
+                if arrived >= PARTIAL_ARRIVAL_COUNT:
+                    print('[execute][partial] 人の手が来ました (ロボットの手先'
+                          'から {:.0f}mm、待った時間 {:.1f} 秒、合わせ直し {} '
+                          '回)。'.format(gap * 1e3, time.time() - t0, n_reaim))
+                    self._log_debug(dict(
+                        event='partial_press_arrived', gap=gap,
+                        wait_time=time.time() - t0, n_reaim=n_reaim))
+                    return current
+                continue
+            arrived = 0
+            if shift < PARTIAL_REAIM_MIN_SHIFT:
+                moved = 0
+                continue
+            moved += 1
+            if moved < PARTIAL_REAIM_COUNT:
+                continue
+            moved = 0
+            print('[execute][partial] 人の手が狙った掌から {:.0f}mm 離れたので、'
+                  '今の姿勢から手先を合わせ直します。'.format(shift * 1e3))
+            self._set_activity(STAGE_PRESS_REFINE)
+            refined = self._refine_press_in(
+                current[-1], joint_names, dict(result, post_process=post),
+                planned_palm=target_palm)
+            if refined is None or self._refined_post is None:
+                print('[execute][partial] 合わせ直せなかったため、今の姿勢の'
+                      'まま待ちます。')
+                self._set_activity(STAGE_PARTIAL_WAIT)
+                continue
+            n_reaim += 1
+            segment = self._hold_neck([current[-1]] + refined, joint_names)
+            self._set_activity(STAGE_PRESS_IN)
+            self._execute_waypoint_segment(segment, joint_names)
+            self._wait_joint_settle('合わせ直し', segment[-1], joint_names,
+                                    robot_arm)
+            current = segment
+            post = self._refined_post
+            target_palm = self._refined_palm
+            self._log_debug(dict(
+                event='partial_press_reaim', shift=shift,
+                partial=bool(post.get('partial')),
+                reached=post.get('press_reached'),
+                remaining=post.get('press_remaining')))
+            if not post.get('partial'):
+                print('[execute][partial] 合わせ直しで最後まで押し込めました。')
+                return current
+            self._set_activity(STAGE_PARTIAL_WAIT)
+        print('[execute][partial] 人の手を待つのを止めました (RESET か終了)。')
+        return None
+
+    def _refine_press_in(self, hover_wp, joint_names, result, base_error=None,
+                         fold=None, planned_palm=None):
         """hover 到達後に手を検出し直して押し込み姿勢を解き直し、押し込み区間の
         waypoint (``hover_wp`` の次以降) を返す (失敗なら None)。
 
         検出した掌を「台車が hover 目標にいる」前提で計画時の座標系に移すので、
         台車のスリップと手の動きの両方を腕で吸収する。``base_error``
         (``_hover_base_error``) は台車を寄せるときの人体との距離の検証に使う。
+
+        ``fold`` (``_execute_with_scan`` の押し込みに台車の補正を織り込む流れ):
+        ``dict(base_move=[dx, dy, dyaw], hand_frames=..., base_error=...)``。
+        台車はまだ ``base_move`` (今の台車の系) だけ動いていない前提で、動いた
+        後の台車から見た掌で解く。手の水平のずれを台車で寄せる分
+        (``_plan_palm_base_shift``) も動かさずに ``base_move`` に足し、
+        ``fold['base_move']`` を書き換える (解けなければ元のまま)。``hand_frames``
+        があればそのフレームで検出する。
+
+        ``planned_palm`` (計画の系) を与えると、計画の掌の代わりにそれを基準に
+        する (行けるところまで押し込んで待つ間の合わせ直し)。解き直した押し込み
+        姿勢と掌 (計画の系) は ``self._refined_post``・``self._refined_palm``。
+        行けるところまで押し込む のは ``fold`` が無い
+        ときだけ (織り込む流れの ``nsp.refine_folded`` は最後まで押し込む)。
         """
         t0 = time.time()
-        with self._lock:
-            planned_palm = self._current_palm
+        self._refined_post = None
+        self._refined_palm = None
+        if planned_palm is None:
+            with self._lock:
+                planned_palm = self._current_palm
         offered_hand = result['offered_hand']
         planned_post = result.get('post_process')
         if planned_post is None or planned_palm is None:
@@ -3615,9 +5030,21 @@ class HandshakePipelineNode(object):
         expected_position = base_rot.T @ (
             np.asarray(planned_palm['position']) - base_pos)
         expected_normal = base_rot.T @ np.asarray(planned_palm['y_axis'])
+        if fold is None:
+            detect_position, detect_normal = expected_position, expected_normal
+        else:
+            # 台車はまだ base_move だけ動いていないので、今の台車の系で探す。
+            move = np.asarray(fold['base_move'], dtype=np.float64)
+            c, s = math.cos(move[2]), math.sin(move[2])
+            move_rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            detect_position = (move_rot @ expected_position
+                               + np.array([move[0], move[1], 0.0]))
+            detect_normal = move_rot @ expected_normal
         palm, hand_frames, distances, candidates = self._detect_offered_palm(
-            offered_hand, expected_position, expected_normal)
-        if palm is not None and self.args.press_in_base_shift:
+            offered_hand, detect_position, detect_normal,
+            hand_frames=None if fold is None else fold.get('hand_frames'))
+        if (palm is not None and fold is None
+                and self.args.press_in_base_shift):
             palm = self._shift_base_to_palm(
                 palm, offered_hand, expected_position, expected_normal,
                 hover_wp=hover_wp, joint_names=joint_names,
@@ -3656,12 +5083,49 @@ class HandshakePipelineNode(object):
             return None
 
         t1 = time.time()
-        self._place_robot_at_waypoint(joint_names, hover_wp)
-        observed = spik.transform_palm(palm, base_rot, base_pos)
-        info = spik.refine_post_process(
-            self.robot, result['robot_arm'], observed, result['turn_deg'],
-            planned_post,
-            planned_palm=(planned_palm if 'x_axis' in planned_palm else None))
+        folded = None
+        if fold is None:
+            self._place_robot_at_waypoint(joint_names, hover_wp)
+            observed = spik.transform_palm(palm, base_rot, base_pos)
+            info = spik.refine_post_process(
+                self.robot, result['robot_arm'], observed, result['turn_deg'],
+                planned_post,
+                planned_palm=(planned_palm if 'x_axis' in planned_palm
+                              else None),
+                partial_press_max_remaining=spik.PARTIAL_PRESS_MAX_REMAINING)
+        else:
+            def clearance_margin(waypoint, hand_shift):
+                return self._hover_clearance_margin(
+                    waypoint, joint_names, offered_hand,
+                    hand_shift=hand_shift)
+
+            margin_fn = (clearance_margin if self.args.press_in_base_shift
+                         else None)
+            folded = nsp.refine_folded(
+                self.robot, joint_names, hover_wp, result, planned_palm,
+                palm, fold['base_move'], base_error=fold.get('base_error'),
+                margin_fn=margin_fn)
+            info, observed = folded['info'], folded['observed']
+            shift_record = folded['shift_record']
+            if shift_record is not None:
+                if shift_record['reason'] == 'shift':
+                    shift_record.update(
+                        applied='folded',
+                        base_move=[float(v) for v in folded['base_move']])
+                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                          'ずれていたため、台車を寄せる分も押し込みに織り込み'
+                          'ます (合計 {:+.3f}m, {:+.3f}m, {:+.1f}deg)。'.format(
+                              shift_record['distance'] * 1e3,
+                              folded['base_move'][0], folded['base_move'][1],
+                              math.degrees(folded['base_move'][2])))
+                elif shift_record['reason'] == 'clearance':
+                    print('[execute][refine] 検出した掌が計画から水平に {:.0f}mm '
+                          'ずれていたが、台車を寄せると人に近づきすぎるため腕'
+                          'だけで補正します。'.format(
+                              shift_record['distance'] * 1e3))
+                self._log_debug(shift_record)
+        self._refined_post = info['post_process']
+        self._refined_palm = observed
         ik_time = time.time() - t1
         palm_shift = np.asarray(observed['position']) - np.asarray(
             planned_palm['position'])
@@ -3692,8 +5156,137 @@ class HandshakePipelineNode(object):
                   if blend else '',
                   info['position_change'] * 1e3,
                   math.degrees(info['rotation_change']), wait_time, ik_time))
-        return build_press_in_waypoints(
-            hover_wp, joint_names, info['post_process'])
+        if folded is not None:
+            fold['base_move'] = folded['base_move']
+            fold['ik_time'] = ik_time
+            fold['target_position'] = info['post_process']['target_position']
+            refined = folded['press_waypoints']
+        else:
+            refined = build_press_in_waypoints(
+                hover_wp, joint_names, info['post_process'])
+        try:
+            self._log_refined_press_in_check(
+                refined, joint_names, offered_hand,
+                result['robot_arm'], observed)
+        except Exception as e:  # noqa: BLE001 (数えるだけ、実行は止めない)
+            log_debug('[execute][refine-check] 失敗: {!r}'.format(e))
+        return refined
+
+    def _log_refined_press_in_check(self, waypoints, joint_names, offered_hand,
+                                    robot_arm, palm):
+        """解き直した押し込みの区間 ``waypoints`` (hover の次から押し込み後まで、
+        計画の base_link 系) の自己干渉・人体距離・前腕の距離を、計画時の候補選び
+        (``spik.pick_verified_candidate`` の押し込み区間の確かめ) と同じ基準で測り、
+        ログに 1 行 (``[execute][refine-check]``、決まった書式) と JSON
+        (``press_in_refine_check``) で出す。動きは止めない (数えるだけ)。
+
+        人体は差し出し時の骨格 (``_frozen_joint_positions``) を体表面からずらした
+        もの、前腕・手の甲は検出し直した掌 ``palm`` で作る。ロボットの姿勢は
+        測った後に戻す。"""
+        t0 = time.time()
+        with self._lock:
+            frozen = self._frozen_joint_positions
+        collision_joints = (spik.shift_torso_joints_from_surface(
+            frozen, (0.0, 0.0), self.args.torso_surface_offset)
+            if frozen else None)
+        obstacle_links, obstacle_samples = phm.build_obstacle_cache(
+            collision_joints)
+        source = self.verification_pairs
+
+        def subset(keep, pairs):
+            if pairs is None:
+                return None
+            kept = [pair for pair in pairs if keep(pair)]
+            if isinstance(pairs, spik.VerificationPairs):
+                return pairs.with_pairs(kept)
+            return kept
+
+        self_pairs = subset(lambda pair: not isinstance(pair[1], int), source)
+        clearance_source = (None if source is None
+                            else spik.human_clearance_pairs(source))
+        press_groups = spik.offered_hand_clearance_groups(
+            clearance_source, offered_hand, robot_arm,
+            spik.PRESS_IN_HUMAN_CLEARANCE, hand_clearance=None)
+        forearm_clearance = spik.PRESS_IN_FOREARM_CLEARANCE
+        forearm_pairs = forearm_obs = None
+        elbow = (collision_joints or {}).get('{}Elbow'.format(offered_hand))
+        wrist = (collision_joints or {}).get('{}Wrist'.format(offered_hand))
+        if (forearm_clearance is not None and clearance_source is not None
+                and elbow is not None and wrist is not None
+                and 'x_axis' in palm):
+            forearm_pairs = spik.forearm_clearance_pairs(
+                clearance_source, robot_arm)
+            forearm_obs = spik.forearm_obstacles(
+                elbow, wrist, palm['position'], spik.palm_rotation(palm))
+        tolerance = spik.DEFAULT_COLLISION_VERIFY_TOLERANCE
+        saved_av = self.robot.angle_vector().copy()
+        saved_coords = self.robot.copy_worldcoords()
+        # 各項目の最悪の値と、その点 (1 始まり)。
+        worst = dict(self_=(float('inf'), None), human=(float('inf'), None),
+                     forearm=(float('inf'), None))
+        human_part = None
+        try:
+            for k, wp in enumerate(waypoints):
+                phm._apply_waypoint(self.robot, joint_names, wp)
+                if self_pairs is not None:
+                    dist = spik.collision_pairs_min_distance(
+                        self.robot, self_pairs, collision_joints,
+                        obstacle_links=obstacle_links,
+                        obstacle_samples=obstacle_samples)
+                    dist = min(dist, spik.other_hand_base_clearance(
+                        self.robot, robot_arm))
+                    if dist < worst['self_'][0]:
+                        worst['self_'] = (float(dist), k + 1)
+                if press_groups and obstacle_links:
+                    index, margin, _, _ = spik.grouped_clearance_shortfall(
+                        self.robot, press_groups, obstacle_links)
+                    if index is not None and margin < worst['human'][0]:
+                        worst['human'] = (float(margin), k + 1)
+                        human_part = spik.human_obstacle_names()[index]
+                if forearm_pairs:
+                    clearances = spik.human_obstacle_clearances(
+                        self.robot, forearm_pairs, forearm_obs,
+                        cull_distance=forearm_clearance)
+                    margin = min(clearances.get(i, float('inf'))
+                                 for i in (0, 1)) - forearm_clearance
+                    if margin < worst['forearm'][0]:
+                        worst['forearm'] = (float(margin), k + 1)
+        finally:
+            self.robot.angle_vector(saved_av)
+            self.robot.newcoords(saved_coords)
+        failed = []
+        if worst['self_'][0] < -tolerance:
+            failed.append('self')
+        if worst['human'][0] < 0.0:
+            failed.append('human')
+        if worst['forearm'][0] < 0.0:
+            failed.append('forearm')
+        check_time = time.time() - t0
+
+        def fmt(item):
+            value, k = worst[item]
+            return ('na' if k is None
+                    else '{:+.4f}@{}'.format(value, k))
+
+        # 数える用の決まった書式 (key=value、値は m、@ の後は点の番号 1 始まり)。
+        print('[execute][refine-check] ok={} failed={} self={} human={} '
+              'human_part={} forearm={} n={} time={:.3f}s'.format(
+                  int(not failed), ','.join(failed) or '-', fmt('self_'),
+                  fmt('human'), human_part or '-', fmt('forearm'),
+                  len(waypoints), check_time))
+        self._log_debug(dict(
+            event='press_in_refine_check', ok=not failed, failed=failed,
+            self_min=(None if worst['self_'][1] is None
+                      else worst['self_'][0]),
+            self_index=worst['self_'][1],
+            human_margin=(None if worst['human'][1] is None
+                          else worst['human'][0]),
+            human_index=worst['human'][1], human_part=human_part,
+            forearm_margin=(None if worst['forearm'][1] is None
+                            else worst['forearm'][0]),
+            forearm_index=worst['forearm'][1],
+            n_waypoints=len(waypoints), time=check_time,
+            has_skeleton=bool(frozen)))
 
     @staticmethod
     def _planar_matrix(x, y, yaw):
@@ -4350,9 +5943,11 @@ class HandshakePipelineNode(object):
 
     def _execute_waypoint_segment(self, waypoints, joint_names,
                                   min_segment_time=MIN_SEGMENT_TIME,
-                                  on_sent=None):
+                                  on_sent=None, neck_from_current=False):
         """``waypoints`` (先頭が現在の姿勢) を 1 つの滑らかな軌道として台車・腕を
         並行に実行する。``on_sent`` はゴール送信直後 (完了待ちの前) に呼ぶ。
+        ``neck_from_current`` なら首の角度は全点で今の実機の角度にする (首を
+        追従に任せるとき、首を計画の角度へ動かす時間で区間を延ばさない)。
 
         Returns: ``(start_odom_coords, final_traj_point)`` (送信時の odom と
         最終 waypoint の先頭基準 ``[dx, dy, dyaw]``、台車移動なしなら None)。
@@ -4364,6 +5959,15 @@ class HandshakePipelineNode(object):
                 if joint.name in name_to_angle:
                     joint.joint_angle(name_to_angle[joint.name])
             arm_angle_vectors.append(self.real_robot.angle_vector())
+        if neck_from_current and arm_angle_vectors:
+            current_av = np.asarray(self.ri.angle_vector(), dtype=np.float64)
+            joint_list = self.real_robot.joint_list
+            for joint in (self.real_robot.neck_y_joint,
+                          self.real_robot.neck_p_joint,
+                          self.real_robot.neck_r_joint):
+                index = joint_list.index(joint)
+                for av in arm_angle_vectors:
+                    av[index] = current_av[index]
         # 先頭 waypoint からの累積移動量 (move_trajectory_sequence は各要素を
         # 開始時の odom から独立に適用する)。
         base_trajectory_points = execution_timing.base_trajectory_points(
@@ -4483,12 +6087,13 @@ class HandshakePipelineNode(object):
             self.ri.move_base_trajectory_action.wait_for_result()
 
     def _limited_time_list(self, arm_angle_vectors, base_trajectory_points,
-                           time_list):
+                           time_list, start_av=None):
         """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど
         上限 (× ``VEL_LIMIT_RATIO``、加速度は ``ACCEL_TIME``) になるよう決めて返す。
         ``time_list`` は区間ごとの下限。
 
-        ``arm_angle_vectors``: 送る関節角列 (始点は実機の現在角)。
+        ``arm_angle_vectors``: 送る関節角列 (始点は ``start_av``、None なら
+        実機の現在角)。
         ``base_trajectory_points``: 区間先頭からの累積 ``[dx, dy, dyaw]`` 列。
         None/空なら判定から外す。コントローラが 3 次エルミートで補間するので、
         その最大値で判定する。
@@ -4502,7 +6107,8 @@ class HandshakePipelineNode(object):
             # コントローラで動かさない関節は判定から外す (inf)。
             arm_max_vel = execution_timing.joint_max_velocities(
                 self.real_robot.joint_list, controller_joint_names)
-            avs = [ri.angle_vector()] + list(arm_angle_vectors)
+            avs = [ri.angle_vector() if start_av is None
+                   else np.asarray(start_av)] + list(arm_angle_vectors)
             arm_deltas = np.array([ri.sub_angle_vector(avs[i + 1], avs[i])
                                    for i in range(len(arm_angle_vectors))])
         return execution_timing.limited_time_list(
@@ -4758,6 +6364,445 @@ class HandshakePipelineNode(object):
                   match['rms'] * 1e3, match['inlier_ratio'], match_time))
         return scan_delta if ok else None
 
+    def _waypoint_angle_vector(self, waypoint, joint_names):
+        """``waypoint`` の関節角を ``self.real_robot`` の angle_vector の形で
+        (``_execute_waypoint_segment`` と同じ。real_robot の姿勢は書き換わる)。"""
+        name_to_angle = dict(zip(joint_names, waypoint['joint_angle_vector']))
+        for joint in self.real_robot.joint_list:
+            if joint.name in name_to_angle:
+                joint.joint_angle(name_to_angle[joint.name])
+        return self.real_robot.angle_vector().copy()
+
+    def _plan_no_stop(self, display_waypoints, reach_boundary, joint_names,
+                      result):
+        """止まらない押し込みの準備: 手前の hover を解き、人体との距離を確かめ、
+        台車と腕に送る waypoint 列を作る (できなければ None で従来の流れ)。"""
+        hover_wp = display_waypoints[reach_boundary - 1]
+        offered_hand = result['offered_hand']
+
+        def margin_fn(waypoint, hand_shift):
+            return self._hover_clearance_margin(
+                waypoint, joint_names, offered_hand, hand_shift=hand_shift)
+
+        approach, info = nsp.retime_approach_arm(
+            self.robot, joint_names, display_waypoints[:reach_boundary],
+            result, margin_fn=margin_fn)
+        if approach is None:
+            print('[execute][no-stop] 接近の終わりの腕を割り振り直すと人に近づき'
+                  'すぎる ({}) ため、hover で止まる流れで実行します。'.format(
+                      info))
+            self._log_debug(dict(event='no_stop_plan', ok=False, **info))
+            return None
+        press_wps = display_waypoints[reach_boundary - 1:]
+        base_wps, arm_wps = nsp.no_stop_waypoints(approach, press_wps)
+        self._log_debug(dict(event='no_stop_plan', ok=True, **info))
+        return dict(hover_wp=hover_wp, pre_hover=approach[-1],
+                    press_wps=press_wps, base_wps=base_wps, arm_wps=arm_wps)
+
+    def _send_no_stop_approach(self, no_stop, joint_names, on_sent=None):
+        """腕に [接近 (末尾が手前の hover), hover, 計画の押し込み] を 1 本で、
+        台車に接近を送り、台車のゴールが終わるまで待つ (腕は待たない)。
+
+        ``no_stop`` に ``arm_avs``・``arm_times``・``n_base``・``dwell``・
+        ``send_ros_time`` (ゴールの開始の ROS 時刻)・``t_hover``/``t_hover_ros``
+        (腕が hover を通る壁時計・ROS 時刻) を足す。
+        Returns: ``(start_odom_coords, final_traj_point)``。
+        """
+        base_wps, arm_wps = no_stop['base_wps'], no_stop['arm_wps']
+        n_base = len(base_wps)
+        arm_avs = [self._waypoint_angle_vector(wp, joint_names)
+                   for wp in arm_wps]
+        base_points = execution_timing.base_trajectory_points(base_wps)
+        base_times = self._limited_time_list(
+            arm_avs[:n_base], base_points, [MIN_SEGMENT_TIME] * n_base)
+        dwell, = self._limited_time_list(
+            [arm_avs[n_base]], None, [nsp.HOVER_DWELL],
+            start_av=arm_avs[n_base - 1])
+        press_base = execution_timing.base_trajectory_points(
+            no_stop['press_wps'])
+        press_times = self._limited_time_list(
+            arm_avs[n_base + 1:], press_base[1:],
+            [MIN_SEGMENT_TIME] * (len(arm_avs) - n_base - 1),
+            start_av=arm_avs[n_base])
+        arm_times = list(base_times) + [dwell] + list(press_times)
+        start_av = self.ri.angle_vector().copy()
+        self._segment_time_list = list(base_times)
+        send_ros_time = rospy.Time.now()
+        send_time = time.time()
+        self.ri.angle_vector_sequence(arm_avs, arm_times)
+        start_odom_coords = self.ri.odom
+        plan = dict(points=np.asarray(base_points, dtype=np.float64),
+                    times=[float(t) for t in base_times],
+                    start_odom=start_odom_coords, sent_time=None)
+        self._segment_base_plan = plan
+        self._send_base_trajectory(base_points, base_times, wait=False)
+        plan['sent_time'] = time.time()
+        t_rel = float(sum(base_times)) + dwell
+        no_stop.update(
+            arm_avs=arm_avs, arm_times=arm_times, start_av=start_av,
+            n_base=n_base, dwell=dwell, send_ros_time=send_ros_time,
+            t_hover=send_time + t_rel,
+            t_hover_ros=send_ros_time + rospy.Duration(t_rel),
+            press_times=list(press_times))
+        log_debug('[debug][segment] 止まらない押し込み: 台車 {} 点 {:.2f}s、'
+                  '腕は台車の到着から {:.2f}s で hover、続けて押し込み {:.2f}s'
+                  .format(n_base, sum(base_times), dwell, sum(press_times)))
+        if on_sent is not None:
+            on_sent()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        state = self.ri.move_base_trajectory_action.get_state()
+        log_debug('[debug][segment] 接近の台車のゴール終了 ({})、腕が hover を'
+                  '通るまで {:.2f}s'.format(GOAL_STATUS_NAMES.get(state, state),
+                                          no_stop['t_hover'] - time.time()))
+        return start_odom_coords, base_points[-1]
+
+    def _send_arm_splice(self, start_ros_time, avs, velocities, times):
+        """腕のゴールを差し替える: ``start_ros_time`` までは今のゴールを続け、
+        そこからの点 ``avs`` (real_robot の angle_vector の形) を、点の速度
+        ``velocities`` と区間の時間 ``times`` (最初は差し替えの時刻から) で
+        送る。コントローラが差し替えの時刻の古い軌道の状態から最初の点までを
+        つなぐ。"""
+        joint_list = self.real_robot.joint_list
+        ri = self.ri
+        cumulative = np.cumsum(times)
+        for action, param in zip(ri.controller_table[ri.controller_type],
+                                 ri.controller_param_table[ri.controller_type]):
+            names = param['joint_names']
+            indices = [joint_list.index(getattr(self.real_robot, name))
+                       for name in names]
+            goal = control_msgs.msg.FollowJointTrajectoryGoal()
+            goal.trajectory.header.stamp = start_ros_time
+            goal.trajectory.joint_names = list(names)
+            for av, vel, t in zip(avs, velocities, cumulative):
+                goal.trajectory.points.append(
+                    trajectory_msgs.msg.JointTrajectoryPoint(
+                        positions=[float(av[i]) for i in indices],
+                        velocities=[float(vel[i]) for i in indices],
+                        time_from_start=rospy.Duration(float(t))))
+            action.send_goal(goal)
+
+    def _run_no_stop_press(self, no_stop, start_odom_coords, final_traj_point,
+                           ref_scan, exclude_centers, palm_anchor,
+                           joint_names, result, hand_followed,
+                           resolve_motion=None):
+        """台車が着いた後、腕が hover を通るまでに手を検出し直して押し込みを
+        解き直し、腕のゴールを hover を通る時刻で差し替え、台車の押し込み
+        (ずれの補正を含む) をその時刻から送って押し込みの終わりまで待つ。
+        解き直した押し込みを使うときは、``resolve_motion`` の横並び移動の
+        解き直し (``_start_transition_resolve``) も始める。
+
+        Returns: 実行した押し込みの waypoint 列 (先頭が hover)。残差が大きく
+        織り込めないときは腕を hover で止めて None (従来の流れで続ける)。
+        """
+        robot_arm = result['robot_arm']
+        hover_wp = no_stop['hover_wp']
+        deadline = no_stop['t_hover'] - nsp.SPLICE_LEAD
+        # IK に残す時間 (実機の解き直しは 0.02〜0.7 秒の見積もり)。
+        frame_timeout = max(0.2, min(PRESS_IN_REFINE_TIMEOUT,
+                                     deadline - time.time() - 0.6))
+        fold = self._prepare_folded_press(
+            start_odom_coords, final_traj_point, ref_scan, exclude_centers,
+            palm_anchor, hover_wp, joint_names, robot_arm, wait_head=False,
+            wait_arm=False, frame_timeout=frame_timeout)
+        n_base = no_stop['n_base']
+        hover_av = no_stop['arm_avs'][n_base]
+        max_vel = execution_timing.joint_max_velocities(
+            self.real_robot.joint_list, {
+                name for param in self.ri.controller_param_table[
+                    self.ri.controller_type]
+                for name in param['joint_names']})
+        # 送った腕の軌道 (時刻は送信からの秒数)。
+        points = [no_stop['start_av']] + list(no_stop['arm_avs'])
+        old_track = nsp.HermiteTrack(
+            points, nsp.point_velocities(points, no_stop['arm_times']),
+            no_stop['arm_times'])
+        send_time = no_stop['t_hover'] - (
+            float(sum(no_stop['arm_times'][:n_base])) + no_stop['dwell'])
+
+        names = [joint.name for joint in self.real_robot.joint_list]
+
+        def splice(press_wps, now_wp, target):
+            """今から SPLICE_LEAD 後に押し込み ``press_wps`` (先頭が hover) へ
+            差し替える。今の手先より後ろの点 (hover など) は飛ばす
+            (``nsp.press_entry``)。Returns: ``(台車の押し込みを始める壁時計の
+            時刻, 台車の点列, 区間の時間, 上限比, 入る点)``、間に合わなければ
+            None。
+
+            計算の後に開始時刻までの余裕が ``nsp.SPLICE_MIN_MARGIN`` を切ったら、
+            かかった時間だけ開始時刻を遅らせて計算し直す。"""
+            t_hover = no_stop['t_hover'] - send_time
+            lead = nsp.SPLICE_LEAD
+            for attempt in range(nsp.SPLICE_ATTEMPTS):
+                compute_start = time.time()
+                t_s = compute_start + lead - send_time
+                if t_s > t_hover - 0.05:
+                    return None
+                plan = plan_splice(press_wps, now_wp, target, t_s, t_hover)
+                margin = send_time + t_s - time.time()
+                if margin >= nsp.SPLICE_MIN_MARGIN:
+                    break
+                lead = time.time() - compute_start + nsp.SPLICE_LEAD
+            angles, vels, all_times, ratio, entry, base_points = plan
+            self._send_arm_splice(
+                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
+                all_times)
+            splice_info.update(attempts=attempt + 1, margin=float(margin),
+                               lead=float(lead),
+                               sent_margin=float(send_time + t_s
+                                                 - time.time()))
+            return send_time + t_s, base_points, list(all_times), ratio, entry
+
+        def plan_splice(press_wps, now_wp, target, t_s, t_hover):
+            q_s, _ = old_track.state(t_s)
+            by_name = dict(zip(names, q_s))
+            current_wp = dict(now_wp, joint_angle_vector=[
+                float(by_name.get(name, angle)) for name, angle in zip(
+                    joint_names, now_wp['joint_angle_vector'])])
+            current_hand = nsp.hand_position(self.robot, joint_names,
+                                             current_wp, robot_arm)
+            keep = nsp.monotone_press(self.robot, joint_names, robot_arm,
+                                      press_wps, current_hand, target)
+            entry = keep[0]
+            # 押し込む向きに単調に進む点 (今の手先より後ろの hover や、後ろへ
+            # 戻る点は飛ばす) へ、腕と台車 (ずれの補正を含む) を差し替えの時刻
+            # から一緒に動かす。台車の補正を hover の後にまとめて行うと、ずれた
+            # 台車のまま hover へ伸びた手先が補正で戻される。
+            entry_wps = [press_wps[k] for k in keep]
+            base_points = execution_timing.base_trajectory_points(
+                [now_wp] + entry_wps)[1:]
+            avs = [self._waypoint_angle_vector(wp, joint_names)
+                   for wp in entry_wps]
+            times = self._limited_time_list(
+                avs, base_points, [MIN_SEGMENT_TIME] * len(avs),
+                start_av=q_s)
+            if entry == 0:
+                # hover には予定の時刻に着く (早めない)。
+                times[0] = max(times[0], t_hover - t_s)
+            angles, vels, all_times, ratio = nsp.splice_at_entry(
+                old_track, t_s, avs, times, max_vel)
+            return angles, vels, all_times, ratio, entry, base_points
+
+        splice_info = {}
+
+        if not fold['ok']:
+            # 織り込めない大きなずれ: 腕を hover で止めて従来どおり直す。
+            t_s = time.time() + nsp.SPLICE_LEAD - send_time
+            angles, vels, all_times, _ = nsp.splice_in_dwell(
+                old_track, t_s, no_stop['t_hover'] - send_time, hover_av, [],
+                [], max_vel)
+            vels = np.zeros_like(np.asarray(vels))
+            self._send_arm_splice(
+                no_stop['send_ros_time'] + rospy.Duration(t_s), angles, vels,
+                all_times)
+            self._log_debug(dict(event='no_stop_press', spliced='hold',
+                                 residual=[float(v) for v in fold['residual']]))
+            return None
+
+        refined = None
+        if time.time() < deadline:
+            refined = self._refine_press_in(hover_wp, joint_names, result,
+                                            fold=fold)
+        in_time = time.time() < deadline
+        use_refined = refined is not None and in_time
+        press_wps = (([hover_wp] + refined) if use_refined
+                     else no_stop['press_wps'])
+        if hand_followed:
+            press_wps = self._hold_neck(press_wps, joint_names)
+        now_wp = execution_timing.prepend_base_move(
+            press_wps, fold['base_move'])[0]
+        target = (fold.get('target_position') if use_refined
+                  else result['post_process']['target_position'])
+        decided_at = time.time()
+        spliced = None
+        if use_refined or hand_followed:
+            spliced = splice(press_wps, now_wp, target)
+        if spliced is not None:
+            press_start, base_points, times, ratio, entry = spliced
+        else:
+            base_points = execution_timing.base_trajectory_points(
+                [now_wp] + list(press_wps[1:]))[1:]
+            press_start, times, ratio, entry = (
+                no_stop['t_hover'], no_stop['press_times'], None, 0)
+        # 腕が hover を通る時刻の予定からの遅れ (差し替えたときは、差し替えの
+        # 時刻から hover までの区間の後)。
+        hover_delay = float(
+            (press_start + (times[0] if spliced is not None else 0.0))
+            - no_stop['t_hover']) if entry == 0 else None
+        # 台車の押し込み (ずれの補正を含む) を、腕が hover を通る時刻 (hover を
+        # 飛ばすときは差し替えの時刻) から。
+        wait = press_start - time.time()
+        if wait > 0:
+            rospy.sleep(wait)
+        self._set_hand_tracking(False)
+        self._set_activity(STAGE_PRESS_IN)
+        self._send_base_trajectory(base_points, list(times), wait=False)
+        if use_refined and resolve_motion is not None:
+            self._start_transition_resolve(resolve_motion, press_wps[-1],
+                                           joint_names)
+        record = dict(
+            event='no_stop_press', spliced=spliced is not None, entry=entry,
+            refined=refined is not None, in_time=in_time,
+            hover_delay=hover_delay,
+            bridge_ratio=ratio, splice=splice_info or None,
+            base_move=[float(v) for v in fold['base_move']],
+            residual=[float(v) for v in fold['residual']],
+            decision_before_hover=float(no_stop['t_hover'] - decided_at),
+            base_stop_to_decision=float(decided_at - fold['start_time']),
+            ik_time=fold.get('ik_time'))
+        self._log_debug(record)
+        print('[execute][no-stop] 押し込み{} (台車の補正 {:+.3f}m, {:+.3f}m, '
+              '{:+.1f}deg、{})。'.format(
+                  'を差し替えました' if use_refined and spliced is not None
+                  else 'は計画どおり' + ('' if in_time else ' (間に合わず)'),
+                  fold['base_move'][0], fold['base_move'][1],
+                  math.degrees(fold['base_move'][2]),
+                  'hover の遅れ {:.2f}s'.format(hover_delay) if entry == 0
+                  else '手先が hover より前にいたので押し込みの {} 点目へ直接'
+                       '入った'.format(entry)))
+        self._wait_body_interpolation()
+        self._log_controller_states()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        self._press_motion_end = time.time()
+        self._wait_joint_settle('押し込み終了', press_wps[-1], joint_names,
+                                robot_arm)
+        return press_wps
+
+    def _prepare_folded_press(self, start_odom_coords, final_traj_point,
+                              ref_scan, exclude_centers, palm_anchor,
+                              hover_wp, joint_names, robot_arm, wait_head,
+                              wait_arm=True,
+                              frame_timeout=PRESS_IN_REFINE_TIMEOUT):
+        """押し込みに台車の補正を織り込む流れの、hover 到着後の準備。
+
+        手の検出 (``PRESS_IN_REFINE_FRAMES`` 枚) を裏で始め、その間に odom の
+        停止・補正の目標までの残差の計測 (台車は動かさない)・腕と首の到着を
+        待つ。残差が許容内なら移動 0、``PRESS_IN_FOLD_MAX_*`` 以内ならその
+        残差を押し込み区間で動かす量 (``base_move``) にする。
+
+        Returns: ``dict(ok, base_move, residual, hand_frames, base_error,
+        start_time)``。``ok`` が False (残差が大きすぎる) なら従来どおり止まって
+        直す。
+        """
+        start_time = time.time()
+        self._set_activity(STAGE_PRESS_REFINE)
+        self._end_hand_follow()
+        frames = {}
+
+        def collect():
+            frames['frames'] = self._collect_hand_frames(
+                PRESS_IN_REFINE_FRAMES, frame_timeout)
+
+        collector = threading.Thread(target=collect, name='press-in-frames')
+        collector.daemon = True
+        collector.start()
+
+        start_odom = self._odom_pose(start_odom_coords)
+        plan = np.asarray(final_traj_point, dtype=np.float64)
+        settle_time, drift = self._wait_odom_settle()
+        log_debug('[execute][correct] 接近区間の終了後に odom が止まるまで {:.2f}s '
+                  '(その間の移動 {:.1f}mm/{:.2f}deg)'.format(
+                      settle_time, drift[0] * 1e3, math.degrees(drift[1])))
+        residual = self._measure_base_residual(
+            start_odom, plan, ref_scan, exclude_centers, palm_anchor, 0)
+        if wait_arm:
+            self._wait_joint_settle('hover', hover_wp, joint_names, robot_arm)
+        if wait_head:
+            self.ri.wait_interpolation(controller_type='head_controller')
+        collector.join()
+
+        error = residual['error']
+        distance = math.hypot(error[0], error[1])
+        base_move, ok = nsp.fold_move(error)
+        within = not np.any(base_move)
+        # 寄せる量の人体距離の検証に使う、補正後の台車の hover 目標からのずれ。
+        base_error = scan_matching.relative(plan, residual['target'])
+        record = dict(event='press_in_fold_prepare', ok=ok, within=within,
+                      residual=[float(v) for v in error],
+                      source=residual['source'],
+                      n_frames=len(frames.get('frames') or []),
+                      time=time.time() - start_time)
+        self._log_debug(record)
+        if not ok:
+            print('[execute][correct] 台車の残差 {:.3f}m / {:.1f}deg が押し込みに'
+                  '織り込める上限 ({:.2f}m / {:.0f}deg) を超えたため、止まって'
+                  '補正します。'.format(
+                      distance, math.degrees(abs(error[2])),
+                      PRESS_IN_FOLD_MAX_POSITION,
+                      math.degrees(PRESS_IN_FOLD_MAX_ANGLE)))
+        elif not within:
+            print('[execute][correct] 台車の残差 ({:+.3f}m, {:+.3f}m, {:+.1f}deg)'
+                  ' は押し込みの前に止まらずに直します。'.format(
+                      error[0], error[1], math.degrees(error[2])))
+        return dict(ok=ok, base_move=base_move, residual=error,
+                    hand_frames=frames.get('frames'), base_error=base_error,
+                    start_time=start_time)
+
+    @staticmethod
+    def _fold_base_move(press_waypoints, base_move):
+        return execution_timing.prepend_base_move(press_waypoints, base_move)
+
+    def _measure_base_residual(self, start_odom, plan, ref_scan,
+                               exclude_centers, palm_anchor, attempt,
+                               angle_tolerance=BASE_CORRECTION_ANGLE_TOLERANCE):
+        """台車を動かさずに、押し込み前の補正の目標までの残差を測る。
+
+        ``start_odom`` は区間先頭の odom の姿勢、``plan`` は接近区間の台車の
+        目標 (区間先頭基準 ``[dx, dy, dyaw]``)。実際の姿勢は ``ref_scan`` との
+        照合、だめなら順につないだ照合、どちらも無ければ odom。目標は
+        ``plan`` (向きは許容内なら今の向き)、``palm_anchor`` があればその掌を
+        計画どおりに見る位置。
+
+        Returns: ``dict(actual, target, error, source, yaw_error)``。``error`` は
+        今の台車の系の ``[dx, dy, dyaw]`` (この量だけ動けば目標に着く)。
+        """
+        odom_delta = scan_matching.relative(
+            start_odom, self._odom_pose(self.ri.odom))
+        actual, source = odom_delta, 'odom'
+        if ref_scan is not None:
+            scan_delta = self._match_scan(
+                ref_scan, odom_delta, exclude_centers, attempt, plan)
+            if scan_delta is not None:
+                actual, source = scan_delta, 'scan'
+            else:
+                # 大きく回った後は基準スキャンとの重なりが減って照合が通らない
+                # ことが多い (10/22 は 8 回中 5 回) ので、順につないだ照合を使う。
+                chained = self._chained_scan_delta(start_odom)
+                if chained is not None:
+                    actual, source = chained, 'scan_chain'
+                    slip = scan_matching.relative(odom_delta, chained)
+                    self._log_debug(dict(
+                        event='scan_correction', attempt=attempt,
+                        ok=True, chained=True,
+                        plan=[float(v) for v in plan],
+                        odom_delta=[float(v) for v in odom_delta],
+                        scan_delta=[float(v) for v in chained],
+                        slip=[float(v) for v in slip]))
+                    log_debug('[execute][scan] attempt={} 順につないだ照合'
+                              'で代用: 実際の移動 ({:+.3f}m, {:+.3f}m, '
+                              '{:+.1f}deg) -> スリップ ({:+.3f}m, '
+                              '{:+.3f}m, {:+.1f}deg)'.format(
+                                  attempt, chained[0], chained[1],
+                                  math.degrees(chained[2]), slip[0],
+                                  slip[1], math.degrees(slip[2])))
+        # 向きは許容を超えたときだけ直す (yaw の補正はキックで打ち消される)。
+        yaw_error = scan_matching.wrap_angle(plan[2] - actual[2])
+        target = np.asarray(plan, dtype=np.float64).copy()
+        if abs(yaw_error) <= angle_tolerance:
+            target[2] = actual[2]
+        if palm_anchor is not None:
+            target[:2] = in_motion_correction.palm_anchored_position(
+                palm_anchor[0], palm_anchor[1], target[2])
+        error = scan_matching.relative(actual, target)
+        log_debug('[execute][correct] attempt={} ({}基準{}) 目標までの残差 '
+                  '{:+.3f}m {:+.3f}m {:+.1f}deg (計画の向きとの差 {:+.1f}deg)'
+                  .format(attempt, source,
+                          '、掌に合わせる' if palm_anchor is not None else '',
+                          error[0], error[1], math.degrees(error[2]),
+                          math.degrees(yaw_error)))
+        return dict(actual=np.asarray(actual, dtype=np.float64),
+                    target=target, error=np.asarray(error, dtype=np.float64),
+                    source=source, yaw_error=yaw_error)
+
     def _correct_base_residual(
             self, start_odom_coords, final_traj_point, ref_scan=None,
             exclude_centers=None, palm_anchor=None,
@@ -4787,51 +6832,11 @@ class HandshakePipelineNode(object):
         err_norm = 0.0
         err_yaw = 0.0
         for attempt in range(max_attempts):
-            odom_delta = scan_matching.relative(
-                start_odom, self._odom_pose(self.ri.odom))
-            actual, source = odom_delta, 'odom'
-            if ref_scan is not None:
-                scan_delta = self._match_scan(
-                    ref_scan, odom_delta, exclude_centers, attempt, plan)
-                if scan_delta is not None:
-                    actual, source = scan_delta, 'scan'
-                else:
-                    # 大きく回った後は基準スキャンとの重なりが減って照合が通らない
-                    # ことが多い (10/22 は 8 回中 5 回) ので、順につないだ照合を使う。
-                    chained = self._chained_scan_delta(start_odom)
-                    if chained is not None:
-                        actual, source = chained, 'scan_chain'
-                        slip = scan_matching.relative(odom_delta, chained)
-                        self._log_debug(dict(
-                            event='scan_correction', attempt=attempt,
-                            ok=True, chained=True,
-                            plan=[float(v) for v in plan],
-                            odom_delta=[float(v) for v in odom_delta],
-                            scan_delta=[float(v) for v in chained],
-                            slip=[float(v) for v in slip]))
-                        log_debug('[execute][scan] attempt={} 順につないだ照合'
-                                  'で代用: 実際の移動 ({:+.3f}m, {:+.3f}m, '
-                                  '{:+.1f}deg) -> スリップ ({:+.3f}m, '
-                                  '{:+.3f}m, {:+.1f}deg)'.format(
-                                      attempt, chained[0], chained[1],
-                                      math.degrees(chained[2]), slip[0],
-                                      slip[1], math.degrees(slip[2])))
-            # 向きは許容を超えたときだけ直す (yaw の補正はキックで打ち消される)。
-            yaw_error = scan_matching.wrap_angle(plan[2] - actual[2])
-            target = plan.copy()
-            if abs(yaw_error) <= angle_tolerance:
-                target[2] = actual[2]
-            if palm_anchor is not None:
-                target[:2] = in_motion_correction.palm_anchored_position(
-                    palm_anchor[0], palm_anchor[1], target[2])
-            err_x, err_y, err_yaw = scan_matching.relative(actual, target)
+            residual = self._measure_base_residual(
+                start_odom, plan, ref_scan, exclude_centers, palm_anchor,
+                attempt, angle_tolerance)
+            err_x, err_y, err_yaw = residual['error']
             err_norm = math.hypot(err_x, err_y)
-            log_debug('[execute][correct] attempt={} ({}基準{}) 目標までの残差 '
-                  '{:+.3f}m {:+.3f}m {:+.1f}deg (計画の向きとの差 {:+.1f}deg)'
-                  .format(attempt, source,
-                          '、掌に合わせる' if palm_anchor is not None else '',
-                          err_x, err_y, math.degrees(err_yaw),
-                          math.degrees(yaw_error)))
 
             if err_norm <= position_tolerance and abs(err_yaw) <= angle_tolerance:
                 if attempt > 0:
@@ -5184,6 +7189,15 @@ def build_arg_parser():
         default=phm.DEFAULT_APPROACH_DISTANCE,
         help='接近開始位置の円の半径への上乗せ分 [m]。')
     parser.add_argument(
+        '--base-max-vel', type=float, default=BASE_MAX_VEL,
+        help='台車の並進の速度上限 [m/s]。実機の base_controller の '
+             'max_velocity (aero_base_link.yaml) 以下にすること。')
+    parser.add_argument(
+        '--base-max-angvel', type=float,
+        default=execution_timing.BASE_MAX_ANGVEL,
+        help='台車の回転の速度上限 [rad/s]。実機の base_link_pan の '
+             'max_velocity 以下にすること。')
+    parser.add_argument(
         '--n-waypoints', type=int, default=phm.DEFAULT_N_WAYPOINTS,
         help='軌道の waypoint 数 (始点・終点を含む)。')
     parser.add_argument(
@@ -5528,6 +7542,7 @@ def _check_voicevox_engine(url):
 def main():
     parser = build_arg_parser()
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
+    apply_base_max_vel(args.base_max_vel, args.base_max_angvel)
 
     log_path = setup_log_dir()
     print('[log] 詳細なログ ([debug] など) は画面に出さず {} 以下に試行 (人) '
@@ -5551,6 +7566,8 @@ def main():
         check_robot_clock_offset(auto_sync=args.clock_sync)
 
     rospy.init_node('run_camera_pipeline_test')
+    import qprof
+    qprof.install()  # MFIX_QPROF のときだけ時間の内訳を測る (無ければ何もしない)
     node = HandshakePipelineNode(args)
 
     # ハンドの握るサービスが起動時にあるか確認 (無ければ以後は待たない)。
