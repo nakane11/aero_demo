@@ -224,8 +224,12 @@ VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
 # (人が付いて歩ける速さにするため)、進む前の発話。
 WALK_FORWARD_DISTANCE = 1.5  # [m]
 WALK_FORWARD_MIN_TIME = 2.0  # [s]
-# 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。
-WALK_TURN_MIN_TIME = 3.0  # [s]
+# 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。手をつないだ人が
+# 付いて回れるよう WALK_TURN_RATE で、WALK_TURN_MIN_TIME〜WALK_TURN_MAX_TIME
+# かける (以前は角度によらず 3 秒。大きく回るときは以前より長くしない)。
+WALK_TURN_MIN_TIME = 1.0  # [s]
+WALK_TURN_MAX_TIME = 3.0  # [s]
+WALK_TURN_RATE = math.radians(20.0)  # [rad/s]
 WALK_TURN_TOLERANCE = math.radians(1.0)
 SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
@@ -4338,6 +4342,7 @@ class HandshakePipelineNode(object):
         hover_wp = display_waypoints[reach_boundary - 1]
         fold = None
         press_done = None
+        self._press_motion_end = None
         if no_stop is not None:
             press_done = self._run_no_stop_press(
                 no_stop, start_odom_coords, final_traj_point, ref_scan,
@@ -4426,6 +4431,7 @@ class HandshakePipelineNode(object):
             self._set_hand_tracking(False)
             self._set_activity(STAGE_PRESS_IN)
             self._execute_waypoint_segment(press_waypoints, joint_names)
+            self._press_motion_end = time.time()
             self._wait_joint_settle(
                 '押し込み終了', press_waypoints[-1], joint_names,
                 robot_arm)
@@ -4441,6 +4447,8 @@ class HandshakePipelineNode(object):
                     press_waypoints, joint_names, result, press_post)
                 if press_waypoints is None:
                     return
+                # 握って待つ時間は、人の手が来て握ったところから数える。
+                self._press_motion_end = None
                 if press_waypoints[-1] is not started:
                     # 合わせ直した姿勢から解き直す (間に合わなければ差を足す)。
                     self._start_transition_resolve(
@@ -4450,7 +4458,11 @@ class HandshakePipelineNode(object):
             self._set_activity(STAGE_GRASP)
             self._set_hand_grasp(True)
         self._say(self.args.speech_done_text)
-        press_end_time = time.time()
+        # 握って待つ時間 (--side-by-side-delay) は押し込みの指令が終わった時刻
+        # から数える (腕の追いつき待ちもこの中に入れる)。
+        press_end_time = (self._press_motion_end
+                          if self._press_motion_end is not None
+                          else time.time())
         early_waypoints = self._wait_early_transition(motion)
         if early_waypoints is not None:
             transition_waypoints_ = early_waypoints
@@ -4461,9 +4473,12 @@ class HandshakePipelineNode(object):
                 and reach_boundary < len(display_waypoints)):
             duration = self.args.grasp_capture_duration
             if do_transition:
-                duration = min(duration, self.args.side_by_side_delay)
-            self._capture_grasp_images(
-                press_waypoints[-1], joint_names, result, duration)
+                # 握って待つ残りの時間の中で撮る。
+                duration = min(duration, press_end_time
+                               + self.args.side_by_side_delay - time.time())
+            if duration > 0:
+                self._capture_grasp_images(
+                    press_waypoints[-1], joint_names, result, duration)
 
         if do_transition:
             self._set_activity(STAGE_TRANSITION_WAIT)
@@ -4495,12 +4510,12 @@ class HandshakePipelineNode(object):
 
     def _walk_forward(self, distance):
         """横並びの後、手をつないだまま台車だけを ``distance`` [m] 前 (台車の
-        +x) へ進める。腕・脚には指令を送らず横並びの姿勢のまま、進む前に
-        ``SPEECH_WALK_FORWARD_TEXT`` を発話し終わるまで待つ。首は顔を追わず
-        正面 (首の関節を全て 0) へ向ける。"""
+        +x) へ進める。腕・脚には指令を送らず横並びの姿勢のまま、前進の向きへ
+        回りながら ``SPEECH_WALK_FORWARD_TEXT`` を発話し、発話し終わってから
+        進む。首は顔を追わず正面 (首の関節を全て 0) へ向ける。"""
         self._set_activity(STAGE_WALK_FORWARD)
-        self._turn_to_walk_heading()
         spoken = self._say(SPEECH_WALK_FORWARD_TEXT, wait=True)
+        self._turn_to_walk_heading()
         spoken.wait(SPEECH_RESULT_TIMEOUT)
         point = [float(distance), 0.0, 0.0]
         sec, = self._limited_time_list(
@@ -4532,7 +4547,10 @@ class HandshakePipelineNode(object):
                       'しません'.format(math.degrees(dyaw)))
             return
         point = [0.0, 0.0, dyaw]
-        sec, = self._limited_time_list(None, [point], [WALK_TURN_MIN_TIME])
+        sec, = self._limited_time_list(
+            None, [point], [min(WALK_TURN_MAX_TIME,
+                                max(WALK_TURN_MIN_TIME,
+                                    abs(dyaw) / WALK_TURN_RATE))])
         print('[execute] 前進の向きへその場で {:+.1f}deg 回転します ({:.1f} 秒)。'
               .format(math.degrees(dyaw), sec))
         self._send_base_trajectory([point], [sec], wait=True)
@@ -6726,6 +6744,7 @@ class HandshakePipelineNode(object):
         self._wait_body_interpolation()
         self._log_controller_states()
         self.ri.move_base_trajectory_action.wait_for_result()
+        self._press_motion_end = time.time()
         self._wait_joint_settle('押し込み終了', press_wps[-1], joint_names,
                                 robot_arm)
         return press_wps
