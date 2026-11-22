@@ -43,6 +43,49 @@ def point_velocities(deltas, times):
     return point_vel
 
 
+# 台車がこれ以下しか動かない区間は「止まっている区間」とみなす [m, rad]。
+BASE_REST_TOLERANCE = 1e-6
+
+
+def base_point_velocities(deltas, times, tolerance=BASE_REST_TOLERANCE,
+                          planar=False):
+    """台車 (``[dx, dy, dyaw]`` の区間ごとの差) の各点の速度。
+    ``point_velocities`` と同じだが、軸ごとに、その軸が止まっている区間
+    (差が ``tolerance`` 以下) の両端の点の速度は 0 にする。
+
+    区間の先頭は今の姿勢の waypoint なので、台車の 1 区間目は長さ 0 になる
+    (腕だけ先頭の姿勢へ動かす区間)。``point_velocities`` のままだと
+    その終点に次の区間の半分の速度が付き、3 次補間で 1 区間目に台車が
+    後ろへ振れ、速度・加速度の上限で 1 区間目が延びて止まって見えた
+    (2026-11-22 試行2: 接近の始めに 0.63 秒・後ろへ 9 mm)。向きを変えない
+    区間 (待機点への直進) の次に回る区間が続くときの yaw も同じ。
+
+    ``planar`` なら並進 (x, y) は軸ごとではなくベクトルで、前後の区間の
+    速度の向きの差が 90 度未満なら平均、そうでなければ 0 にする (軸ごとだと
+    曲がり角で片方の軸が 0 になり、加速度の上限で次の区間が延びて遅くなる。
+    走っている台車を待機点から接近へつなぐとき)。
+    """
+    point_vel = point_velocities(deltas, times)
+    n_segments = len(times)
+    if planar and n_segments > 1:
+        seg_vel = deltas[:, :2] / np.asarray(times)[:, None]
+        forward = np.sum(seg_vel[:-1] * seg_vel[1:], axis=1) > 0.0
+        point_vel[1:n_segments, :2] = np.where(
+            forward[:, None], 0.5 * (seg_vel[:-1] + seg_vel[1:]), 0.0)
+        # 並進が止まっている区間の両端は 0 (軸ごとではなく両軸で)。
+        still = np.all(np.abs(deltas[:, :2]) <= tolerance, axis=1)
+        point_vel[:-1, :2][still] = 0.0
+        point_vel[1:, :2][still] = 0.0
+        rest = np.abs(deltas[:, 2:]) <= tolerance
+        point_vel[:-1, 2:][rest] = 0.0
+        point_vel[1:, 2:][rest] = 0.0
+        return point_vel
+    rest = np.abs(deltas) <= tolerance
+    point_vel[:-1][rest] = 0.0
+    point_vel[1:][rest] = 0.0
+    return point_vel
+
+
 def _hermite_coefficients(deltas, times, point_vel):
     """各区間の 3 次エルミート ``p(t) = a t^3 + b t^2 + v0 t`` の ``(a, b, v0)``。"""
     seg_times = times[:, None]
@@ -134,8 +177,57 @@ def prepend_base_move(waypoints, base_move, tolerance=1e-6):
     return [now] + list(waypoints)
 
 
+def compose_planar(a, b):
+    """平面の姿勢 ``a`` の系で表した ``b`` (どちらも ``[x, y, yaw]``) を
+    ``a`` の親の系へ移す (向きは折り返さない)。"""
+    c, s = math.cos(a[2]), math.sin(a[2])
+    return np.array([a[0] + c * b[0] - s * b[1],
+                     a[1] + s * b[0] + c * b[1], a[2] + b[2]])
+
+
+# 走っている台車を待機点から接近へつなぐとき、待機点からこの距離 [m] までの
+# lead-in の点は通らず、今の位置からその先の点へ 1 区間でつなぐ (待機点で
+# 曲がる・回り始めるところで減速しないように)。2026-11-22 試行2 の点では、
+# 0.15 m だと差し替え後に 0.12 m/s まで落ち、0.25 m 以上なら螺旋の入口まで
+# min(差し替え時の速さ, lead-in の速さ 0.24 m/s) を下回らない。
+SPLICE_LOOKAHEAD = 0.25
+
+
+def _waypoint_pose(wp):
+    return np.array([wp['base_position'][0], wp['base_position'][1],
+                     wp['base_yaw']], dtype=np.float64)
+
+
+def spliced_start(waypoints, offset):
+    """``waypoints`` (先頭は区間先頭 = 動く前の姿勢、次が待機点) の先頭の台車を、
+    そこから ``offset`` (先頭の系の ``[dx, dy, dyaw]``) だけ動いた今の姿勢に
+    替えたリスト。走っている台車の今の位置から残りへつないで送るときに使う。"""
+    first = waypoints[0]
+    pose = compose_planar(_waypoint_pose(first), offset)
+    now = dict(first, base_position=[float(pose[0]), float(pose[1]), 0.0],
+               base_yaw=float(pose[2]))
+    return [now] + list(waypoints[1:])
+
+
+def splice_target_index(waypoints, max_index, lookahead=SPLICE_LOOKAHEAD):
+    """走っている台車を今の位置から最初につなぐ点の添字。``waypoints`` は
+    先頭が動く前の姿勢、次 (添字 1) が待機点。待機点から ``lookahead`` 以上
+    離れた最初の点 (添字 ``max_index`` まで、ふつうは lead-in の終わり =
+    接近の始点) で、それより前の点 (待機点を含む) は通らない (曲がり角・
+    回り始めを 1 区間の 3 次補間でならす)。"""
+    max_index = min(max_index, len(waypoints) - 1)
+    if max_index < 1:
+        return max(max_index, 0)
+    standby = _waypoint_pose(waypoints[1])
+    for j in range(1, max_index + 1):
+        if np.linalg.norm(_waypoint_pose(waypoints[j])[:2]
+                          - standby[:2]) >= lookahead:
+            return j
+    return max_index
+
+
 def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
-                      log=None):
+                      log=None, base_start_velocity=None, base_planar=False):
     """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど
     上限 (× ``VEL_LIMIT_RATIO``、加速度は ``ACCEL_TIME``) になるよう決めて返す。
     ``time_list`` は区間ごとの下限。
@@ -144,6 +236,9 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
     関節ごとの上限 (``joint_max_velocities``)。``base_points``: 区間先頭からの
     累積 ``[dx, dy, dyaw]`` 列 (``base_trajectory_points``)。どちらも None/空なら
     判定から外す。``log``: 上限内に収まらず一律に延ばしたときに文を渡す関数。
+    ``base_start_velocity``: 台車が動いている途中から送るときの始点の速度
+    (区間先頭の系の ``[vx, vy, vyaw]``、None なら静止)。``base_planar``:
+    台車の点の速度を ``base_point_velocities(planar=True)`` で付けるとき。
     """
     base_deltas = None
     if base_points is not None and len(base_points):
@@ -169,7 +264,10 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
             vel_ratios.append(vel / arm_max_vel)
             acc_ratios.append(acc / (arm_max_vel / ACCEL_TIME))
         if base_deltas is not None:
-            point_vel = point_velocities(base_deltas, times)
+            point_vel = base_point_velocities(base_deltas, times,
+                                              planar=base_planar)
+            if base_start_velocity is not None:
+                point_vel[0] = base_start_velocity
             # 並進は向きによらず超えないようベクトルの大きさで判定する。
             vel_xy, acc_xy = hermite_peaks(
                 base_deltas[:, :2], times, point_vel[:, :2], norm=True)
@@ -245,7 +343,7 @@ class SegmentMotion(object):
         base_deltas = np.diff(self._base_points, axis=0)
         self._base = _hermite_coefficients(
             base_deltas, self.times,
-            point_velocities(base_deltas, self.times))
+            base_point_velocities(base_deltas, self.times))
 
     def waypoint_time(self, index):
         """``index`` 番目の waypoint に着く時刻 [秒] (先頭が 0)。"""

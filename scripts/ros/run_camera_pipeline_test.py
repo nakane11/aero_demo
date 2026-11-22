@@ -130,9 +130,14 @@ ARM_INITIAL_POSE_MOVE_TIME = 10  # [秒] ARM 時に初期姿勢へ戻す時間
 HEAD_NOD_PITCH_DEG = 40.0
 HEAD_NOD_MOVE_TIME = 0.5  # [秒] 下げる・戻すそれぞれの時間の下限
 
-# 差し出し手が決まったらすぐ (計画を待たずに)、腕を下ろしたまま台車だけ先に
-# 動かし、計画は待機点から解く。掌へ向かって直進し (向きは変えない)、掌と人の
-# 立ち位置のどちらにも PRE_MOVE_STANDOFF より近づかない点 (待機点) で止まる。
+# 差し出し手が決まったら待機点を決め、計画は待機点から解く。うなずき始める
+# 前 (動く前) に基準スキャンを取り、うなずきで首を戻し始めたら腕を下ろした
+# まま台車だけ待機点へ動かす (計画の終わりは待たない)。実行は走っている
+# 台車の今の位置・速度から待機点の先の lead-in へつないで差し替え、待機点で
+# 減速しない (区間先頭 = 補正の基準は動く前の位置)。台車が待機点で止まる
+# のは、止まるまでに計画が終わらなかったときだけ。
+# 掌へ向かって直進し (向きは変えない)、掌と人の立ち位置のどちらにも
+# PRE_MOVE_STANDOFF より近づかない点 (待機点) へ向かう。
 # 接近開始位置の円 (最終台車位置と掌の距離 + 接近の上乗せ 0.3 m、多くは
 # 0.7〜0.9 m) の外側。移動量は PRE_MOVE_MAX_DISTANCE、所要時間は
 # PRE_MOVE_MAX_TIME で動ける距離まで (腕の動き出しを待たせない)。
@@ -202,6 +207,9 @@ ODOM_FRAME = 'odom'
 
 # 実機再生時の区間の時間・速度上限 (表示ツールのシミュレーション表示と共有)。
 MIN_SEGMENT_TIME = execution_timing.MIN_SEGMENT_TIME
+# 待機点へ走っている台車のゴールを差し替えたとき、送らなかった先頭の区間
+# (動く前の姿勢 -> 今の姿勢) を記録の上で残す長さ [秒] (添字をずらさないため)。
+SPLICE_BOOKKEEPING_TIME = 1e-3
 BASE_MAX_VEL = execution_timing.BASE_MAX_VEL
 VEL_LIMIT_RATIO = execution_timing.VEL_LIMIT_RATIO
 
@@ -419,7 +427,7 @@ def pre_move_target(palm_xy, human_xy, standoff,
 
 
 def pre_move_distance_for_time(max_time, step=PRE_MOVE_SEARCH_STEP):
-    """1 区間の直進 (``_start_pre_move`` と同じ送り方) で ``max_time`` 秒以内に
+    """1 区間の直進 (``_send_pre_move_after_nod`` と同じ送り方) で ``max_time`` 秒以内に
     動ける距離 [m] (``step`` 刻み)。"""
     distance = 0.0
     while True:
@@ -1837,9 +1845,18 @@ class HandshakePipelineNode(object):
         self._last_failure = None
         self._nod_done = threading.Event()
         self._nod_done.set()
-        # 台車を先に動かしたとき の dict(end=待機点 [x, y, yaw]
-        # (差し出し時の base_link 系)、sent_time、start_odom)。動かさなければ None。
+        # うなずきで首を戻し始めた (台車を待機点へ動かし始めてよい)。
+        self._nod_returning = threading.Event()
+        self._nod_returning.set()
+        # 台車を先に動かす待機点の dict(end=待機点 [x, y, yaw]
+        # (差し出し時の base_link 系)、state、plan_failed、sent_time、
+        # start_odom・ref_scan (うなずき前の odom・基準スキャン)、lead_end)。
+        # state は 'pending' (首を戻し始める前、まだ送っていない)・
+        # 'sent' (待機点へ送った)・'merged' (送る前に実行が始まり、動く前の
+        # 位置から接近の先頭へつないだ)。
+        # 動かさなければ None。self._pre_move_lock で state を排他にする。
         self._pre_move = None
+        self._pre_move_lock = threading.Lock()
         self._initial_pose_done = threading.Event()
         self._initial_pose_done.set()
         # 首の追従の指令とうなずきの開始を排他にする (_head_tracking_loop)。
@@ -2703,22 +2720,22 @@ class HandshakePipelineNode(object):
             self._busy = True
             if self.ri is not None:
                 self._nod_done.clear()
-        if self.ri is not None:
-            # 差し出した手を見てから顔へ戻す。
-            look_at = palms[offered_hand]['position']
-            threading.Thread(target=self._nod_head, args=(look_at,),
-                             daemon=True).start()
+                self._nod_returning.clear()
         self._pre_move = None
         if self.ri is not None:
             try:
-                self._start_pre_move(joint_positions, palms[offered_hand],
-                                     handshake_t0)
+                self._prepare_pre_move(joint_positions, palms[offered_hand],
+                                       handshake_t0)
             except Exception as exc:  # noqa: BLE001  (先に動かせなくても計画は続ける)
-                print('[pre-move][WARN] 台車を先に動かす処理で例外が起きました '
-                      '({!r})。{}'.format(
-                          exc, '台車は待機点へ向かっています。'
-                          if self._pre_move is not None
-                          else '台車は動かさずに計画します。'))
+                self._pre_move = None
+                print('[pre-move][WARN] 待機点を決める処理で例外が起きました '
+                      '({!r})。台車は動かさずに計画します。'.format(exc))
+        if self.ri is not None:
+            # 基準スキャンを取ってから、差し出した手を見て顔へ戻す。
+            look_at = palms[offered_hand]['position']
+            threading.Thread(target=self._capture_ref_then_nod,
+                             args=(self._pre_move, look_at),
+                             daemon=True).start()
         # 以降は骨格・計画とも今の base_link 系なので、実機の姿勢もここを原点に出す。
         real_pose_ref = self._lookup_odom_from_base(rospy.Time.from_sec(stamp))
         with self._lock:
@@ -2839,6 +2856,12 @@ class HandshakePipelineNode(object):
         planned = self.planner.plan(
             joint_positions, palms, offered_hand, attempt,
             start_base_pose=start_base_pose)
+        if pre_move is not None and not (
+                planned['result'].get('solved')
+                and planned['motion'] is not None):
+            # 解けなければ (首を戻し始める前なら) 台車は動かさない。
+            with self._pre_move_lock:
+                pre_move['plan_failed'] = True
         result, motion = planned['result'], planned['motion']
         palm = palms[offered_hand]
         if motion is not None and planned.get('transition_refine'):
@@ -2885,6 +2908,9 @@ class HandshakePipelineNode(object):
             and has_post_process
             and motion is not None and display_waypoints is not None
             and self._execution_verified(motion))
+        if pre_move is not None and not executable:
+            with self._pre_move_lock:
+                pre_move['plan_failed'] = True
         if motion is not None and not self._motion_verified(motion):
             print('[execute] 軌道の干渉検証に通らなかったため (verified={}, '
                   'lead_in_verified={})、--auto-execute でも実機を動かし'
@@ -3535,6 +3561,10 @@ class HandshakePipelineNode(object):
                 [HEAD_NOD_MOVE_TIME, HEAD_NOD_MOVE_TIME])
             self.ri.angle_vector_sequence(
                 [down_av, up_av], time_list, controller_type='head_controller')
+            returning = threading.Timer(float(time_list[0]),
+                                        self._nod_returning.set)
+            returning.daemon = True
+            returning.start()
             self.ri.wait_interpolation(controller_type='head_controller')
             log_debug('[nod] 首を {} {:.0f} 度まで下げて {:.0f} 度に戻しました '
                   '({:.2f} 秒)。'.format(
@@ -3544,7 +3574,22 @@ class HandshakePipelineNode(object):
         except Exception as exc:  # noqa: BLE001  (うなずけなくても握手の実行は止めない)
             print('[nod] うなずきに失敗しました ({})。'.format(exc))
         finally:
+            self._nod_returning.set()
             self._nod_done.set()
+
+    def _capture_ref_then_nod(self, pre_move, look_at):
+        """台車を待機点へ動かすなら、うなずき始める前 (台車が止まっている間) に
+        基準スキャンとそのときの odom を ``pre_move`` に取ってからうなずく。
+        区間先頭 (補正の基準) はこの動く前の位置になる。"""
+        if pre_move is not None:
+            try:
+                pre_move['start_odom'] = self.ri.odom
+                if self.args.base_correction == 'scan':
+                    pre_move['ref_scan'] = self._capture_scan_msg()
+            except Exception as exc:  # noqa: BLE001  (取れなければ odom だけで補正)
+                print('[pre-move][WARN] 動く前の基準スキャンを取れませんでした '
+                      '({!r})。'.format(exc))
+        self._nod_head(look_at)
 
     def _neck_toward(self, current_av, target):
         """実機の関節角 ``current_av`` の首 (ヨー・ピッチ) だけを、カメラ光軸が
@@ -3572,11 +3617,11 @@ class HandshakePipelineNode(object):
             spik.NECK_ROLL_FIXED_ANGLE
         return av
 
-    def _start_pre_move(self, joint_positions, palm, handshake_t0):
-        """差し出し手が決まったらすぐ、腕・首はそのままで台車だけ待機点
-        (``pre_move_target``) へ動かし始める (完了は待たない)。計画は待機点から
-        解き、実行は台車が止まってから始める。動かす量が
-        ``PRE_MOVE_MIN_DISTANCE`` 未満なら動かさない (``self._pre_move`` は None)。"""
+    def _prepare_pre_move(self, joint_positions, palm, handshake_t0):
+        """差し出し手が決まったら待機点 (``pre_move_target``) を決め、計画は
+        待機点から解く。台車はうなずきで首を戻し始めてから動かす
+        (``_send_pre_move_after_nod``)。動かす量が ``PRE_MOVE_MIN_DISTANCE``
+        未満なら動かさない (``self._pre_move`` は None)。"""
         end = pre_move_goal(palm['position'],
                             spik.human_standing_xy(joint_positions))
         distance = float(np.linalg.norm(end[:2]))
@@ -3584,27 +3629,57 @@ class HandshakePipelineNode(object):
             print('[pre-move] 既に人の手に近い (待機点まで {:.2f} m) ため、'
                   '台車は先に動かしません。'.format(distance))
             return
-        points = [[float(end[0]), float(end[1]), 0.0]]
-        time_list = self._limited_time_list(None, points, [MIN_SEGMENT_TIME])
-        start_odom = self.ri.odom
-        self._send_base_trajectory(points, time_list, wait=False)
-        self._pre_move = dict(end=end, start_odom=start_odom,
-                              sent_time=time.time(),
-                              duration=float(sum(time_list)))
-        print('[pre-move] 差し出しから {:.2f} 秒で台車を待機点へ動かし始め'
-              'ました ({:.2f} m、{:.1f} 秒)。'.format(
-                  time.time() - handshake_t0, distance,
-                  self._pre_move['duration']))
+        pre_move = dict(end=end, state='pending', plan_failed=False,
+                        start_odom=None, ref_scan=None, sent_time=None,
+                        duration=None)
+        self._pre_move = pre_move
+        threading.Thread(target=self._send_pre_move_after_nod,
+                         args=(pre_move, handshake_t0), daemon=True).start()
+
+    def _send_pre_move_after_nod(self, pre_move, handshake_t0):
+        """うなずきで首を戻し始めたら、腕・首はそのままで台車だけ待機点へ
+        動かし始める (計画の終わりは待たない)。実行は走っている台車の今の
+        位置・速度から接近へつないで差し替える (``_execute_waypoint_segment``・
+        ``_send_no_stop_approach`` の ``splice``)。計画が既に失敗していれば
+        動かさない。"""
+        self._nod_returning.wait(timeout=10.0)
+        with self._pre_move_lock:
+            if (pre_move is not self._pre_move
+                    or pre_move['state'] != 'pending'
+                    or pre_move['plan_failed']):
+                return
+            end = pre_move['end']
+            points = [[float(end[0]), float(end[1]), 0.0]]
+            time_list = self._limited_time_list(
+                None, points, [MIN_SEGMENT_TIME])
+            if pre_move['start_odom'] is None:
+                pre_move['start_odom'] = self.ri.odom
+            self._send_base_trajectory(points, time_list, wait=False)
+            pre_move.update(state='sent', sent_time=time.time(),
+                            duration=float(sum(time_list)))
+        distance = float(np.linalg.norm(end[:2]))
+        print('[pre-move] 首を戻し始めたので、差し出しから {:.2f} 秒で台車を'
+              '待機点へ動かし始めました ({:.2f} m、{:.1f} 秒)。'.format(
+                  time.time() - handshake_t0, distance, pre_move['duration']))
         log_debug_event(dict(
             event='pre_move', end=[float(v) for v in end], distance=distance,
-            duration=self._pre_move['duration'],
+            duration=pre_move['duration'],
             since_offer=time.time() - handshake_t0))
 
-    def _wait_pre_move(self):
-        """先に動かした台車 (``self._pre_move``) が止まるまで待ち、待機点との
-        ずれ (odom) をログに出す。"""
+    def _pre_move_sent(self):
+        """台車を待機点へ送ったか (骨格・掌の系を待機点の系へ移すかどうか)。"""
         pre_move = self._pre_move
-        if pre_move is None or pre_move.get('done'):
+        if pre_move is None:
+            return False
+        with self._pre_move_lock:
+            return pre_move['state'] == 'sent'
+
+    def _wait_pre_move(self):
+        """待機点へ送った台車 (``self._pre_move``) が止まるまで待ち、待機点との
+        ずれ (odom) をログに出す。送っていなければ何もしない。"""
+        pre_move = self._pre_move
+        if (pre_move is None or not self._pre_move_sent()
+                or pre_move.get('done')):
             return
         t0 = time.time()
         self.ri.move_base_trajectory_action.wait_for_result()
@@ -3623,8 +3698,8 @@ class HandshakePipelineNode(object):
 
     def _palm_in_pre_move_frame(self, palm):
         """掌 ``palm`` (差し出し時の base_link 系) を待機点の台車の系へ移した
-        コピー (先に動かしていなければそのまま)。"""
-        if self._pre_move is None or palm is None:
+        コピー (待機点へ送っていなければそのまま)。"""
+        if not self._pre_move_sent() or palm is None:
             return palm
         moved = dict(palm)
         position = np.asarray(palm['position'], dtype=np.float64).copy()
@@ -3642,9 +3717,10 @@ class HandshakePipelineNode(object):
 
     def _to_pre_move_frame(self, xy):
         """差し出し時の base_link 系の水平位置 ``xy`` (n, 2) を、待機点の台車の系へ
-        移す (先に動かしていなければそのまま)。"""
+        移す (待機点へ送っていなければそのまま。接近の先頭へつないだときの
+        基準スキャンは動く前の位置で取る)。"""
         xy = np.asarray(xy, dtype=np.float64)
-        if self._pre_move is None:
+        if not self._pre_move_sent():
             return xy
         end = self._pre_move['end']
         c, s = math.cos(end[2]), math.sin(end[2])
@@ -4130,8 +4206,34 @@ class HandshakePipelineNode(object):
         if not self._nod_done.wait(timeout=10.0):
             print('[execute] うなずきが 10 秒以内に終わらなかったため、'
                   '待たずに実行します。')
-        # 先に動かした台車が待機点 (計画の始点) に着いてから実行する。
-        self._wait_pre_move()
+        # 動く前の位置 -> 待機点の直進 (腕はそのまま) を接近の先頭に足す
+        # (区間先頭 = 動く前の位置 = 基準スキャンの位置)。待機点へ既に送って
+        # いれば、走っている台車の今の位置・速度から残りへつないで差し替え、
+        # 待機点で減速しない (splice)。
+        pre_move = self._pre_move
+        splice = None
+        if pre_move is not None:
+            with self._pre_move_lock:
+                if pre_move['state'] == 'pending':
+                    pre_move['state'] = 'merged'
+                elif pre_move['state'] == 'sent':
+                    splice = pre_move
+            display_waypoints = execution_timing.prepend_base_move(
+                display_waypoints, pre_move['end'])
+            n_prepend += 1
+            # 添字 n_prepend が接近の始点 (lead-in の終わり)。差し替えでは
+            # ここより先の点は飛ばさない。
+            pre_move['lead_end'] = n_prepend
+            print('[pre-move] 待機点 ({:.2f} m 先) で止まらずに接近へ'
+                  'つなぎます ({})。'.format(
+                      float(np.linalg.norm(pre_move['end'][:2])),
+                      '走っている台車の軌道を差し替え' if splice is not None
+                      else 'まだ動いていない'))
+            log_debug_event(dict(
+                event='pre_move_merged', spliced=splice is not None,
+                end=[float(v) for v in pre_move['end']],
+                since_sent=(time.time() - pre_move['sent_time']
+                            if splice is not None else None)))
 
         joint_names = motion['joint_names']
         # [:reach_boundary] が接近区間 (末尾が hover 目標)、[reach_boundary-1:]
@@ -4155,13 +4257,16 @@ class HandshakePipelineNode(object):
         exclude_centers = None
         scan_odometry_stop = None
         if self.args.base_correction == 'scan':
-            ref_scan, ref_msg = self._capture_scan_msg()
+            if pre_move is not None:
+                # うなずき始める前 (動く前の位置) に取ったもの。骨格と同じ系。
+                ref_scan, ref_msg = pre_move.get('ref_scan') or (None, None)
+            else:
+                ref_scan, ref_msg = self._capture_scan_msg()
             with self._lock:
                 frozen = self._frozen_joint_positions
             if frozen:
-                # 基準スキャンは待機点で取るので、その系へ移す。
-                exclude_centers = self._to_pre_move_frame(np.array(
-                    [p[:2] for p in frozen.values()], dtype=np.float64))
+                exclude_centers = np.array(
+                    [p[:2] for p in frozen.values()], dtype=np.float64)
             if ref_scan is not None and self.args.scan_odometry:
                 scan_odometry_stop = self._start_scan_odometry(
                     ref_scan, ref_msg, exclude_centers)
@@ -4169,14 +4274,17 @@ class HandshakePipelineNode(object):
             self._execute_with_scan(
                 result, motion, display_waypoints, joint_names,
                 reach_boundary, n_prepend, transition_waypoints_,
-                ref_scan, exclude_centers)
+                ref_scan, exclude_centers, splice=splice)
         finally:
             self._stop_scan_odometry(scan_odometry_stop)
 
     def _execute_with_scan(self, result, motion, display_waypoints,
                            joint_names, reach_boundary, n_prepend,
-                           transition_waypoints_, ref_scan, exclude_centers):
-        """``_execute`` の基準スキャンを取った後の実行 (接近 -> 押し込み -> 横並び)。"""
+                           transition_waypoints_, ref_scan, exclude_centers,
+                           splice=None):
+        """``_execute`` の基準スキャンを取った後の実行 (接近 -> 押し込み -> 横並び)。
+        ``splice`` は待機点へ走っている台車の ``self._pre_move`` (接近を今の
+        位置・速度からつないで送る)。"""
 
         # 接近の直線は首で顔を追い、螺旋に入ったら差し出し手の掌を追う (全身ゴール
         # 送信後に開始。螺旋の開始は time_list の累積時間)。押し込み直前の補正まで
@@ -4256,12 +4364,13 @@ class HandshakePipelineNode(object):
         if no_stop is not None:
             # 止まらない押し込みの接近は首も計画の角度で送る。
             start_odom_coords, final_traj_point = self._send_no_stop_approach(
-                no_stop, joint_names, on_sent=on_approach_sent)
+                no_stop, joint_names, on_sent=on_approach_sent,
+                splice=splice)
         else:
             start_odom_coords, final_traj_point = \
                 self._execute_waypoint_segment(
                     display_waypoints[:reach_boundary], joint_names,
-                    on_sent=on_approach_sent,
+                    on_sent=on_approach_sent, splice=splice,
                     # 送信直後から首は顔 (螺旋以降は掌) を追う。
                     # 接近のゴールの首は今の角度のまま (首を計画の角度へ戻す
                     # のを待たずに動き出す)。
@@ -5326,7 +5435,9 @@ class HandshakePipelineNode(object):
         (先頭が送信時の位置)。"""
         points = np.vstack([np.zeros(3), plan['points']])
         times = np.asarray(plan['times'], dtype=np.float64)
-        velocities = self._point_velocities(np.diff(points, axis=0), times)
+        velocities = plan.get('velocities')
+        if velocities is None:
+            velocities = self._point_velocities(np.diff(points, axis=0), times)
         x0, y0, yaw0 = self._odom_pose(plan['start_odom'])
         rot = self._planar_matrix(0.0, 0.0, yaw0)[:2, :2]
         return (np.concatenate([[0.0], np.cumsum(times)]),
@@ -5970,14 +6081,19 @@ class HandshakePipelineNode(object):
 
     def _execute_waypoint_segment(self, waypoints, joint_names,
                                   min_segment_time=MIN_SEGMENT_TIME,
-                                  on_sent=None, neck_from_current=False):
+                                  on_sent=None, neck_from_current=False,
+                                  splice=None):
         """``waypoints`` (先頭が現在の姿勢) を 1 つの滑らかな軌道として台車・腕を
         並行に実行する。``on_sent`` はゴール送信直後 (完了待ちの前) に呼ぶ。
         ``neck_from_current`` なら首の角度は全点で今の実機の角度にする (首を
         追従に任せるとき、首を計画の角度へ動かす時間で区間を延ばさない)。
+        ``splice`` (待機点へ走っている ``self._pre_move``) があれば、先頭は
+        動く前の姿勢で、台車は今の位置・速度から残りへつないで送る
+        (``_splice_send``)。
 
         Returns: ``(start_odom_coords, final_traj_point)`` (送信時の odom と
-        最終 waypoint の先頭基準 ``[dx, dy, dyaw]``、台車移動なしなら None)。
+        最終 waypoint の先頭基準 ``[dx, dy, dyaw]``、台車移動なしなら None。
+        ``splice`` なら動く前の odom とそこからの量)。
         """
         arm_angle_vectors = []
         for wp in waypoints:
@@ -5999,6 +6115,19 @@ class HandshakePipelineNode(object):
         # 開始時の odom から独立に適用する)。
         base_trajectory_points = execution_timing.base_trajectory_points(
             waypoints)
+
+        if splice is not None:
+            start_odom_coords, time_list = self._splice_send(
+                splice, waypoints, arm_angle_vectors, min_segment_time)
+            if on_sent is not None:
+                on_sent()
+            self._wait_body_interpolation()
+            self._log_controller_states()
+            self.ri.move_base_trajectory_action.wait_for_result()
+            log_debug('[debug][segment] 差し替えた接近の台車のゴール終了 ({})'
+                      .format(GOAL_STATUS_NAMES.get(
+                          self.ri.move_base_trajectory_action.get_state())))
+            return start_odom_coords, base_trajectory_points[-1]
 
         # それぞれ 1 ゴールで送る (非ブロッキング)。台車と腕に同じ time_list を渡して揃える。
         time_list = self._limited_time_list(
@@ -6088,12 +6217,111 @@ class HandshakePipelineNode(object):
         log_debug('[debug][segment] 腕・脚コントローラのゴール終了状態: '
                   + ', '.join(parts))
 
+    def _splice_send(self, splice, base_wps, arm_avs, min_segment_time,
+                     arm_tail_avs=(), arm_tail_times=()):
+        """待機点へ走っている台車 (``splice`` = ``self._pre_move``) の今の位置・
+        速度から、``base_wps`` (先頭は動く前の姿勢、次が待機点) の残りへ
+        つないで台車と腕に送る。``arm_avs`` は ``base_wps`` に対応する腕の
+        関節角列、``arm_tail_avs``・``arm_tail_times`` はその後に腕だけ続ける点。
+
+        先頭 (動く前の姿勢) を今の姿勢に替え、今の姿勢から待機点の先の点
+        (``execution_timing.splice_target_index``、待機点と lead-in の始めは
+        通らない) -> 残りを、今の速度を始点の速度として時間を決めて送る。
+        ``self._segment_base_plan`` は動く前の odom を区間先頭として記録する
+        (基準スキャンと同じ位置。補正・再照準はこれを使う)。
+
+        Returns: ``(動く前の odom, 区間の時間のリスト)``。区間の時間は
+        ``base_wps`` と同じ数 (先頭の区間と通らない点への区間は
+        ``SPLICE_BOOKKEEPING_TIME``。記録用で添字を変えないため)。
+        """
+        origin = self._odom_pose(splice['start_odom'])
+        offset, start_velocity = self._splice_state(origin)
+        send_wps = execution_timing.spliced_start(base_wps, offset)
+        target = execution_timing.splice_target_index(
+            send_wps, splice.get('lead_end', len(send_wps) - 1))
+        target = max(target, 1)
+        base_points = execution_timing.base_trajectory_points(
+            send_wps)[target:]
+        avs = list(arm_avs[target:])
+        times = self._limited_time_list(
+            avs, base_points, [min_segment_time] * len(avs),
+            base_start_velocity=start_velocity)
+        full_times = [SPLICE_BOOKKEEPING_TIME] * target + list(times)
+        self._segment_time_list = list(full_times)
+        self.ri.angle_vector_sequence(
+            avs + list(arm_tail_avs), list(times) + list(arm_tail_times))
+        # 時間を決めている間も台車は走っているので、今の位置・速度は送る直前に
+        # 測り直す。残りの点は動く前の位置を基準にした odom の絶対位置で送り、
+        # 送るゴールと記録 (再照準・補正の基準) を同じ点にする。
+        offset, start_velocity = self._splice_state(origin)
+        rest = np.asarray(execution_timing.base_trajectory_points(
+            base_wps)[target:], dtype=np.float64)
+        plan = self._spliced_plan(splice, offset, start_velocity, rest,
+                                  times)
+        self._segment_base_plan = plan
+        cum_times, positions, velocities, yaws, yaw_rates = \
+            self._planned_base_in_odom(plan)
+        start = 1  # 先頭 (動く前の位置) は送らない。時刻 0 は今の位置。
+        t0 = cum_times[start]
+        self._send_tail_goal([
+            (float(cum_times[i] - t0), positions[i], velocities[i], yaws[i],
+             yaw_rates[i]) for i in range(start, len(cum_times))])
+        plan['sent_time'] = time.time() - plan['times'][0]
+        log_debug('[debug][segment] 待機点へ走っている台車を差し替えました '
+                  '(動く前から {:+.3f} m, {:+.3f} m、速さ {:.2f} m/s、{} 点目へ '
+                  '{:.2f}s でつなぐ、台車 {} 点 {:.2f}s)'.format(
+                      offset[0], offset[1],
+                      float(np.linalg.norm(start_velocity[:2])), target,
+                      times[0], len(times), sum(times)))
+        self._log_debug(dict(
+            event='pre_move_splice', offset=[float(v) for v in offset],
+            start_velocity=[float(v) for v in start_velocity],
+            since_sent=float(plan['times'][0]), target=int(target),
+            first_segment=float(times[0]), total=float(sum(times))))
+        return splice['start_odom'], full_times
+
+    def _splice_state(self, origin):
+        """今の台車の、動く前の姿勢 ``origin`` (odom の ``[x, y, yaw]``) から
+        見た姿勢 ``[dx, dy, dyaw]`` と、台車の系の速度 ``[vx, vy, vyaw]``。"""
+        offset = scan_matching.relative(origin, self._odom_pose(self.ri.odom))
+        twist = self.ri.odom_msg.twist.twist
+        return offset, np.array(
+            [twist.linear.x, twist.linear.y, twist.angular.z])
+
+    def _spliced_plan(self, splice, offset, start_velocity, rest_points,
+                      times):
+        """``_splice_send`` で送るゴールを、動く前の姿勢を区間先頭とする
+        ``_segment_base_plan`` の形にする。点は ``[今の位置 offset] +
+        rest_points`` (どちらも動く前の系)、先頭の区間 (動く前 -> 今の位置)
+        は待機点へ送ってからの時間。点の速度は今の速度を始点にして付ける
+        (``_planned_base_in_odom`` で送るゴールを作るので、送るものと同じ)。"""
+        rest_points = np.asarray(rest_points, dtype=np.float64)
+        points = np.vstack([np.asarray(offset, dtype=np.float64)[None],
+                            rest_points])
+        deltas = np.diff(points, axis=0)
+        # 区間の差は今の位置の系で付ける (時間を決めたときと同じ軸)。
+        rot = self._planar_matrix(0.0, 0.0, offset[2])[:2, :2]
+        deltas_now = deltas.copy()
+        deltas_now[:, :2] = deltas[:, :2] @ rot
+        velocities = self._point_velocities(
+            deltas_now, np.asarray(times, dtype=np.float64))
+        velocities[0] = start_velocity
+        velocities[:, :2] = velocities[:, :2] @ rot.T
+        elapsed = max(time.time() - splice['sent_time'],
+                      SPLICE_BOOKKEEPING_TIME)
+        return dict(points=points, times=[float(elapsed)] + [
+                        float(t) for t in times],
+                    velocities=np.vstack([np.zeros(3), velocities]),
+                    start_odom=splice['start_odom'], sent_time=None)
+
     def _send_base_trajectory(self, base_trajectory_points, time_list,
-                              wait):
+                              wait, start_velocity=None):
         """区間先頭基準の累積 ``[dx, dy, dyaw]`` 列を ``time_list`` で台車に送る。
 
         各点の速度は ``_point_velocities`` で付け直す (skrobot のままだと静止から
-        区間の平均速度へ跳ぶため)。
+        区間の平均速度へ跳ぶため)。``start_velocity`` (区間先頭の系の
+        ``[vx, vy, vyaw]``) があれば始点の速度をそれにする (走っている台車の
+        ゴールを差し替えるとき)。
         """
         goal = self.ri.move_trajectory_sequence(
             base_trajectory_points, time_list, stop=True, send_action=False)
@@ -6103,6 +6331,8 @@ class HandshakePipelineNode(object):
             np.asarray(base_trajectory_points, dtype=np.float64)]), axis=0)
         point_vel = self._point_velocities(
             deltas, np.asarray(time_list, dtype=np.float64))
+        if start_velocity is not None:
+            point_vel[0] = start_velocity
         yaw0 = points[0].positions[2]
         cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
         for point, (vx, vy, vyaw) in zip(points, point_vel):
@@ -6114,7 +6344,7 @@ class HandshakePipelineNode(object):
             self.ri.move_base_trajectory_action.wait_for_result()
 
     def _limited_time_list(self, arm_angle_vectors, base_trajectory_points,
-                           time_list, start_av=None):
+                           time_list, start_av=None, base_start_velocity=None):
         """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど
         上限 (× ``VEL_LIMIT_RATIO``、加速度は ``ACCEL_TIME``) になるよう決めて返す。
         ``time_list`` は区間ごとの下限。
@@ -6140,9 +6370,11 @@ class HandshakePipelineNode(object):
                                    for i in range(len(arm_angle_vectors))])
         return execution_timing.limited_time_list(
             arm_deltas, arm_max_vel, base_trajectory_points, time_list,
-            log=log_debug)
+            log=log_debug, base_start_velocity=base_start_velocity)
 
-    _point_velocities = staticmethod(execution_timing.point_velocities)
+    # 台車の点の速度 (送るゴール・送ったゴールの再現の両方。止まっている区間の
+    # 両端は 0)。
+    _point_velocities = staticmethod(execution_timing.base_point_velocities)
 
     def _wait_odom_settle(self, timeout=ODOM_SETTLE_TIMEOUT):
         """odom が止まるまで最大 ``timeout`` 秒待つ。
@@ -6426,7 +6658,8 @@ class HandshakePipelineNode(object):
         return dict(hover_wp=hover_wp, pre_hover=approach[-1],
                     press_wps=press_wps, base_wps=base_wps, arm_wps=arm_wps)
 
-    def _send_no_stop_approach(self, no_stop, joint_names, on_sent=None):
+    def _send_no_stop_approach(self, no_stop, joint_names, on_sent=None,
+                               splice=None):
         """腕に [接近 (末尾が手前の hover), hover, 計画の押し込み] を 1 本で、
         台車に接近を送り、台車のゴールが終わるまで待つ (腕は待たない)。
 
@@ -6440,8 +6673,6 @@ class HandshakePipelineNode(object):
         arm_avs = [self._waypoint_angle_vector(wp, joint_names)
                    for wp in arm_wps]
         base_points = execution_timing.base_trajectory_points(base_wps)
-        base_times = self._limited_time_list(
-            arm_avs[:n_base], base_points, [MIN_SEGMENT_TIME] * n_base)
         dwell, = self._limited_time_list(
             [arm_avs[n_base]], None, [nsp.HOVER_DWELL],
             start_av=arm_avs[n_base - 1])
@@ -6451,19 +6682,30 @@ class HandshakePipelineNode(object):
             arm_avs[n_base + 1:], press_base[1:],
             [MIN_SEGMENT_TIME] * (len(arm_avs) - n_base - 1),
             start_av=arm_avs[n_base])
-        arm_times = list(base_times) + [dwell] + list(press_times)
         start_av = self.ri.angle_vector().copy()
-        self._segment_time_list = list(base_times)
         send_ros_time = rospy.Time.now()
         send_time = time.time()
-        self.ri.angle_vector_sequence(arm_avs, arm_times)
-        start_odom_coords = self.ri.odom
-        plan = dict(points=np.asarray(base_points, dtype=np.float64),
-                    times=[float(t) for t in base_times],
-                    start_odom=start_odom_coords, sent_time=None)
-        self._segment_base_plan = plan
-        self._send_base_trajectory(base_points, base_times, wait=False)
-        plan['sent_time'] = time.time()
+        if splice is not None:
+            # 送らない区間は記録の上で長さ SPLICE_BOOKKEEPING_TIME の区間と
+            # して残る (添字を変えない)。
+            start_odom_coords, base_times = self._splice_send(
+                splice, base_wps, arm_avs[:n_base], MIN_SEGMENT_TIME,
+                arm_tail_avs=arm_avs[n_base:],
+                arm_tail_times=[dwell] + list(press_times))
+            arm_times = list(base_times) + [dwell] + list(press_times)
+        else:
+            base_times = self._limited_time_list(
+                arm_avs[:n_base], base_points, [MIN_SEGMENT_TIME] * n_base)
+            arm_times = list(base_times) + [dwell] + list(press_times)
+            self._segment_time_list = list(base_times)
+            self.ri.angle_vector_sequence(arm_avs, arm_times)
+            start_odom_coords = self.ri.odom
+            plan = dict(points=np.asarray(base_points, dtype=np.float64),
+                        times=[float(t) for t in base_times],
+                        start_odom=start_odom_coords, sent_time=None)
+            self._segment_base_plan = plan
+            self._send_base_trajectory(base_points, base_times, wait=False)
+            plan['sent_time'] = time.time()
         t_rel = float(sum(base_times)) + dwell
         no_stop.update(
             arm_avs=arm_avs, arm_times=arm_times, start_av=start_av,
