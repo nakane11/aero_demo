@@ -44,6 +44,7 @@ import tf2_ros
 import trajectory_msgs.msg
 from sensor_msgs.msg import CameraInfo, Image, JointState, LaserScan
 from std_msgs.msg import String
+from speech_recognition_msgs.msg import SpeechRecognitionCandidates
 from std_srvs.srv import SetBool, Trigger, TriggerResponse
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -225,6 +226,15 @@ SPEECH_FALLBACK_PER_CHAR = 0.2
 # 環境変数 VOICEVOX_TEXTTOSPEECH_URL/PORT と同じ (エンジンはこの PC で動かす)。
 VOICEVOX_ENGINE_URL = 'http://192.168.97.180:50021'
 VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
+# 声で ARM する (ARM ボタンと同じ)。ros_speech_recognition の認識結果で、IDLE の
+# ときに「(エアロ、) 手を繋いで」を聞いたら ARMED にして返事をする。空白・句読点を
+# 除いてから「手を繋」か「繋いで」を含むかで判定する (表記の揺れを許す)。名前は
+# 問わない (Google の認識では「エアロ」が「エラー」になるか落ち、「手を」も
+# 「を」「と」になることがある: 11/22 実機のマイク)。
+VOICE_ARM_TOPIC = '/speech_to_text'
+VOICE_ARM_REQUEST = re.compile('手を?(繋|つな)|(繋|つな)いで')
+VOICE_ARM_IGNORE = re.compile(r'[\s、。,.!！?？]')
+VOICE_ARM_REPLY = 'いいよ、手を出してね'
 # 横並びの後、手をつないだまま台車を前へ進める距離と、それにかける最短時間
 # (人が付いて歩ける速さにするため)、進む前の発話。
 WALK_FORWARD_DISTANCE = 1.5  # [m]
@@ -1996,6 +2006,9 @@ class HandshakePipelineNode(object):
             '~arm', Trigger, self._on_arm_service)
         self.reset_service = rospy.Service(
             '~reset', Trigger, self._on_reset_service)
+        self.voice_sub = rospy.Subscriber(
+            VOICE_ARM_TOPIC, SpeechRecognitionCandidates, self._on_voice,
+            queue_size=1)
 
         # camera_info は同期に含めず最新 1 つだけ持つ (画像が遅れると組ができない)。
         self._latest_camera_info = None
@@ -2482,6 +2495,20 @@ class HandshakePipelineNode(object):
                                    message='IK・軌道計画の計算中です')
         self._arm('ARM サービス')
         return TriggerResponse(success=True, message='ARMED')
+
+    def _on_voice(self, msg):
+        """IDLE で「(エアロ、) 手を繋いで」を聞いたら ARMED にして返事をする。"""
+        for transcript in msg.transcript:
+            if VOICE_ARM_REQUEST.search(VOICE_ARM_IGNORE.sub('', transcript)):
+                break
+        else:
+            return
+        if self.state != 'idle':
+            print('[voice] 「{}」を聞きましたが {} なので ARM しません。'.format(
+                transcript, self.state))
+            return
+        self._arm('声「{}」'.format(transcript))
+        self._say(VOICE_ARM_REPLY)
 
     def _on_reset_service(self, _req):
         if self.state in ('solving',):
