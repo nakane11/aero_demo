@@ -766,7 +766,7 @@ class StageBuilder(object):
                 robot_colors[link.name] = PAIR_COLOR
                 human_colors[other] = PAIR_COLOR
         # 差し出した前腕 (細らせた円柱) × ロボットの手先側の 4 リンク。
-        # 掌・指は組に入れない (hover が掌から約 2 cm のため)。
+        # 掌・指は組に入れない (hover が掌から約 3 cm のため)。
         for name in spik.OFFERED_HAND_PENALTY_LINKS:
             robot_colors[name.format(self.p.robot_arm)] = OFFERED_COLOR
         human_colors[obstacle_index(
@@ -876,7 +876,7 @@ class StageBuilder(object):
              '干渉はコスト (効き始め 6 cm、重み 10) で、対象は collision_pairs.json '
              'の 8 組 (台車・胴体・肩・上腕 × 人の脛・体幹) と、'
              'ロボットの手・親指・手首・前腕 × 差し出した前腕の 4 組だけ。前腕は '
-             '{:.0f} cm で効くよう細らせ、掌・指は組に入れない (hover が掌から約 2 cm '
+             '{:.0f} cm で効くよう細らせ、掌・指は組に入れない (hover が掌から約 3 cm '
              'のため)。コストなので干渉が残っても収束扱いになり、必ず事後検証を'
              '挟む。'.format(100 * spik.OFFERED_HAND_CLEARANCE)])
         wp = hover_wp(p)
@@ -975,7 +975,7 @@ class StageBuilder(object):
              'の安い順に検証し、通った最初の候補で第 2 段 (押し込み) を解く。',
              '人体との距離: 指ありモデル (表示しているロボット) の表面から全身 {} 本'
              'の円柱まで {:.0f} cm 以上。ただし差し出した手まわり (掌・指・同じ側の'
-             '前腕) は hover が掌から約 2 cm なので {:.0f} cm。この段階で初めて'
+             '前腕) は hover が掌から約 3 cm なので {:.0f} cm。この段階で初めて'
              '全身を見る。この人の余裕が最小の部位: {}。'.format(
                  len(spik.human_obstacle_names()), 100 * clearance,
                  100 * hand_clearance, closest_text),
@@ -998,7 +998,7 @@ class StageBuilder(object):
                 '円柱を 6 cm 膨らませた形。ロボットの表面がこの中に入ると棄却',
                 colors=[HUMAN_SHELL_COLOR])
         s.layer('hand_shell', '差し出した手まわり + 2 cm',
-                '掌・指・同じ側の前腕だけは 2 cm (hover が掌から約 2 cm のため)',
+                '掌・指・同じ側の前腕だけは 2 cm (hover が掌から約 3 cm のため)',
                 colors=[HAND_SHELL_COLOR])
         colors = {closest: CLOSEST_COLOR} if closest is not None else {}
         shell = hand_shell(p.hand, clearance, hand_clearance)
@@ -1189,7 +1189,7 @@ class StageBuilder(object):
                  kinds.get(motion['kind'], motion['kind']),
                  math.degrees(motion.get('approach_angle') or 0.0)),
              '検証: 全 waypoint で人体から {:.0f} cm (差し出した手・前腕だけ '
-             '{:.0f} cm。hover が掌から約 2 cm のため)・自己干渉 0 mm。lead-in は'
+             '{:.0f} cm。hover が掌から約 3 cm のため)・自己干渉 0 mm。lead-in は'
              '人から 1.0 m 以内の waypoint だけ検証。'
              'この人の余裕が最小の点: waypoint {} で {} まで {:.1f} cm '
              '(余裕 {:+.1f} cm)。'.format(

@@ -263,7 +263,7 @@ class Trial(object):
                 residual[0], residual[1], math.degrees(residual[2]),
                 '押し込みに織り込む' if fold_ok and np.any(base_move)
                 else '許容内 (動かさない)' if fold_ok
-                else '**織り込めない (実機は hover で止めて従来どおり)**'),
+                else '**織り込めない (実機は hover で止まって台車を直す)**'),
             '- 掌のずれで台車を寄せる: {}'.format(
                 '-' if shift is None else '{} ({:.0f}mm)'.format(
                     shift['reason'], shift['distance'] * 1e3)),

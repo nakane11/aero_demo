@@ -373,8 +373,8 @@ def main():
     parser.add_argument('--variants', default=','.join(VARIANTS),
                         help='比べる手の選び方 (カンマ区切り、既定は全部)')
     parser.add_argument('--blend-major', action='store_true',
-                        help='refine の解き直しを 11/17 以前の順 (向きの寄せ'
-                             'ごとに脚の段階) にする')
+                        help='refine の解き直しを、向きの寄せごとに脚の段階を'
+                             '回す順 (REFINE_STAGE_MAJOR=False) にする')
     parser.add_argument('--out', default=None, help='結果の JSON')
     parser.add_argument('--verbose', action='store_true',
                         help='フレームごとの手の候補を出す')

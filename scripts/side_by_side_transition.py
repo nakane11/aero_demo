@@ -3279,8 +3279,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
             if best[1] >= SBS_PARTIAL_MIN_FRACTION:
                 # SBS_PARTIAL_MIN_FRACTION 以上進めて捨てた経路だけログに出す。
                 print('[transition] 横並び移動の経路が移動先の {:.0f}% までしか'
-                      '解けなかったため、この探索では通らなかった扱いにします '
-                      '(前の形なら途中までで実行していた)。'
+                      '解けなかったため、この探索では通らなかった扱いにします。'
                       .format(100.0 * best[1]))
         result.update(reason=reason, compute_time=time.time() - t0)
         return result
