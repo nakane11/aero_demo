@@ -84,8 +84,7 @@ python3 tools/grid_search_handshake_motion.py --num-samples 100 \
 `scripts/collision_pairs.json` (本番の `solve_palm_ik.py
 --collision-pairs` が読む既定ファイルそのもの) を、干渉回避無しで解いた
 IK 結果から実際に干渉した頻度でランキングし直して作り直すツール。内部の
-`analyze_handshake_dir` (旧 `analyze_collision_pairs.py` から移植) が
-集計処理を担う。
+`analyze_handshake_dir` が集計処理を担う。
 
 ```bash
 python3 tools/build_collision_pairs.py --num-pairs 8
@@ -112,7 +111,7 @@ python3 tools/handshake_reachability_map.py --mode orientation \
 
 `handshake_reachability_map.py` の結果 (JSON Lines) から、IK 失敗時の手の
 出し方の助言 (`aero_demo.hand_offer_advice`、`run_camera_pipeline_test.py`
-の `--hand-offer-table`) が使う `config/hand_offer_reachability.json` を作る。
+が使う) が読む `config/hand_offer_reachability.json` を作る。
 
 ```bash
 python3 tools/build_hand_offer_reachability.py \
@@ -225,7 +224,7 @@ hover で止まっている区間の画像で実機ノードと同じく Hands �
 (`REFINE_MAX_*`) は外して、必要だった補正量と IK が解けるかを出し、実機
 ノードの上限で採用されるかに `*` を付ける。`--warmup approach` (既定) は
 実機ノードと同じく接近の開始から Hands を走らせて追跡を温め、`--warmup 0`
-は補正のときだけ Hands を呼ぶ (2026-10-16 までの実機ノード)。入力は試行の
+は補正のときだけ Hands を呼ぶ。入力は試行の
 `person_NN.log` (同じディレクトリに `palms/`・`handshakes/`・`motions/`) と
 bag。roscore は不要。
 
@@ -366,7 +365,7 @@ python3 scripts/ros/run_camera_pipeline_test.py \
     --auto-arm --no-wait-for-client
 ```
 
-**注意 (未修正の既知の問題):** 現在の実装は `HandshakePipelineNode` の構築 (TF 待ちを含む)
+**注意 (既知の問題):** `HandshakePipelineNode` の構築 (TF 待ちを含む)
 が終わってから `rosbag play --clock` を起動するため、`/clock` が来ないまま起動処理で
 止まることがある。その場合は `rosbag play <bag> --clock` を先に別プロセスで起動しておき、
 ノードは `--bag` を付けずに起動する ([`jax_compilation_cache.md`](jax_compilation_cache.md)
@@ -375,7 +374,8 @@ python3 scripts/ros/run_camera_pipeline_test.py \
 
 - `--bag <path>`: 実カメラの代わりに指定した rosbag を再生する (内部で `rosbag play
   --clock` をサブプロセスとして起動し、`/use_sim_time` をあわせて有効にする)。
-  `--bag-rate` で再生速度 (既定 1.0)、`--bag-loop` で繰り返し再生を指定できる。
+  再生は等速で 1 回だけ (速度を変えたり繰り返したりするときは、上の注意と同じく
+  `rosbag play` を別に起動する)。
 - `--auto-arm`: viser 画面の ARM ボタンを押す代わりに起動直後から ARMED 状態にする
   (無人でのバッグ再生テスト用)。ARMED は差し出し手が決まるまで時間制限なく待つ。
   `--auto-execute` で IK・軌道計画に失敗して動かせなかったときは ARMED のまま次の差し出しを
@@ -443,12 +443,12 @@ python3 scripts/handshake_viewer.py --ros
 表示」で戻る。Play が記録の終わりに追いつくとライブ表示に戻る)。次の試行の計画が届くと
 記録し直す。
 
-`~status` を記録していない bag (2026-10-23 より前) では、実機ノードを実機なしで動かすと
+`~status` を記録していない bag では、実機ノードを実機なしで動かすと
 状態が計算の後で止まる。`--log <bag と一緒に保存した person_NN.log>` を付けると、ログの
 出来事 (`[execute] 実機で waypoint を…` など、`src/aero_demo/node_log_stages.py`) から
 当時の状態の切り替わりを復元して出す。ログの時刻 (時:分:秒) は bag の時刻の日付と
-この PC の地方時で読む (違う時差の PC で書いたログは `--log-utc-offset`)。ログに出ない
-切り替わり (関節の到着待ちの始まりなど) は前の状態のまま。今後の bag は `~status`・
+この PC の地方時で読む (ログを書いた PC と時差が同じであること)。ログに出ない
+切り替わり (関節の到着待ちの始まりなど) は前の状態のまま。bag に `~status`・
 `~plan` も記録しておけば `--log` は要らない。
 
 ```bash
@@ -467,8 +467,9 @@ python3 scripts/handshake_viewer.py --ros \
 軌道計画の `dt` (`plan_handshake_motion.DEFAULT_DT`) は最適化のコスト正規化に使うだけで、
 実行速度には関係しない。
 
-- 速度の上限: 台車は `BASE_MAX_VEL`/`BASE_MAX_ANGVEL` (並進 0.3 m/s・回頭 1.0 rad/s、
-  ロボット本体側の `aero_base_link.yaml` の `max_velocity` と必ず一致させる)、
+- 速度の上限: 台車は `BASE_MAX_VEL`/`BASE_MAX_ANGVEL` (並進 0.40 m/s・回頭 1.2 rad/s、
+  ロボット本体側の `aero_base_link.yaml` の `max_velocity` と必ず一致させる。
+  `--base-max-vel`/`--base-max-angvel` で下げられる)、
   腕・首・腰・リフターは URDF の `velocity`。指令ではこれに `VEL_LIMIT_RATIO`
   (既定 0.9) を掛けた値までしか使わない。
 - 加速度の上限: 上記の速度まで `ACCEL_TIME` 秒 (既定 0.4) かけて加速する値。大きくする
@@ -485,9 +486,10 @@ python3 scripts/handshake_viewer.py --ros \
   最初の区間の速度へいきなり跳ぶため。
 
 押し込みの後は、既定で横並び移動 (つないだ手を人の体の横へ下ろしながら横並びへ移る) を続けて
-行う。計画が移動先の 3 割以上まで進めた (`verified`) 人だけで、解けていない試行は実機を動かさない。
+行う。計画が移動先まで最後まで解けた (`verified`、`side_by_side_transition.MIN_FRACTION`)
+人だけで、解けていない試行は実機を動かさない。
 押し込み終了 (「どうぞ」) から `--side-by-side-delay` 秒 (既定 4.0) 後に「一緒に横に並びますね」
-(`--speech-transition-text`) と発話して動き出す。人の手を引いて動くので、各区間は
+(定数 `SPEECH_TRANSITION_TEXT`) と発話して動き出す。人の手を引いて動くので、各区間は
 `--side-by-side-segment-time` 秒 (既定 0.2) 以上かける。押し込み後の画像の保存
 (`--grasp-capture-duration`) は動き出すまでで打ち切る。
 接近中と横並び移動中は首で人の顔を追い (`--no-head-tracking` で、ARMED 中の追従・見渡しとともに無効)、hover に着いたら首を
@@ -495,7 +497,7 @@ python3 scripts/handshake_viewer.py --ros \
 追従の目標の方位が首ヨーの可動域 (約 ±120°) から 10° (`HEAD_TRACK_YAW_OUT_MARGIN_DEG`) を超えて
 外れている間は追わずに今の向きで待ち、今の首ヨーと目標の方位が 45° (`HEAD_TRACK_RESEED_DEG`) を
 超えて離れたら方位から視線 IK を解き直す (`_seed_neck_yaw`。今の角度から解くだけだと、台車の
-回転で目標が背中側を通ったとき首が可動域の端に張り付いて戻れなかった。実機 10/21)。
+回転で目標が背中側を通ったとき首が可動域の端に張り付いて戻れないため)。
 
 ログは画面には重要なものだけ出し、詳細 (`[debug]` など) は
 `/tmp/run_camera_pipeline_test_logs/<起動時刻>/` 以下に、起動時 (`startup.log`) と試行 (人)

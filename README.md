@@ -237,8 +237,8 @@ python3 scripts/ros/run_camera_pipeline_test.py \
     --auto-arm --no-wait-for-client
 ```
 
-ただし現在の実装は `--bag` を付けると初期化中に `/clock` が来ず止まることがある
-(未修正、回避策は [`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 6 節
+ただし `--bag` を付けると初期化中に `/clock` が来ず止まることがある
+(既知の問題。回避策は [`docs/jax_compilation_cache.md`](docs/jax_compilation_cache.md) 6 節
 と各試行の `replay.sh`)。
 
 次の詳細は [`docs/dev_tools.md`](docs/dev_tools.md) にまとめてある。

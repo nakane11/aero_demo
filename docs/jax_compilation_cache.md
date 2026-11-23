@@ -45,6 +45,9 @@ venv/jax バージョンで同じ形状の計算であればディスクキャ�
 スクリプトでは常に有効)のときは
 横並び移動のバッチ IK(`side_by_side_transition.warmup_batch_ik`)も解く。
 乱数は warmup 中だけ固定シードにし、終了後に元へ戻す。
+軌道最適化 (jaxls) の warmup は、既定では別プロセスで行い、最適化が要る人の
+計画だけその完了を待つ(`--no-background-optimizer-warmup` で同一プロセスの
+同期実行)。
 
 scikit-robot 側の `JaxlsSolver` はコンパイル済み問題を腕ごと
 (`collision_link_list` が l/r で異なる)に別々のキャッシュとして保持する。
@@ -66,10 +69,10 @@ scikit-robot 側の `JaxlsSolver` はコンパイル済み問題を腕ごと
 jaxls 自体が呼ばれない(`plan_handshake_motion.py` の `--force-optimize` を
 付けると常に jaxls まで実行させられる、ベンチマーク用オプション)。
 
-## 3. コンパイル時間の内訳(軌道最適化 1 回分、過去の実測)
+## 3. コンパイル時間の内訳(軌道最適化 1 回分)
 
-`NonlinearSolver.solve` を lower/compile/execute の 3 段階に分離して計測した
-(当時の問題規模での値。現行 warmup の秒数は 13. を参照)。
+`NonlinearSolver.solve` を lower/compile/execute の 3 段階に分離して計測した例
+(問題規模によって秒数は変わるが、比率の傾向は同じ)。
 
 | フェーズ | コールド(ディスクキャッシュ無) | ヒット(ディスクキャッシュ有) |
 |---|---|---|
@@ -84,23 +87,21 @@ jaxls 自体が呼ばれない(`plan_handshake_motion.py` の `--force-optimize`
   (約28秒)の正体はほぼ全て XLA コンパイル自体であり、実行コストではない。
 - **`lower`(トレース)はディスクキャッシュの対象外**で、ヒット時でも毎回
   数秒かかる。キャッシュが短縮するのは `compile` のみ。
-- この特性のため `.lower().compile()` で execute のみ省略する AOT 化は
-  効果薄(左腕で 0.4 秒程度の節約)と判断し、導入していない。
+- 実行は短いので、`.lower().compile()` で execute だけを省く AOT 化はしていない。
 
-## 4. FK定数の量子化(キャッシュミス対策、解決済み)
+## 4. FK定数の量子化(キャッシュミス対策)
 
 jaxls が計算グラフに焼き込む FK 由来の定数が実行ごとに微妙にブレると
-別計算とみなされ再コンパイルが起きる問題があった。対策として
-`jaxls_solver.py`(scikit-robot fork `base_limit` ブランチ)に
-`_quantize_fk_constants` を追加し、FK 定数を小数9桁に丸めたうえで `+0.0`
+別計算とみなされ再コンパイルが起きる。これを避けるため
+`jaxls_solver.py`(scikit-robot fork `base_limit` ブランチ)の
+`_quantize_fk_constants` で、FK 定数を小数9桁に丸めたうえで `+0.0`
 して負ゼロ(`-0.0`)を正規化している(`np.round` は符号を保持するため、
 丸めても `-0.0` が残ると別定数として扱われフィンガープリントが変わる)。
 同じ丸め処理を `kinematics/differentiable.py`(`extract_fk_parameters`)にも
 適用している。
 
-なお、これとは別に「ノード終了時の `SIGKILL` が次回起動時の見かけ上の
-キャッシュミスを誘発する」現象がある(7. 参照)。運用でのミスはこちらが
-主因だった。
+これとは別に、ノード終了時の `SIGKILL` も次回起動時の見かけ上の
+キャッシュミスを起こす(7. 参照)。
 
 ## 5. デバッグ手法
 
@@ -120,7 +121,7 @@ jaxls が計算グラフに焼き込む FK 由来の定数が実行ごとに微�
   既定で設定している。他のスクリプトで抑えたい場合は同じ環境変数や
   `XLA_PYTHON_CLIENT_MEM_FRACTION` を使う。
 
-## 6. `--bag` 起動時のデッドロック(未修正)
+## 6. `--bag` 起動時のデッドロック(既知の問題)
 
 `run_camera_pipeline_test.py --bag <file>` は、`rospy.set_param
 ('/use_sim_time', True)` → `rospy.init_node` → `HandshakePipelineNode(args)`
@@ -142,24 +143,17 @@ rosbag play data/real/2026-09-17_session1/session1.bag --clock &
 python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
 ```
 
-本体コード側の恒久修正(rosbag play の起動を `rospy.init_node` の直後・
-`HandshakePipelineNode` 構築の前に前倒しすれば解消するはず)はまだ行って
-いない。
+rosbag play の起動を `rospy.init_node` の直後・`HandshakePipelineNode` 構築の
+前に前倒しすれば解消するはずだが、コードはまだそうなっていない。
 
-## 7. 実運用でのキャッシュミス: SIGKILL が原因(解決済み)
+## 7. ノードを `SIGKILL` で止めない
 
-以前は実ノードで低頻度(8回中3回程度)のキャッシュミスが観測されていた
-が、原因は FK 定数のブレではなく**ベンチの終了方法**だった。
+`SIGKILL` で強制終了すると、jax の永続コンパイルキャッシュへの非同期書き込みが
+完了する前にプロセスが死に、次回起動時に不完全なエントリを読んで見かけ上の
+キャッシュミス(再コンパイル)が起きる。
 
-`SIGINT` → 2秒待ち → `SIGKILL` で強制終了すると、jax の永続コンパイル
-キャッシュへの非同期書き込みが完了する前にプロセスが死に、次回起動時に
-不完全なエントリを読んで見かけ上の miss を起こしていた。`SIGKILL` を
-撤廃し、`SIGINT` 送信後にプロセスが自発的に終了するまで待つようにした
-ところ、16回連続起動で miss 0回・2回目以降のキャッシュ更新も0件だった。
-
-**運用上の結論: ノード終了時に `SIGKILL` を使わない
-(`SIGINT` を送った後はプロセスが自発的に終了するまで待つ)。** これだけで
-安定してキャッシュヒットする。本体コード側の対策は不要と判断した。
+**ノードを止めるときは `SIGINT` を送り、プロセスが自発的に終了するまで待つ。**
+これで起動を繰り返してもキャッシュミスは起きない。
 
 ## 8. `solve_palm_ik.py` と `plan_handshake_motion.py` の warmup
 
@@ -177,24 +171,22 @@ python3 scripts/ros/run_camera_pipeline_test.py --auto-arm --no-wait-for-client
   `np.random.seed(0)` し、人物ごとにファイル名の `zlib.crc32` で乱数シードを
   決め直す。
 
-## 9. 台車可動域の人物ごとの変更は再コンパイルを起こさない(解決済み)
+## 9. 台車可動域の人物ごとの変更は再コンパイルを起こさない
 
 `solve_palm_ik.py` の `restrict_base_yaw_range_to_human_facing`/
 `restrict_base_y_range_to_hand_side`(`main()` が人物ごとの
 `person_base_limits` を作る箇所)は、台車の可動域 (`base_limits`) を人物ごとに
 異なる連続値へ絞る。`base_limits` は `batch_inverse_kinematics` 内部で仮想
 台車関節 (`_attach_batch_virtual_base_chain`) の `min_angle`/`max_angle`
-になるが、以前はこれが `solve_batched` (jax.jit) のクロージャに定数として
-焼き込まれ、人物ごとに HLO が変わって「1 人につき 1 回」再コンパイル
-(約 9 秒/人)していた。
+になる。これが `solve_batched` (jax.jit) のクロージャに定数として焼き込まれると、
+人物ごとに HLO が変わって 1 人につき 1 回 (約 9 秒) 再コンパイルする。
 
-**対策 (scikit-robot フォーク):** `differentiable.py` の
-`create_batch_ik_solver` で `joint_limits_lower`/`joint_limits_upper` を
+そのため scikit-robot フォークの `differentiable.py` の
+`create_batch_ik_solver` は、`joint_limits_lower`/`joint_limits_upper` を
 クロージャ定数ではなく `solve_single`/`solve_batch` の通常引数 (trace 対象)
-として渡すようにした。`robot_model.py` 側も `_batch_ik_collision_solver_cache`
-のキャッシュキーから台車の可動域を外し、呼び出しごとの実際の範囲を渡す。
-これにより人物ごとに `base_limits` が変わっても再コンパイルは起きない
-(18 人処理で 2 回連続実行してもキャッシュ増分 0 を確認済み)。
+として受け取る。`robot_model.py` 側も `_batch_ik_collision_solver_cache`
+のキャッシュキーに台車の可動域を含めず、呼び出しごとの実際の範囲を渡す。
+これにより人物ごとに `base_limits` が変わっても再コンパイルは起きない。
 
 `run_camera_pipeline_test.py` の `HandshakePlanner.plan` も同じ制限
 (`restrict_base_y_range_to_hand_side`/`restrict_base_yaw_range_to_human_facing`)
@@ -234,38 +226,35 @@ jaxls の最適化まで進む。そのため「1 人あたりの最大計算時
 (`body_link`)」で `batch_inverse_kinematics` を呼ぶ(組が作れず干渉コストは
 0)。干渉回避を切るとヤコビアン法になり、台車を動かすと人ごとに再コンパイル
 して 1 人約 9 秒かかるため(`tools/build_collision_pairs.py` の手順 3)。
-今はペアありと同じ勾配降下法なので、腕ごとに 1 回のコンパイルで済む。
+ペアありと同じ勾配降下法なので、腕ごとに 1 回のコンパイルで済む。
 
-## 13. 現行コードでの warmup と 1 人あたり計算時間の実測(2026-10-15)
+## 13. warmup と 1 人あたり計算時間の測り方
 
-テストデータの置き場所は docs/test_data.md。WSL (aero-uv venv、jax キャッシュあり、実機なし) で測った値。
+テストデータの置き場所は [test_data.md](test_data.md)。計算時間は jax キャッシュが
+温まった状態 (同じコードで 2 回目以降) で測る。
 
-### `scripts/run_pipeline_test.py 400 --seed 0 --plan-motion --side-by-side-transition` (合成 400 人)
+### `scripts/run_pipeline_test.py` (合成データ)
 
-IK 対象 (差し出した人) は 62 人で、IK 成功 60・軌道 verified 59・横並び 59/59。
-42 人 (`--seed 0`) だと対象が 6 人しかなく、平均が揺れるので 400 人で測った。
+```bash
+cd scripts
+python3 run_pipeline_test.py --input-set ../data/synthetic/seed0_ik_targets \
+    --plan-motion --side-by-side-transition
+```
 
-| 段階 | warmup | 1 人あたり平均 | 最大 |
-|---|---|---|---|
-| IK (`solve_palm_ik.py`、1+2 段階目) | 13.4 秒 (l 7.5 + r 5.9) | 0.63 秒 (1 段階目 0.35 + 2 段階目 0.28) | 4.63 秒 |
-| 軌道計画 (`plan_handshake_motion.py`、横並び除く) | 32.2 秒 (l 18.4 + r 13.8) | 0.15 秒 | 0.27 秒 |
-| 横並び移動 (transition) | 上の軌道計画の warmup に含む | 1.38 秒 | 11.22 秒 |
-| 掌推定 | なし | 0.001 秒 | - |
+- `seed0_ik_targets` (IK 対象 67 人) か `400 --seed 0` で測る。42 人 (`--seed 0`) だと対象が
+  数人しかなく、平均が揺れる。
+- warmup は `[warmup]` 行と、各段階の「warmup 合計」の表示で見る。`plan_handshake_motion.py`
+  の warmup は `solve_palm_ik.py` と並行して走るので (test_data.md)、全体の待ち時間は
+  2 つの warmup の和より短い。
+- スクリプトの表示は平均だけなので、最大は各人の JSON (`handshakes/*.json` の
+  `collision_ik_time`+`candidate_selection_time`、`motions/*.json` の `compute_time`・
+  `transition.compute_time`) から集計する。最大は少数の外れ値で決まり、段階ごとの最大の
+  単純な合計より小さい。
 
-- warmup 合計は約 46 秒 (IK 13.4 + 軌道 32.2)。2 つのスクリプトが別プロセスなので足し算になる。
-- 1 人あたりの合計 (IK + 軌道 + 横並び) は平均約 2.2 秒。最大は人ごとにばらつくので、各段階の最大の単純な合計 (約 16 秒) より小さい。
-- 最大は IK 4.6 秒・横並び 11.2 秒とも外れ値で、平均の 7〜8 倍。
-- 最大は各人の JSON (`handshakes/*.json` の `collision_ik_time`+`candidate_selection_time`、`motions/*.json` の `compute_time`・`transition.compute_time`) から集計した (スクリプトの表示は平均のみ)。
+### `scripts/ros/run_camera_pipeline_test.py` (切り出し bag の再生)
 
-### `scripts/ros/run_camera_pipeline_test.py` (切り出し bag の再生、0.5 倍速)
-
-| 試行 | 結果 | IK | 軌道 | 横並び |
-|---|---|---|---|---|
-| `2026-10-15/trial1_side_by_side/` | 成功 | 1.5 秒 | 0.1 秒 | 4.00 秒 |
-| `2026-10-15/trial2_side_by_side/` | 成功 | 1.7 秒 | 0.2 秒 | 0.72 秒 |
-| `2026-10-13/trial22_side_by_side/` | 押し込み姿勢が解けず軌道計画なし | - | - | - |
-
-- warmup は起動から「[warmup] 完了」まで 60〜62 秒 (計 3 回: 61.7 / 60.2 / 60.2)。run_pipeline_test.py の IK+軌道 warmup の合計 (約 46 秒) より長い。
-- 1 人あたりの IK+軌道は 1.6〜1.9 秒 (横並び込みで 2.3〜5.9 秒)。ただし成功したのは 2 試行 (各 1 人) だけなので平均・最大としては参考値。run_camera_pipeline_test.py は再生ごとに 1 人しか処理しないので、数を稼ぐには何度も再生する必要がある。
-- 同じ bag でも掌の向きが毎回ずれるので成否・時間が変わる (上記の境界ケース)。trial22 は今回失敗。
-- `RATE=1.0` で再生すると bag が先頭 1 秒で止まり人が検出されなかった。時間を測るときは既定の 0.5 倍速で回す。
+- warmup は起動から「[warmup] 完了」までの時間で見る。
+- 再生ごとに 1 人しか処理せず、同じ bag でも掌の向きが毎回ずれるので成否・時間が変わる。
+  数を稼ぐには何度も再生する。
+- `replay.sh` の既定の 0.5 倍速で回す (`RATE=1.0` では bag が先頭 1 秒で止まり人が検出
+  されないことがある)。

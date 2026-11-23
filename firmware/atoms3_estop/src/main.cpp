@@ -13,7 +13,7 @@
 
 #include "wifi_secrets.h"
 
-// estop_node.py の --listen-port 既定値と合わせる。
+// estop_node.py の LISTEN_PORT と合わせる。
 #ifndef ESTOP_PORT
 #define ESTOP_PORT 5555
 #endif

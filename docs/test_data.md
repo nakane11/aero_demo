@@ -22,26 +22,26 @@ data/
 
 | 確かめたいこと | 使うデータ | やり方 |
 |---|---|---|
-| 変更後も骨格検出から横並び移動の計画まで通るか (動作確認) | `real/2026-10-15/trial1_side_by_side/` | `bash replay.sh`。再生で 3/3 成功している安定した試行なので、まずこれを回す |
+| 変更後も骨格検出から横並び移動の計画まで通るか (動作確認) | `real/2026-10-15/trial1_side_by_side/` | `bash replay.sh`。まずこれを回す (しゃがまないと届かない掌なので、成否は `LEG_LOW_SIDE_MARGIN_RATIO` で揺れる。下の注) |
 | 左右どちらの腕でも通るか | 上に加えて `real/2026-10-13/trial22_side_by_side/` | trial1 は R手/l腕、trial22 は L手/r腕。trial22 は 0.5 倍速 (既定) で回す |
-| 境界の試行で改善・悪化したか | `real/2026-10-15/trial2_side_by_side/` | 変更前でも 2/5 しか成功しない。何回か回して成功率で比べ、1 回の失敗を回帰とみなさない |
+| 境界の試行で改善・悪化したか | `real/2026-10-15/trial2_side_by_side/` | 成功しない回が多い境界のケース。何回か回して成功率で比べ、1 回の失敗を回帰とみなさない |
 | IK・軌道計画・横並びの成功率を実機の人で前後比較 | `real/2026-10-13/logs/` の 22 試行 (+ `real/2026-10-15/logs/` の 2 試行、`real/2026-10-22/logs/*` の 13 試行) | `tools/ros/resolve_saved_trials.py` で保存した skeletons/palms の JSON を解き直す (下記) |
 | 差し出し判定 (どちらの手か・見逃し・誤トリガー) | `real/2026-09-30_session1/` (ラベル 167 件)、`real/2026-09-30_session3/` (差し出し無し) | `tools/tune_offer_selector.py` などで抽出フレームを評価する ([dev_tools.md](dev_tools.md)) |
 
 - 切り出し bag の再生では、骨格検出が毎回少しずつ違うフレームで差し出しを判定するので、掌の向きが実機と数度〜数十度ずれる。結果は実機との一致ではなく、ARMED になった手と IK・軌道計画の成否で見る。
 - 再生は `--no-robot-interface` で回すので、scan による台車位置の補正、押し込み直前の解き直し、実機での実行は試されない。これらを確かめるには実機が要る。
-- 保存した JSON からの解き直しは、検出の揺れが入らず毎回同じ結果になるので、変更前後の比較に向いている。`tools/ros/resolve_saved_trials.py` はノードと同じ `HandshakePlanner` で解き、試行ごとの到達段階 (ik_fail / no_press / motion_ng / motion_ok / transition_ok) と、保存時の段階から変わった試行を出す。ノードのオプション (`--torso-surface-offset` など) はそのまま渡せる。roscore は不要。
+- 保存した JSON からの解き直しは、検出の揺れが入らないので、変更前後の比較に向いている (ただし解は回ごとに少しずれることがある。下の `seed0_ik_targets/` の注)。`tools/ros/resolve_saved_trials.py` はノードと同じ `HandshakePlanner` で解き、試行ごとの到達段階 (ik_fail / no_press / motion_ng / motion_ok / transition_ok) と、保存時の段階から変わった試行を出す。ノードのオプション (`--torso-surface-offset` など) はそのまま渡せる。roscore は不要。
 
   ```bash
   python3 tools/ros/resolve_saved_trials.py \
       data/real/2026-10-13/logs data/real/2026-10-15/logs --out /tmp/resolve.json
   ```
 - 連続録画のセッション bag (`real/2026-09-*`) には /odom・/scan・/joint_states が入っていない。差し出し判定や起動・warmup の確認には使えるが、試行の通し確認には使わない。
-- 合成データでの回帰テストは `scripts/run_pipeline_test.py` で行う (`run_camera_pipeline_test.py` は使わない)。`--plan-motion` のときは `plan_handshake_motion.py` を `solve_palm_ik.py` と並行して先に起動し、入力に依存しない warmup (約40秒) を重ねる (400 人・`--side-by-side-transition` で 132 秒 → 95 秒、結果は同一。`--no-parallel-warmup` で従来どおり順に実行)。並行実行のため子プロセスには `XLA_PYTHON_CLIENT_PREALLOCATE=false` を渡している (GPU メモリを 75% ずつ確保すると後から起動した方が失敗するため)。
+- 合成データでの回帰テストは `scripts/run_pipeline_test.py` で行う (`run_camera_pipeline_test.py` は使わない)。`--plan-motion` のときは `plan_handshake_motion.py` を常に `solve_palm_ik.py` と並行して先に起動し、入力に依存しない warmup (約 40 秒) を IK と重ねる (順に実行した場合と結果は変わらない)。並行実行のため子プロセスには `XLA_PYTHON_CLIENT_PREALLOCATE=false` を渡している (GPU メモリを 75% ずつ確保すると後から起動した方が失敗するため)。
 
 ## 置き方の決まり
 
-- `record_camera_pipeline.launch` は 10/21 以降、再生に使う入力に加えて、実機の動作の事後解析用に各コントローラの goal/feedback/result・state、`/cmd_vel`、`/amcl_pose`、`/estop`、`/aero_hand/command`・`is_grasped` も録る (再生テストでは使わない)。10/21 以前の bag と、10/21 の切り出し 4 本にはこれらは入っていない。
+- `record_camera_pipeline.launch` は、再生に使う入力に加えて、実機の動作の事後解析用に各コントローラの goal/feedback/result・state、`/cmd_vel`、`/amcl_pose`、`/estop`、`/aero_hand/command`・`is_grasped` も録る (再生テストでは使わない)。2026-10-21 より前の bag と、`2026-10-21/` の切り出し 4 本にはこれらは入っていない。
 - 実機の全体 bag は `data/bags/` に録る。テストに使う区間は
   `tools/ros/clip_bag.py` で切り出して `data/real/<日付>/<名前>/` に置き、
   元の全体 bag は消してよい。
@@ -62,8 +62,8 @@ data/
   を併用する。この bag は画像が無いので bag 再生テストには使えないが、ノードの
   `~detections` (処理したフレームごとの 2D/3D 骨格・Hands の手・掌・差し出し判定の内訳、
   JSON の `std_msgs/String`、約 12KB/フレーム) と `~status`・`~plan` を録るので、
-  検出・判定・計画は画像なしで追える (10/23 以降は画像ありの bag にも入る)。
-  試行ごとの skeletons/palms/handshakes/motions の JSON とログは従来どおり残るので、
+  検出・判定・計画は画像なしで追える (画像ありの bag にも入る。2026-10-23 より前の bag には無い)。
+  試行ごとの skeletons/palms/handshakes/motions の JSON とログは画像なしでも残るので、
   IK・軌道の解き直し (`tools/ros/resolve_saved_trials.py`) はそのまま使える。
 
 ## 実機・実カメラ (`data/real/`)
@@ -75,11 +75,11 @@ data/
 で人が付けた正解ラベル。どの bag にも /camera の画像・camera_info と /tf
 (/tf_static) だけが入っている (/odom・/scan・/joint_states は無い)。
 
-| ディレクトリ | bag | フレーム (ラベル) | 用途・旧名 |
+| ディレクトリ | bag | フレーム (ラベル) | 用途 |
 |---|---|---|---|
-| `2026-09-17_session1/` | session1.bag (53 秒・13 GB) | 19 (R 7 / L 4 / null 8) | jax キャッシュの実ノード検証 ([jax_compilation_cache.md](jax_compilation_cache.md))。旧 `data/` |
-| `2026-09-30_session1/` | session1.bag (95 秒・24 GB) | 167 (R 62 / L 62 / null 43) | 差し出し見逃しの解析、人体の胴体の大きさの検証 ([ik_and_motion_constraints.md](ik_and_motion_constraints.md))。旧 `data2/` |
-| `2026-09-30_session3/` | session3.bag (49 秒・12 GB) | 79 (全部 null) | 差し出していない場面 (誤トリガーの評価)。旧 `data3/` とリポジトリ直下の `session3.bag` |
+| `2026-09-17_session1/` | session1.bag (53 秒・13 GB) | 19 (R 7 / L 4 / null 8) | jax キャッシュの実ノード検証 ([jax_compilation_cache.md](jax_compilation_cache.md)) |
+| `2026-09-30_session1/` | session1.bag (95 秒・24 GB) | 167 (R 62 / L 62 / null 43) | 差し出し見逃しの解析、人体の胴体の大きさの検証 ([ik_and_motion_constraints.md](ik_and_motion_constraints.md)) |
+| `2026-09-30_session3/` | session3.bag (49 秒・12 GB) | 79 (全部 null) | 差し出していない場面 (誤トリガーの評価) |
 
 ### 実機デモの日
 
@@ -106,10 +106,9 @@ data/
 | `20261022_161835` | 2 | 試行1 軌道 NG (干渉検証)、試行2 横並びまで実行 (「離れてから近づく・手が下がらない」と報告した試行。16:20:35〜16:21:11 付近) | 16-19-15 |
 | `20261022_170254` | 3 | 試行1 IK 失敗、試行2・3 横並びまで実行 (試行3 は hover で手を再検出できず no_hand、押し込み後の画像 0 フレーム) | 17-03-43、18-13-47 |
 
-- この日のコードは 10/22 夕方時点 (commit `822cf5f` まで)。横並びまで実行した 8 試行は、
-  どれも裏の計画を実行している (ログの「裏の計画の横並び移動を使います」)。ただし
-  motions の JSON には裏の計画 (`transition_refined`) が入っていない (保存するように
-  したのは `bda60dd` 以降)。
+- 横並びまで実行した 8 試行は、どれも裏の計画を実行している (ログの「裏の計画の
+  横並び移動を使います」)。ただし motions の JSON には裏の計画 (`transition_refined`)
+  が入っていない (当時のコードは保存していなかった)。
 - 全体 bag 8 本 (計 約 205 GB) は `data/bags/camera_pipeline_2026-10-22-*.bag` に残っている:
   15-52-08、15-53-29、15-57-54、16-01-13 (62 GB)、16-05-25、16-19-15、17-03-43、18-13-47。
   まだ切り出していない (候補は 16-19-15 の試行2)。
@@ -125,7 +124,7 @@ data/
 
 `replay.sh` は最初の `[result]` (成功・失敗とも) が出た 3 秒後に残りの再生を打ち切る。
 `--no-robot-interface` では ARMED 後の区間は使われないので、bag を最後まで再生して
-待つだけだった約 1 分が不要になる (trial1 で warmup 済みのとき約 150 秒 → 80 秒)。
+待つ約 1 分を省ける。
 bag の最後まで再生したいときは `EARLY_STOP=0 bash replay.sh`。warmup は jax の
 キャッシュが温まっていれば約 45 秒だが、solve_palm_ik.py などを変更した直後の
 初回はキャッシュミスで約 100 秒かかる。何回も回して成功率を見るときは、初回を
@@ -134,10 +133,10 @@ bag の最後まで再生したいときは `EARLY_STOP=0 bash replay.sh`。warm
 | ディレクトリ | 区間 (元 bag) | 実機の試行 | 再生の結果 |
 |---|---|---|---|
 | `2026-10-13/trial22_side_by_side/` | 22:08:46.0〜22:09:20.0 (34 秒) | L手/r腕、横並びまで成功 | 0.5 倍速 2/2、等速 4/5 成功 (等速は掌の向きが 6〜20° ずれる) |
-| `2026-10-15/trial1_side_by_side/` | 17:12:08.5〜17:12:46.0 (37.5 秒) | R手/l腕、横並びまで成功 | 10/15 は 3/3 成功。**10/20 は 0.5 倍速で 1/3〜3/3 と揺れる** (`LEG_LOW_SIDE_MARGIN_RATIO` 0.3 での境界のクリップ。下の注) |
-| `2026-10-15/trial2_side_by_side/` | 17:13:50.2〜17:14:25.5 (35.3 秒) | R手/l腕、横並びまで成功 (scan 補正 16 cm、押し込みの解き直しは too_large) | 10/15 は 2/5 成功 (掌の向き次第の境界のケース)。**10/20 は 0/5〜1/4** (`LEG_LOW_SIDE_MARGIN_RATIO` 0.3 のため。下の注) |
+| `2026-10-15/trial1_side_by_side/` | 17:12:08.5〜17:12:46.0 (37.5 秒) | R手/l腕、横並びまで成功 | 0.5 倍速で 1/3〜3/3 と揺れる (`LEG_LOW_SIDE_MARGIN_RATIO` の境界のクリップ。下の注) |
+| `2026-10-15/trial2_side_by_side/` | 17:13:50.2〜17:14:25.5 (35.3 秒) | R手/l腕、横並びまで成功 (scan 補正 16 cm、押し込みの解き直しは too_large) | 0/5〜1/4 (掌の向き次第の境界のケースで、`LEG_LOW_SIDE_MARGIN_RATIO` にも効かれる。下の注) |
 
-**trial1・trial2 の 10/20 以降の結果について**: 10/19 の実機で「沈みすぎ」と指摘があり、足首・膝の低い側の制限 `LEG_LOW_SIDE_MARGIN_RATIO` を 0.1 から 0.3 にした (`80b96f2` で 0.2、`c778487` で 0.3)。この 2 つのクリップは、しゃがまないと届かない掌なので、0.3 では解けない回が増える (沈みを抑える代わりに合成 400 人でも後処理まで 61→54 人)。10/20 に、各再生で検出された掌・骨格 8 通りを 6 通りの名前で解き直した (`resolve_saved_trials.py`、計 48 試行) ところ、`0937b40` までは 7/48、`80b96f2` 以降は 0/48、現在のコードで 0.3 を 0.1 に戻すと 39/48 だった (hover の重みを戻しても 0/48 のまま)。これらのクリップを回帰テストに使うときは、この値による差であることに注意する。
+**trial1・trial2 の結果について**: 足首・膝の低い側の制限 `LEG_LOW_SIDE_MARGIN_RATIO` (`solve_palm_ik.py`、0.3) は、しゃがみすぎを抑えるための値である。この 2 つのクリップはしゃがまないと届かない掌なので、解けない回が多い (各再生で検出された掌・骨格を `resolve_saved_trials.py` で解き直すと、0.3 では 0/48、0.1 にすると 39/48)。これらのクリップを回帰テストに使うときは、この値による差であることに注意する。
 | `2026-10-16/trial3_side_by_side/` | 20:07:01.1〜20:07:35.8 (34.7 秒、元は 20-06-35.bag) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正は 1 回目だけ採用) | 未確認 |
 | `2026-10-16/trial6_side_by_side/` | 20:11:14.7〜20:11:52.3 (37.6 秒) | R手/l腕、横並びまで成功 (hover で手を再検出できず no_hand 2 回、scan 補正 2 回) | 未確認 |
 | `2026-10-21/trial1_side_by_side/` | 13:55:32.5〜13:56:11.0 (38.5 秒、元は 13-55-12.bag) | R手/l腕、横並びまで成功 (IK 0.5 秒) | 未確認 |
@@ -174,14 +173,14 @@ python3 tools/ros/clip_bag.py \
 
 | ディレクトリ | 中身 |
 |---|---|
-| `random_human_poses/` ほか 3 つ | 40 人ぶん。2026-09-08 の生成で、IK 結果は hand_y 固定より前のもので古い。最新のコードで評価するときは `scripts/run_pipeline_test.py` で作り直す (seed を指定すれば再現できる) |
+| `random_human_poses/` ほか 3 つ | 40 人ぶん。IK 結果は古いコードのもの。今のコードで評価するときは `scripts/run_pipeline_test.py` で作り直す (seed を指定すれば再現できる) |
 | `label_backup_20260902/` | 2026-09-02 時点の掌 JSON (100 人) のバックアップ |
 | `seed0_ik_targets/` | **IK・軌道計画・横並び移動のパラメータを変えたときの前後比較用 (日常はこれを使う)**。下記 |
 
 ### `seed0_ik_targets/` (固定の比較セット)
 
 `run_pipeline_test.py 400 --seed 0` が作る 400 人のうち、掌を差し出していて IK の
-対象になる 67 人 (R 36 / L 31) の `skeletons/` と `palms/` を保存したもの (2026-10-20 作成)。
+対象になる 67 人 (R 36 / L 31) の `skeletons/` と `palms/` を保存したもの。
 残りの 333 人は掌を差し出していないので IK 以降を素通りし、成功数にも時間にも効かない。
 そのため 400 人で回した結果と同じ数字が約 1/6 の人数で得られる (骨格生成の約 15 秒も省ける)。
 
@@ -192,15 +191,16 @@ python3 run_pipeline_test.py --input-set ../data/synthetic/seed0_ik_targets \
 ```
 
 - `--input-set` を付けると骨格生成・掌推定を省き、このセットを読み取り専用で使う (`num_people` は不要)。
-  結果は従来どおり `/tmp/aero_demo_pipeline_*` に出る。
+  結果は `/tmp/aero_demo_pipeline_*` に出る。
 - **ファイル名 (`human_NNN.json`) を変えたり、番号を詰め直したりしない。** `solve_palm_ik.py` は
   人ごとの乱数シードをファイル名の crc32 で決めるので、名前が変わると IK の結果が変わる。
-- 400 人 (seed 0) と同じ結果になることを確認済み: solved 54/67、軌道 verified 53/67。
-  所要時間は 400 人の 115 秒 → 約 107 秒 (IK 約 38 秒、横並び移動約 39 秒が大半。warmup はキャッシュが温まっていれば 7 秒)。
-  IK だけの変更なら `--plan-motion` を外すと solve のみ (約 50 秒) で済む。
-- **横並び移動の成否は同じ入力でも回ごとに揺れる。** 同じセットを 3 回回して 49・52/53 (400 人では 51/53)。
-  揺れるのは境界の 3 人 (human_150・175・358) で、IK・軌道計画は 3 回とも一致した。横並び移動の
-  1〜2 人の差は変更の効果とみなさず、複数回回して比べるか、揺れる人を除いて見ること (原因は未調査)。
+- 集計は回をまたいで一致する: solved 56/67、後処理 44/67、軌道 verified 43/67。所要時間の大半は IK と
+  横並び移動で、IK だけの変更なら `--plan-motion` を外すと solve のみで済む。
+- **同じコード・同じ入力でも、人ごとの解は回ごとに少しずれる。** 67 人中 25 人程度で関節角などが
+  1e-7 程度ずれ、human_096・270 は台車位置まで入れ替わる (集計の 56・44・43 は変わらない)。
+  横並び移動の成否はこのずれで揺れ、verified 43 人のうち 34〜35 人。横並び移動の 1 人程度の差は
+  変更の効果とみなさず、複数回回して比べること。人ごとの解を比べるときは、ずれが 1e-7 程度か
+  台車位置の入れ替わりかを見て、変更による差と分ける。
 - seed 0 は調整に何度も使っているため、採用を決める前に別の seed (`run_pipeline_test.py 400 --seed 1` など)
   でも同じ向きに動くことを確認する。
 - 作り直すとき: `run_pipeline_test.py 400 --seed 0 --plan-motion` を回し、`handshakes/` の JSON で

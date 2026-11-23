@@ -22,8 +22,9 @@ cp include/wifi_secrets.h.example include/wifi_secrets.h
 #define ESTOP_NODE_HOST "192.168.xxx.xxx"
 ```
 
-ポート番号 (既定 5555) は `estop_node.py` 側の `--listen-port` と揃える
-必要がある。変更する場合は `src/main.cpp` の `ESTOP_PORT` を書き換える。
+ポート番号 (5555) は `scripts/ros/estop_node.py` の定数 `LISTEN_PORT` と揃える
+必要がある。変更する場合は `src/main.cpp` の `ESTOP_PORT` と `LISTEN_PORT` の
+両方を書き換える。
 
 ## 書き込み
 

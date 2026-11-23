@@ -4288,7 +4288,8 @@ def main():
     parser.add_argument(
         '--leg-rise-allow', type=float, default=None,
         help='strict のとき、押し込みで腰が上がってよい量の目安 [m] (足首・'
-            '膝の下限・上限の余裕を 2 倍の [rad] にする。既定は上げない)。')
+            '膝の下限・上限の余裕を 2 倍の [rad] にする。既定 {})。'.format(
+                LEG_RISE_ALLOW))
     parser.add_argument(
         '--torso-surface-offset', type=float, default=0.0,
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '

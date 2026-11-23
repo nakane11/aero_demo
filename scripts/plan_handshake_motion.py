@@ -1282,7 +1282,8 @@ def main():
             '既定 {})。'.format(sbs.GOAL_LEG_RISE))
     parser.add_argument(
         '--leg-rise-allow', type=float, default=None,
-        help='strict のとき横並びで腰が上がってよい量 [m] (既定は上げない)。')
+        help='strict のとき横並びで腰が上がってよい量 [m] (既定 {})。'.format(
+            spik.LEG_RISE_ALLOW))
     parser.add_argument(
         '--leg-low-margin', type=float, default=None,
         help='足首の上限・膝の下限を全域幅のこの割合だけ狭める '
