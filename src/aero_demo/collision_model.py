@@ -93,12 +93,15 @@ def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
 
     ``primitive_type`` ('box'/'cylinder'/'sphere') で形状を強制できる
     (None なら自動選択)。変換結果はキャッシュし、``force`` で作り直す。
+    元の URDF の方が新しい (手首の有無を変えたなど) ときも作り直す。
     """
     urdf_path = Path(urdf_path)
     primitives_path = urdf_path.parent / f"{urdf_path.stem}_primitives.urdf"
     output_path = urdf_path.parent / f"{urdf_path.stem}_primitives_extra.urdf"
 
-    if primitives_path.exists() and not force:
+    stale = (primitives_path.exists()
+             and primitives_path.stat().st_mtime < urdf_path.stat().st_mtime)
+    if primitives_path.exists() and not force and not stale:
         print(f"[skip] 既存の干渉モデルURDFを再利用します: {primitives_path}")
     else:
         print(f"[convert] {urdf_path} -> {primitives_path}")

@@ -839,7 +839,11 @@ def other_hand_points(side):
             if link.collision_mesh is None or \
                     not link.name.startswith(s + '_'):
                 continue
-            if 'feetech' not in link.name and link.name != s + '_hand_link':
+            # 手首の受動関節 (feetech_hand の flexible_wrist、URDF で有無を選ぶ) も含める。
+            wrist_parts = ['{}_wrist_{}_link'.format(s, k)
+                           for k in ('bottom', 'base', 'top')]
+            if 'feetech' not in link.name and \
+                    link.name not in [s + '_hand_link'] + wrist_parts:
                 continue
             world = (link_surface_samples(link) @ link.worldrot().T
                      + link.worldpos())
