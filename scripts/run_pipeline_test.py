@@ -269,20 +269,12 @@ def main():
         '--facing-yaw-weight', type=float, default=None,
         help='solve_palm_ik.py に --facing-yaw-weight を渡す。')
     parser.add_argument(
-        '--collision-verify-model', choices=('mixed', 'nohand', 'hand'),
-        default=None,
-        help='solve_palm_ik.py と plan_handshake_motion.py に渡す。')
-    parser.add_argument(
         '--side-by-side-transition', action='store_true',
         help='plan_handshake_motion.py に --side-by-side-transition を渡す。')
     parser.add_argument(
-        '--no-parallel-warmup', action='store_true',
-        help='--plan-motion のとき plan_handshake_motion.py を solve_palm_ik.py '
-            'と並行して先に起動する (warmup を重ねる) のをやめ、順に実行する。')
-    parser.add_argument(
         '--solve-args', default='',
         help='solve_palm_ik.py にそのまま渡す引数 (空白区切りの 1 文字列、'
-            '例: "--bow-weight 500 --press-in-leg-rise off")。')
+            '例: "--bow-weight 500 --press-in-leg-rise fallback")。')
     parser.add_argument(
         '--motion-args', default='',
         help='plan_handshake_motion.py にそのまま渡す引数 (空白区切りの '
@@ -346,14 +338,10 @@ def main():
         solve_args += ['--front-offset-weight', str(args.front_offset_weight)]
     if args.facing_yaw_weight is not None:
         solve_args += ['--facing-yaw-weight', str(args.facing_yaw_weight)]
-    if args.collision_verify_model is not None:
-        solve_args += ['--collision-verify-model',
-                       args.collision_verify_model]
     solve_args += args.solve_args.split()
 
     # warmup は入力に依存しないので solve_palm_ik.py と並行して先に起動し、
     # solve_done_path ができたら本処理に入る。
-    motion_args = None
     motion_step = None
     solve_done_path = os.path.join(base_dir, 'solve_done')
     if args.plan_motion:
@@ -367,19 +355,15 @@ def main():
                 str(v) for v in args.initial_base_pose]
         if args.approach_distance is not None:
             motion_args += ['--approach-distance', str(args.approach_distance)]
-        if args.collision_verify_model is not None:
-            motion_args += ['--collision-verify-model',
-                            args.collision_verify_model]
         if args.side_by_side_transition:
             motion_args.append('--side-by-side-transition')
         motion_args += args.motion_args.split()
-        if not args.no_parallel_warmup:
-            print('[4.5/5] plan_handshake_motion.py を warmup のため '
-                  'solve_palm_ik.py と並行して先に起動します。')
-            motion_step = BackgroundStep(
-                '4.5/5', 'plan_handshake_motion.py',
-                motion_args + ['--wait-file', solve_done_path],
-                os.path.join(base_dir, 'plan_handshake_motion.log'))
+        print('[4.5/5] plan_handshake_motion.py を warmup のため '
+              'solve_palm_ik.py と並行して先に起動します。')
+        motion_step = BackgroundStep(
+            '4.5/5', 'plan_handshake_motion.py',
+            motion_args + ['--wait-file', solve_done_path],
+            os.path.join(base_dir, 'plan_handshake_motion.log'))
 
     try:
         solve_elapsed, solve_stdout = run_step('4/5', 'solve_palm_ik.py',
@@ -409,15 +393,11 @@ def main():
     # 4.5. plan_handshake_motion.py (--plan-motion 指定時のみ)
     motion_summary = None
     if args.plan_motion:
-        if motion_step is not None:
-            after_solve_t0 = time.time()
-            motion_elapsed, motion_stdout = motion_step.wait()
-            print('[4.5/5] plan_handshake_motion.py は solve_palm_ik.py と並行'
-                  'して起動済み (solve_palm_ik.py の終了後 {:.1f} 秒で完了)。'
-                  .format(time.time() - after_solve_t0))
-        else:
-            motion_elapsed, motion_stdout = run_step(
-                '4.5/5', 'plan_handshake_motion.py', motion_args)
+        after_solve_t0 = time.time()
+        motion_elapsed, motion_stdout = motion_step.wait()
+        print('[4.5/5] plan_handshake_motion.py は solve_palm_ik.py と並行'
+              'して起動済み (solve_palm_ik.py の終了後 {:.1f} 秒で完了)。'
+              .format(time.time() - after_solve_t0))
         motion_warmup_lines, motion_warmup_total = extract_warmup_lines(
             motion_stdout)
         motion_summary = summarize_motions(motion_dir)

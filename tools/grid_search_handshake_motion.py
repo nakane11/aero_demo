@@ -398,7 +398,7 @@ def main():
     spik.apply_collision_model(robot)
     spik.apply_hand_box(robot)
     # 検証ペアはロボット構造だけで決まる ('r' は結果に影響しない)。
-    verification_pairs = spik.build_collision_verification_pairs(robot, 'r')
+    verification_pairs = spik.build_collision_verification_pairs(robot)
 
     rows = []
     for combo in combos:

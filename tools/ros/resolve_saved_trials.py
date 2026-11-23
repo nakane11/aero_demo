@@ -182,7 +182,7 @@ def resolve_transition_only(planner, args, data_dir, name):
     joint_positions = spik.load_skeleton_json(
         os.path.join(data_dir, 'skeletons', name))
     offset = spik.human_translation_offset(
-        joint_positions, front_distance=args.human_front_distance)
+        joint_positions, front_distance=rcpt.spik.HUMAN_FRONT_DISTANCE)
     translated_joints = spik.translate_joint_positions(
         joint_positions, offset)
     collision_joints = spik.shift_torso_joints_from_surface(

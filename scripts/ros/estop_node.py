@@ -4,7 +4,7 @@
 """AtomS3 のボタンを UDP で受け、全コントローラの follow_joint_trajectory と
 move_base のゴールを cancel する非常停止ノード。
 
-プロトコル: ``--listen-port`` へ改行区切りの ``STOP`` / ``RESUME``。
+プロトコル: UDP の ``LISTEN_PORT`` (5555) へ改行区切りの ``STOP`` / ``RESUME``。
 停止中は ``/estop`` (Bool, latch) が True。cancel だけでは直後に送られる
 次のゴールを防げないので、デモ側は True の間は新しい動作を送らないこと。
 UDP は到達保証が無いため、送信側は STOP を複数回送り、こちらも cancel を
@@ -12,7 +12,7 @@ UDP は到達保証が無いため、送信側は STOP を複数回送り、こ�
 
 Usage
 -----
-    rosrun aero_demo estop_node.py --listen-port 5555
+    rosrun aero_demo estop_node.py
 """
 
 import argparse
@@ -30,6 +30,9 @@ CANCEL_REPEAT_INTERVAL = 0.05  # [sec]
 
 # rospy.is_shutdown() を確認するための受信タイムアウト。
 SOCKET_POLL_TIMEOUT = 0.5  # [sec]
+
+LISTEN_HOST = '0.0.0.0'
+LISTEN_PORT = 5555
 
 DEFAULT_CONTROLLERS = [
     'base_controller',
@@ -52,7 +55,7 @@ class EstopNode(object):
             name: rospy.Publisher(
                 '/{}/follow_joint_trajectory/cancel'.format(name),
                 GoalID, queue_size=1)
-            for name in args.controllers
+            for name in DEFAULT_CONTROLLERS
         }
         self._move_base_cancel_pub = rospy.Publisher(
             '/move_base/cancel', GoalID, queue_size=1)
@@ -66,7 +69,7 @@ class EstopNode(object):
         self._estop_pub.publish(Bool(data=False))
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind((args.listen_host, args.listen_port))
+        self._sock.bind((LISTEN_HOST, LISTEN_PORT))
         self._sock.settimeout(SOCKET_POLL_TIMEOUT)
 
     # ------------------------------------------------------------------
@@ -123,8 +126,7 @@ class EstopNode(object):
     def spin(self):
         rospy.loginfo(
             '[estop_node] UDP %s:%d で待受を開始します。対象コント'
-            'ローラ: %s', self.args.listen_host, self.args.listen_port,
-            self.args.controllers)
+            'ローラ: %s', LISTEN_HOST, LISTEN_PORT, DEFAULT_CONTROLLERS)
 
         while not rospy.is_shutdown():
             try:
@@ -143,12 +145,6 @@ class EstopNode(object):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--listen-host', type=str, default='0.0.0.0')
-    parser.add_argument('--listen-port', type=int, default=5555)
-    parser.add_argument(
-        '--controllers', type=str, nargs='+',
-        default=DEFAULT_CONTROLLERS,
-        help='cancel を送る対象コントローラの名前空間一覧。')
     args, _ = parser.parse_known_args(rospy.myargv()[1:])
 
     rospy.init_node('estop_node')

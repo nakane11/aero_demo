@@ -83,7 +83,7 @@ def analyze_handshake_dir(handshake_dir, skeleton_dir,
         ``n_samples``。
     """
     robot = build_robot()
-    pairs = build_collision_verification_pairs(robot, 'r')
+    pairs = build_collision_verification_pairs(robot)
     names = [collision_pair_name(pair) for pair in pairs]
     is_self = np.array([not isinstance(other, int) for _, other in pairs])
 

@@ -313,7 +313,7 @@ class PeoplePoseEstimator(object):
             if neck_pos is None:
                 continue
 
-            if not self._is_valid_person(positions, neck_pos, current_time):
+            if not self._is_valid_person(positions, neck_pos):
                 continue
 
             # 履歴はカメラ座標系のまま保持する (フィルタと同じ座標系)
@@ -632,7 +632,7 @@ class PeoplePoseEstimator(object):
                         del positions[name]
         return positions
 
-    def _is_valid_person(self, positions, neck_pos, current_time):
+    def _is_valid_person(self, positions, neck_pos):
         """椅子などの誤検出を弾く."""
         is_valid_by_history = False
         for _, p in self.recent_human_positions:

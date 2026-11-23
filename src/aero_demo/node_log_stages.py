@@ -46,15 +46,11 @@ _RULES = [
 class LogStages(object):
     """ログから読み取った状態の切り替わり ``[(時刻 [epoch 秒], (見出し, 補足))]``。"""
 
-    def __init__(self, path, reference_time, utc_offset_hours=None):
+    def __init__(self, path, reference_time):
         """``reference_time``: ログと同じ日の時刻 (epoch 秒。bag の時刻など)。
-        ログの時刻 (時:分:秒) をその日付で epoch 秒にする。``utc_offset_hours``
-        はログを書いた PC の時差 (None ならこの PC の地方時)。日付をまたぐ
-        ログは、前の行より時刻が戻ったら翌日とみなす。"""
-        if utc_offset_hours is None:
-            tz = datetime.datetime.fromtimestamp(reference_time).astimezone().tzinfo
-        else:
-            tz = datetime.timezone(datetime.timedelta(hours=utc_offset_hours))
+        ログの時刻 (時:分:秒) をこの PC の地方時でその日付の epoch 秒にする。
+        日付をまたぐログは、前の行より時刻が戻ったら翌日とみなす。"""
+        tz = datetime.datetime.fromtimestamp(reference_time).astimezone().tzinfo
         day = datetime.datetime.fromtimestamp(reference_time, tz).date()
         self.events = []
         previous = None

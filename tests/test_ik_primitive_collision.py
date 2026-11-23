@@ -61,7 +61,7 @@ def _random_cylinders(rng, center, n=12, spread=0.35):
     return obstacles
 
 
-def _set_random_pose(robot, rng, link_list):
+def _set_random_pose(rng, link_list):
     """関節を可動域の中央 60% のランダムな角度にする (無限可動域は除く)。
 
     mimic 関節を親で上書きさせるため逆順に設定する。"""
@@ -149,7 +149,7 @@ def test_distance_matches_samples_with_moving_base(robot, seed):
         fk_params, setup = _build(robot, link_list, robot.rarm_end_coords,
                                   collision_links, obstacles)
 
-        _set_random_pose(robot, rng, whole_body.link_list)
+        _set_random_pose(rng, whole_body.link_list)
         x, y, yaw = rng.uniform(-0.5, 0.5), rng.uniform(-0.5, 0.5), \
             rng.uniform(-math.pi, math.pi)
         for joint, value in zip(state['chain_joints'], (x, y, yaw)):
@@ -190,7 +190,7 @@ def test_distance_matches_samples_for_links_fixed_to_base(robot):
         n_static = sum(int(b['is_static'].sum())
                        for b in setup['robot_buckets'].values())
         assert n_static > 0
-        _set_random_pose(robot, rng, link_list)
+        _set_random_pose(rng, link_list)
         prim = _primitive_distances(setup, link_list, fk_params, obstacles)
         n_compared, max_err = _compare(collision_links, obstacles, prim)
         print('fixed-to-base: {} static links, {} pairs compared, max '
@@ -209,7 +209,7 @@ def test_human_obstacle_clearances_agree(robot):
     obstacles = _random_cylinders(rng, robot.rarm_end_coords.worldpos())
     fk_params, setup = _build(robot, link_list, robot.rarm_end_coords,
                               collision_links, obstacles)
-    _set_random_pose(robot, rng, link_list)
+    _set_random_pose(rng, link_list)
     prim = _primitive_distances(setup, link_list, fk_params, obstacles)
     pairs = [(link, i) for link in collision_links
              for i in range(len(obstacles))]
@@ -238,7 +238,7 @@ def test_human_obstacle_clearances_match_brute_force(robot):
     for _ in range(5):
         robot.reset_pose()
         obstacles = _random_cylinders(rng, robot.rarm_end_coords.worldpos())
-        _set_random_pose(robot, rng, link_list)
+        _set_random_pose(rng, link_list)
         pairs = [(link, i) for link in collision_links
                  for i in range(len(obstacles))]
         clearances = spik.human_obstacle_clearances(
@@ -322,7 +322,7 @@ def test_constants_are_reproducible(robot):
 
     robot.reset_pose()
     first = build()
-    _set_random_pose(robot, np.random.default_rng(5),
+    _set_random_pose(np.random.default_rng(5),
                      robot.rarm_whole_body.link_list)
     robot.reset_pose()
     second = build()

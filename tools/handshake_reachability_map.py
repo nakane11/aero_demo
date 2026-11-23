@@ -237,8 +237,7 @@ class IkEvaluator(object):
         spik.other_hand_points('r')
         spik.attach_camera_optical_coords(robot)
         self.robot = robot
-        self.verification_pairs = spik.build_verification_pairs_for_model(
-            robot, spik.DEFAULT_COLLISION_VERIFY_MODEL)
+        self.verification_pairs = spik.build_verification_pairs_for_model(robot)
         self.collision_pairs = spik.load_collision_pairs(
             args.collision_pairs, robot)
         self.base_limits = [tuple(spik.DEFAULT_BASE_X_RANGE),

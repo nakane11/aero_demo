@@ -135,8 +135,7 @@ def setup_transition_robot():
     結果が壊れる)。``(robot, collision_pairs, verification_pairs,
     base_limits)``。"""
     robot = load_robot()
-    verification_pairs = spik.build_verification_pairs_for_model(
-        robot, spik.DEFAULT_COLLISION_VERIFY_MODEL)
+    verification_pairs = spik.build_verification_pairs_for_model(robot)
     pairs = spik.load_collision_pairs(
         os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'), robot)
     base_limits = [tuple(spik.DEFAULT_BASE_X_RANGE),
@@ -396,8 +395,7 @@ def main():
     robot = load_robot()
     collision_pairs = spik.load_collision_pairs(
         os.path.join(_SCRIPTS_DIR, 'collision_pairs.json'), robot)
-    verification_pairs = spik.build_verification_pairs_for_model(
-        robot, spik.DEFAULT_COLLISION_VERIFY_MODEL)
+    verification_pairs = spik.build_verification_pairs_for_model(robot)
     base_limits = [spik.DEFAULT_BASE_X_RANGE,
                    (-spik.BASE_Y_MOVABLE_HALF_RANGE,
                     spik.BASE_Y_MOVABLE_HALF_RANGE),

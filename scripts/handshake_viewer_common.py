@@ -83,7 +83,7 @@ def sync_robot_collision_overlay(collision_robot, robot):
     collision_robot.newcoords(robot.base_link.copy_worldcoords())
 
 
-def colliding_link_pairs(robot, pairs, obstacle_links,
+def colliding_link_pairs(pairs, obstacle_links,
                          tolerance=spik.DEFAULT_COLLISION_VERIFY_TOLERANCE):
     """``pairs`` のうち ``tolerance`` を超えて貫通している組を列挙する。
 

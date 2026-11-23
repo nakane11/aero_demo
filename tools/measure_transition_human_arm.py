@@ -178,8 +178,7 @@ def main():
     parser.add_argument('--out', default=None)
     args = parser.parse_args()
     robot = load_robot()
-    checkers = dict(pairs=spik.build_verification_pairs_for_model(
-        robot, spik.DEFAULT_COLLISION_VERIFY_MODEL))
+    checkers = dict(pairs=spik.build_verification_pairs_for_model(robot))
     records = []
     for motion_dir in args.motion_dirs:
         for name in sorted(os.listdir(motion_dir)):

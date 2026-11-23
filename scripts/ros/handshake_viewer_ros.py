@@ -20,19 +20,21 @@ from aero_demo.ros_camera_utils import imgmsg_to_ndarray
 from aero_demo.ros_camera_utils import transform_to_matrix
 
 ODOM_FRAME = 'odom'
+BASE_FRAME = 'base_link'
+# 実機ノードの名前 (``~status`` などの名前空間)。
+NODE = '/run_camera_pipeline_test'
 
 
 class RosBridge(object):
     """受け取った最新の値を持つ (コールバックは rospy のスレッドから来る)。"""
 
-    def __init__(self, node, joint_states_topic='/joint_states',
-                 base_frame='base_link', image_topic=None):
-        """``node``: 実機ノードの名前 (``~status`` などの名前空間)。
-        ``image_topic``: カメラ画像のトピック (None ならノードの ``~skeleton_image``)。"""
+    def __init__(self, joint_states_topic='/joint_states'):
+        """実機ノード ``NODE`` の ``~status`` などと、カメラ画像としてその
+        ``~skeleton_image`` を受け取る。"""
         rospy.init_node('handshake_viewer', anonymous=True,
                         disable_signals=True)
-        self.node = node.rstrip('/')
-        self.base_frame = base_frame
+        self.node = NODE
+        self.base_frame = BASE_FRAME
         self._lock = threading.Lock()
         self._plan = None
         self._plan_version = 0
@@ -50,7 +52,7 @@ class RosBridge(object):
                              queue_size=1),
             rospy.Subscriber(self.node + '/skeleton', String,
                              self._on_skeleton, queue_size=1),
-            rospy.Subscriber(image_topic or self.node + '/skeleton_image',
+            rospy.Subscriber(self.node + '/skeleton_image',
                              Image, self._on_image, queue_size=1,
                              buff_size=2 ** 24),
             rospy.Subscriber(joint_states_topic, JointState,

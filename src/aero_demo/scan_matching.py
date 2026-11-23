@@ -89,7 +89,7 @@ def _reference_normals(points, tree):
 
 
 def icp_2d(ref_points, cur_points, initial_pose, exclude_centers=None,
-           exclude_radius=0.0, schedule=CORRESPONDENCE_SCHEDULE):
+           exclude_radius=0.0):
     """基準から見た現在の台車の姿勢を point-to-line ICP で求める.
 
     ``exclude_centers`` (基準座標系) から ``exclude_radius`` 以内の点は
@@ -122,7 +122,7 @@ def icp_2d(ref_points, cur_points, initial_pose, exclude_centers=None,
 
     iterations = 0
     residuals = np.zeros(0)
-    for max_dist in schedule:
+    for max_dist in CORRESPONDENCE_SCHEDULE:
         for _ in range(ITERATIONS_PER_STAGE):
             iterations += 1
             moved = transform_points(cur, pose)
@@ -157,7 +157,7 @@ class ScanOdometry(object):
 
     基準スキャンだけと照合すると、接近で大きく回った後は重なりが減って照合の品質
     が足りなくなる (180 度回ると半分以上の試行で失敗した)。そこでキーフレーム
-    (直近に照合が通ったスキャン) と照合し、``key_yaw``・``key_distance`` 以上
+    (直近に照合が通ったスキャン) と照合し、10 度・0.25 m 以上
     動いたら今のスキャンを新しいキーフレームにする。照合の品質が足りないスキャンは
     直前の推定に odom の増分を足した予測で埋める。
 
@@ -168,17 +168,16 @@ class ScanOdometry(object):
 
     def __init__(self, ref_points, ref_stamp, exclude_centers=None,
                  exclude_radius=0.0, min_inlier_ratio=0.3, min_inliers=100,
-                 max_rms=0.03, key_yaw=math.radians(10.0),
-                 key_distance=0.25, history=400):
+                 max_rms=0.03):
         self._key_points = np.asarray(ref_points, dtype=np.float64)
         self._key_pose = np.zeros(3)
         self._exclude = (None if exclude_centers is None
                          else np.asarray(exclude_centers, dtype=np.float64))
         self._exclude_radius = exclude_radius
         self._quality = (min_inlier_ratio, min_inliers, max_rms)
-        self._key_yaw = key_yaw
-        self._key_distance = key_distance
-        self._history_size = history
+        self._key_yaw = math.radians(10.0)
+        self._key_distance = 0.25
+        self._history_size = 400
         # (時刻, 推定した姿勢, その時刻の odom_delta, 照合が通ったか)
         self.history = [(float(ref_stamp), np.zeros(3), np.zeros(3), True)]
         self.n_fallback = 0

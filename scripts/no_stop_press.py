@@ -107,9 +107,9 @@ def press_direction(robot, joint_names, hover_wp, result):
     return hover_hand, direction / norm
 
 
-def approach_slide_cos(robot, joint_names, approach_wps, result, palm,
-                       n_last=APPROACH_DIRECTION_POINTS):
-    """接近の終わりの手先の向き (末尾 ``n_last`` 点の始めから hover へ) と、
+def approach_slide_cos(robot, joint_names, approach_wps, result, palm):
+    """接近の終わりの手先の向き (末尾 ``APPROACH_DIRECTION_POINTS`` 点の始め
+    から hover へ) と、
     押し込みですべらせる向き (``spik.press_in_slide_direction``) の cos。
 
     負なら手先は人の指先の側から来て、掌を越えた手首の側の hover まで行って
@@ -120,7 +120,8 @@ def approach_slide_cos(robot, joint_names, approach_wps, result, palm,
         return None
     robot_arm = result['robot_arm']
     first = hand_position(robot, joint_names,
-                          approach_wps[-min(n_last, len(approach_wps))],
+                          approach_wps[-min(APPROACH_DIRECTION_POINTS,
+                                            len(approach_wps))],
                           robot_arm)
     last = hand_position(robot, joint_names, approach_wps[-1], robot_arm)
     direction = last - first
@@ -133,7 +134,6 @@ def approach_slide_cos(robot, joint_names, approach_wps, result, palm,
 
 
 def retime_approach_arm(robot, joint_names, approach_wps, result,
-                        dwell=HOVER_DWELL, radii=RETIME_RADII,
                         margin_fn=None):
     """接近の waypoint 列 (末尾が hover) の終わりの腕を、計画の経路のまま
     時間だけ割り振り直す (台車は同じ)。
@@ -141,12 +141,12 @@ def retime_approach_arm(robot, joint_names, approach_wps, result,
     計画では、台車がゆっくり回り終える間に腕はもう hover の姿勢に着いて
     待っている。手先が hover の手先から ``radius`` に入った点 j から先は、
     腕を計画の経路 (点 j から hover までの関節角の列) に沿って、hover に着く
-    時刻 (台車が着いてから ``dwell`` 秒後) まで一定の速さで進ませる
+    時刻 (台車が着いてから ``HOVER_DWELL`` 秒後) まで一定の速さで進ませる
     (経路の長さは関節ごとの速度上限で割った時間の尺度)。台車が着く点は
     hover の少し手前 (「手前の hover」) になり、腕は後戻りしない。
 
     ``margin_fn(waypoint, None)`` があれば割り振り直した点の人体との距離の余裕
-    を確かめ、通らなければ ``radii`` の次 (小さい範囲) で試す。
+    を確かめ、通らなければ ``RETIME_RADII`` の次 (小さい範囲) で試す。
     Returns: ``(waypoints, info)``、どれも通らなければ ``(None, info)``。
     """
     robot_arm = result['robot_arm']
@@ -158,13 +158,13 @@ def retime_approach_arm(robot, joint_names, approach_wps, result,
     max_vel = max_velocities(joint_names, joints)
     times = limited_times(approach_wps, max_vel)
     arrivals = np.concatenate([[0.0], np.cumsum(times)])
-    t_hover = float(arrivals[-1]) + dwell
+    t_hover = float(arrivals[-1]) + HOVER_DWELL
     angles = np.array([wp['joint_angle_vector'] for wp in approach_wps],
                       dtype=np.float64)
     weights = np.where(np.isfinite(max_vel), 1.0 / max_vel, 0.0)
     n = len(approach_wps)
     info = dict(reason='no_radius')
-    for radius in radii:
+    for radius in RETIME_RADII:
         far = [k for k, hand in enumerate(hands)
                if np.linalg.norm(hand - hover_hand) > radius]
         start = min(far[-1] + 1 if far else 0, n - 2)
@@ -260,13 +260,12 @@ def palm_in_base(palm_world, base_pose):
         palm_world, rot, -rot @ np.array([base_pose[0], base_pose[1], 0.0]))
 
 
-def base_residual(target_pose, actual_pose,
-                  angle_tolerance=BASE_ANGLE_TOLERANCE):
+def base_residual(target_pose, actual_pose):
     """実機ノードの ``_measure_base_residual`` と同じ目標までの残差 (今の台車の
     系の ``[dx, dy, dyaw]``)。向きは許容内なら直さない。"""
     target = np.asarray(target_pose, dtype=np.float64).copy()
     yaw_error = scan_matching.wrap_angle(target[2] - actual_pose[2])
-    if abs(yaw_error) <= angle_tolerance:
+    if abs(yaw_error) <= BASE_ANGLE_TOLERANCE:
         target[2] = actual_pose[2]
     return np.asarray(scan_matching.relative(actual_pose, target))
 
@@ -281,12 +280,12 @@ def fold_move(residual):
             ), bool(ok)
 
 
-def clearance_scale(margin_at, scales=CLEARANCE_SCALES):
+def clearance_scale(margin_at):
     """``margin_at(scale)`` (台車のずらしをその割合にしたときの人体との距離の
     余裕) で縮める割合を決める (実機ノードの ``_clearance_scale`` と同じ)。
     ``(割合 or None, 余裕)``。"""
     margins = []
-    for scale in scales:
+    for scale in CLEARANCE_SCALES:
         margin = margin_at(scale)
         if margin >= 0.0:
             return scale, margin
@@ -363,8 +362,7 @@ def _without_retreat(move_xy, axis_xy):
 
 
 def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
-                  palm_now, base_move, base_error=None, margin_fn=None,
-                  no_retreat=True):
+                  palm_now, base_move, base_error=None, margin_fn=None):
     """台車がまだ ``base_move`` (今の台車の系) だけ動いていない前提で、検出した
     掌 ``palm_now`` (今の台車の系) から押し込みを解き直す。
 
@@ -372,7 +370,7 @@ def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
     (``margin_fn`` があれば ``plan_palm_base_shift``) も ``base_move`` に足して
     から ``spik.refine_post_process`` で解く。
 
-    ``no_retreat`` なら、台車の動き (ずれの補正・寄せる分) のうち押し込む向き
+    台車の動き (ずれの補正・寄せる分) のうち押し込む向き
     (計画の hover の手先から押し込みの目標へ、水平) と逆向きの成分を除き、
     その分は腕で吸収する。台車が人の側へずれた・人が手を前に出したときに
     台車を下げると、押し込みの間に手先が引かれるため。それで解けなければ
@@ -389,7 +387,7 @@ def refine_folded(robot, joint_names, hover_wp, result, planned_palm,
         # 押し込む向きを hover の台車の系の水平へ。
         axis = _rz(hover_wp['base_yaw']).T[:2, :2] @ found[1][:2]
     axis_norm = float(np.linalg.norm(axis))
-    if no_retreat and axis_norm > 1e-6:
+    if axis_norm > 1e-6:
         out = _refine_folded(robot, joint_names, hover_wp, result,
                              planned_palm, palm_now, base_move, base_error,
                              margin_fn, axis / axis_norm)
@@ -476,21 +474,20 @@ def hover_clearance_margin(robot, joint_names, waypoint, joint_positions,
 # 時間づけと差し替え
 # ---------------------------------------------------------------------------
 
-def max_velocities(joint_names, joints_by_name, controlled=None):
+def max_velocities(joint_names, joints_by_name):
     """``joint_names`` の順の速度上限 (× VEL_LIMIT_RATIO)。"""
     return et.joint_max_velocities(
-        [joints_by_name[name] for name in joint_names], controlled)
+        [joints_by_name[name] for name in joint_names], None)
 
 
-def limited_times(waypoints, max_vel, with_base=True,
-                  min_time=et.MIN_SEGMENT_TIME):
+def limited_times(waypoints, max_vel, with_base=True):
     """``waypoints`` (先頭が動き始め) の区間ごとの時間 (len - 1 個)。"""
     angles = np.array([wp['joint_angle_vector'] for wp in waypoints],
                       dtype=np.float64)
     base = (np.asarray(et.base_trajectory_points(waypoints))[1:]
             if with_base else None)
     return et.limited_time_list(np.diff(angles, axis=0), max_vel, base,
-                                [min_time] * (len(waypoints) - 1))
+                                [et.MIN_SEGMENT_TIME] * (len(waypoints) - 1))
 
 
 def point_velocities(angles, times):
@@ -500,8 +497,7 @@ def point_velocities(angles, times):
                                np.asarray(times, dtype=np.float64))
 
 
-def fit_bridge(start_position, start_velocity, angles, times, max_vel,
-               max_iterations=50):
+def fit_bridge(start_position, start_velocity, angles, times, max_vel):
     """差し替え: t_s の古い軌道の状態 (``start_position``・``start_velocity``)
     から ``angles`` (新しいゴールの点) へつなぐときの、区間の時間と点の速度。
 
@@ -516,7 +512,7 @@ def fit_bridge(start_position, start_velocity, angles, times, max_vel,
                       np.asarray(angles, dtype=np.float64)])
     max_vel = np.asarray(max_vel, dtype=np.float64)
     ratio = 0.0
-    for _ in range(max_iterations):
+    for _ in range(50):
         vel = et.point_velocities(np.diff(path, axis=0), times)
         vel[0] = np.asarray(start_velocity, dtype=np.float64)
         delta = (path[1] - path[0])[None, :]
@@ -534,7 +530,7 @@ def fit_bridge(start_position, start_velocity, angles, times, max_vel,
 
 
 def monotone_press(robot, joint_names, robot_arm, press_wps, current_hand,
-                   target, ahead=ENTRY_AHEAD):
+                   target):
     """差し替えで通る押し込みの点 (``press_wps`` の添字の列、先頭が hover)。
 
     押し込む向き (押し込みの最初の点の手先から目標 ``target`` へ) に、今の手先
@@ -554,7 +550,7 @@ def monotone_press(robot, joint_names, robot_arm, press_wps, current_hand,
     if norm < 1e-6:
         return [len(press_wps) - 1]
     direction /= norm
-    last = float(current_hand @ direction) + ahead
+    last = float(current_hand @ direction) + ENTRY_AHEAD
     keep = []
     for k, hand in enumerate(hands):
         progress = float(hand @ direction)

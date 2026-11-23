@@ -909,9 +909,7 @@ class HandshakeViewer(object):
             # ROS は実機・rosbag のときだけ使う (合成骨格は source 無しで動かす)。
             sys.path.insert(0, os.path.join(_THIS_DIR, 'ros'))
             from handshake_viewer_ros import RosBridge
-            self.bridge = RosBridge(args.node,
-                                    joint_states_topic=args.joint_states_topic,
-                                    image_topic=args.image_topic)
+            self.bridge = RosBridge(joint_states_topic=args.joint_states_topic)
         self.source = None
         if not args.ros:
             skeleton_dir, handshake_dir, motion_dir = input_dirs(args)
@@ -1117,8 +1115,7 @@ class HandshakeViewer(object):
         if self.log_stages is None:
             # ログの時刻 (時:分:秒) の日付は、最初に受け取った ROS の時刻で決める。
             from aero_demo.node_log_stages import LogStages
-            self.log_stages = LogStages(self.args.log, now,
-                                        self.args.log_utc_offset)
+            self.log_stages = LogStages(self.args.log, now)
             print('[viewer] {} から状態の切り替わりを {} 件読みました。'.format(
                 self.args.log, len(self.log_stages.events)))
         stage, since = self.log_stages.stage_at(now)
@@ -1155,7 +1152,7 @@ class HandshakeViewer(object):
         notes = []
         if status is None:
             stage = ('実機ノードの状態を待っています',
-                     '{}/status が届いていません'.format(self.args.node))
+                     '{}/status が届いていません'.format(self.bridge.node))
             info = []
         else:
             stage = (status['stage'], status['detail'])
@@ -1292,22 +1289,13 @@ def build_arg_parser():
     parser.add_argument(
         '--ros', action='store_true',
         help='実機・rosbag: 実機ノードの状態と実機の姿勢を表示する (ROS が要る)。')
-    parser.add_argument(
-        '--node', type=str, default='/run_camera_pipeline_test',
-        help='実機ノードの名前 (--ros)。')
     parser.add_argument('--joint-states-topic', type=str,
                         default='/joint_states')
-    parser.add_argument(
-        '--image-topic', type=str, default=None,
-        help='カメラ画像のトピック (既定は実機ノードの骨格を重ねた画像)。')
     parser.add_argument(
         '--log', type=str, default=None,
         help='bag と一緒に保存した実機ノードのログ (person_NN.log)。指定すると '
              '実機表示の状態を ~status の代わりにこのログから出す (~status を'
              '記録していない bag 用)。')
-    parser.add_argument(
-        '--log-utc-offset', type=float, default=None,
-        help='--log を書いた PC の UTC からの時差 [時間] (既定はこの PC の地方時)。')
     parser.add_argument(
         '--work-dir', type=str, default=None,
         help='skeletons/・handshakes/・motions/ を持つディレクトリ '

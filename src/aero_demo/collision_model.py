@@ -88,12 +88,11 @@ def write_extra_collision_urdf(src_path, dst_path):
         dst_path, ', '.join(extra_boxes)))
 
 
-def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
+def build_collision_model_urdf(urdf_path):
     """URDF のメッシュをプリミティブに変換し、追加リンク込みの URDF パスを返す.
 
-    ``primitive_type`` ('box'/'cylinder'/'sphere') で形状を強制できる
-    (None なら自動選択)。変換結果はキャッシュし、``force`` で作り直す。
-    元の URDF の方が新しい (手首の有無を変えたなど) ときも作り直す。
+    形状は自動選択。変換結果はキャッシュし、元の URDF の方が新しい (手首の
+    有無を変えたなど) ときは作り直す。
     """
     urdf_path = Path(urdf_path)
     primitives_path = urdf_path.parent / f"{urdf_path.stem}_primitives.urdf"
@@ -101,7 +100,7 @@ def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
 
     stale = (primitives_path.exists()
              and primitives_path.stat().st_mtime < urdf_path.stat().st_mtime)
-    if primitives_path.exists() and not force and not stale:
+    if primitives_path.exists() and not stale:
         print(f"[skip] 既存の干渉モデルURDFを再利用します: {primitives_path}")
     else:
         print(f"[convert] {urdf_path} -> {primitives_path}")
@@ -110,7 +109,6 @@ def build_collision_model_urdf(urdf_path, primitive_type=None, force=False):
             str(primitives_path),
             convert_visual=True,
             convert_collision=True,
-            primitive_type=primitive_type,
         )
         print(f"[convert] {modified} 個のジオメトリをプリミティブに変換しました")
     write_extra_collision_urdf(primitives_path, output_path)

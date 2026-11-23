@@ -348,7 +348,7 @@ def main():
     viewer.add(robot_collision_overlay)
     # 事後検証と同じ干渉ペア ('r' はプレースホルダ)。
     verification_pairs = build_collision_verification_pairs(
-        robot_collision_overlay, 'r')
+        robot_collision_overlay)
     # スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
     remove_obstacles_gui(viewer)
@@ -423,8 +423,7 @@ def main():
 
         # 貫通している組 (事後検証と同じ基準)。
         colliding_pairs = colliding_link_pairs(
-            robot_collision_overlay, verification_pairs,
-            current_obstacle_links,
+            verification_pairs, current_obstacle_links,
             tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
 
         target_coords = pose_coords(

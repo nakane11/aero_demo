@@ -51,8 +51,7 @@ def point_velocities(deltas, times):
 BASE_REST_TOLERANCE = 1e-6
 
 
-def base_point_velocities(deltas, times, tolerance=BASE_REST_TOLERANCE,
-                          planar=False):
+def base_point_velocities(deltas, times, tolerance=BASE_REST_TOLERANCE):
     """台車 (``[dx, dy, dyaw]`` の区間ごとの差) の各点の速度。
     ``point_velocities`` と同じだが、軸ごとに、その軸が止まっている区間
     (差が ``tolerance`` 以下) の両端の点の速度は 0 にする。
@@ -63,27 +62,8 @@ def base_point_velocities(deltas, times, tolerance=BASE_REST_TOLERANCE,
     後ろへ振れ、速度・加速度の上限で 1 区間目が延びて止まって見えた
     (2026-11-22 試行2: 接近の始めに 0.63 秒・後ろへ 9 mm)。向きを変えない
     区間 (待機点への直進) の次に回る区間が続くときの yaw も同じ。
-
-    ``planar`` なら並進 (x, y) は軸ごとではなくベクトルで、前後の区間の
-    速度の向きの差が 90 度未満なら平均、そうでなければ 0 にする (軸ごとだと
-    曲がり角で片方の軸が 0 になり、加速度の上限で次の区間が延びて遅くなる。
-    走っている台車を待機点から接近へつなぐとき)。
     """
     point_vel = point_velocities(deltas, times)
-    n_segments = len(times)
-    if planar and n_segments > 1:
-        seg_vel = deltas[:, :2] / np.asarray(times)[:, None]
-        forward = np.sum(seg_vel[:-1] * seg_vel[1:], axis=1) > 0.0
-        point_vel[1:n_segments, :2] = np.where(
-            forward[:, None], 0.5 * (seg_vel[:-1] + seg_vel[1:]), 0.0)
-        # 並進が止まっている区間の両端は 0 (軸ごとではなく両軸で)。
-        still = np.all(np.abs(deltas[:, :2]) <= tolerance, axis=1)
-        point_vel[:-1, :2][still] = 0.0
-        point_vel[1:, :2][still] = 0.0
-        rest = np.abs(deltas[:, 2:]) <= tolerance
-        point_vel[:-1, 2:][rest] = 0.0
-        point_vel[1:, 2:][rest] = 0.0
-        return point_vel
     rest = np.abs(deltas) <= tolerance
     point_vel[:-1][rest] = 0.0
     point_vel[1:][rest] = 0.0
@@ -100,10 +80,11 @@ def _hermite_coefficients(deltas, times, point_vel):
     return a, b, v0
 
 
-def hermite_peaks(deltas, times, point_vel, norm=False, n_samples=101):
+def hermite_peaks(deltas, times, point_vel, norm=False):
     """各区間を点の速度 ``point_vel`` の 3 次エルミート補間で動かしたときの速度と
     加速度の最大値 (絶対値) を返す。形状は ``deltas`` と同じ、``norm=True`` なら
-    ベクトルの大きさで ``(区間数,)`` (このときの速度は ``n_samples`` 点で評価する)。"""
+    ベクトルの大きさで ``(区間数,)`` (このときの速度は 101 点で評価する)。"""
+    n_samples = 101
     seg_times = times[:, None]
     a, b, v0 = _hermite_coefficients(deltas, times, point_vel)
     v1 = point_vel[1:]
@@ -159,14 +140,14 @@ def base_trajectory_points(waypoints):
     return points
 
 
-def prepend_base_move(waypoints, base_move, tolerance=1e-6):
+def prepend_base_move(waypoints, base_move):
     """``waypoints`` (先頭が今の姿勢として送る waypoint) の前に、台車がまだ
     ``base_move`` (今の台車の系の ``[dx, dy, dyaw]``) だけ動いていない同じ姿勢の
     waypoint を足したリストを返す。``base_trajectory_points`` で送ると、腕は
     先頭の姿勢のまま台車が ``base_move`` だけ動き、そのまま残りへ続く。
     移動が無ければ ``waypoints`` をそのまま返す。"""
     move = [float(v) for v in base_move]
-    if all(abs(v) <= tolerance for v in move):
+    if all(abs(v) <= 1e-6 for v in move):
         return waypoints
     first = waypoints[0]
     x, y, yaw = (first['base_position'][0], first['base_position'][1],
@@ -231,7 +212,7 @@ def splice_target_index(waypoints, max_index, lookahead=SPLICE_LOOKAHEAD):
 
 
 def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
-                      log=None, base_start_velocity=None, base_planar=False):
+                      log=None, base_start_velocity=None):
     """区間ごとの所要時間を、律速する軸の指令の速度・加速度の最大値がちょうど
     上限 (× ``VEL_LIMIT_RATIO``、加速度は ``ACCEL_TIME``) になるよう決めて返す。
     ``time_list`` は区間ごとの下限。
@@ -241,8 +222,7 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
     累積 ``[dx, dy, dyaw]`` 列 (``base_trajectory_points``)。どちらも None/空なら
     判定から外す。``log``: 上限内に収まらず一律に延ばしたときに文を渡す関数。
     ``base_start_velocity``: 台車が動いている途中から送るときの始点の速度
-    (区間先頭の系の ``[vx, vy, vyaw]``、None なら静止)。``base_planar``:
-    台車の点の速度を ``base_point_velocities(planar=True)`` で付けるとき。
+    (区間先頭の系の ``[vx, vy, vyaw]``、None なら静止)。
     """
     base_deltas = None
     if base_points is not None and len(base_points):
@@ -286,8 +266,7 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
             vel_ratios.append(vel / arm_max_vel)
             acc_ratios.append(acc / (arm_max_vel / ACCEL_TIME))
         if base_deltas is not None:
-            point_vel = base_point_velocities(base_deltas, times,
-                                              planar=base_planar)
+            point_vel = base_point_velocities(base_deltas, times)
             if base_start_velocity is not None:
                 point_vel[0] = base_start_velocity
             # 並進は向きによらず超えないようベクトルの大きさで判定する。

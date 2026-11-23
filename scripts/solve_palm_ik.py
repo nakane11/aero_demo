@@ -147,9 +147,9 @@ PRESS_IN_BASE_RATIO = 1.0
 # 押し込み区間の手先目標の数 (hover を含まず最終目標を含む)。
 PRESS_IN_PATH_POINTS = 8
 # 押し込み区間で腰を上げないか: 'strict' は脚を腰が高くなる側へ動かさない
-# (解けなければ失敗)、'fallback' は解けないときだけ制限なし、'off' は制限なし。
+# (解けなければ失敗)、'fallback' は解けないときだけ制限なし。
 PRESS_IN_LEG_RISE = 'strict'
-PRESS_IN_LEG_RISE_MODES = ('off', 'strict', 'fallback')
+PRESS_IN_LEG_RISE_MODES = ('strict', 'fallback')
 # 押し込みで腰が上がってよい量 [m]。LEG_RISE_PIN_TOLERANCE は脚の関節を直前の
 # 角度に合わせるときの許容 [rad] (その 2 倍)。
 LEG_RISE_ALLOW = 0.20  # [m]
@@ -357,16 +357,13 @@ SURFACE_SHIFTED_MARKER = 'SurfaceShifted'
 
 
 def shift_torso_joints_from_surface(joint_positions, viewpoint_xy,
-                                    offset=DEFAULT_TORSO_SURFACE_OFFSET,
-                                    limb_offsets=None):
+                                    offset=DEFAULT_TORSO_SURFACE_OFFSET):
     """体幹の関節を ``viewpoint_xy`` (カメラの x/y) から離れる水平方向へ ``offset`` [m]、
-    頭・腕・脚の関節を ``limb_offsets`` ずつずらし、目印を加えたコピーを返す。
+    頭・腕・脚の関節を ``LIMB_SURFACE_OFFSETS`` ずつずらし、目印を加えたコピーを返す。
     ``offset`` が 0 以下なら何もしない。"""
     if offset <= 0.0 or not joint_positions:
         return joint_positions
-    if limb_offsets is None:
-        limb_offsets = LIMB_SURFACE_OFFSETS
-    offsets = dict(limb_offsets)
+    offsets = dict(LIMB_SURFACE_OFFSETS)
     offsets.update((name, offset) for name in TORSO_SURFACE_JOINTS)
     viewpoint_xy = np.asarray(viewpoint_xy, dtype=np.float64)[:2]
     shifted = dict(joint_positions)
@@ -1308,7 +1305,7 @@ OFFERED_HAND_PENALTY_LINKS = ('{}_hand_link', '{}_thumb_box_link',
 # 押し込み区間と横並び移動で、ロボットの差し出す腕の肘・前腕・手首
 # (FOREARM_CHECK_LINKS、手は人の掌に触れるので除く) を、人の差し出した前腕
 # (肘 -> 手首) と手の甲 (``hand_back_segment``) から離す距離 [m]。押し込み区間
-# は PRESS_IN_FOREARM_CLEARANCE (None で見ない)。
+# は PRESS_IN_FOREARM_CLEARANCE。
 FOREARM_CHECK_LINKS = ('{}_elbow_link', '{}_forearm_link', '{}_hand_yaw_link')
 PRESS_IN_FOREARM_CLEARANCE = OFFERED_HAND_CLEARANCE
 HUMAN_FOREARM_RADIUS = 0.04  # HUMAN_COLLISION_SEGMENTS の肘-手首と同じ
@@ -1356,22 +1353,6 @@ def palm_rotation(palm):
     n = n - np.dot(n, x) * x
     n = n / np.linalg.norm(n)
     return np.column_stack([x, n, np.cross(x, n)])
-
-
-def add_press_in_forearm_argument(parser):
-    parser.add_argument(
-        '--press-in-forearm-clearance', type=float,
-        default=PRESS_IN_FOREARM_CLEARANCE,
-        help='押し込み区間でロボットの肘・前腕・手首を人の前腕・手の甲から離す'
-             '距離 [m] (既定 {}、負で見ない)。'.format(
-                 PRESS_IN_FOREARM_CLEARANCE))
-
-
-def apply_press_in_forearm_argument(args):
-    global PRESS_IN_FOREARM_CLEARANCE
-    value = args.press_in_forearm_clearance
-    PRESS_IN_FOREARM_CLEARANCE = (None if value is None or value < 0.0
-                                  else value)
 
 
 def forearm_clearance_pairs(source, robot_arm):
@@ -1490,11 +1471,11 @@ def clearance_shortfall(clearances, thresholds):
     return best
 
 
-def offered_hand_penalty_obstacle(obstacle, margin,
-                                  hand_clearance=OFFERED_HAND_CLEARANCE):
+def offered_hand_penalty_obstacle(obstacle, margin):
     """バッチ IK の干渉ペナルティ (マージン ``margin`` は共通) で前腕との距離を
-    ``hand_clearance`` にするため、半径と長さを ``margin - hand_clearance`` 細らせた円柱を返す。"""
-    shrink = max(margin - hand_clearance, 0.0)
+    ``OFFERED_HAND_CLEARANCE`` にするため、半径と長さを ``margin - OFFERED_HAND_CLEARANCE`` 細らせた
+    円柱を返す。"""
+    shrink = max(margin - OFFERED_HAND_CLEARANCE, 0.0)
     return Cylinder(radius=max(obstacle.radius - shrink, 1e-3),
                     height=max(obstacle.height - 2.0 * shrink, 1e-3),
                     pos=obstacle.worldpos().tolist(),
@@ -2464,7 +2445,7 @@ def self_collision_ignored(robot, collision_link_list):
     return ignored
 
 
-def build_collision_verification_pairs(robot, robot_arm):
+def build_collision_verification_pairs(robot):
     """事後検証用の総当たりのペア (``load_collision_pairs`` と同じ形式): ``self_collision_ignored`` を除いた
     自己干渉の全組と、全リンク x 全人体セグメント。"""
     collision_link_list = collision_link_list_for_arm(robot)
@@ -2521,33 +2502,20 @@ def self_collision_pairs(verification_pairs):
 
 
 def human_clearance_pairs(verification_pairs):
-    """人体との距離を測る組 ('mixed' なら指ありモデルの組)。"""
+    """人体との距離を測る組 (``build_verification_pairs_for_model`` のものなら指ありモデルの組)。"""
     return getattr(verification_pairs, 'clearance_pairs', None) \
         or verification_pairs
 
 
-COLLISION_VERIFY_MODELS = ('mixed', 'nohand', 'hand')
-DEFAULT_COLLISION_VERIFY_MODEL = 'mixed'
-
-
-def build_verification_pairs_for_model(
-        robot, verify_model=DEFAULT_COLLISION_VERIFY_MODEL):
-    """``verify_model`` で事後検証する ``VerificationPairs`` を作る: 'nohand' は ``robot``、
-    'hand' は指ありモデル、'mixed' は自己干渉を ``robot`` で、人体との距離を指ありモデルで測る。"""
-    if verify_model in ('nohand', 'mixed'):
-        pairs = VerificationPairs(
-            build_collision_verification_pairs(robot, 'r'))
-        if verify_model == 'mixed':
-            hand = build_verification_pairs_for_model(robot, 'hand')
-            pairs.clearance_pairs = hand.with_pairs(
-                [pair for pair in hand if isinstance(pair[1], int)])
-        return pairs
-    if verify_model != 'hand':
-        raise ValueError('verify_model は {} のどれかです: {!r}'.format(
-            COLLISION_VERIFY_MODELS, verify_model))
+def build_verification_pairs_for_model(robot):
+    """事後検証する ``VerificationPairs`` を作る: 自己干渉を ``robot`` で、人体との距離を
+    指ありモデルで測る。"""
+    pairs = VerificationPairs(build_collision_verification_pairs(robot))
     model = new_hand_model()
-    return VerificationPairs(
-        build_collision_verification_pairs(model, 'r'), model)
+    hand = VerificationPairs(build_collision_verification_pairs(model), model)
+    pairs.clearance_pairs = hand.with_pairs(
+        [pair for pair in hand if isinstance(pair[1], int)])
+    return pairs
 
 
 def attach_camera_optical_coords(robot, pos=None, rot=None):
@@ -2874,8 +2842,8 @@ def solve_press_in(robot, robot_arm, palm, target_rot, leg_rise=None,
     global LAST_PRESS_IN_PARTIAL, LAST_PRESS_IN_FAILURE
     if leg_rise is None:
         leg_rise = PRESS_IN_LEG_RISE
-    if leg_rise == 'off' or (kwargs.get('posture_goal') is not None
-                             and kwargs.get('fix_legs')):
+    if (kwargs.get('posture_goal') is not None
+            and kwargs.get('fix_legs')):
         return _solve_press_in(robot, robot_arm, palm, target_rot,
                                limit_legs=False, **kwargs)
     start_time = time.time()
@@ -2971,11 +2939,10 @@ PRESS_FAIL_LABELS = {
     'check': '押し込み区間の干渉・人との距離の確かめ', None: '段が不明'}
 
 
-def press_fail_summary(counter=None):
-    """``PICK_PRESS_FAILS`` (または ``counter``) を「段 N 候補、…」の文字列にする (無ければ '')。"""
-    counter = PICK_PRESS_FAILS if counter is None else counter
+def press_fail_summary():
+    """``PICK_PRESS_FAILS`` を「段 N 候補、…」の文字列にする (無ければ '')。"""
     return '、'.join('{} {} 候補'.format(PRESS_FAIL_LABELS.get(k, k), n)
-                    for k, n in counter.most_common())
+                    for k, n in PICK_PRESS_FAILS.most_common())
 
 
 def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
@@ -3540,7 +3507,7 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         hand_clearance=None)
     # 押し込み区間で、ロボットの前腕まわりを人の前腕・手の甲から離す。
     press_forearm_pairs = press_forearm_obstacles = None
-    if (PRESS_IN_FOREARM_CLEARANCE is not None and joint_positions
+    if (joint_positions
             and '{}Elbow'.format(hand) in joint_positions
             and '{}Wrist'.format(hand) in joint_positions):
         press_forearm_pairs = forearm_clearance_pairs(clearance_source,
@@ -4191,10 +4158,8 @@ def _warmup_batch_ik(robot, base_limits, ik_kwargs):
 
 
 def main():
-    global PRESS_IN_SLIDE, PRESS_IN_ADVANCE, PRESS_IN_LIFT, \
-        PRESS_IN_CURVE_EXPONENT, PRESS_IN_BASE_RATIO, CROUCH_WEIGHT, \
-        BOW_WEIGHT, PRESS_IN_LEG_RISE, LEG_RISE_PIN_TOLERANCE, \
-        LEG_LOW_SIDE_MARGIN_RATIO
+    global PRESS_IN_ADVANCE, BOW_WEIGHT, PRESS_IN_LEG_RISE, \
+        LEG_RISE_PIN_TOLERANCE, LEG_LOW_SIDE_MARGIN_RATIO
     parser = argparse.ArgumentParser(
         description='掌の位置姿勢 JSON から、手を繋ぐ全身 IK (台車移動を含む) '
                     'を人物ごとに解いて JSON に保存する。')
@@ -4222,11 +4187,6 @@ def main():
         help='干渉回避でチェックする組の JSON (tools/build_collision_pairs.py '
             'が生成)。無ければ干渉回避と事後検証を無効にする (0 組なら干渉'
             '回避だけ無効)。')
-    parser.add_argument(
-        '--collision-verify-model', choices=COLLISION_VERIFY_MODELS,
-        default=DEFAULT_COLLISION_VERIFY_MODEL,
-        help='事後検証のモデル。mixed (既定) は自己干渉を指なし+手の箱、人体'
-            'との距離を指ありで判定。nohand は両方箱、hand は両方指あり。')
     parser.add_argument(
         '--post-process-max-candidates', type=int,
         default=DEFAULT_POST_PROCESS_MAX_CANDIDATES,
@@ -4289,18 +4249,10 @@ def main():
         help='バッチに載せる向きの候補数 (turn_candidates_deg の先頭から、'
             '既定は全部の {})。'.format(NUM_TURN_CANDIDATES))
     parser.add_argument(
-        '--base-yaw-facing-margin', type=float,
-        default=DEFAULT_BASE_YAW_FACING_MARGIN_DEG,
-        help='台車の yaw を人の正面方向 ± この角度 [deg] に絞る (既定 {})。'
-            .format(DEFAULT_BASE_YAW_FACING_MARGIN_DEG))
-    parser.add_argument(
         '--plan-time-limit', type=float, default=PLAN_TIME_LIMIT,
         help='1 人の計画全体 (IK -> 軌道計画 -> 横並び移動) の時間の上限 '
              '[秒] (実機ノードと同じ、既定 {})。IK はこの時間を過ぎたら次の '
              'x の窓を解かない。0 以下なら上限なし。'.format(PLAN_TIME_LIMIT))
-    parser.add_argument(
-        '--no-base-y-side-restriction', action='store_true',
-        help='台車の y を差し出した手の側に絞らない。')
     parser.add_argument(
         '--base-y-half-range', type=float, default=BASE_Y_MOVABLE_HALF_RANGE,
         help='台車の y の可動域の半幅 [m] (既定 {})。'.format(
@@ -4321,27 +4273,9 @@ def main():
         help='後処理 IK の腕の姿勢の収束閾値 [deg] (既定 {:.1f})。'.format(
             math.degrees(DEFAULT_POST_PROCESS_IK_RTHRE)))
     parser.add_argument(
-        '--hover-human-clearance', type=float,
-        default=DEFAULT_HOVER_HUMAN_CLEARANCE,
-        help='hover 姿勢でロボットと人体の間に空ける距離 [m] (既定 {}、'
-            '負で無効)。'.format(DEFAULT_HOVER_HUMAN_CLEARANCE))
-    add_press_in_forearm_argument(parser)
-    parser.add_argument(
-        '--press-in-slide', type=float, default=PRESS_IN_SLIDE,
-        help='hover 目標を押し込みの最終目標からロボットの指先と逆向きに '
-            'ずらす距離 [m] (既定 {})。'.format(PRESS_IN_SLIDE))
-    parser.add_argument(
         '--press-in-advance', type=float, default=PRESS_IN_ADVANCE,
         help='押し込みの最終目標を掌の位置からさらにロボットの指先方向へ進める '
             '距離 [m]。hover は変わらない (既定 {})。'.format(PRESS_IN_ADVANCE))
-    parser.add_argument(
-        '--press-in-lift', type=float, default=PRESS_IN_LIFT,
-        help='hover 目標を押し込みの最終目標から掌の法線方向に浮かせる距離 '
-            '[m] (既定 {})。'.format(PRESS_IN_LIFT))
-    parser.add_argument(
-        '--crouch-weight', type=float, default=CROUCH_WEIGHT,
-        help='hover の腰の沈み込み [m] を候補のコストに足す重み '
-            '(0 で無効、既定 {})。'.format(CROUCH_WEIGHT))
     parser.add_argument(
         '--bow-weight', type=float, default=BOW_WEIGHT,
         help='hover の腰の前傾 [rad] の二乗を候補のコストに足す重み '
@@ -4349,7 +4283,7 @@ def main():
     parser.add_argument(
         '--press-in-leg-rise', choices=PRESS_IN_LEG_RISE_MODES,
         default=PRESS_IN_LEG_RISE,
-        help='押し込みで腰を上げるか (off: 制限なし、strict: 脚を腰が高く'
+        help='押し込みで腰を上げるか (strict: 脚を腰が高く'
             'なる側へ動かさない、fallback: 解けないときだけ制限なし、'
             '既定 {})。'.format(PRESS_IN_LEG_RISE))
     parser.add_argument(
@@ -4361,27 +4295,12 @@ def main():
         help='strict のとき、押し込みで腰が上がってよい量の目安 [m] (足首・'
             '膝の下限・上限の余裕を 2 倍の [rad] にする。既定は上げない)。')
     parser.add_argument(
-        '--press-in-base-ratio', type=float, default=PRESS_IN_BASE_RATIO,
-        help='押し込み中に台車も動かす割合 (指先方向の押し出しの水平成分に '
-            '対する割合、0 で台車固定、既定 {})。'.format(PRESS_IN_BASE_RATIO))
-    parser.add_argument(
-        '--press-in-curve-exponent', type=float,
-        default=PRESS_IN_CURVE_EXPONENT,
-        help='押し込みの曲線の指数 (1 で直線、既定 {})。'.format(
-            PRESS_IN_CURVE_EXPONENT))
-    parser.add_argument(
         '--torso-surface-offset', type=float, default=0.0,
         help='干渉判定用に体幹の関節をカメラから離れる水平方向へずらす距離 '
             '[m]。実カメラの骨格では {} を指定する (既定 0)。'.format(
                 DEFAULT_TORSO_SURFACE_OFFSET))
     args = parser.parse_args()
-    apply_press_in_forearm_argument(args)
-    PRESS_IN_SLIDE = args.press_in_slide
     PRESS_IN_ADVANCE = args.press_in_advance
-    PRESS_IN_LIFT = args.press_in_lift
-    PRESS_IN_CURVE_EXPONENT = args.press_in_curve_exponent
-    PRESS_IN_BASE_RATIO = args.press_in_base_ratio
-    CROUCH_WEIGHT = args.crouch_weight
     BOW_WEIGHT = args.bow_weight
     PRESS_IN_LEG_RISE = args.press_in_leg_rise
     if args.leg_rise_allow is not None:
@@ -4417,10 +4336,9 @@ def main():
         print('[collision-pairs] {} 組の干渉ペアを {} から読み込みました。'
               .format(len(collision_pairs), args.collision_pairs))
         # 事後検証は総当たりの組で行う。
-        verification_pairs = build_verification_pairs_for_model(
-            robot, args.collision_verify_model)
-        print('[collision-verify] 事後検証は {} モデルの {} 組で行います。'
-              .format(args.collision_verify_model, len(verification_pairs)))
+        verification_pairs = build_verification_pairs_for_model(robot)
+        print('[collision-verify] 事後検証は mixed モデルの {} 組で行います。'
+              .format(len(verification_pairs)))
     else:
         print('[collision-pairs] {} が見つからないため、干渉回避 (自己干渉'
               '・人体との干渉の両方) を無効にして IK を解きます。'.format(
@@ -4454,8 +4372,7 @@ def main():
             if args.post_process_max_candidates
             and args.post_process_max_candidates > 0 else None),
         n_turn_candidates=args.turn_candidates,
-        hover_human_clearance=(args.hover_human_clearance
-                               if args.hover_human_clearance >= 0.0 else None))
+        hover_human_clearance=DEFAULT_HOVER_HUMAN_CLEARANCE)
 
     # IK 対象が 1 人もいなければウォームアップしない。
     has_target = any(
@@ -4513,7 +4430,7 @@ def main():
         person_base_limits = base_limits
         side_sign = offered_hand_side_sign(
             human_hand, joint_positions, palm)
-        if side_sign is not None and not args.no_base_y_side_restriction:
+        if side_sign is not None:
             person_base_limits = [
                 base_limits[0],
                 restrict_base_y_range_to_hand_side(
@@ -4527,8 +4444,7 @@ def main():
                     person_base_limits[0],
                     person_base_limits[1],
                     restrict_base_yaw_range_to_human_facing(
-                        person_base_limits[2], human_yaw,
-                        margin=math.radians(args.base_yaw_facing_margin))]
+                        person_base_limits[2], human_yaw)]
 
         standing_xy = (None if joint_positions is None
                        else human_standing_xy(joint_positions))

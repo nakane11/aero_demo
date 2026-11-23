@@ -312,9 +312,6 @@ def main():
         '--no-hand', dest='use_hand', action='store_false',
         help='指関節なしの URDF で表示する。')
     parser.set_defaults(use_hand=True)
-    parser.add_argument(
-        '--fps', type=float, default=DEFAULT_PLAYBACK_FPS,
-        help='自動再生の速さ [waypoint/秒]。')
     parser.add_argument('--client-wait-timeout', type=float, default=30.0,
                         help='ブラウザ接続を待つ 1 回あたりの秒数。')
     parser.add_argument('--no-open-browser', action='store_true',
@@ -336,7 +333,7 @@ def main():
     robot = load_aero(use_hand=args.use_hand)
 
     viewer = ViserViewer(draw_grid=True)
-    controls = PlaybackControls(viewer, args.fps)
+    controls = PlaybackControls(viewer, DEFAULT_PLAYBACK_FPS)
     controls.set_person_count(len(names))
     label_text = viewer._server.gui.add_markdown('')
 
@@ -347,7 +344,7 @@ def main():
     robot_collision_overlay = build_robot_collision_overlay(robot)
     viewer.add(robot_collision_overlay)
     verification_pairs = build_collision_verification_pairs(
-        robot_collision_overlay, 'r')
+        robot_collision_overlay)
     # スライダーは robot と overlay の姿勢を食い違わせるので消す。
     remove_joint_angle_gui(viewer)
     remove_obstacles_gui(viewer)
@@ -508,8 +505,7 @@ def main():
                 handle.vertices = vertices
 
         colliding = colliding_link_pairs(
-            robot_collision_overlay, verification_pairs,
-            current_obstacle_links,
+            verification_pairs, current_obstacle_links,
             tolerance=DEFAULT_COLLISION_VERIFY_TOLERANCE)
         label_text.content = status_text(
             current['name'], controls.person_index, controls.n_people,

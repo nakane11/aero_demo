@@ -399,9 +399,6 @@ def main():
         help='SMPL (女性) モデル .pkl のパス (無ければ男性のみ)。')
     parser.add_argument('--seed', type=int, default=None,
                         help='乱数シード。')
-    parser.add_argument(
-        '--start-index', type=int, default=0,
-        help='ファイル名の連番の開始値 (追記時は --seed も変えること)。')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -410,11 +407,10 @@ def main():
     skeleton_generator = RandomSkeletonGenerator()
 
     for i in range(args.num_samples):
-        index = args.start_index + i
         out_path = os.path.join(args.output_dir,
-                                'human_{:03d}.json'.format(index))
+                                'human_{:03d}.json'.format(i))
         if os.path.exists(out_path):
-            print('{} は既にあります。--start-index を大きくしてください。'
+            print('{} は既にあります。別の --output-dir を指定してください。'
                   .format(out_path))
             return
         smpl_person = smpl_generator.generate()

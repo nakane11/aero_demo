@@ -164,7 +164,7 @@ def collect_press(out):
         mo = json.load(open(os.path.join(base_dir, 'motions', name)))
         hand, arm, turn = hs['offered_hand'], hs['robot_arm'], hs['turn_deg']
         off = spik.human_translation_offset(
-            joints, front_distance=args.human_front_distance)
+            joints, front_distance=rcpt.spik.HUMAN_FRONT_DISTANCE)
         tj = spik.translate_joint_positions(joints, off)
         cj = spik.shift_torso_joints_from_surface(tj, off,
                                                   args.torso_surface_offset)
