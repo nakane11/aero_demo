@@ -28,6 +28,10 @@ VEL_LIMIT_RATIO = 0.9
 # 上限速度 (× VEL_LIMIT_RATIO) まで加速するのにかける時間 [秒]。
 ACCEL_TIME = 0.4
 TIME_LIMIT_MAX_ITERATIONS = 100
+# 反復の後に残った超過を、超えている区間だけ延ばして直す回数の上限と、
+# 延ばすときに掛ける余裕 (ちょうど 1 倍で止まって振動しないように)。
+LOCAL_STRETCH_MAX_ITERATIONS = 200
+LOCAL_STRETCH_MARGIN = 1.001
 
 
 def point_velocities(deltas, times):
@@ -254,6 +258,24 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
         arm_deltas = np.asarray(arm_deltas)
         arm_max_vel = np.asarray(arm_max_vel)
 
+    if base_start_velocity is not None:
+        # 始点の速度が上限を超えていると、区間をいくら延ばしても超過が残り、
+        # 下の反復で時間が発散する (odom の速度の揺れなど)。時間を決めるときは
+        # 上限で頭打ちにする。
+        start = np.array(base_start_velocity, dtype=np.float64)
+        limit_xy = BASE_MAX_VEL * VEL_LIMIT_RATIO
+        limit_yaw = BASE_MAX_ANGVEL * VEL_LIMIT_RATIO
+        speed = float(np.linalg.norm(start[:2]))
+        if (speed > limit_xy * 1.05 or abs(start[2]) > limit_yaw * 1.05) \
+                and log is not None:
+            log('[debug][segment] 台車の始点の速度 ({:.2f} m/s, {:+.2f} rad/s) '
+                'が上限を超えているため、時間を決めるときは上限で頭打ちに'
+                'します。'.format(speed, start[2]))
+        if speed > limit_xy:
+            start[:2] *= limit_xy / speed
+        start[2] = float(np.clip(start[2], -limit_yaw, limit_yaw))
+        base_start_velocity = start
+
     def peak_ratios(times):
         # 区間・軸ごとの 速度/上限 と sqrt(加速度/上限)。
         vel_ratios = []
@@ -293,14 +315,41 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
             times = new_times
             break
         times = new_times
-    # 残った超過は全区間を一律に延ばして必ず上限内にする。
+    # 残った超過は、超えている区間だけをその超過率で延ばす (短い区間どうしが
+    # 点の速度で影響し合って上の反復が収まらないことがある。全区間を一律に
+    # 延ばすと、1 区間の超過で接近全体が 1.2〜1.3 倍に延びていた。2026-11-23)。
+    # 延ばしても超過が 1 を下回らない区間 (始点の速度そのものが上限を超える
+    # など) では収まらないので、そのときと一律より長くなるときは従来どおり
+    # 全区間を一律に延ばす。
     worst = float(np.max(peak_ratios(times)))
-    if worst > 1.0:
+    if worst <= 1.0:
+        return [float(t) for t in times]
+    uniform = times * worst
+    local = times.copy()
+    n_local = 0
+    fitted = False
+    for n_local in range(1, LOCAL_STRETCH_MAX_ITERATIONS + 1):
+        ratio = np.max(peak_ratios(local), axis=1)
+        if not np.all(np.isfinite(local)) or \
+                np.sum(local) >= np.sum(uniform):
+            break
+        if float(np.max(ratio)) <= 1.0:
+            fitted = True
+            break
+        over = ratio > 1.0
+        local[over] *= ratio[over] * LOCAL_STRETCH_MARGIN
+    if fitted:
         if worst > 1.01 and log is not None:
-            log('[debug][segment] 速度上限の反復で収まらなかったため '
-                '全区間を {:.3f} 倍に延ばします。'.format(worst))
-        times *= worst
-    return [float(t) for t in times]
+            log('[debug][segment] 速度上限の反復で収まらなかった区間 '
+                '(最大 {:.3f} 倍) だけを延ばしました ({} 回、計 {:.2f} 秒、'
+                '一律なら {:.2f} 秒)。'.format(
+                    worst, n_local, float(np.sum(local)),
+                    float(np.sum(uniform))))
+        return [float(t) for t in local]
+    if worst > 1.01 and log is not None:
+        log('[debug][segment] 速度上限の反復で収まらなかったため '
+            '全区間を {:.3f} 倍に延ばします。'.format(worst))
+    return [float(t) for t in uniform]
 
 
 class SegmentMotion(object):
