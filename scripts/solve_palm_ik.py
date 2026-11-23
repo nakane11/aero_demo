@@ -839,12 +839,7 @@ def other_hand_points(side):
             if link.collision_mesh is None or \
                     not link.name.startswith(s + '_'):
                 continue
-            # 手首の受動関節とアダプタ (feetech_hand の flexible_wrist、URDF で
-            # 有無を選ぶ) も含める。
-            wrist_parts = ['{}_wrist_{}_link'.format(s, k)
-                           for k in ('adapter', 'bottom', 'base', 'top')]
-            if 'feetech' not in link.name and \
-                    link.name not in [s + '_hand_link'] + wrist_parts:
+            if 'feetech' not in link.name and link.name != s + '_hand_link':
                 continue
             world = (link_surface_samples(link) @ link.worldrot().T
                      + link.worldpos())
@@ -972,15 +967,25 @@ _HAND_MODEL_GRASP_CACHE = {}
 
 
 def hand_model_grasp_in_hand_link(side):
-    """指ありの URDF (aero_with_feetech_hand.urdf、feetech_hand で手首の有無に合わせて
-    作ったもの) での ``{side}_eef_grasp_link`` の ``{side}_hand_link`` から見た 4x4 の姿勢。
+    """IK の手先の親にする ``{side}_eef_grasp_link`` の ``{side}_hand_link`` から見た 4x4 の姿勢。
 
-    指なしの ``aero_nohand.urdf`` の IK の手先は手首 (feetech_hand の flexible_wrist)
-    がある前提なので、手首の無い側は指ありの URDF の方が正しい。読み込みは軽い XML の
-    解析だけ (URDF の更新時刻ごとにキャッシュ)。"""
-    import xml.etree.ElementTree as ET
+    指なしの ``aero_nohand.urdf`` の姿勢 (手首 = feetech_hand の flexible_wrist がある
+    前提) を、指ありの URDF (aero_with_feetech_hand.urdf、手首の有無に合わせて作ったもの)
+    との ``hand_link`` の z (手首の方向) の差だけ平行移動したもの。手首のある側は
+    指なしの URDF と同じ、無い側は手首の長さだけ hand_link 寄りになる。指ありの URDF の
+    横 (x, y) のずれと向きは使わない。"""
     from aero_demo.aero_urdf_setup import ensure_feetech_hand_urdf_cached
-    path = ensure_feetech_hand_urdf_cached()
+    from skrobot.data import aero_urdfpath
+    T = _urdf_grasp_in_hand_link(aero_urdfpath(use_hand=False), side).copy()
+    T[2, 3] = _urdf_grasp_in_hand_link(
+        ensure_feetech_hand_urdf_cached(), side)[2, 3]
+    return T
+
+
+def _urdf_grasp_in_hand_link(path, side):
+    """URDF ``path`` の ``{side}_eef_grasp_link`` の ``{side}_hand_link`` から見た 4x4 の姿勢
+    (軽い XML の解析だけ、URDF の更新時刻ごとにキャッシュ)。"""
+    import xml.etree.ElementTree as ET
     key = (path, os.path.getmtime(path), side)
     cached = _HAND_MODEL_GRASP_CACHE.get(key)
     if cached is not None:
@@ -1005,11 +1010,11 @@ def hand_model_grasp_in_hand_link(side):
 
 
 def shift_grasp_point(robot):
-    """``{r,l}arm_end_coords`` を、指ありの URDF の ``{r,l}_eef_grasp_link`` から局所 +X に
+    """``{r,l}arm_end_coords`` を、``hand_model_grasp_in_hand_link`` の姿勢から局所 +X に
     ``GRASP_POINT_OFFSET_X`` [m] の位置に置き直す (親のリンクは変えない)。
 
-    指なしのロボット (``Aero(use_hand=False)``) でも手先が指ありのモデル (手首の有無を
-    反映したもの) と同じ位置になる。"""
+    指なしのロボット (``Aero(use_hand=False)``) でも指ありのロボットでも同じ手先になり、
+    手首の無い側だけ手首の長さだけ hand_link 寄りになる。"""
     for side in ('r', 'l'):
         end_coords = getattr(robot, '{}arm_end_coords'.format(side), None)
         hand_link = getattr(robot, '{}_hand_link'.format(side), None)
@@ -1019,11 +1024,13 @@ def shift_grasp_point(robot):
         # 親 (eef_grasp_link) の hand_link から見た姿勢 (このロボットの URDF の値)
         parent_in_hand = (np.linalg.inv(hand_link.worldcoords().T())
                           @ parent.worldcoords().T())
-        offset = np.eye(4)
-        offset[0, 3] = GRASP_POINT_OFFSET_X
-        local = (np.linalg.inv(parent_in_hand)
-                 @ hand_model_grasp_in_hand_link(side) @ offset)
-        end_coords.newcoords(Coordinates(pos=local[:3, 3], rot=local[:3, :3]))
+        # 位置だけ置き直し、向きは end_coords の元の向き (親から見た) のままにする。
+        tip = (np.linalg.inv(parent_in_hand)
+               @ hand_model_grasp_in_hand_link(side)
+               @ np.array([GRASP_POINT_OFFSET_X, 0.0, 0.0, 1.0]))
+        local = end_coords.copy_coords()
+        local.translation = tip[:3]
+        end_coords.newcoords(local)
 
 
 # {r,l}_hand_y_joint の origin [m] (指ありの URDF の値)。
@@ -2275,6 +2282,13 @@ def apply_hand_box(robot):
     robot.extra_collision_links = extra_links
 
 
+# 干渉を見ない手首のリンク (feetech_hand の flexible_wrist の受動関節とアダプタ)。
+# 手首が無かったころと同じ判定にする (手の箱・事後検証・差し出さない手の点に入れない)。
+WRIST_COLLISION_IGNORED_LINKS = frozenset(
+    '{}_wrist_{}_link'.format(s, k)
+    for s in ('r', 'l') for k in ('adapter', 'base', 'bottom', 'top'))
+
+
 def apply_collision_model(robot):
     """``robot`` の各リンクの ``collision_mesh`` をプリミティブ近似形状に差し替え、
     干渉モデルにだけあるリンクを ``robot.extra_collision_links`` に足す。"""
@@ -2297,6 +2311,14 @@ def apply_collision_model(robot):
             link.collision_primitive = getattr(
                 collision_link, 'collision_primitive', None)
             n_replaced += 1
+
+    # 手首 (feetech_hand の flexible_wrist) のリンクは干渉を見ない。
+    n_ignored = 0
+    for link in robot.link_list:
+        if link.name in WRIST_COLLISION_IGNORED_LINKS:
+            link.collision_mesh = None
+            link.collision_primitive = None
+            n_ignored += 1
 
     # 干渉モデルにだけあるリンクは、親リンクに assoc した干渉専用のリンクにする (parent_link も設定)。
     robot_links_by_name = {link.name: link for link in robot.link_list}
@@ -2329,11 +2351,13 @@ def apply_collision_model(robot):
     robot.extra_collision_links = extra_links
 
     print('[collision-model] {} 個のリンクの干渉ジオメトリを ({}) から '
-          '差し替えました{}。'.format(
+          '差し替えました{}{}。'.format(
               n_replaced, collision_urdf_path,
               ' (干渉専用のリンク {} を追加)'.format(
                   ', '.join(link.name for link in extra_links))
-              if extra_links else ''))
+              if extra_links else '',
+              '、手首の {} 個のリンクは干渉を見ません'.format(n_ignored)
+              if n_ignored else ''))
 
 
 def collision_link_list_for_arm(robot):
