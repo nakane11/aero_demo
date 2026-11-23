@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
-"""scripts/qprof.py の計測を、legacy の 5 段 (hover・後処理・軌道・横並び・寄せ) と warmup に分けて、
+"""scripts/qprof.py の計測を、計画の 5 段 (hover・後処理・軌道・横並び・寄せ) と warmup に分けて、
 1 回 (1 人) あたりの秒を分類ごと・包んだ関数ごと・段階 (入れ子) ごとに出す (Markdown)。
 
-develop の ``tools/q_profile_report.py`` (3352223) の legacy 版。まとまりを develop の確保・M3 から
-legacy の 5 段に替え、関数ごと (秒/人・回/人・ms/回) と段階の入れ子ごと (中の時間を含む) の表を足した。
+関数ごとの表は秒/人・回/人・ms/回、段階の入れ子ごとの表は中の時間を含む。
 
     python3 tools/q_profile_report.py <prof のディレクトリ> [--n 67] [--min 0.005]
 

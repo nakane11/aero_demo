@@ -104,9 +104,8 @@ LEAD_IN_CHECK_RADIUS = 1.0  # [m]
 # lead-in の waypoint 間隔 (並進 / 回頭)。
 LEAD_IN_STEP = 0.1  # [m]
 LEAD_IN_ANGLE_STEP = math.radians(10.0)  # [rad]
-# True なら lead-in で回頭と直進を同時に行う (False は回頭してから直進、
-# 11/17 以前)。実機 13 試行の計画で接近が平均 11.4 -> 10.2 秒
-# (tools/analyze_approach_timing.py --lead-in-concurrent)。
+# True なら lead-in で回頭と直進を同時に行う (False は回頭してから直進)。
+# 同時の方が接近が約 1 秒短い。
 LEAD_IN_BLEND = True
 
 # 自己干渉の許容貫通量 [m]。
@@ -115,7 +114,7 @@ DEFAULT_MOTION_COLLISION_VERIFY_TOLERANCE = (
 
 # 軌道最適化の人体との干渉の組 (``approach_problem_options``) は hover の
 # IK と同じ collision_pairs.json の 8 組 + 手先 × 差し出した前腕の 4 組。全リンク
-# と比べ合成 100 人で最適化の成否は全員同じ、時間は約 1 割短い (2026-10-29)。
+# と比べ最適化の成否は変わらず、時間は約 1 割短い。
 DEFAULT_COLLISION_PAIRS_PATH = os.path.join(_THIS_DIR, 'collision_pairs.json')
 
 # 押し込み前 (lead-in・接近軌道) の検証での人体との距離 [m]。
@@ -1367,7 +1366,7 @@ def main():
     n_transition = n_transition_verified = 0
     initial_state = spik.robot_state(robot)
     for i, path in enumerate(files):
-        # 結果が前に処理した人によらないよう、ロボットの状態を決め直す (R7)。
+        # 結果が前に処理した人によらないよう、ロボットの状態を決め直す。
         spik.restore_robot_state(robot, initial_state)
         out_path = os.path.join(args.output_dir, os.path.basename(path))
         handshake = json.load(open(path))

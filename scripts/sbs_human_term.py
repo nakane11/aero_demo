@@ -1,19 +1,15 @@
 # -*- coding:utf-8 -*-
-# develop 458db87 の scripts/goal_ik/human_palm.py をそのまま写したもの (人の項の式)。
-# 横並び移動 (side_by_side_transition) の人の楽さの指標に使う (study/sbs-comfort)。
-# 式を変えるときは develop の human_palm.py と合わせること。
-"""ユニット M2: 横並び後・寄せ後の人の掌の変数と、人の項 (楽さ) の誤差項。
+# 横並び移動 (side_by_side_transition) の人の楽さの指標に使う人の項の式。
+# 式は develop の scripts/goal_ik/human_palm.py と同じ (変えるときは合わせる)。
+"""横並び後・寄せ後の人の掌の変数と、人の項 (楽さ) の誤差項。
 
 人の掌の位置 3・回転 3 (回転ベクトル、初期の掌の向きに左から掛ける) を PoseGoalSolver の変数にし、
 ロボットの手先の目標を掌の変数から作る (``press_target`` と同じ関係 = 掌の座標系に固定した剛体の変換)。
 掌の変数を使う段階 (横並び後・寄せ後) は ``palm_active`` = 1、他の段階は 0 で掌を初期値に留める。
 
-人の項は ``tools/hand_comfort_jax.py`` (M1、``hand_comfort.py`` の numpy 版と照合済み) の ``errors`` と、
-M1d の可操作度のヒンジ (ユーザー決定 11/06):
+人の項は ``hand_comfort_jax`` の ``errors`` と可操作度のヒンジ:
   [モーメント, LUBA 7 成分 (肩の屈曲・外転は負の側だけ), 届かない量, 上腕の挙上, 可操作度のヒンジ] の 11 成分。
 重みは全部 1、ε は ``hand_comfort_jax`` の既定。手首は既定 (掌から 4.1cm)。
-tools/ は import しない (tools/hand_comfort*.py は jax を CPU に固定する設定を持つため)。式は同じものを写し、
-``tools/m2_human_term_check.py`` で ``hand_comfort_jax`` と一致を確かめる。
 
 座標: 人の肩を原点、右手の正準座標 (x = 前、y = 左、z = 上、差し出す腕の外向き = -y)。左手は y を反転して写す
 (``canonical_basis``)。位置は人ごとの腕の長さ (上腕 + 前腕) で割る。
@@ -43,7 +39,7 @@ MANIP_AXIS_EPS = 1e-9
 MOMENT_EPS = 0.0099
 REACH_EPS = 0.05
 ELEVATION_EPS = 90.0
-# 可操作度のヒンジの下限 (最大値に対する割合、ε = 下限)。M1d・ユーザー決定。
+# 可操作度のヒンジの下限 (最大値に対する割合、ε = 下限)。
 MANIP_MIN = 0.4
 # 人の項の成分の名前 (残差の並び)。
 TERM_NAMES = ('moment',) + JOINTS + ('reach', 'elevation', 'manipulability')
@@ -66,7 +62,7 @@ PARAM_FIELDS = (
     ('palm_active', 1), ('palm0_pos', 3), ('palm0_rot', 9),
     ('human_shoulder', 3), ('human_basis', 9), ('human_length', 1), ('human_ratio', 1),
     ('human_w', N_TERMS),
-    # 台車の向きの制約 (|台車 yaw − 人の向き| ≤ 幅、M2b)。角度の制約なので解いた後に切り詰める。
+    # 台車の向きの制約 (|台車 yaw − 人の向き| ≤ 幅)。角度の制約なので解いた後に切り詰める。
     ('yaw_active', 1), ('yaw_lower', 1), ('yaw_upper', 1),
 )
 # 掌を留める項の許容幅 (使わない段階で、掌の変数の LM の歩幅を 0 にするため)。
@@ -169,9 +165,9 @@ def _two_link_elbow(xp, wrist, upper, fore):
 def comfort(xp, pos_n, rot, upper_ratio, consts, elbow_n=None, wrist_n=None):
     """``hand_comfort_jax.comfort`` と同じ (正準座標の掌 ``pos_n``・``rot``、上腕の比 ``upper_ratio``)。
 
-    study/sbs-comfort の追加: ``elbow_n``・``wrist_n`` (正準座標、腕の長さで割った肘・手首) を与えると、
-    手首を掌から 4.1 cm・肘を 2 リンクの規則で決める代わりに、その肘・手首を使う (ctb の ``HumanArm`` の腕)。
-    角度の定義は ctb の ``human_arm_joint_angles``・``human_wrist_angles`` と同じ式。"""
+    ``elbow_n``・``wrist_n`` (正準座標、腕の長さで割った肘・手首) を与えると、
+    手首を掌から 4.1 cm・肘を 2 リンクの規則で決める代わりに、その肘・手首を使う (``sbs.HumanArm`` の腕)。
+    角度の定義は ``sbs`` の ``human_arm_joint_angles``・``human_wrist_angles`` と同じ式。"""
     L = LENGTH
     upper = upper_ratio * L
     fore = L - upper
@@ -267,8 +263,8 @@ def _bsigned_angle(a, b, axis):
 
 
 def luba_batch(pos_n, rot, upper_ratio, consts):
-    """Q2: ``comfort`` の LUBA 7 関節の角度 ``angles`` (n, 7) と使用量 ``usage`` (n, 7) だけを、正準座標の掌
-    (n, 3)・(n, 3, 3) についてまとめて (numpy)。式は ``comfort`` と同じ順 (``goal_e.luba_usage`` 用)。"""
+    """``comfort`` の LUBA 7 関節の角度 ``angles`` (n, 7) と使用量 ``usage`` (n, 7) だけを、正準座標の掌
+    (n, 3)・(n, 3, 3) についてまとめて求める (numpy)。式は ``comfort`` と同じ順。"""
     pos_n = np.asarray(pos_n, dtype=np.float64)
     rot = np.asarray(rot, dtype=np.float64)
     n = len(pos_n)
@@ -336,7 +332,7 @@ def canonical_batch(palm_pos, palm_rot, p):
 
 def errors(xp, pos_n, rot, upper_ratio, consts, elbow_n=None, wrist_n=None):
     """人の項の 11 成分 (``TERM_NAMES`` の順、各 e/ε)。最初の 10 は ``hand_comfort_jax.errors`` と同じ。
-    ``elbow_n``・``wrist_n`` は ``comfort`` と同じ (study/sbs-comfort の追加)。"""
+    ``elbow_n``・``wrist_n`` は ``comfort`` と同じ。"""
     c = comfort(xp, pos_n, rot, upper_ratio, consts, elbow_n, wrist_n)
     first_two = xp.asarray([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     e_joint = c['usage'] * (1.0 - first_two * (c['angles'] >= 0.0))

@@ -159,9 +159,9 @@ TRANSITION_RESOLVE_TIME_LIMIT = 6.0
 
 # 差し出しの確定に要る掌の静止時間 [秒]。スコアが OFFER_FAST_STILLNESS_SCORE
 # 以上の手は OFFER_FAST_STILLNESS_WINDOW で確定する (閾値ぎりぎりの手は
-# epp.STILLNESS_WINDOW のまま)。2026-10-30〜11-18 の bag 12 回では、本物の
-# 差し出しの確定時のスコアは多くが 0.8 以上 (0.70〜0.87)、逆の手が一時的に
-# 閾値を超えたのは 0.69〜0.76 (0.3 秒だけにすると誤って確定)。
+# epp.STILLNESS_WINDOW のまま)。本物の差し出しの確定時のスコアは多くが 0.8
+# 以上、逆の手が一時的に閾値を超えるのは 0.76 以下 (0.3 秒だけにすると誤って
+# 確定する)。
 OFFER_FAST_STILLNESS_WINDOW = 0.3
 OFFER_FAST_STILLNESS_SCORE = 0.8
 
@@ -198,8 +198,8 @@ HEAD_TRACK_RESEND_DEG = 0.5
 # IK を方位から解き直す (``_seed_neck_yaw``)。
 HEAD_TRACK_YAW_OUT_MARGIN_DEG = 10.0
 HEAD_TRACK_RESEED_DEG = 45.0
-# 実行中は人の体が近づき、体の一部を人と誤検出して顔が低く出る (bag 2026-10-21 で
-# 高さ 20〜50cm、正常な検出は高さ 11cm・水平 20cm 以内)。実行開始時の顔・体幹から
+# 実行中は人の体が近づき、体の一部を人と誤検出して顔が低く出る (高さ 20〜50cm
+# ずれる。正常な検出のずれは高さ 11cm・水平 20cm 以内)。実行開始時の顔・体幹から
 # これ以上離れた検出は追従の目標に使わない。
 HEAD_TRACK_MAX_DZ = 0.15  # [m]
 HEAD_TRACK_MAX_DXY = 0.30  # [m]
@@ -238,7 +238,7 @@ VOICEVOX_CHECK_TIMEOUT = 2.0  # [s]
 # ときに「(エアロ、) 手を繋いで」を聞いたら ARMED にして返事をする。空白・句読点を
 # 除いてから「手を繋」か「繋いで」を含むかで判定する (表記の揺れを許す)。名前は
 # 問わない (Google の認識では「エアロ」が「エラー」になるか落ち、「手を」も
-# 「を」「と」になることがある: 11/22 実機のマイク)。
+# 「を」「と」になることがある)。
 VOICE_ARM_TOPIC = '/speech_to_text'
 VOICE_ARM_REQUEST = re.compile('手を?(繋|つな)|(繋|つな)いで')
 VOICE_ARM_IGNORE = re.compile(r'[\s、。,.!！?？]')
@@ -249,7 +249,7 @@ WALK_FORWARD_DISTANCE = 1.5  # [m]
 WALK_FORWARD_MIN_TIME = 2.0  # [s]
 # 前進前のその場回転 (実行開始時の向きの逆向きへ揃える)。手をつないだ人が
 # 付いて回れるよう WALK_TURN_RATE で、WALK_TURN_MIN_TIME〜WALK_TURN_MAX_TIME
-# かける (以前は角度によらず 3 秒。大きく回るときは以前より長くしない)。
+# かける。
 WALK_TURN_MIN_TIME = 1.0  # [s]
 WALK_TURN_MAX_TIME = 3.0  # [s]
 WALK_TURN_RATE = math.radians(20.0)  # [rad/s]
@@ -268,8 +268,7 @@ SPEECH_TRANSITION_FAIL_TEXT = ('ごめんなさい、横に並ぶ道が見つか
                                'もう一度手を出してください')
 VIEWER_CAMERA_FPS = 5.0  # [Hz] viser の状態パネルに出すカメラ画像の更新頻度
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
-# 取り違えているとみなして裏返す。実機の差し出し 206 件 (bag のフレームを含む) では
-# 正しい掌は -0.25 以上、-0.8 未満はすべて裏返った推定だった (2026-10-21)。
+# 取り違えているとみなして裏返す。正しい掌は -0.25 以上、-0.8 未満は裏返った推定。
 OUTWARD_PALM_MAX_MEDIAL = -0.5
 
 # 台車をずらした hover の人体距離の検証で試すずらしの縮め方 (_clearance_scale)。
@@ -279,14 +278,13 @@ CLEARANCE_SCALES = (1.0, 0.5, 0.25)
 # 螺旋の開始) から RETARGET_LEAD_MIN 秒前まで RETARGET_PERIOD 秒ごとに、直近
 # RETARGET_WINDOW 秒の掌の検出 (スキャンを順につないだ照合で区間先頭の台車系に置く。
 # odom は回転中に実機より 10〜20 度先行する) の中央値が今の目標から
-# RETARGET_MIN_SHIFT 以上ずれていれば、残りの台車軌道をその分平行移動する。10/22
-# 実機 8 試行の bag の検出でこの処理を動かすと、到着時の掌のずれは平均 66→34mm・
-# 最大 128→59mm (到着 1 秒前まで追うと近距離の誤検出で悪化した)。
+# RETARGET_MIN_SHIFT 以上ずれていれば、残りの台車軌道をその分平行移動する
+# (到着の直前まで追うと近距離の誤検出で悪化する)。
 RETARGET_PERIOD = 0.5  # [s]
 RETARGET_WINDOW = 0.6  # [s]
 RETARGET_LEAD_MIN = 1.5  # [s]
 # 到着のこの秒数より前には始めない (早い検出はぶれが大きく、行って戻る差し替えが
-# 増える。bag の再生で 5 秒前からが最大のずれ最小・差し替え 2〜4 回)。
+# 増える)。
 RETARGET_LEAD_MAX = 5.0  # [s]
 RETARGET_MIN_DETECTIONS = 4
 RETARGET_MIN_SHIFT = 0.03  # [m]
@@ -341,11 +339,11 @@ OFFER_HANDS_MAX_DISTANCE = 0.15  # [m] Holistic の掌からの距離
 # 合成 (solve_palm_ik.py・plan_handshake_motion.py) と同じ値。
 PLAN_TIME_LIMIT = spik.PLAN_TIME_LIMIT
 # 計画の時間の上限で切れたことは専用の失敗の原因 (``_failure_cause`` の 'timeout') にし、
-# 専用の発話 (SPEECH_TIMEOUT_FAIL_TEXT) をする (develop J23、J_report 9.13 の 1)。
+# 専用の発話 (SPEECH_TIMEOUT_FAIL_TEXT) をする。
 
 PRESS_IN_REFINE_FRAMES = 3
 # hover で押し込みを解き直した後、その区間の自己干渉・人体距離・前腕の距離を計画時と
-# 同じ基準で測り、ログに出す (動きは止めない、数えるだけ。develop V_report 8.6)。
+# 同じ基準で測り、ログに出す (動きは止めない)。
 PRESS_IN_REFINE_TIMEOUT = 1.5  # [s]
 PRESS_IN_REFINE_MAX_HAND_DISTANCE = 0.25  # [m] 計画時の掌からの距離
 # Hands は掌甲を取り違えて法線が反転することがあるので score と法線角の両方で弾く。
@@ -354,9 +352,8 @@ PRESS_IN_REFINE_MAX_NORMAL_ANGLE_DEG = 70.0
 # 押し込み直前の補正で、検出し直した掌が計画から水平にこれ以上ずれていたら、
 # 腕だけで吸収せず先にその分だけ台車を寄せる。
 PRESS_IN_BASE_SHIFT_MIN = nsp.PALM_SHIFT_MIN  # [m]
-# hover で止まって台車を直さず、残差を測るだけにして
-# 押し込みに織り込む。残差がこれを超えたら従来どおり止まって直す。実機 10/21〜22
-# で 1 回目の残差は最大 10cm。
+# hover で止まって台車を直さず、残差を測るだけにして押し込みに織り込む。残差が
+# これを超えたら止まって直す (通常の流れ)。
 PRESS_IN_FOLD_MAX_POSITION = nsp.FOLD_MAX_POSITION  # [m]
 PRESS_IN_FOLD_MAX_ANGLE = nsp.FOLD_MAX_ANGLE  # [rad]
 # 押し込み後の姿勢から解き直した横並び移動の寄せ後の
@@ -481,12 +478,6 @@ def face_point(joint_positions):
         return (np.asarray(ears[0], dtype=np.float64)[:3]
                 + np.asarray(ears[1], dtype=np.float64)[:3]) / 2.0
     return None
-
-
-# master-fixes の「横並び移動の可動域の判定 (B2、超えたら横並び移動をしない)」は
-# 取り込まない (ユーザー判断 11/19)。押し込みの解き直しの差は _execute_transition
-# で終点へ向けて 0 に戻し計画用ロボットの可動域に収め、押し込み後の姿勢から
-# 解き直せればそれを使う。
 
 
 def project_base_point(frame, point):
@@ -629,9 +620,8 @@ def log_debug(text):
 
 
 def _json_default(value):
-    """numpy の値 (np.bool_ など) を JSON に書ける形にする。ログの 1 行で実行の
-    スレッドが落ちないように (11/18 の偽のコントローラでの再生で、押し込み前の
-    記録の np.bool_ で実行が止まった)。"""
+    """numpy の値 (np.bool_ など) を JSON に書ける形にする (ログの 1 行で実行の
+    スレッドが落ちないように)。"""
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -762,10 +752,10 @@ def _optimizer_warmup_child(args):
 
 
 # 軌道最適化の準備の子プロセスは hover の IK を解かず、前の起動で同じ子が解いた押し込み
-# 姿勢 (handshake) をファイルから読む (develop Q R6、Q_report 2.8)。軌道最適化の形は
-# 姿勢に依らないので、姿勢は永続キャッシュを温めるための入力にすぎない。鍵 (scripts と
-# src/aero_demo のコード・jax/jaxlib/skrobot の版と skrobot のコード・装置・hover に効く
-# 引数) が変わったら今までどおり解いて保存する。
+# 姿勢 (handshake) をファイルから読む。軌道最適化の形は姿勢に依らないので、姿勢は
+# 永続キャッシュを温めるための入力にすぎない。鍵 (scripts と src/aero_demo のコード・
+# jax/jaxlib/skrobot の版と skrobot のコード・装置・hover に効く引数) が変わったら
+# 解き直して保存する。
 _WARMUP_POSE_ARGS = ('attempts_per_pose', 'base_x_range', 'base_y_range',
                      'base_yaw_range', 'max_iterations', 'n_waypoints')
 
@@ -892,7 +882,7 @@ def _transition_worker_main(args, conn, stop):
     robot = planner.robot
     spik.attach_camera_optical_coords(robot)
     phm.arms_down_angles(robot, robot.joint_list)
-    # R7: このプロセスの準備の後の状態を取り、計画ごとの始めに戻す (結果が前の
+    # このプロセスの準備の後の状態を取り、計画ごとの始めに戻す (結果が前の
     # 計画の角度・リンクの座標の丸めの履歴によらないように)。
     initial_state = spik.robot_state(robot)
     while True:
@@ -1322,7 +1312,8 @@ class HandshakePlanner(object):
                         self.refine_collision_pairs, self.base_limits)
                 log_debug('[warmup] {}腕: 横並び移動のバッチ IK {:.1f} 秒'
                           .format(label, time.time() - t0))
-        # R7: 計画ごとにこの状態へ戻す (結果が前の試行の角度・リンクの座標の丸めの履歴によらないように)。
+        # 計画ごとにこの状態へ戻す (結果が前の試行の角度・リンクの座標の丸めの
+        # 履歴によらないように)。
         self._initial_state = spik.robot_state(self.robot)
         self._refine_initial_state = (None if self.refine_robot is None
                                       else spik.robot_state(self.refine_robot))
@@ -1343,7 +1334,7 @@ class HandshakePlanner(object):
             if self._optimizer_process is not None else ''))
 
     def _restore_refine_robot(self):
-        """裏の計画のロボットを warmup の後の状態に戻す (R7、裏スレッドから呼ぶ)。"""
+        """裏の計画のロボットを warmup の後の状態に戻す (裏スレッドから呼ぶ)。"""
         if getattr(self, '_refine_initial_state', None) is not None:
             spik.restore_robot_state(self.refine_robot, self._refine_initial_state)
 
@@ -1366,7 +1357,7 @@ class HandshakePlanner(object):
         palm = palms[offered_hand]
         plan_t0 = time.time()
         if getattr(self, '_initial_state', None) is not None:
-            # R7: 前の試行の角度・リンクの座標の丸めの履歴を持ち越さない。
+            # 前の試行の角度・リンクの座標の丸めの履歴を持ち越さない。
             spik.restore_robot_state(self.robot, self._initial_state)
         time_limit = getattr(args, 'plan_time_limit', PLAN_TIME_LIMIT)
         deadline = (plan_t0 + time_limit
@@ -1381,7 +1372,7 @@ class HandshakePlanner(object):
 
         def mark_timed_out(result, stage):
             # 時間切れを専用の原因 (``_failure_cause`` の 'timeout') にする。
-            # ``stage`` は切れた段 (develop J23)。
+            # ``stage`` は切れた段。
             result['plan_timed_out'] = True
             result.setdefault('plan_timeout_stage', stage)
             print('[plan] 試行{}: 計画の時間の上限 ({:.1f} 秒) で {} が切れました '
@@ -1701,7 +1692,7 @@ class HandshakePlanner(object):
                       '、このスレッドで解きます ({})。'.format(
                           None if message is None else message[1:]))
         if transition is None:
-            # R7: refine_robot を使う処理の始めに、同じスレッドで戻す
+            # refine_robot を使う処理の始めに、同じスレッドで戻す
             # (呼び出し元が _refine_lock で 1 つずつにしている)。
             self._restore_refine_robot()
             transition = sbs.plan_transition(
@@ -2026,8 +2017,8 @@ class HandshakePipelineNode(object):
             args.camera_info_topic, CameraInfo, self._on_camera_info,
             queue_size=1)
         # 既定の購読は待ち行列が無制限で、処理が追いつかないと古い画像を順に
-        # 処理する (2026-11-18 の bag で撮影から判定まで 0.45〜0.65 秒) ので、
-        # 待ち行列を 1 にして古い画像を捨てる。
+        # 処理する (撮影から判定まで 0.5 秒前後遅れる) ので、待ち行列を 1 に
+        # して古い画像を捨てる。
         sub_kwargs = dict(queue_size=1, buff_size=2 ** 26)
         color_sub = message_filters.Subscriber(args.color_topic, Image,
                                                **sub_kwargs)
@@ -2759,8 +2750,7 @@ class HandshakePipelineNode(object):
         """掌の法線が体の外側を大きく向いている (``OUTWARD_PALM_MAX_MEDIAL``
         未満) 手を、掌と甲の取り違えとみなして裏返した ``palms`` を返す。
 
-        手を上げた直後などに手の点がつぶれると法線だけ反転することがある
-        (2026-10-21 試行1)。
+        手を上げた直後などに手の点がつぶれると法線だけ反転することがある。
         """
         corrected = dict(palms)
         for side in ('R', 'L'):
@@ -2841,7 +2831,7 @@ class HandshakePipelineNode(object):
                   .format(offered_hand, medial))
             self._log_debug(dict(event='outward_palm_flip', side=offered_hand,
                                  medial_before_flip=medial))
-        # 試行ごとに乱数の種を差し出した掌から決める (同じ掌なら同じ計画。J0 の案 3)。
+        # 試行ごとに乱数の種を差し出した掌から決める (同じ掌なら同じ計画)。
         np.random.seed(_palm_seed(palms[offered_hand]))
         pre_move = self._pre_move
         start_base_pose = None if pre_move is None else pre_move['end']
@@ -3128,10 +3118,8 @@ class HandshakePipelineNode(object):
 
         計画の押し込み姿勢から解いた横並び移動に解き直しの関節角の差を足すと
         (``_execute_transition``)、途中の姿勢は干渉・人の腕の楽さを確かめて
-        いない。解き直しは実機の 8 試行の押し込み後の姿勢で 5 試行が解け、
-        寄せまで 3〜6 秒 (押し込みの解き直しから横並び移動の開始まで 5.8〜9.8
-        秒)。裏の計画 (寄せ) がまだ動いていれば、その結果を予備に残すため
-        解き直さない。"""
+        いないため。裏の計画 (寄せ) がまだ動いていれば、その結果を予備に残す
+        ため解き直さない。"""
         worker = self.planner.worker
         if worker is None or not worker.alive():
             return
@@ -3144,8 +3132,7 @@ class HandshakePipelineNode(object):
             print('[transition] 裏の計画 (寄せ) がまだ終わっていないため、押し込み'
                   '後の姿勢からの横並び移動の解き直しはしません。')
             return
-        # 予備の解の掌の向き・下ろし方から試す (実機 8 試行のオフラインで、
-        # 解けた 5 試行の時間 平均 2.1 -> 1.3 秒、寄せ後 平均 0.71 -> 0.68 m)。
+        # 予備の解の掌の向き・下ろし方から試す (速く解け、寄せ後も近くなる)。
         backup = self._backup_transition(motion)
         hint = None
         if (backup.get('verified') and backup.get('fraction', 0.0) >= 1.0
@@ -3237,8 +3224,8 @@ class HandshakePipelineNode(object):
             self._resave_motion(motion)
             return None
         # 予備 (裏の計画、使えなければ確保済みの解) より寄せ後が
-        # RESOLVE_MAX_LATERAL_LOSS を超えて遠ければ予備を使う (ユーザー判断
-        # 11/19: 近さを優先、予備は差を終点で 0 へ戻して足す)。
+        # RESOLVE_MAX_LATERAL_LOSS を超えて遠ければ予備を使う (近さを優先する。
+        # 予備は差を終点で 0 へ戻して足す)。
         backup = self._backup_transition(motion)
         lateral = _final_lateral(transition)
         backup_lateral = _final_lateral(backup)
@@ -3768,9 +3755,8 @@ class HandshakePipelineNode(object):
         を超えて外れていれば何もせず False。
 
         今の角度から解くだけだと、台車の回転で目標が背中側を通ったとき首ヨーが
-        可動域の端に張り付き、目標が反対側へ出ても戻れない (bag 2026-10-21 試行6、
-        +119.7 度のまま)。今の角度と方位の差が ``HEAD_TRACK_RESEED_DEG`` を超える
-        ときだけ方位から解き直す。"""
+        可動域の端に張り付き、目標が反対側へ出ても戻れない。今の角度と方位の差が
+        ``HEAD_TRACK_RESEED_DEG`` を超えるときだけ方位から解き直す。"""
         joint = gaze_robot.neck_y_joint
         local = joint.parent_link.worldcoords().inverse_transform_vector(
             np.asarray(target, dtype=np.float64))
@@ -4363,7 +4349,7 @@ class HandshakePipelineNode(object):
                 hand_followed,
                 resolve_motion=motion)
             if press_done is None:
-                # 腕は hover で止めた。従来どおり止まって台車を直す。
+                # 腕は hover で止めた。止まって台車を直す (通常の流れ)。
                 self._set_activity(STAGE_BASE_CORRECTION)
                 self._correct_base_residual(
                     start_odom_coords, final_traj_point, ref_scan=ref_scan,
@@ -4378,7 +4364,7 @@ class HandshakePipelineNode(object):
                 exclude_centers, palm_anchor, hover_wp, joint_names,
                 robot_arm, wait_head=head_to_hover or hand_followed)
             if fold is not None and not fold['ok']:
-                # ずれが大きいときは従来どおり止まって直す (手は検出し直す)。
+                # ずれが大きいときは止まって直す (通常の流れ、手は検出し直す)。
                 fold = None
                 self._set_activity(STAGE_BASE_CORRECTION)
                 self._correct_base_residual(
@@ -4572,12 +4558,11 @@ class HandshakePipelineNode(object):
 
         押し込みを解き直した関節角の差 (``press_wp`` - ``planned_press_wp``) を
         (1 - k/N) 倍して各 waypoint に足し、終点で 0 (計画どおり) にする。
-        各区間は ``--side-by-side-segment-time`` 秒以上かける (11/19 までは全
-        waypoint に同じ差を足していたが、解き直しの IK は手先が 10cm 程度しか
-        違わなくても肘・腰を数十度変えるので、腕を下ろした姿勢に同じ差を足すと
-        終点の手先が計画から実機 16 試行の中央 12cm・最大 33cm ずれていた)。
-        差を足した角度は計画用ロボットの可動域 (``restrict_waist_range`` など
-        実機で届く範囲) に収める。
+        解き直しの IK は手先が 10cm 程度しか違わなくても肘・腰を数十度変える
+        ので、腕を下ろした姿勢に同じ差を足すと終点の手先が計画から大きくずれる
+        ため。各区間は ``--side-by-side-segment-time`` 秒以上かける。差を足した
+        角度は計画用ロボットの可動域 (``restrict_waist_range`` など実機で届く
+        範囲) に収める。
         """
         delta = (np.asarray(press_wp['joint_angle_vector'])
                  - np.asarray(planned_press_wp['joint_angle_vector']))
@@ -4887,9 +4872,8 @@ class HandshakePipelineNode(object):
         掌を検出し直し、移動後の掌を返す (検出できなければ移動量を引いた掌)。
 
         腕だけで大きなずれを吸収すると押し込みの途中点が届かずに飛ばされ、hover から
-        最終目標へ直行して手の甲側を通ることがあるため (10/22 試行2)。合成 60 人で
-        手が水平にずれたとき、補正が解ける割合は 10cm で 78→91%、15cm で 70→88%
-        (腕だけ -> 台車で寄せる)。
+        最終目標へ直行して手の甲側を通ることがあるため (台車で寄せると補正が
+        解ける割合も上がる)。
 
         ``hover_wp`` があれば、寄せた hover が人体との距離の検証に通る (差し出した
         手もずれの分だけ動かした骨格で見る) まで寄せる量を縮める。``base_error``
@@ -5091,8 +5075,8 @@ class HandshakePipelineNode(object):
         ``planned_palm`` (計画の系) を与えると、計画の掌の代わりにそれを基準に
         する (行けるところまで押し込んで待つ間の合わせ直し)。解き直した押し込み
         姿勢と掌 (計画の系) は ``self._refined_post``・``self._refined_palm``。
-        行けるところまで押し込む のは ``fold`` が無い
-        ときだけ (織り込む流れの ``nsp.refine_folded`` は最後まで押し込む)。
+        行けるところまで押し込むのは ``fold`` が無いときだけ (織り込む流れの
+        ``nsp.refine_folded`` は最後まで押し込む)。
         """
         t0 = time.time()
         self._refined_post = None
@@ -6391,7 +6375,8 @@ class HandshakePipelineNode(object):
     def _plan_no_stop(self, display_waypoints, reach_boundary, joint_names,
                       result):
         """止まらない押し込みの準備: 手前の hover を解き、人体との距離を確かめ、
-        台車と腕に送る waypoint 列を作る (できなければ None で従来の流れ)。"""
+        台車と腕に送る waypoint 列を作る (できなければ None で hover で止まる
+        流れ)。"""
         hover_wp = display_waypoints[reach_boundary - 1]
         offered_hand = result['offered_hand']
 
@@ -6517,12 +6502,13 @@ class HandshakePipelineNode(object):
         解き直し (``_start_transition_resolve``) も始める。
 
         Returns: 実行した押し込みの waypoint 列 (先頭が hover)。残差が大きく
-        織り込めないときは腕を hover で止めて None (従来の流れで続ける)。
+        織り込めないときは腕を hover で止めて None (止まって直す通常の流れで
+        続ける)。
         """
         robot_arm = result['robot_arm']
         hover_wp = no_stop['hover_wp']
         deadline = no_stop['t_hover'] - nsp.SPLICE_LEAD
-        # IK に残す時間 (実機の解き直しは 0.02〜0.7 秒の見積もり)。
+        # IK に残す時間 (解き直しは 0.02〜0.7 秒かかる)。
         frame_timeout = max(0.2, min(PRESS_IN_REFINE_TIMEOUT,
                                      deadline - time.time() - 0.6))
         fold = self._prepare_folded_press(
@@ -6610,7 +6596,7 @@ class HandshakePipelineNode(object):
         splice_info = {}
 
         if not fold['ok']:
-            # 織り込めない大きなずれ: 腕を hover で止めて従来どおり直す。
+            # 織り込めない大きなずれ: 腕を hover で止めて止まって直す (通常の流れ)。
             t_s = time.time() + nsp.SPLICE_LEAD - send_time
             angles, vels, all_times, _ = nsp.splice_in_dwell(
                 old_track, t_s, no_stop['t_hover'] - send_time, hover_av, [],
@@ -6705,8 +6691,8 @@ class HandshakePipelineNode(object):
         残差を押し込み区間で動かす量 (``base_move``) にする。
 
         Returns: ``dict(ok, base_move, residual, hand_frames, base_error,
-        start_time)``。``ok`` が False (残差が大きすぎる) なら従来どおり止まって
-        直す。
+        start_time)``。``ok`` が False (残差が大きすぎる) なら止まって直す
+        (通常の流れ)。
         """
         start_time = time.time()
         self._set_activity(STAGE_PRESS_REFINE)
@@ -6790,7 +6776,7 @@ class HandshakePipelineNode(object):
                 actual, source = scan_delta, 'scan'
             else:
                 # 大きく回った後は基準スキャンとの重なりが減って照合が通らない
-                # ことが多い (10/22 は 8 回中 5 回) ので、順につないだ照合を使う。
+                # ことが多いので、順につないだ照合を使う。
                 chained = self._chained_scan_delta(start_odom)
                 if chained is not None:
                     actual, source = chained, 'scan_chain'
@@ -7287,9 +7273,9 @@ def build_arg_parser():
 
 CLOCK_OFFSET_WARN_SEC = 0.1  # [秒] ロボットとの時計ずれがこれを超えたら警告
 # カーネルの tick [us] の標準値と、これ以上外れていたら警告する幅。WSL では
-# Windows との差が数秒 (10/30 実測で 3 秒は放置・6 秒は補正) を超えると時計を
-# Windows へ合わせ直し、WSL が先行していると tick を下げて追いつかせる (実測で
-# 9167、約 0.09 秒/秒)。普段の揺れは 9995〜10035 程度。
+# Windows との差が数秒を超えると時計を Windows へ合わせ直し、WSL が先行して
+# いると tick を下げて追いつかせる (9167 前後、約 0.09 秒/秒)。普段の揺れは
+# 9995〜10035 程度。
 KERNEL_TICK_NOMINAL = 10000  # [us]
 KERNEL_TICK_WARN = 100  # [us]
 SYNC_CLOCK_ADVICE = (

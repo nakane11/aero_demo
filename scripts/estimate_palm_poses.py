@@ -81,9 +81,8 @@ STILLNESS_WINDOW = 0.5  # [s]
 STILLNESS_MAX_DISPLACEMENT = 0.05  # [m]
 # 履歴のサンプル間隔がこれを超えたら履歴を捨てる [s]。
 STILLNESS_MAX_GAP = 0.4
-# 推定深度の平面 (from_model_depth) の掌でも深度の平面の掌を待たずに確定する
-# (develop の O の待ちは入れない。差し出しの確定を早める
-# --offer-fast-stillness-window を優先、ユーザー判断 11/19)。
+# 推定深度の平面 (from_model_depth) の掌でも、深度の平面の掌を待たずに確定する
+# (差し出しの確定を早めるため)。
 
 # 欠測関節の補完に使う人体比。
 _TORSO_PER_SHOULDER_WIDTH = 1.25

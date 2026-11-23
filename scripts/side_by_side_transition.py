@@ -59,7 +59,7 @@ LOWERED_TARGET_COUNT = 3
 # 移動先のバッチ IK の目標の作り方。'per_angle' は上腕の角度ごとに 3 つとも
 # 同じ下ろし方 (初期値を 3 倍に使う)、'group' は組の 3 つの角度を 1 バッチで
 # 解く。'group' は障害物が目標の間で共有されるので、低い下ろし方の目標も
-# 高い下ろし方の上腕を避け、低い下ろし方が解けにくい (10/22 実機試行 2)。
+# 高い下ろし方の上腕を避け、低い下ろし方が解けにくい。
 LOWERED_ARM_BATCHES = ('per_angle', 'group')
 LOWERED_ARM_BATCH = 'per_angle'
 
@@ -67,12 +67,9 @@ LOWERED_ARM_BATCH = 'per_angle'
 # PALM_FACING_ORDER の順に最大 LOWERED_TARGET_COUNT 個まとめて 1 回のバッチ IK
 # で解き、人ごとのキャッシュ (_person_cache) に置く (試す順は変えない)。上腕は
 # 同じなので障害物の共有で低い下ろし方が解けなくなることはない。バッチ IK の
-# 時間は初期値の数よりも呼び出しの回数で決まる (384 -> 1152 レーンで 0.20 ->
-# 0.33 秒)。目標 1 つあたりの初期値は GOAL_BUNDLE_ATTEMPTS_PER_POSE。まとめ
-# ないときもこの数で解き、バッチ IK の形を 1 つにする (形が増えると warmup の
-# コンパイルが実機ノードで約 20 秒延びる)。384 (まとめないときの同じ目標 3 つ
-# と同じ数) は、確保する計画で横並びまで解けた人の時間が中央値で +0.5 秒延び、
-# 成功数は 128 と同じだった (2026-10-23)。
+# 時間は初期値の数よりも呼び出しの回数で決まる。目標 1 つあたりの初期値は
+# GOAL_BUNDLE_ATTEMPTS_PER_POSE。まとめないときもこの数で解き、バッチ IK の形を
+# 1 つにする (形が増えると warmup のコンパイルが実機ノードで約 20 秒延びる)。
 GOAL_BUNDLE_FACINGS = True
 GOAL_BUNDLE_ATTEMPTS_PER_POSE = 128
 # 段階 1 の下ろし方ごとの結果 (経路まで) を人ごとのキャッシュに置き、同じ人の
@@ -99,7 +96,7 @@ LOWERED_NATURAL_MAX_VERTICAL = 0.5
 # 掌の向きは LOWERED_FACING_ORDER の順に試す (``plan_transition`` の
 # ``facing_variants``)。押し込み時からの前腕のひねりがこの角度 [度] を超える
 # 向きは試さない。None なら見ない (既定。前腕のひねりは HUMAN_ARM_LIMITS_DEG の
-# 絶対的な回内・回外 (LUBA) で判定する。2026-10-27 まで 80 度)。
+# 絶対的な回内・回外 (LUBA) で判定する)。
 LOWERED_TWIST_MAX_DEG = None
 
 # 腕を下ろしきったときに押し込み時の手首の曲げを戻す割合 (0: 戻さず
@@ -132,9 +129,8 @@ GOAL_X_MARGIN = 0.05
 # 移動先のバッチ IK の目標 1 つあたりの初期値の数。
 GOAL_ATTEMPTS_PER_POSE = 128
 
-# 横並び移動・寄せの移動先のバッチ IK (_batch_ik) の反復の上限。既定は 60 で、hover の
-# spik.DEFAULT_COLLISION_IK_STOP (80) より少ない。寄せの時間の大半はここ
-# (80 にすると前の形 (hover と同じ反復))。
+# 横並び移動・寄せの移動先のバッチ IK (_batch_ik) の反復の上限。hover の
+# spik.DEFAULT_COLLISION_IK_STOP (80) より少ない (寄せの時間の大半はここ)。
 SBS_COLLISION_IK_STOP = 60
 
 # 移動先のコストの重み: 人の正面方向の前方ずれ [m]、向きのずれ [rad]、
@@ -142,8 +138,8 @@ SBS_COLLISION_IK_STOP = 60
 GOAL_FRONT_OFFSET_WEIGHT = 100.0
 # 移動先のコストで、台車の人からの横の距離が GOAL_LATERAL_TARGET [m] を超えた
 # 分 [m] に掛ける重み (遠くへ離れてから寄せで戻る動きを避ける)。0 で無効。
-# 段階 1 の移動先は腕の枝の制限で人の近くの解がほとんど無く、100 でも離れて
-# 戻る量が変わらなかったので使わない (MERGE_APPROACH で対処)。
+# 段階 1 の移動先は腕の枝の制限で人の近くの解がほとんど無く効かないので使わない
+# (MERGE_APPROACH で対処)。
 GOAL_LATERAL_WEIGHT = 0.0
 GOAL_LATERAL_TARGET = 0.6
 GOAL_FACING_YAW_WEIGHT = spik.DEFAULT_FACING_YAW_WEIGHT
@@ -196,8 +192,8 @@ GOAL_BRANCH_JOINTS = ('{}_shoulder_y_joint', '{}_wrist_y_joint')
 # --- 上半身・台車の向き・台車と脚の距離・寄せ (段階 2) ----------------------
 # 横並び (と寄せ) の間、上半身 (body_link の +x) を UPPER_BODY_REFERENCE の
 # 向きから ±UPPER_BODY_LIMIT_DEG に収める。'base' は台車の前方向 (前進前の
-# その場回転で台車が前を向いたとき、上半身も前を向く)、'human' は人の正面
-# (2026-11-19 まで)。移動先は範囲外の候補を捨て、ずれの二乗に
+# その場回転で台車が前を向いたとき、上半身も前を向く)、'human' は人の正面。
+# 移動先は範囲外の候補を捨て、ずれの二乗に
 # UPPER_BODY_WEIGHT [1/rad^2] を掛けたコストを足す。経路の IK は、始点の
 # 上半身が範囲内 (UPPER_BODY_START_SLACK_DEG まで超えていても範囲内とみなす)
 # なら全体を、範囲外なら移動先だけを範囲に絞る (押し込み姿勢から出る途中の
@@ -218,10 +214,7 @@ REFINE_TIME_LIMIT = 10.0
 # 寄せ後の横の距離が APPROACH_FALLBACK_LATERAL を超える人だけ
 # GOAL_YAW_FALLBACK_DEG まで広げて解き直す (終点は GOAL_YAW_MARGIN_DEG
 # に収まるものだけ採る)。None なら広げない。
-# 2026-11-19 まで 20 / 30 度 (上半身は人の正面基準)。45 度・上半身を台車の
-# 前方向基準にすると、実機 15 試行の計画で寄せ後の横の距離が平均 0.734 ->
-# 0.699 m (最大 0.86 -> 0.77 m)、寄せまでの計算が中央 4.1 -> 1.6 秒。代わりに
-# 前進前のその場回転が中央 16 -> 26 度 (最大 45 度) に増える。
+# 広く取るほど寄せ後の横の距離が近く計算も速いが、前進前のその場回転が増える。
 GOAL_YAW_MARGIN_DEG = 45.0
 GOAL_YAW_FALLBACK_DEG = None
 APPROACH_FALLBACK_LATERAL = 0.85
@@ -260,8 +253,7 @@ APPROACH_END_YAW_DEG = 10.0
 
 # 前進前のその場回転 (腕は止めたまま台車を人の正面へ回す) の後に、人の肩から
 # つないだ手までの距離がこれ [m] を超える移動先は捨てる (人の腕が伸びきって
-# 前へ引っ張られる)。None なら見ない。実機 15 試行の計画では、向き ±45° で
-# 回転後の距離が最大 0.68 m (0.60 m 超は 2 試行)。
+# 前へ引っ張られる)。None なら見ない。
 HUMAN_REACH_AFTER_TURN_MAX = 0.60
 
 # 移動先の候補のうち、経路まで試す数と、押し込み IK・検証まで試す数
@@ -282,7 +274,7 @@ MAX_JOINT_STEP = math.radians(20.0)
 # 関節角が飛んだ区間を、この数に分けて直前の解から解き進め直す (順に試し、
 # どれでも飛ぶなら止める)。空なら分けない。waypoint の刻みは
 # PLANNED_JOINT_STEP と同じ 20 度なので、IK の解が少しずれるだけで飛びと
-# 判定されていた (2026-10-30)。
+# 判定されるのを防ぐ。
 PATH_JUMP_SUBDIVISIONS = (2, 3, 4)
 
 # waypoint の数は、押し込み姿勢と移動先の関節角の差がこの角度 [rad]
@@ -291,11 +283,10 @@ PLANNED_JOINT_STEP = math.radians(20.0)
 
 # 移動先までのうち進めた割合がこれに満たなければ、横並び移動はしない (通らな
 # かった扱い。裏の計画では確保した経路へ、どちらも無ければ横並び移動をしない)。
-# ユーザー決定 (11/17): 移動先まで最後まで (1.0) 解けた経路だけ通ったとする
-# (develop bfc768f の J23 の 2、UNIFIED_J23_FULL と同じ)。確保 (plan_transition)
+# 1.0 は移動先まで最後まで解けた経路だけ通ったとする。確保 (plan_transition)
 # と裏の計画 ① (refine_transition) の両方に効く。
 MIN_FRACTION = 1.0
-# 前の形の MIN_FRACTION (この割合以上進めた経路を捨てたときにログで知らせる)。
+# この割合以上進めた経路を MIN_FRACTION で捨てたときにログで知らせる。
 SBS_PARTIAL_MIN_FRACTION = 0.3
 
 # 人の腕の目安 (表示・ログ用、超えても止めない。reach <= 1 だけ止める)。
@@ -379,16 +370,15 @@ HUMAN_ARM_LIMITS_DEG = collections.OrderedDict(
     for key in ('shoulder_flexion', 'shoulder_abduction', 'shoulder_rotation',
                 'elbow_flexion', 'pronation'))
 
-# --- 人の項 (develop の人の楽さの指標、study/sbs-comfort) --------------------
-# develop の人の項 (sbs_human_term = develop の goal_ik/human_palm.py の写し) の
-# 11 成分の 2 乗和を、人の掌 (位置・人の手の向き) から求めて使う。
-# 11/20 ユーザー決定: 下ろし方・掌の向きを、下ろしきった掌の人の項の小さい順に
-# 試し、計画を選ぶ鍵 (``_result_key``) で寄せ後の横の距離が 2 cm 刻みで同じなら
-# 人の項の小さい方を選ぶ。
-# COMFORT_ARM: 人の項の関節角をどの腕で測るか。'skeleton' は ctb の
+# --- 人の項 (人の楽さの指標) ------------------------------------------------
+# 人の項 (``sbs_human_term``) の 11 成分の 2 乗和を、人の掌 (位置・人の手の
+# 向き) から求めて使う。下ろし方・掌の向きを、下ろしきった掌の人の項の小さい
+# 順に試し、計画を選ぶ鍵 (``_result_key``) で寄せ後の横の距離が 2 cm 刻みで
+# 同じなら人の項の小さい方を選ぶ。
+# COMFORT_ARM: 人の項の関節角をどの腕で測るか。'skeleton' は
 #   ``HumanArm`` の肘・手首 (下ろし方で決まる腕) をそのまま使う。'develop' は
-#   develop と同じく掌から求め直す (手首は掌から 4.1 cm、肘は 2 リンクの規則。
-#   比べる道具が ``arm_mode`` で渡す)。
+#   掌から求め直す (手首は掌から 4.1 cm、肘は 2 リンクの規則。``arm_mode``
+#   で渡す)。
 COMFORT_ARM = 'skeleton'
 _COMFORT_PERSON = {}
 
@@ -396,7 +386,7 @@ _COMFORT_PERSON = {}
 def comfort_total(joints, hand, palm_pos, hand_rot, elbow=None, wrist=None,
                   arm_mode=None):
     """人の掌 ``palm_pos``・人の手の向き ``hand_rot`` (列が指先・法線・指先 x
-    法線) の人の項 (develop の 11 成分) の ``(2 乗和, 成分の配列)``。
+    法線) の人の項 (11 成分) の ``(2 乗和, 成分の配列)``。
     ``arm_mode`` (既定 ``COMFORT_ARM``) が 'skeleton' で ``elbow``・``wrist``
     (世界座標) があれば、その腕で関節角を測る。"""
     import sbs_human_term as ht
@@ -1134,8 +1124,7 @@ _DOWN = np.array([0.0, 0.0, -1.0])
 
 # 腕を下ろす動き (``HumanArm.lowering_pose``・``_arm``) の、同じ両端の Slerp と
 # 出発の腕だけで決まる部分を使い回す。値は毎回作るのと同じ (同じ入力の同じ
-# 計算)。鍵は入力の値 (バイト列)。develop の Q2 (UNIFIED_Q2_LOWERING_CACHE、
-# 04d89bf) と同じ。
+# 計算)。鍵は入力の値 (バイト列)。
 _LOWERING_CACHE = {}
 _LOWERING_CACHE_MAX = 4096
 
@@ -1152,11 +1141,9 @@ def _lowering_cached(key, make):
 
 # 腕を下ろす動きの下ろし方 (``HumanArm.lowering``)・途中の腕
 # (``lowering_pose``)・人の腕の判定 (``lowering_problem``) を、同じ値の入力なら
-# 前の結果を使い回す。横並び移動・寄せは 1 人の
-# 計画で ``HumanArm`` を何度も作り直し、同じ押し込み時の腕から同じ 64 通りほどの
-# 下ろし方を毎回計算し直すので、人の腕 (肩・押し込み時の手首と掌・腕の長さ・
-# 正面・外向き) と下ろし方の値を鍵にして、``HumanArm`` をまたいで使い回す。
-# 値は計算し直すのと同じ (同じ入力の同じ計算)。配列は写しを返す。
+# 前の結果を使い回す。横並び移動・寄せは 1 人の計画で ``HumanArm`` を何度も
+# 作り直すので、人の腕 (肩・押し込み時の手首と掌・腕の長さ・正面・外向き) と
+# 下ろし方の値を鍵にして、``HumanArm`` をまたいで使い回す。配列は写しを返す。
 _LOWERING_REUSE_CACHE = {}
 _LOWERING_REUSE_MAX = 20000
 _LOWERING_NONE = object()
@@ -1209,8 +1196,8 @@ def _lowering_slerp(a, b, s):
 
 
 # 腕を下ろす動きの人の腕の判定 (``HumanArm.lowering_problem``) を、標本の点
-# (10 点) をまとめた配列の計算にする (``_batch_lowering_problem``)。式は 1 点
-# ずつ計算するのと同じ。develop の Q3 (UNIFIED_Q3_LOWERING_BATCH、b320f2d) と同じ。
+# をまとめた配列の計算にする (``_batch_lowering_problem``)。式は 1 点ずつ
+# 計算するのと同じ。
 
 
 def _dot_rows(a, b):
@@ -2249,9 +2236,9 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
     人の立ち位置まわりに回して人の正面方向が +x の座標系で解き、台車の位置
     姿勢は元の座標系に戻す。左右は差し出した手の側 (``y_window``
     ``(下限, 上限)`` [m] で手の側の横の距離を絞る)、向きは人の正面方向
-    ±``yaw_margin_deg`` (既定 ``GOAL_YAW_MARGIN_DEG``) 度に絞る。上半身が人の
-    正面から ``UPPER_BODY_LIMIT_DEG`` を超える候補は捨て、残りはずれの二乗の
-    コスト (``UPPER_BODY_WEIGHT``) を足す。
+    ±``yaw_margin_deg`` (既定 ``GOAL_YAW_MARGIN_DEG``) 度に絞る。上半身が基準
+    (``UPPER_BODY_REFERENCE``) から ``UPPER_BODY_LIMIT_DEG`` を超える候補は
+    捨て、残りはずれの二乗のコスト (``UPPER_BODY_WEIGHT``) を足す。
 
     Returns
     -------
@@ -2379,13 +2366,11 @@ def solve_goal_candidates(robot, robot_arm, hand, goal_palms, seed_av,
 
 def _lowering_path_steps(human_arm, lowering):
     """``lowering`` の動きの掌の道のり [m] と回転 [rad] (肩を中心に円弧で
-    下りるので、両端の差より長い。20 区間で測る)。点はまとめて計算する
-    (develop の Q3b の P3 (UNIFIED_Q3_PATH_STEPS_BATCH、450d4b1) と同じ)。
-    足し方 (前から順) と 1 区間ごとの式は 1 点ずつの形 (``_lowering_path_steps_loop``) と同じ。"""
+    下りるので、両端の差より長い。20 区間で測る)。点はまとめて計算し、
+    足し方 (前から順) と 1 区間ごとの式は ``_lowering_path_steps_loop`` と同じ。"""
     samples = 20
     if isinstance(human_arm, _StaticArm):
-        # 掌は動かないので、どの区間も同じ値 (前の形と同じく区間の数だけ前から
-        # 足す)。
+        # 掌は動かないので、どの区間も同じ値 (区間の数だけ前から足す)。
         rot = human_arm.palm_rot
         step = Rotation.from_matrix(rot @ rot.T).magnitude()
         zero = np.linalg.norm(human_arm.palm_pos - human_arm.palm_pos)
@@ -2799,7 +2784,7 @@ def _result_key(result, translated_joints, hand):
     """横並び移動の計画結果の良さの並べ替えの鍵 (小さいほど良い): 寄せまで
     進んだもの (寄せ後の横の距離、2 cm 刻み) > 横並びまで進んだもの (横の
     距離、2 cm 刻み) > 途中まで (進めた割合) > 失敗。寄せ・横並びまで進んだ
-    ものは刻みが同じなら人の項の小さい方 (11/20 ユーザー決定)、それも同じなら
+    ものは刻みが同じなら人の項の小さい方、それも同じなら
     ``PALM_FACING_ORDER`` の先の向き。"""
     facing = result.get('palm_facing')
     phi = (PALM_FACING_ORDER.index(facing) if facing in PALM_FACING_ORDER
@@ -2849,8 +2834,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
 
     ``hint`` (``arm_deg``・``abduction_deg``・``palm_facing`` の dict、
     予備の解の下ろし方) を与えると、その上腕の角度を含む組・その下ろし方から
-    試す (押し込みを解き直した姿勢からの解き直し用。実機 8 試行で、解けた
-    5 試行の時間 平均 2.1 -> 1.3 秒、寄せ後 平均 0.71 -> 0.68 m)。
+    試す (押し込みを解き直した姿勢からの解き直し用)。
 
     Returns
     -------
@@ -3293,7 +3277,7 @@ def _plan_stage1(robot, robot_arm, hand, post, turn_deg,
                 100.0 * best[1])
             reason = head if reason is None else head + ', ' + reason
             if best[1] >= SBS_PARTIAL_MIN_FRACTION:
-                # 前の形なら途中までで実行していた経路だけログに出す。
+                # SBS_PARTIAL_MIN_FRACTION 以上進めて捨てた経路だけログに出す。
                 print('[transition] 横並び移動の経路が移動先の {:.0f}% までしか'
                       '解けなかったため、この探索では通らなかった扱いにします '
                       '(前の形なら途中までで実行していた)。'
@@ -3615,7 +3599,7 @@ MERGE_APPROACH = True
 # APPROACH_ALT_ELBOWS 度曲げた下ろし方 (掌の向きは PALM_FACING_ORDER、LUBA の
 # 目安内) を移動先にして、押し込み姿勢から 1 本の経路で解き直す。上半身を人の
 # 正面に向けたまま近くで手をつなぐには、腕を真下に垂らした掌はロボットの手が
-# 合わせにくく、少し前に出して肘を曲げた掌が合わせやすい (2026-10-30 の総当たり)。
+# 合わせにくく、少し前に出して肘を曲げた掌が合わせやすい。
 APPROACH_ALT_ARM_DEGS = (20.0, 40.0)
 APPROACH_ALT_ABDUCTIONS = (15.0, 30.0)
 APPROACH_ALT_ELBOWS = (30.0, 60.0)
@@ -3917,11 +3901,11 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
 
     人の掌の向き (``PALM_FACING_ORDER``) ごとに段階 1 を解き、横並びまで進んだ
     向きだけ段階 2 へ進める。寄せ後の横の距離が ``stop_lateral`` 以下の向きで
-    打ち切り、打ち切れなければ全部解いて寄せ後の一番近い向き (差が 2 cm 以内
-    なら回す量の小さい向き) を選ぶ。腕を下ろしきった掌が一番低い計画より
-    ``LOWERED_HEIGHT_TOLERANCE`` を超えて高い計画は選ばない。台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG``
-    で ``APPROACH_FALLBACK_LATERAL`` 以内に寄れなければ、
-    ``GOAL_YAW_FALLBACK_DEG`` まで広げて解き直す。上半身は ``UPPER_BODY_REFERENCE`` から
+    打ち切り、打ち切れなければ全部解いて寄せ後の一番近い向き (``_result_key``)
+    を選ぶ。腕を下ろしきった掌が一番低い計画より ``LOWERED_HEIGHT_TOLERANCE``
+    を超えて高い計画は選ばない。台車の向きの範囲 ``GOAL_YAW_MARGIN_DEG`` で
+    ``APPROACH_FALLBACK_LATERAL`` 以内に寄れなければ、``GOAL_YAW_FALLBACK_DEG``
+    まで広げて解き直す。上半身は ``UPPER_BODY_REFERENCE`` から
     ``UPPER_BODY_LIMIT_DEG`` に収める。
 
     ``translated_joints``・``collision_joints``・``base_limits`` と戻り値は
@@ -4066,7 +4050,7 @@ def _plan_transition(robot, robot_arm, hand, post, turn_deg,
 def comfort_facing_order(post, turn_deg, robot_arm, hand, translated_joints,
                          facings):
     """掌の向き ``facings`` を、その向きの下ろし方 (最初の上腕の組・脇の開き)
-    で下ろしきった掌の人の項の最小の小さい順に並べ替える (study/sbs-comfort)。
+    で下ろしきった掌の人の項の最小の小さい順に並べ替える。
     使えない向きは後ろ (今の順)。"""
     palm = human_palm_from_press(post, turn_deg, robot_arm)
     human_arm = HumanArm(translated_joints, hand, palm, turn_deg, robot_arm)

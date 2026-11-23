@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 
-"""study/sbs-comfort: 横並び移動に develop の人の項を入れた案を、保存した実機の
-試行で比べる。
+"""人の項を入れた横並び移動の計画を、保存した実機の試行で評価する。
 
 IK・軌道の揺れを除くため、押し込みまでの結果 (横並び移動の job) を 1 度だけ
-解いて pickle に置き、案ごとに横並び移動だけを解き直す。
+解いて pickle に置き、横並び移動だけを解き直す。
 
   collect DIRS... --jobs J.pkl
       保存した試行 (skeletons/・palms/) を resolve_saved_trials と同じ手順
       (ノードの既定の引数) で解き、横並び移動の job を保存する。
   collect-press --jobs J.pkl
-      11/18・11/19 の実機の押し込み後の姿勢 (bag の /joint_states) から解き直す
+      ``PRESS_TRIALS`` の実機の押し込み後の姿勢 (bag の /joint_states) から解き直す
       job (ノードの押し込み後の解き直しと同じ形、resolve_timing.py と同じ)。
   run --jobs J.pkl --out OUT.json
       job ごとに、early: 確保 (寄せなし) -> 裏の計画 (寄せ、refine_transition)、
       resolve: 押し込み後の解き直し (寄せまで、掌の向きは全部) を解き、人の項と
-      一緒に記録する (案を選ぶ環境変数 SBS_COMFORT_* などは 11/20 の整理で
-      無くなり、今の既定 (oskel) だけを解く)。
+      一緒に記録する (人の項は既定の設定で解く)。
 """
 
 import argparse
@@ -118,7 +116,7 @@ def _translate_post(pp, off):
 
 
 def collect_press(out):
-    """resolve_timing.py (11/19) と同じ押し込み後の姿勢の job。"""
+    """resolve_timing.py と同じ押し込み後の姿勢の job。"""
     import rosbag
     args, planner = make_planner()
     robot = planner.refine_robot
@@ -230,7 +228,8 @@ def summarize(tr, job):
         totals.append(t)
         terms.append(e)
     end = wps[-1]
-    # 測り方を揃えた比較用: develop の求め直し・ctb の腕の両方で終点を測る。
+    # 比較用に、終点を掌から求め直した腕 ('develop') と骨格の腕 ('skeleton')
+    # の両方で測る。
     measures = {}
     for mode in ('develop', 'skeleton'):
         t, e = sbs.waypoint_comfort(joints, hand, end, press_turn, arm, mode)

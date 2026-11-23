@@ -180,16 +180,16 @@ REFINE_MAX_ROTATION_CHANGE = math.radians(60.0)  # [rad]
 # 最終補正が脚を動かす段階 (名前, 脚を IK で固定するか, 動かせる角度 [rad] or None)。
 REFINE_LEG_STAGES = (('fixed', True, None),
                      ('limited', False, math.radians(8.0)))
-# 最終補正の 'fixed' の段では、脚を計画の押し込み後の角度に固定する (develop V4 案 1、V_report 8.1。押し込みの
-# 区間で hover から計画の押し込み後への関節の補間を IK の初期値にし、押し込み後は脚をその角度に固定。hover の脚の
-# ままだと脚が計画と違うまま腰で合わせるので、押し込みの区間で腰ピッチが計画と違う向きに大きく動く)。
-# 最終補正の 'limited' の段 (脚を hover から ±leg_range) では、腰を上げない側の制限 (_pin_leg_floor) の基準を
-# 幅で狭めた後の可動域にし、両側とも ±leg_range を上限にする (inventory B10)。
+# 最終補正の 'fixed' の段では、押し込みの区間で hover から計画の押し込み後への関節の補間を IK の
+# 初期値にし、押し込み後は脚を計画の角度に固定する (hover の脚のままだと腰で合わせることになり、
+# 腰ピッチが計画と違う向きに大きく動く)。
+# 'limited' の段 (脚を hover から ±leg_range) では、腰を上げない側の制限 (_pin_leg_floor) の基準を
+# 幅で狭めた後の可動域にし、両側とも ±leg_range を上限にする。
 # 検出した掌の向きのままでは解けないとき、向きを計画時の掌へ寄せる割合 (0: 検出した向き、
 # 1: 計画時の向き、位置は常に検出した位置)。この順に試す (``refine_post_process``)。
 REFINE_ROTATION_BLENDS = (0.0, 0.5, 1.0)
 # True: 脚の段階ごとに向きの寄せを順に試す (脚固定で寄せた解を、脚を動かす解より
-# 先に試す)。False: 向きの寄せごとに脚の段階を順に試す (11/17 以前)。
+# 先に試す)。False: 向きの寄せごとに脚の段階を順に試す。
 REFINE_STAGE_MAJOR = True
 
 # pick_verified_candidate が事後検証・後処理を試す候補数の上限 (None = 無制限)。
@@ -295,9 +295,8 @@ HUMAN_COLLISION_SEGMENTS = (
 # 人の足 (靴を含む) の円柱。骨格に足先・かかとの点は無いので、足首から腰の
 # 正面方向 (``human_foot_segments``) を FOOT_TOE_OUT_DEG だけ外へ開いた向きに、
 # かかと側 FOOT_HEEL_LENGTH・つま先側 FOOT_TOE_LENGTH の軸を床から半径の高さに
-# 置く。寸法は合成 67 人の SMPL の足 (裸足) の頂点で、足首から前 0.11〜0.20 m
-# (中央 0.15)・後ろ 0.05〜0.08 m・外向き中央 15°・幅 ±0.05 m だったのに、靴の
-# 約 2 cm を足した値 (2026-10-29)。床は z = 0。
+# 置く。寸法は SMPL の裸足 (足首から前 0.11〜0.20 m・後ろ 0.05〜0.08 m・
+# 外向き 15°・幅 ±0.05 m) に靴の約 2 cm を足した値。床は z = 0。
 FOOT_TOE_LENGTH = 0.20
 FOOT_HEEL_LENGTH = 0.09
 FOOT_TOE_OUT_DEG = 15.0
@@ -519,10 +518,10 @@ def press_in_final_position(palm, target_rot):
 
 # 低い掌で滑らせる向きが縦に近いとき (滑らせる向きの上下成分が LOW_PALM_SLIDE_UP を超えて hover が掌の下に
 # なり、かつ既定の形の hover の高さが H [m] 未満) だけ、縦の滑らせを <長さ> [m] に縮め、法線の浮きを <浮き> [m]
-# にする (develop J28、J_report 9.19〜9.21)。押し込みの最終目標 (掌が重なる位置) は変えない。低い掌では掌の
-# 15 cm 下から指を上に向けて差し上げる形になり、手先が届かない・押し込みで脚が追いつかない。
-# 条件に入っても先に既定の形で解き、押し込み後まで解けないときだけ低い掌の形で解き直す ('late'。
-# 初めから低い形にすると試行22 の掌で横並び移動が上限 5 秒に収まらない、master_fixes/report_t22.md)。
+# にする。押し込みの最終目標 (掌が重なる位置) は変えない。低い掌では掌の 15 cm 下から指を上に
+# 向けて差し上げる形になり、手先が届かない・押し込みで脚が追いつかないため。
+# 条件に入っても先に既定の形で解き、押し込み後まで解けないときだけ低い掌の形で解き直す
+# (初めから低い形にすると横並び移動が計画時間の上限に収まらないことがある)。
 # 低い掌の形で解いた結果は post_process の 'low_palm_press' が True で、hover での解き直し
 # (refine_post_process) もその形で解く。
 # (H [m], <長さ> [m], <浮き> [m])。
@@ -1233,8 +1232,7 @@ def _human_body_obstacles(joint_positions, cylinder_between, palm_obstacle,
 # 人体の障害物の円柱を、同じ入力 (端点・点・半径の値のバイト列) なら作り直さず
 # 使い回す (``human_body_obstacles_reused``)。横並び移動・寄せの検証
 # (``TransitionChecker``) は差し出した腕だけ動かした骨格で何度も作り直すので、
-# 胴・脚・頭・反対の腕は同じ円柱になる。値は作り直すのと同じ (同じ入力の同じ
-# 計算)。使い回した円柱は読むだけで、動かさないこと。
+# 胴・脚・頭・反対の腕は同じ円柱になる。使い回した円柱は読むだけで、動かさないこと。
 _OBSTACLE_REUSE_CACHE = {}
 _OBSTACLE_REUSE_MAX = 20000
 _NONE = object()
@@ -2264,7 +2262,7 @@ def apply_hand_box(robot):
 
 
 # 干渉を見ない手首のリンク (feetech_hand の flexible_wrist の受動関節とアダプタ)。
-# 手首が無かったころと同じ判定にする (手の箱・事後検証・差し出さない手の点に入れない)。
+# 手の箱・事後検証・差し出さない手の点のいずれにも入れない。
 WRIST_COLLISION_IGNORED_LINKS = frozenset(
     '{}_wrist_{}_link'.format(s, k)
     for s in ('r', 'l') for k in ('adapter', 'base', 'bottom', 'top'))
@@ -2601,8 +2599,8 @@ def sync_leg_mimics(robot):
             joint.joint_angle(float(joint.joint_angle()))
 
 
-# 人ごと・計画ごとにロボットを warmup の後の状態へ戻し、リンクの座標を角度から作り直す (Q の R7、
-# ``restore_robot_state``)。
+# 人ごと・計画ごとにロボットを warmup の後の状態へ戻し、リンクの座標を角度から作り直す
+# (``restore_robot_state``)。
 
 
 def refresh_link_coords(robot):
@@ -2610,7 +2608,7 @@ def refresh_link_coords(robot):
     (直動は 1 回の平行移動) で作り直す。
 
     skrobot は関節を前の角度との差で回すので、角度が同じでもリンクの座標の下位ビット (5e-8 程度) が
-    それまでの角度の通り道で変わる。作り直すと FK が関節の角度と根の座標だけで決まる (Q の R7)。"""
+    それまでの角度の通り道で変わる。作り直すと FK が関節の角度と根の座標だけで決まる。"""
     from skrobot.model.joint import LinearJoint, RotationalJoint
     for link in robot.link_list:
         joint = getattr(link, 'joint', None)
@@ -2636,7 +2634,7 @@ def robot_state(robot):
 
 def restore_robot_state(robot, state):
     """``robot_state`` の状態に戻し、リンクの座標を角度から作り直す。人ごとの計算の始めに呼び、
-    結果が前に処理した人 (角度の引き継ぎ・リンクの座標の丸めの履歴) によらないようにする (R7)。
+    結果が前に処理した人 (角度の引き継ぎ・リンクの座標の丸めの履歴) によらないようにする。
     ``state`` が None なら何もしない。"""
     if state is None:
         return
@@ -2895,7 +2893,7 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
     leg_limits = _leg_limits(robot)
     # 狭める順は、幅 → 腰を上げない側。腰を上げない側の基準 (pin_base) は、幅で狭めた後の可動域 (両側とも
     # ±leg_range を上限にする。元の可動域を基準にすると、腰が上がる側は 1 点ごとに LEG_RISE_PIN_TOLERANCE
-    # まで動け ±leg_range が効かない、inventory B10)。押し込みの計画 (leg_range なし) は元の可動域。
+    # まで動け ±leg_range が効かない)。押し込みの計画 (leg_range なし) は元の可動域。
     # 終わったら元の可動域に戻す。
     pin_base = leg_limits
     if leg_range is not None:
@@ -2913,7 +2911,7 @@ def _solve_press_in(robot, robot_arm, palm, target_rot,
         _restore_leg_limits(robot, leg_limits)
 
 
-# 直前の _solve_press_in_path が失敗した点 (計測用): ``point`` は失敗した点
+# 直前の _solve_press_in_path が失敗した点: ``point`` は失敗した点
 # (1 から、``n_points`` は最終目標)、``stage`` は 'ik'・'settle'・'final'。
 # 成功したら None。
 LAST_PRESS_IN_FAILURE = None
@@ -2930,7 +2928,7 @@ LAST_PRESS_IN_PARTIAL = None
 PARTIAL_PRESS_MAX_REMAINING = 0.08
 
 # 押し込みが解けなかった段 (``_solve_press_in_path`` の最後の失敗) と、候補選び (``pick_verified_candidate``)
-# で押し込みに落ちた候補の段ごとの数 (develop J25 のログの直し)。ログだけで結果は変えない。
+# で押し込みに落ちた候補の段ごとの数。ログにだけ使い、結果は変えない。
 PRESS_IN_FAIL = {'stage': None}
 PICK_PRESS_FAILS = collections.Counter()
 PRESS_FAIL_LABELS = {
@@ -2963,7 +2961,7 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                 goal_angle_vector[i] = posture_goal[joint.name]
 
     def move_posture(u):
-        # develop V4 (案 1): 各点の IK の初期値を hover → posture_goal の関節の補間にする。押し込み後 (u = 1) は
+        # 各点の IK の初期値を hover → posture_goal の関節の補間にする。押し込み後 (u = 1) は
         # 脚をこの角度のまま固定して解く。
         if posture_goal is None:
             return
@@ -2972,7 +2970,7 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
         sync_leg_mimics(robot)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
     # posture_goal があるときは、途中の点の脚は IK で動かす (脚を補間の角度に縛ると、腰の高さが合わず途中の点で
-    # 届かないことがある、V_report 8.1)。押し込み後だけ脚を固定する。
+    # 届かないことがある)。押し込み後だけ脚を固定する。
     body_links = _body_link_list(whole_body, fix_legs and posture_goal is None)
     move_target = getattr(robot, '{}arm_end_coords'.format(robot_arm))
     final_position = press_in_final_position(palm, target_rot)
@@ -3054,7 +3052,7 @@ def _solve_press_in_path(robot, robot_arm, palm, target_rot, stop, thre,
                          + [float(yaw)])
     move_base(1.0)
     move_posture(1.0)
-    # R7: 押し込み後の確かめ (手先・視線の IK) がリンクの座標の丸めの履歴によらないように。
+    # 押し込み後の確かめ (手先・視線の IK) がリンクの座標の丸めの履歴によらないように。
     refresh_link_coords(robot)
     post = solve_post_process(
         robot, robot_arm, palm, target_rot, stop=stop, thre=thre,
@@ -3183,9 +3181,7 @@ def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     """
     start_time = time.time()
     # skrobot は可動域の重み (joint_angle_limit_weight_maps) を前の IK から
-    # 持ち越すので、同じ入力でも前に解いた IK で解が変わる (実機 15 試行の
-    # 再計算で、検出した向きのまま解けたのが 10〜12 試行と揺れた)。空にして
-    # から解く。
+    # 持ち越すので、同じ入力でも前に解いた IK で解が変わる。空にしてから解く。
     if hasattr(robot, 'joint_angle_limit_weight_maps'):
         robot.joint_angle_limit_weight_maps = {}
     if planned_post.get('partial'):
@@ -3220,7 +3216,7 @@ def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
         return info
     planned_angles = dict(zip(planned_post['joint_names'],
                               planned_post['joint_angle_vector']))
-    # develop V4 (案 1): 脚を固定する段は、脚を計画の押し込み後の角度に固定する (hover の脚のままだと腰で合わせる
+    # 脚を固定する段は、脚を計画の押し込み後の角度に固定する (hover の脚のままだと腰で合わせる
     # ことになり、計画の押し込み後・横並び移動と脚・腰が大きく違う)。
     posture_goal = {name: float(angle)
                     for name, angle in planned_angles.items()}
@@ -3237,8 +3233,7 @@ def _refine_post_process(robot, robot_arm, palm, turn_deg, planned_post,
     legs = None
     used = None
     # 脚の段階を外側に回す (脚を固定したまま向きを寄せた解を、脚を動かす解より
-    # 先に試す)。実機 10/21〜22 の補正は全部脚固定で解け、向きを寄せた 6 回は
-    # 検出した向きで脚を動かす段階まで失敗してから解けていた (IK 0.7〜1.4 秒)。
+    # 先に試す)。実機の補正はほぼ脚固定で解けるので、脚を動かす段階の失敗を待つと遅い。
     order = ([(stage, c) for stage in leg_stages for c in candidates]
              if REFINE_STAGE_MAJOR else
              [(stage, c) for c in candidates for stage in leg_stages])
@@ -3363,13 +3358,13 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             excluded_turns=(),
                             collect=None, exhaustive=False, accept=None,
                             partial_press_max_remaining=None):
-    """``excluded_turns`` (向きの添字の集合) の候補は使わない。
+    """バッチ IK の候補から、事後検証と後処理判定を通る候補をコストの低い順に探す。
 
-    バッチ IK の候補 (添字 = 向き * ``attempts_per_pose`` + 初期値) から、収束・事後検証
+    候補の添字は 向き * ``attempts_per_pose`` + 初期値。収束・事後検証
     (自己干渉の貫通なし、人体から ``hover_human_clearance`` 以上、ロボットの差し出す腕の肘から先と
     差し出した手まわりの組だけ ``OFFERED_HAND_CLEARANCE`` 以上)・後処理判定 (``solve_press_in`` が
     解け、自己干渉と、肘から先 x 手まわり以外の人体距離 ``PRESS_IN_HUMAN_CLEARANCE`` を満たす) を
-    すべて通る候補をコストの低い順に探す。
+    すべて通る候補を探す。``excluded_turns`` (向きの添字の集合) の候補は使わない。
 
     コストは関節の曲げ量に、台車の正面方向のずれ x ``front_offset_weight`` と向きのずれ x
     ``facing_yaw_weight`` を足したもの。後処理だけ失敗した場合は、事後検証を通った最小コストの候補を
@@ -3378,10 +3373,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     ``(turn_index, angle_vector, base_pose, post_process_result)`` または None を返す。
     ``robot`` は最後に調べた候補の姿勢のままになる。
 
-    計測用: ``collect`` (list) を与えると、調べた候補ごとに結果の dict (``time``・
+    ``collect`` (list) を与えると、調べた候補ごとに結果の dict (``time``・
     ``cost``・``outcome``・押し込みが失敗した点 ``press_failure`` など) を足す。
     ``exhaustive`` が True なら、通った候補で止めずに残りも調べる (戻り値は
-    最初に通った候補で、既定と同じ)。
+    最初に通った候補)。
 
     ``accept`` (``picked`` を受けて bool を返す関数) を与えると、押し込みまで
     通った候補をさらにそれで判定し (例: 横並び移動が解けるか)、False なら次の
@@ -3796,7 +3791,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
     ``collision_joint_limit_margin_ratio`` はバッチ IK の間だけ適用。``n_turn_candidates`` は解く向きの数。
 
     ``(picked, collision_ik_time, candidate_selection_time)`` を返す (時間は秒)。
-    ``collect``・``exhaustive`` (計測用)・``accept``・
+    ``collect``・``exhaustive``・``accept``・
     ``partial_press_max_remaining`` は ``pick_verified_candidate`` へ渡す。
     """
     seed_arm_pose(robot, robot_arm)
@@ -3919,12 +3914,12 @@ def solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
                                  x_margins=DEFAULT_BASE_X_STANDING_MARGINS,
                                  deadline=None, **kwargs):
     """``_solve_person_ik_side_by_side`` を既定の押し込みの形で解き、押し込み後まで解けず
-    (``picked`` が None か後処理の結果が None)、低い掌の形で形が変わる向きがあれば ('late'、
-    ``LOW_PALM_PRESS``)、低い掌の形で解き直す。``deadline`` を過ぎていれば解き直さない。
+    (``picked`` が None か後処理の結果が None)、低い掌の形で形が変わる向きがあれば
+    (``LOW_PALM_PRESS``)、低い掌の形で解き直す。``deadline`` を過ぎていれば解き直さない。
     解き直しで押し込み後まで解ければその結果 (後処理の結果の 'low_palm_press' が True)、解けなければ
     既定の形の結果を返す。時間は両方の合計。返り値は ``_solve_person_ik_side_by_side`` と同じ。
     """
-    # 解き直しは初めから低い形で解いたとき (前の J28) と同じ乱数で解く。
+    # 解き直しは既定の形で解いたときと同じ乱数の状態から始める。
     random_state = np.random.get_state()
     with low_palm_press_shape(False):
         first = _solve_person_ik_side_by_side(
@@ -4386,7 +4381,7 @@ def main():
     n_not_target = 0
     initial_state = robot_state(robot)
     for i, path in enumerate(files):
-        # 結果が処理順に依存しないよう、人物ごとにシードとロボットの状態 (R7) を決め直す。
+        # 結果が処理順に依存しないよう、人物ごとにシードとロボットの状態を決め直す。
         np.random.seed(zlib.crc32(os.path.basename(path).encode()))
         restore_robot_state(robot, initial_state)
         out_path = os.path.join(args.output_dir, os.path.basename(path))

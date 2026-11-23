@@ -17,7 +17,7 @@ Usage
 合成骨格・保存した試行 (ROS 不要)::
 
     python3 scripts/handshake_viewer.py --work-dir /tmp/aero_demo_pipeline_xxxx
-    python3 scripts/handshake_viewer.py --work-dir data/real/2026-10-21/trial3_side_by_side
+    python3 scripts/handshake_viewer.py --work-dir data/real/<日付>/<試行>_side_by_side
 
 実機・rosbag (実機ノードと同じ ROS マスター)::
 

@@ -178,7 +178,7 @@ def main():
         t_new_seg = timed(new_arm, joint_vel, new_base, new_n, args,
                           uniform=False)
         base_deltas = np.diff(np.vstack([np.zeros(3), base_points]), axis=0)
-        CATMULL[0] = False  # 律速の内訳は今の規則で見る
+        CATMULL[0] = False  # 律速の内訳は実機と同じ接線で見る
         r, names = axis_ratios(arm_deltas, joint_vel * default.vel_ratio,
                                base_deltas, t_seg, default.accel_time,
                                default.base_vel, default.base_angvel,

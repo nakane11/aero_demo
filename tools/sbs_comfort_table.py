@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
-"""study/sbs-comfort: sbs_comfort_eval.py run の結果 (案ごとの JSON) を表にする。
+"""sbs_comfort_eval.py run の結果 (案ごとの JSON) を表にする。
 
     python3 tools/sbs_comfort_table.py base=a.json tie=b.json ...
 """

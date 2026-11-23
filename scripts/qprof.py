@@ -1,10 +1,6 @@
 # -*- coding:utf-8 -*-
 """計算時間の内訳の計測 (環境変数 ``MFIX_QPROF`` = 出力ディレクトリ のときだけ有効)。
 
-develop の Q0 (``scripts/qprof.py``、3352223・d4c9f88・7bdf134) の legacy の部品だけの版。develop の
-goal_ik (PoseGoalSolver・goal_e・M3 など) と qcheck を包む所は master に無いので外し、legacy の
-横並び移動・寄せの中の段 (``side_by_side_transition``) と人の腕の判定を足した。
-
 ``install()`` を各スクリプトの main の先頭 (計測したいモジュールの import の後) で呼ぶ。無効なら何もしない
 (関数を包まないので、結果も時間も変わらない)。関数を包んで、段階 (stage) ごとに次の分類の排他的な時間
 (入れ子の内側の分を引いた時間) を足し込む:
@@ -158,7 +154,7 @@ def wrap_cat(owner, attr, cat, record_calls=False, size_fn=None, name=None):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         st = _state()
-        # solve の中の FK・検証は solve に含める (legacy の IK は中で FK を回す)。
+        # solve の中の FK・検証は solve に含める (IK は中で FK を回す)。
         if st.stack and st.stack[-1][1] == 'solve':
             return fn(*args, **kwargs)
         stage = _stage(st)

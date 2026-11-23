@@ -2,9 +2,6 @@
 # -*- coding:utf-8 -*-
 """scripts/qprof.py の計測 (MFIX_QPROF のディレクトリの JSON) を表にする。
 
-develop の ``tools/q_profile_summary.py`` (3352223・d4c9f88・7bdf134) の legacy 版。分類の export の鍵を
-人の腕 (``human``) に替えた。
-
     python3 tools/q_profile_summary.py <prof のディレクトリ> [--depth 3] [--episodes] [--calls] [--fns] [--md]
         [--warmup all|only|exclude]
 

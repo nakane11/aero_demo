@@ -18,7 +18,6 @@ import numpy as np
 MIN_SEGMENT_TIME = 1.0 / 15.0
 
 # 台車の速度上限。実機の aero_base_link.yaml の max_velocity と一致させること。
-# 2026-11-18 にロボット本体側を 0.3 -> 0.40 m/s・1.0 -> 1.2 rad/s に変更。
 BASE_MAX_VEL = 0.40  # [m/s] 実機の base_link_x/y の max_velocity
 BASE_MAX_ANGVEL = 1.2  # [rad/s] 実機の base_link_pan の max_velocity
 
@@ -59,9 +58,8 @@ def base_point_velocities(deltas, times, tolerance=BASE_REST_TOLERANCE):
     区間の先頭は今の姿勢の waypoint なので、台車の 1 区間目は長さ 0 になる
     (腕だけ先頭の姿勢へ動かす区間)。``point_velocities`` のままだと
     その終点に次の区間の半分の速度が付き、3 次補間で 1 区間目に台車が
-    後ろへ振れ、速度・加速度の上限で 1 区間目が延びて止まって見えた
-    (2026-11-22 試行2: 接近の始めに 0.63 秒・後ろへ 9 mm)。向きを変えない
-    区間 (待機点への直進) の次に回る区間が続くときの yaw も同じ。
+    後ろへ振れ、速度・加速度の上限で 1 区間目が延びて止まって見える。
+    向きを変えない区間 (待機点への直進) の次に回る区間が続くときの yaw も同じ。
     """
     point_vel = point_velocities(deltas, times)
     rest = np.abs(deltas) <= tolerance
@@ -172,9 +170,8 @@ def compose_planar(a, b):
 
 # 走っている台車を待機点から接近へつなぐとき、待機点からこの距離 [m] までの
 # lead-in の点は通らず、今の位置からその先の点へ 1 区間でつなぐ (待機点で
-# 曲がる・回り始めるところで減速しないように)。2026-11-22 試行2 の点では、
-# 0.15 m だと差し替え後に 0.12 m/s まで落ち、0.25 m 以上なら螺旋の入口まで
-# min(差し替え時の速さ, lead-in の速さ 0.24 m/s) を下回らない。
+# 曲がる・回り始めるところで減速しないように)。0.25 m 以上なら螺旋の入口まで
+# min(差し替え時の速さ, lead-in の速さ) を下回らない (0.15 m では落ちる)。
 SPLICE_LOOKAHEAD = 0.25
 
 
@@ -234,7 +231,7 @@ def limited_time_list(arm_deltas, arm_max_vel, base_points, time_list,
     if arm_deltas is None and base_deltas is None:
         return [float(t) for t in time_list]
     if arm_deltas is not None:
-        # 型は呼び出し側のまま (実機ノードの従来の計算と同じ結果にするため)。
+        # 型は呼び出し側のまま (実機ノードと同じ結果にするため)。
         arm_deltas = np.asarray(arm_deltas)
         arm_max_vel = np.asarray(arm_max_vel)
 
