@@ -963,15 +963,67 @@ def lock_fixed_joints(robot):
 GRASP_POINT_OFFSET_X = 0.04
 
 
+def _urdf_rpy_matrix(rpy):
+    r, p, y = rpy
+    return rpy_matrix(y, p, r)  # skrobot の rpy_matrix は (yaw, pitch, roll)
+
+
+_HAND_MODEL_GRASP_CACHE = {}
+
+
+def hand_model_grasp_in_hand_link(side):
+    """指ありの URDF (aero_with_feetech_hand.urdf、feetech_hand で手首の有無に合わせて
+    作ったもの) での ``{side}_eef_grasp_link`` の ``{side}_hand_link`` から見た 4x4 の姿勢。
+
+    指なしの ``aero_nohand.urdf`` の IK の手先は手首 (feetech_hand の flexible_wrist)
+    がある前提なので、手首の無い側は指ありの URDF の方が正しい。読み込みは軽い XML の
+    解析だけ (URDF の更新時刻ごとにキャッシュ)。"""
+    import xml.etree.ElementTree as ET
+    from aero_demo.aero_urdf_setup import ensure_feetech_hand_urdf_cached
+    path = ensure_feetech_hand_urdf_cached()
+    key = (path, os.path.getmtime(path), side)
+    cached = _HAND_MODEL_GRASP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    joints = {j.find('child').get('link'): j
+              for j in ET.parse(path).getroot().findall('joint')}
+    T = np.eye(4)
+    link = '{}_eef_grasp_link'.format(side)
+    while link != '{}_hand_link'.format(side):
+        joint = joints[link]
+        origin = joint.find('origin')
+        local = np.eye(4)
+        if origin is not None:
+            local[:3, :3] = _urdf_rpy_matrix(
+                [float(v) for v in origin.get('rpy', '0 0 0').split()])
+            local[:3, 3] = [float(v)
+                            for v in origin.get('xyz', '0 0 0').split()]
+        T = local @ T
+        link = joint.find('parent').get('link')
+    _HAND_MODEL_GRASP_CACHE[key] = T
+    return T
+
+
 def shift_grasp_point(robot):
-    """``{r,l}arm_end_coords`` を親から局所 +X に ``GRASP_POINT_OFFSET_X`` [m] の位置に置き直す。"""
+    """``{r,l}arm_end_coords`` を、指ありの URDF の ``{r,l}_eef_grasp_link`` から局所 +X に
+    ``GRASP_POINT_OFFSET_X`` [m] の位置に置き直す (親のリンクは変えない)。
+
+    指なしのロボット (``Aero(use_hand=False)``) でも手先が指ありのモデル (手首の有無を
+    反映したもの) と同じ位置になる。"""
     for side in ('r', 'l'):
         end_coords = getattr(robot, '{}arm_end_coords'.format(side), None)
-        if end_coords is None:
+        hand_link = getattr(robot, '{}_hand_link'.format(side), None)
+        if end_coords is None or hand_link is None:
             continue
-        local = end_coords.copy_coords()
-        local.translation = np.array([GRASP_POINT_OFFSET_X, 0.0, 0.0])
-        end_coords.newcoords(local)
+        parent = end_coords.parent
+        # 親 (eef_grasp_link) の hand_link から見た姿勢 (このロボットの URDF の値)
+        parent_in_hand = (np.linalg.inv(hand_link.worldcoords().T())
+                          @ parent.worldcoords().T())
+        offset = np.eye(4)
+        offset[0, 3] = GRASP_POINT_OFFSET_X
+        local = (np.linalg.inv(parent_in_hand)
+                 @ hand_model_grasp_in_hand_link(side) @ offset)
+        end_coords.newcoords(Coordinates(pos=local[:3, 3], rot=local[:3, :3]))
 
 
 # {r,l}_hand_y_joint の origin [m] (指ありの URDF の値)。
