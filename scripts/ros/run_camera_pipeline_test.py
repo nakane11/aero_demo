@@ -2705,7 +2705,8 @@ class HandshakePipelineNode(object):
                 self._nod_done.clear()
                 self._nod_returning.clear()
         self._pre_move = None
-        if self.ri is not None:
+        # 台車を先に動かすのは実機を動かすとき (--auto-execute) だけ。
+        if self.ri is not None and self.args.auto_execute:
             try:
                 self._prepare_pre_move(joint_positions, palms[offered_hand],
                                        handshake_t0)
