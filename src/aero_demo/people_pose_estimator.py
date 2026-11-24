@@ -8,6 +8,7 @@ BGR 画像 (と深度) から人物の 2D/3D 関節位置を求める。
 
 import logging
 import math
+import threading
 import time
 
 import cv2
@@ -158,6 +159,16 @@ class PeoplePoseEstimator(object):
             )
         # 手だけの検出 (estimate_hands_3d) は必要になったときに作る。
         self.hands = None
+        # reset_tracking で差し替える予備 (keep_spare で有効)。
+        self._spare = None
+        self._spare_thread = None
+        self._keep_spare = False
+
+    def keep_spare(self, enabled=True):
+        """``reset_tracking`` 用の予備を常に 1 つ持つ (複数人の見張りで使う)."""
+        self._keep_spare = bool(enabled)
+        if self._keep_spare:
+            self.prepare_spare()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -174,6 +185,12 @@ class PeoplePoseEstimator(object):
         if self.hands is not None:
             self.hands.close()
             self.hands = None
+        self._keep_spare = False
+        if self._spare_thread is not None:
+            self._spare_thread.join()
+        if self._spare is not None:
+            self._spare.close()
+            self._spare = None
 
     def __enter__(self):
         return self
@@ -184,8 +201,94 @@ class PeoplePoseEstimator(object):
     # ------------------------------------------------------------------
     # 2D estimation
     # ------------------------------------------------------------------
-    def estimate(self, bgr_img):
+    def _new_tracker(self):
+        if self.use_hand:
+            return mp.solutions.holistic.Holistic(
+                min_detection_confidence=self.min_detection_confidence,
+                min_tracking_confidence=self.min_tracking_confidence)
+        return mp.solutions.pose.Pose(
+            model_complexity=0,
+            min_detection_confidence=self.min_detection_confidence,
+            min_tracking_confidence=self.min_tracking_confidence)
+
+    def prepare_spare(self):
+        """``reset_tracking`` で差し替える予備を裏で作り始める.
+
+        作るのに約 80 ms かかるので、切り替えのフレームで待たないようにする。
+        """
+        if self._spare_thread is not None or self._spare is not None:
+            return
+
+        def build():
+            self._spare = self._new_tracker()
+            self._spare_thread = None
+        self._spare_thread = threading.Thread(target=build, daemon=True)
+        self._spare_thread.start()
+
+    def reset_tracking(self):
+        """Holistic の追跡状態を捨てる (見る人を切り替えたとき).
+
+        MediaPipe の追跡モードは前のフレームの骨格の周りだけを探すので、
+        見る人を変える前に作り直す。``prepare_spare`` で予備ができていれば
+        差し替えるだけ (古い方は裏で閉じ、次の予備を作る)。Hands
+        (``estimate_hands_3d``) は作り直さない (ほかの人は塗るので追わない)。
+        """
+        spare, self._spare = self._spare, None
+        if spare is None:
+            spare = self._new_tracker()
+        old = self.holistic if self.use_hand else self.pose
+        if self.use_hand:
+            self.holistic = spare
+        else:
+            self.pose = spare
+        if old is not None:
+            threading.Thread(target=old.close, daemon=True).start()
+        self.recent_human_positions = []
+        if self._keep_spare:
+            self.prepare_spare()
+
+    @staticmethod
+    def _crop(bgr_img, roi):
+        """``roi`` = (x0, y0, x1, y1) [px] で切り出した画像と左上の座標を返す."""
+        if roi is None:
+            return bgr_img, 0, 0
+        h, w = bgr_img.shape[:2]
+        x0 = int(max(0, min(w - 1, math.floor(roi[0]))))
+        y0 = int(max(0, min(h - 1, math.floor(roi[1]))))
+        x1 = int(max(x0 + 1, min(w, math.ceil(roi[2]))))
+        y1 = int(max(y0 + 1, min(h, math.ceil(roi[3]))))
+        return bgr_img[y0:y1, x0:x1], x0, y0
+
+    @staticmethod
+    def _masked(bgr_img, mask):
+        """``mask`` = dict(keep=bbox, boxes=[bbox, ...]) の ``boxes`` を黒く塗る.
+
+        ``keep`` の中は塗らない (人が重なっても見る人は隠さない)。``boxes`` が
+        空なら元の画像をそのまま返す (1 人のときは今までと同じ入力)。
+        """
+        if not mask or not mask.get('boxes'):
+            return bgr_img
+        h, w = bgr_img.shape[:2]
+
+        def clip(box):
+            x0, y0, x1, y1 = box
+            return (int(max(0, math.floor(y0))), int(min(h, math.ceil(y1))),
+                    int(max(0, math.floor(x0))), int(min(w, math.ceil(x1))))
+        img = bgr_img.copy()
+        for box in mask['boxes']:
+            y0, y1, x0, x1 = clip(box)
+            img[y0:y1, x0:x1] = 0
+        if mask.get('keep') is not None:
+            y0, y1, x0, x1 = clip(mask['keep'])
+            img[y0:y1, x0:x1] = bgr_img[y0:y1, x0:x1]
+        return img
+
+    def estimate(self, bgr_img, roi=None, mask=None):
         """BGR 画像から画像座標の関節位置を推定する.
+
+        ``roi`` (x0, y0, x1, y1) [px] を渡すとその範囲だけを推定に使う
+        (返す座標は元の画像のまま)。``mask`` (``_masked``) を渡すとほかの人を
+        塗ってから推定する。複数人のときに見る人を決めるのに使う。
 
         Returns
         -------
@@ -193,6 +296,17 @@ class PeoplePoseEstimator(object):
             人物ごとに dict(limb=str, x=float, y=float, score=float) のリスト。
             score が負の関節は未検出。
         """
+        crop, ox, oy = self._crop(self._masked(bgr_img, mask), roi)
+        joints = self._estimate_full(crop)
+        if ox or oy:
+            for person in joints:
+                for joint in person:
+                    if joint['score'] >= 0:
+                        joint['x'] += ox
+                        joint['y'] += oy
+        return joints
+
+    def _estimate_full(self, bgr_img):
         h, w, _ = bgr_img.shape
         rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
 
@@ -286,18 +400,19 @@ class PeoplePoseEstimator(object):
         raise ValueError('Unsupported depth encoding: {}'.format(encoding))
 
     def estimate_3d(self, bgr_img, depth_img, intrinsics,
-                    output_transform=None):
+                    output_transform=None, roi=None, mask=None):
         """深度画像 [m] とカメラ内部パラメータから 3 次元姿勢を求める.
 
         output_transform (4x4 行列か callable) を渡すと返す点をその座標系へ
-        変換する。フィルタはカメラ座標系のまま行う。
+        変換する。フィルタはカメラ座標系のまま行う。``roi``・``mask`` は
+        ``estimate`` と同じ。
 
         Returns
         -------
         (list of dict, list of list of dict)
             人物ごとの {関節名: [x, y, z]} (検出できた関節のみ) と 2D 関節位置。
         """
-        people_joint_positions = self.estimate(bgr_img)
+        people_joint_positions = self.estimate(bgr_img, roi=roi, mask=mask)
 
         people = []
         current_time = time.time()
@@ -326,8 +441,11 @@ class PeoplePoseEstimator(object):
         return people, people_joint_positions
 
     def estimate_hands_3d(self, bgr_img, depth_img, intrinsics,
-                          output_transform=None):
+                          output_transform=None, roi=None, mask=None):
         """体を使わず MediaPipe Hands で手だけを検出する (体が画角外でも使える).
+
+        ``roi`` (x0, y0, x1, y1) [px] を渡すとその範囲の手だけを探す (座標は
+        元の画像のまま)。``mask`` は ``estimate`` と同じ (ほかの人の手を拾わない)。
 
         Returns
         -------
@@ -343,8 +461,9 @@ class PeoplePoseEstimator(object):
                 max_num_hands=MAX_NUM_HANDS,
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence)
-        h, w, _ = bgr_img.shape
-        results = self.hands.process(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
+        crop, ox, oy = self._crop(self._masked(bgr_img, mask), roi)
+        h, w, _ = crop.shape
+        results = self.hands.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
         if not results.multi_hand_landmarks:
             return []
         hands = []
@@ -355,6 +474,9 @@ class PeoplePoseEstimator(object):
             side = 'R' if classification.label == 'Left' else 'L'
             joints_2d = self._hand_joint_positions(
                 '{}Hand'.format(side), landmarks, w, h)
+            for joint_pos in joints_2d:
+                joint_pos['x'] += ox
+                joint_pos['y'] += oy
             positions = {}
             for joint_pos in joints_2d:
                 if not (0 <= joint_pos['y'] < depth_img.shape[0]

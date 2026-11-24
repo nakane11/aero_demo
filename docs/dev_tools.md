@@ -509,6 +509,66 @@ python3 scripts/handshake_viewer.py --ros \
 [debug][segment] waypoint数=21 計画上のdyaw=-35.2deg (=[...]) 送信直前odom_yaw=0.3deg time_list合計=8.94s (=[0.35, 0.31, ...])
 ```
 
+## 複数人の見張り (`--multi-person-model`)
+
+Holistic は追跡モードで一度捕まえた人の周りしか探さないので、ほかの人が手を
+出しても気が付かない。`--multi-person-model <pose_landmarker_lite.task>` を
+付けると `src/aero_demo/multi_person_watcher.py` の見張りが別スレッドで動き、
+
+1. PoseLandmarker (IMAGE モード) で全員の体の骨格を取る。画像全体ではほぼ
+   1 人しか返さないので、見つけた人を黒く塗って探し直す (1 回 55〜80 ms)。
+2. 体幹の位置 (3 次元と画像上の近い方) で人に番号を振る。
+3. 体の骨格だけの粗い候補スコア (手がロボットの方へ出ているか・腰より上か)
+   が今見ている人より 0.25 以上高く 0.5 以上の人がいれば、0.1 秒続いたら
+   見る人を切り替える (Holistic・平滑化・静止判定を作り直す。確定後は固定)。
+4. Holistic と Hands には、ほかの人を黒く塗った画像全体を渡す (切り出すと
+   範囲が動いたときに Holistic の追跡がずれて骨格が崩れる)。1 人のときは
+   塗る所がないので、今までとまったく同じ入力になる。
+5. 椅子などを人と見ないよう、鼻・肩の高さ (床から、深度で測る) が 0.8 m
+   未満か測れない骨格は見張りで人として数えない。Holistic の骨格がそう
+   なら、idle・ARMED 中は首の追従・差し出しの判定に使わず (人が見えないのと
+   同じ)、0.5 秒続いたらその範囲を 5 秒塗って Holistic を作り直す
+   (`[multi-person] 人でないもの ... を見ていたので` が出る)。11/24 の実機の
+   録画では、立った人は肩 1.13〜1.22 m、誤検出は肩 0.62 m 以下だった。
+   しゃがんだ人・子どもはこの高さを下回ると見ない。
+
+モデルは `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task`
+(`_lite` を `_full` にすると full)。lite を勧める (11/24): full だと同じプロセスの
+Holistic が 1 フレーム約 2 ms (遅い方の 1 割で約 2〜10 ms) 遅くなり、lite では
+見張りなしと同じだった (rosbag 再生)。本命の確定の時刻は lite でも変わらない
+(1 人の bag 4 本は今の方式と一致、合成 2 組は単独比 ±0.0 / -0.27 秒)。
+見張りを回す間隔を空けると、本命の確定がその分遅れる (0.4 秒で約 +0.6 秒) ので
+空けていない。
+
+### `tools/eval_multi_person_offer.py`: 確定までのオフライン比較
+
+同じフレームを今の方式 (Holistic を画像全体に) と見張りありの両方に通し、
+差し出しの確定 (`PalmPoseEstimator` の `offered_hand`) の時刻・その人の番号・
+処理時間を `events.json` に、フレームごとの内訳を `frames.jsonl` に、重ねた
+動画を `overlay.mp4` (`--video`) に出す。見張りは測った処理時間だけ遅れて結果が
+使える (別スレッド 1 本) として再現する。入力は `tools/multi_person_sources.py`:
+
+- `--source bag`: 実機の bag (`--start`/`--end` は bag 先頭からの秒)。
+- `--source composite`: 実機の bag 2 本を重ねる。A (`--bag`) の画面に、B
+  (`--bag-b`) の人を深度で切り抜いて `--b-shift` (画像の幅の割合) だけ横に
+  ずらし、`--b-delay` 秒後から重ねる。`events.json` の `gt.b_t` は B の bag の
+  `--start-b` からの秒で、B だけを `--source bag` で流した結果と比べられる。
+- `--source panoptic`: CMU Panoptic の Kinect 1 台 (`--panoptic-dir` に
+  `kinect1.mp4`・`depth1.dat`・`kcalibration.json`・`ksynctables.json`)。
+  カメラをロボットの頭とみなす (上向きは見えた人の腰→肩から決める)。
+
+```bash
+python3 tools/eval_multi_person_offer.py --source composite \
+    --bag data/bags/camera_pipeline_2026-11-19-14-49-51.bag --start 8 --end 17 \
+    --bag-b data/bags/camera_pipeline_2026-11-23-16-46-33.bag --start-b 12.8 \
+    --b-shift -0.30 --b-delay 1.0 \
+    --model ~/work/multiperson_data/models/pose_landmarker_lite.task \
+    --output-dir /tmp/mp_eval --video
+```
+
+`tools/ros/scan_multi_person_bags.py` は bag を間引いて見張りに通し、2 人以上
+写っている区間を探す。
+
 ## 実機データでの回帰テスト
 
 どのデータを使うかは [`docs/test_data.md`](test_data.md) にまとめてある。

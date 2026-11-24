@@ -1811,6 +1811,7 @@ class HandshakePipelineNode(object):
             dcutoff=args.joint_smoothing_dcutoff)
 
         self._lock = threading.Lock()
+        self._start_multi_person_watcher(args)
         # viewer の add/delete/redraw は直列化する (別スレッド同時呼びで落ちる。
         # self._lock 保持中にも呼ぶので別 lock)。
         self._viewer_lock = threading.Lock()
@@ -2320,8 +2321,12 @@ class HandshakePipelineNode(object):
             depth_raw, encoding=depth_msg.encoding)
         intrinsics = CameraIntrinsics.from_matrix(info_msg.K)
 
+        # 複数人のときはほかの人を塗った画像で見る (1 人なら view の boxes は空)。
+        view = self._multi_person_view(color, depth_m, intrinsics,
+                                       camera_to_base, color_msg.header.stamp)
         people, joints_2d = self.pose_estimator.estimate_3d(
-            color, depth_m, intrinsics, output_transform=camera_to_base)
+            color, depth_m, intrinsics, output_transform=camera_to_base,
+            mask=view)
 
         publish_overlay = self.skeleton_image_pub.get_num_connections() > 0
         if publish_overlay or self._viewer_camera_image is not None:
@@ -2335,6 +2340,20 @@ class HandshakePipelineNode(object):
                 self._viewer_camera_overlay = overlay
         is_base_frame = camera_to_base is not None
         raw_joint_positions = people[0] if people else None
+        if (self.multi_watcher is not None and is_base_frame and joints_2d
+                and self.state in ('idle', 'armed')):
+            if self.multi_watcher.check_focus(
+                    raw_joint_positions, self._joints_box(joints_2d[0]),
+                    color_msg.header.stamp.to_sec(), color.shape[1],
+                    color.shape[0]):
+                # 椅子などに張り付いた Holistic を、その範囲を塗って作り直す。
+                print('[multi-person] 人でないもの (鼻・肩が床から {:.1f} m '
+                      '未満) を見ていたので、そこを塗って探し直します。'.format(
+                          self.multi_watcher.min_body_height))
+                self._reset_person_tracking()
+            if not self.multi_watcher.looks_like_person(raw_joint_positions):
+                # 首の追従・差し出しの判定に使わない (人が見えないのと同じ)。
+                raw_joint_positions = None
         preview_joint_positions = (
             None if raw_joint_positions is None
             else self._joint_smoother.update(
@@ -2380,11 +2399,14 @@ class HandshakePipelineNode(object):
                     if joints_2d else None),
                 raw_joint_positions=raw_joint_positions,
                 joint_positions=preview_joint_positions,
-                hands=None)
+                hands=None,
+                multi_person=(None if self.multi_watcher is None
+                              else self.multi_watcher.summary()))
         if ((hand_frames_requested or hand_tracking or armed
              or hand_follow is not None) and is_base_frame):
             hands = self.pose_estimator.estimate_hands_3d(
-                color, depth_m, intrinsics, output_transform=camera_to_base)
+                color, depth_m, intrinsics, output_transform=camera_to_base,
+                mask=view)
             if detection is not None:
                 detection['hands'] = hands
             stamp = color_msg.header.stamp.to_sec()
@@ -2415,6 +2437,99 @@ class HandshakePipelineNode(object):
                                 detection=detection)
         else:
             self._publish_detection(detection)
+
+    # ------------------------------------------------------------------
+    # 複数人の見張り (--multi-person-model)
+    # ------------------------------------------------------------------
+    def _start_multi_person_watcher(self, args):
+        """見張り (``MultiPersonWatcher``) を別スレッドで動かす.
+
+        PoseLandmarker は 1 回 70〜110 ms かかるので、画像の処理 (_on_frame) は
+        待たせず、最新のフレームだけを渡して結果は次のフレームから使う。
+        """
+        self.multi_watcher = None
+        if not args.multi_person_model:
+            return
+        from aero_demo.multi_person_watcher import (
+            MultiPersonWatcher, TargetChooser, joints_box)
+        self._joints_box = joints_box
+        self.multi_watcher = MultiPersonWatcher(
+            args.multi_person_model,
+            chooser=TargetChooser(
+                switch_score=args.multi_person_switch_score,
+                switch_margin=args.multi_person_switch_margin,
+                switch_hold=args.multi_person_switch_hold))
+        self._watch_lock = threading.Lock()
+        self._watch_event = threading.Event()
+        self._watch_input = None
+        self._watch_result = None
+        # 最初の推論は初期化 (EGL など) を含んで遅いので、最初の人が来る前に
+        # 起動時に空の画像で 1 回済ませておく。
+        self.multi_watcher.watcher.detect(np.zeros((480, 640, 3), np.uint8))
+        # 切り替えで Holistic を作り直す時間 (約 80 ms) を待たないよう予備を持つ。
+        self.pose_estimator.keep_spare()
+        threading.Thread(target=self._multi_person_loop, daemon=True).start()
+        print('[multi-person] 見張りを有効にしました ({})。'.format(
+            args.multi_person_model))
+
+    def _multi_person_loop(self):
+        while not rospy.is_shutdown():
+            self._watch_event.wait(0.5)
+            self._watch_event.clear()
+            with self._watch_lock:
+                job, self._watch_input = self._watch_input, None
+            if job is None:
+                continue
+            stamp, color, depth_m, intrinsics, camera_to_base, odom, robot = job
+            try:
+                people = self.multi_watcher.detect(
+                    color, depth_m, intrinsics, camera_to_base, odom, robot)
+            except Exception as exc:  # noqa: BLE001  (見張りが落ちても判定は続ける)
+                rospy.logwarn_throttle(
+                    5.0, '[multi-person] 見張りで例外 ({!r})'.format(exc))
+                continue
+            with self._watch_lock:
+                # MultiPersonWatcher.apply(people, t, w, h) の引数の順。
+                self._watch_result = (people, stamp, color.shape[1],
+                                      color.shape[0])
+
+    def _multi_person_view(self, color, depth_m, intrinsics, camera_to_base,
+                           stamp):
+        """見張りに最新のフレームを渡し、届いた結果で塗る範囲を更新して返す."""
+        if self.multi_watcher is None or camera_to_base is None:
+            return None
+        robot = self.offered_hand_selector.robot_position
+        if robot is None:
+            robot = self.robot_position
+        with self._watch_lock:
+            self._watch_input = (
+                stamp.to_sec(), color, depth_m, intrinsics, camera_to_base,
+                self._lookup_odom_from_base(stamp), np.asarray(robot))
+            result, self._watch_result = self._watch_result, None
+        self._watch_event.set()
+        if result is not None:
+            # 差し出しを確定した後は見る人を変えない。
+            self.multi_watcher.lock(self.state not in ('idle', 'armed'))
+            _view, switched = self.multi_watcher.apply(*result)
+            if switched:
+                self._on_multi_person_switch()
+        return self.multi_watcher.view
+
+    def _reset_person_tracking(self):
+        """前の人の追跡・平滑化・静止判定の履歴を捨てる."""
+        self.pose_estimator.reset_tracking()
+        self._joint_smoother.reset()
+        self.offered_hand_selector.reset_stillness()
+        with self._lock:
+            self._offer_hands.clear()
+
+    def _on_multi_person_switch(self):
+        """見る人が変わった."""
+        self._reset_person_tracking()
+        log_debug('[multi-person] 見る人を {} 番に切り替えました ({})'.format(
+            self.multi_watcher.target_id,
+            [(p['track_id'], round(p['score_ema'] or 0.0, 2))
+             for p in self.multi_watcher.summary()]))
 
     def _publish_detection(self, detection):
         """``_on_frame`` の 1 フレームの検出結果を ``~detections`` に出す。"""
@@ -7142,6 +7257,19 @@ def build_arg_parser():
     parser.add_argument(
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
         help='差し出し手判定の基準にするロボット手先の TF フレーム。')
+    parser.add_argument(
+        '--multi-person-model', type=str, default='',
+        help='複数人の見張りに使う PoseLandmarker のモデル '
+             '(pose_landmarker_lite.task を推奨)。空なら見張りなし (1 人前提)。')
+    parser.add_argument(
+        '--multi-person-switch-score', type=float, default=0.5,
+        help='見張りの候補スコア (0〜1) がこれ以上の人へ切り替えうる。')
+    parser.add_argument(
+        '--multi-person-switch-margin', type=float, default=0.25,
+        help='今見ている人より候補スコアがこれだけ高いときに切り替える。')
+    parser.add_argument(
+        '--multi-person-switch-hold', type=float, default=0.1,
+        help='上の条件がこの秒数続いたら切り替える。')
     parser.add_argument(
         '--attempts-per-pose', type=int,
         default=spik.DEFAULT_ATTEMPTS_PER_POSE)
