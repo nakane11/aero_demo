@@ -3357,7 +3357,8 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
                             placement_joint_positions=None,
                             excluded_turns=(),
                             collect=None, exhaustive=False, accept=None,
-                            partial_press_max_remaining=None):
+                            partial_press_max_remaining=None,
+                            deadline=None):
     """バッチ IK の候補から、事後検証と後処理判定を通る候補をコストの低い順に探す。
 
     候補の添字は 向き * ``attempts_per_pose`` + 初期値。収束・事後検証
@@ -3387,6 +3388,9 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
     無いとき、押し込みを途中まで進めて最終目標まで残りがこれ以内の最初の候補を
     ``partial_press_post`` の形 (``partial`` が True) で返す (後処理前の解より
     優先)。
+
+    ``deadline`` (``time.time()`` の値) を過ぎたら残りの候補は調べず、それまでに
+    見つけた解 (途中までの押し込み・後処理前の解) を上と同じ順で返す。
     """
     turn_degs = turn_candidates_deg(hand, palm)
     bend_cost_indices = _joint_bend_cost_indices(robot, robot_arm)
@@ -3589,6 +3593,10 @@ def pick_verified_candidate(robot, success_flags, angle_vectors, base_poses,
         if (post_process_max_candidates is not None
                 and examined >= post_process_max_candidates):
             break
+        if deadline is not None and time.time() >= deadline:
+            print('  [post-process] 計画の時間の上限を過ぎたため、残りの候補 '
+                  '{} 個は調べません。'.format(len(candidates) - examined))
+            break
         examined += 1
         turn_index = candidate_index // attempts_per_pose
         attempt_index = candidate_index % attempts_per_pose
@@ -3782,7 +3790,7 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
                     placement_joint_positions=None,
                     excluded_turns=(),
                     collect=None, exhaustive=False, accept=None,
-                    partial_press_max_remaining=None):
+                    partial_press_max_remaining=None, deadline=None):
     """1 人分の全ての向き x 初期値を、人体と ``collision_pairs`` の自己干渉を回避する
     バッチ IK (jax) で解き、``pick_verified_candidate`` で 1 つ選ぶ。
 
@@ -3792,7 +3800,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
 
     ``(picked, collision_ik_time, candidate_selection_time)`` を返す (時間は秒)。
     ``collect``・``exhaustive``・``accept``・
-    ``partial_press_max_remaining`` は ``pick_verified_candidate`` へ渡す。
+    ``partial_press_max_remaining``・``deadline`` は ``pick_verified_candidate``
+    へ渡す。
     """
     seed_arm_pose(robot, robot_arm)
     whole_body = getattr(robot, '{}arm_whole_body'.format(robot_arm))
@@ -3890,7 +3899,8 @@ def solve_person_ik(robot, palm, hand, robot_arm, collision_obstacles,
         placement_joint_positions=placement_joint_positions,
         excluded_turns=excluded_turns,
         collect=collect, exhaustive=exhaustive, accept=accept,
-        partial_press_max_remaining=partial_press_max_remaining)
+        partial_press_max_remaining=partial_press_max_remaining,
+        deadline=deadline)
     candidate_selection_time = time.time() - candidate_selection_start
     return picked, collision_ik_time, candidate_selection_time
 
@@ -3991,7 +4001,7 @@ def _solve_person_ik_side_by_side(robot, palm, hand, robot_arm,
             base_limits[1], base_limits[2]]
         picked, ik_time, selection_time = solve_person_ik(
             robot, palm, hand, robot_arm, collision_obstacles,
-            base_limits=person_base_limits, **kwargs)
+            base_limits=person_base_limits, deadline=deadline, **kwargs)
         collision_ik_time += ik_time
         candidate_selection_time += selection_time
         if (picked is not None and picked[3] is not None
