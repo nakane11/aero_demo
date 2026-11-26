@@ -1823,6 +1823,7 @@ class HandshakePipelineNode(object):
         # ARMED 中の Hands の結果 [(stamp, hands, カメラ位置)] (直近だけ)。
         self._offer_hands = collections.deque()
         self._current_palm = None         # 直近の IK に使った掌 (base_link、平行移動前) or None
+        self._current_offered_hand = None  # 直近の IK に使った差し出し手 ('left'/'right') or None
         self._latest_offer_selection = None  # ARMED 中の直近の差し出し手判定の内訳 or None
         # 'idle' -> 'armed' -> 'solving' -> 'result' (RESET で 'idle')。
         # --auto-execute で失敗したら 'armed' に戻る。
@@ -2995,6 +2996,7 @@ class HandshakePipelineNode(object):
             self._current_result = result
             self._current_motion = motion
             self._current_palm = palm
+            self._current_offered_hand = offered_hand
             self._display_waypoints = display_waypoints
             self._display_n_prepend = n_prepend
             self._display_n_approach = n_approach
@@ -4169,8 +4171,8 @@ class HandshakePipelineNode(object):
             self._head_person_ref = (
                 None if seen is None else self._seen_target_odom(seen))
         try:
-            self._execute_on_robot_body()
-            self._set_activity(STAGE_DONE)
+            if self._execute_on_robot_body() != 'failed':
+                self._set_activity(STAGE_DONE)
         except Exception:
             self._set_activity(STAGE_ERROR)
             raise
@@ -4182,6 +4184,26 @@ class HandshakePipelineNode(object):
             self._set_face_tracking(False)
             self._end_hand_follow()
             self._set_hand_tracking(False)
+
+    def _fail_before_execution(self):
+        """計画は通ったが実行の直前に横並び移動が解けていないと分かったとき
+        (接近の実行中に解く横並び移動が、実行より先に解けずに終わった場合)、
+        計画の失敗 (``_solve_handshake`` の 'failed') と同じく理由を話して
+        ARMED に戻る。"""
+        pre_move = self._pre_move
+        if pre_move is not None:
+            with self._pre_move_lock:
+                pre_move['plan_failed'] = True
+        with self._lock:
+            palm = self._current_palm
+            offered_hand = self._current_offered_hand
+        print('[advice] 横並び移動が解けなかったため、手の出し方は助言しません。')
+        self._last_failure = (
+            offered_hand, self._palm_in_pre_move_frame(palm),
+            self._say(SPEECH_TRANSITION_FAIL_TEXT, wait=True))
+        self._wait_pre_move()
+        self._reset_view()
+        self._arm('失敗', move_to_initial_pose=False, wait_offer_change=True)
 
     def _hand_follow_target(self, waypoint, joint_names):
         """``waypoint`` に台車がいる前提での、計画時の掌の位置と法線
@@ -4268,7 +4290,8 @@ class HandshakePipelineNode(object):
         if not self._execution_verified(motion):
             print('[execute] 横並び移動が解けていないため実機を動かせ '
                   'ません。')
-            return
+            self._fail_before_execution()
+            return 'failed'
 
         self._set_activity(STAGE_NOD_WAIT)
         if not self._nod_done.wait(timeout=10.0):
