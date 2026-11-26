@@ -528,6 +528,7 @@ class PeoplePoseEstimator(object):
         positions = {}
         pixels = {}
         model_depths = {}
+        no_depth = []  # 画素は取れたが周りに有効な深度が無い関節
         for joint_pos in person_joint_positions:
             if joint_pos['score'] < 0:
                 continue
@@ -541,13 +542,17 @@ class PeoplePoseEstimator(object):
             z = self._sample_depth(
                 depth_img, int(joint_pos['x']), int(joint_pos['y']))
             if z is None:
+                no_depth.append(joint_pos['limb'])
                 continue
             x = (joint_pos['x'] - intrinsics.cx) * z / intrinsics.fx
             y = (joint_pos['y'] - intrinsics.cy) * z / intrinsics.fy
             positions[joint_pos['limb']] = np.array([x, y, z], dtype=np.float64)
-        # 腰→膝の長さで膝を落とす前に、手の深度を拾った体幹の関節を直す。
+        # 腰→膝の長さで膝を落とす前に、手の深度を拾った体幹の関節を直し、
+        # 深度が抜けた体幹の関節を補う。
         positions = self._repair_occluded_torso_joints(
             positions, pixels, intrinsics)
+        positions = self._fill_missing_torso_depths(
+            positions, pixels, intrinsics, no_depth)
         positions = self._prune_implausible_limbs(positions)
         positions = self._prune_implausible_hand_landmarks(positions)
         positions = self._prune_implausible_hand_wrist_offset(positions)
@@ -650,26 +655,64 @@ class PeoplePoseEstimator(object):
             return positions
         positions = dict(positions)
         for name in occluded:
-            opposite, same_side = self._TORSO_JOINT_PARTNERS[name]
-            opposite_other = self._TORSO_JOINT_PARTNERS[opposite][1]
-            reliable = [n for n in (opposite, same_side, opposite_other)
-                        if n in positions and n not in occluded]
-            if len(reliable) == 3:
-                z = (positions[same_side][2] + positions[opposite][2]
-                     - positions[opposite_other][2])
-            elif opposite in reliable:
-                z = positions[opposite][2]
-            else:
+            z = self._torso_partner_depth(name, positions, occluded)
+            if z is None:
                 logger.debug("Joint %s dropped: occluded by a hand", name)
                 del positions[name]
                 continue
             logger.debug("Joint %s depth repaired: %.2fm -> %.2fm "
                          "(occluded by a hand)", name, positions[name][2], z)
-            u, v = pixels[name]
-            positions[name] = np.array([
-                (u - intrinsics.cx) * z / intrinsics.fx,
-                (v - intrinsics.cy) * z / intrinsics.fy, z], dtype=np.float64)
+            positions[name] = self._back_project(pixels[name], z, intrinsics)
         return positions
+
+    def _fill_missing_torso_depths(self, positions, pixels, intrinsics,
+                                   no_depth):
+        """画素は取れたが深度が抜けた肩・腰を、ほかの体幹の関節の深度で補う.
+
+        肩・腰の点は体の輪郭の近くにあり、深度カメラの影や縁で周りの深度が
+        すべて抜けることがある (保存した骨格の約 5% で片方の肩が抜けていた)。
+        深度は手に隠れたときと同じく ``_torso_partner_depth`` で決める。
+        相手も無ければ補わない (落ちたまま)。
+        """
+        missing = [name for name in self._TORSO_JOINT_PARTNERS
+                   if name in no_depth and name in pixels
+                   and name not in positions]
+        if not missing:
+            return positions
+        positions = dict(positions)
+        for name in missing:
+            z = self._torso_partner_depth(name, positions, missing)
+            if z is None:
+                continue
+            logger.debug("Joint %s depth filled: %.2fm (no valid depth)",
+                         name, z)
+            positions[name] = self._back_project(pixels[name], z, intrinsics)
+        return positions
+
+    def _torso_partner_depth(self, name, positions, unreliable):
+        """体幹の関節 ``name`` の深度を相手の関節から決める (決まらなければ None).
+
+        「同じ側のもう一方の体幹関節 + 反対側の同じ組の深度差」(体の左右の線が
+        平行とみなす)、それが無ければ反対側の同じ関節の深度。``unreliable`` に
+        ある関節は相手に使わない。
+        """
+        opposite, same_side = self._TORSO_JOINT_PARTNERS[name]
+        opposite_other = self._TORSO_JOINT_PARTNERS[opposite][1]
+        reliable = [n for n in (opposite, same_side, opposite_other)
+                    if n in positions and n not in unreliable]
+        if len(reliable) == 3:
+            return float(positions[same_side][2] + positions[opposite][2]
+                         - positions[opposite_other][2])
+        if opposite in reliable:
+            return float(positions[opposite][2])
+        return None
+
+    @staticmethod
+    def _back_project(pixel, z, intrinsics):
+        u, v = pixel
+        return np.array([
+            (u - intrinsics.cx) * z / intrinsics.fx,
+            (v - intrinsics.cy) * z / intrinsics.fy, z], dtype=np.float64)
 
     def _prune_implausible_limbs(self, positions):
         """``max_limb_length`` を超える区間の遠位側の関節を落とす."""

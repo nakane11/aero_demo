@@ -87,6 +87,43 @@ def test_falls_back_to_opposite_joint_then_drops():
     assert 'LHip' not in repaired
 
 
+def test_missing_shoulder_depth_is_filled_from_other_torso_joints():
+    positions, pixels = _scene(left_hip_depth=1.9)
+    del positions['LShoulder']  # 周りに有効な深度が無かった
+    filled = _estimator()._fill_missing_torso_depths(
+        positions, pixels, INTRINSICS, ['LShoulder'])
+    # 左腰 1.9 + (右肩 2.0 - 右腰 1.9) = 2.0
+    assert filled['LShoulder'][2] == pytest.approx(2.0)
+    u = filled['LShoulder'][0] * INTRINSICS.fx / filled['LShoulder'][2] \
+        + INTRINSICS.cx
+    assert u == pytest.approx(pixels['LShoulder'][0])
+    assert 'LShoulder' not in positions  # 入力は変えない
+
+
+def test_missing_depth_falls_back_then_stays_missing():
+    positions, pixels = _scene(left_hip_depth=1.9)
+    del positions['LShoulder']
+    del positions['LHip']
+    filled = _estimator()._fill_missing_torso_depths(
+        positions, pixels, INTRINSICS, ['LShoulder', 'LHip'])
+    # 同じ側の腰も抜けていれば反対側の肩の深度、腰は右腰の深度。
+    assert filled['LShoulder'][2] == pytest.approx(2.0)
+    assert filled['LHip'][2] == pytest.approx(1.9)
+
+    del positions['RShoulder']
+    filled = _estimator()._fill_missing_torso_depths(
+        positions, pixels, INTRINSICS, ['LShoulder', 'RShoulder', 'LHip'])
+    assert 'LShoulder' not in filled and 'RShoulder' not in filled
+
+
+def test_missing_depth_of_non_torso_joint_is_not_filled():
+    positions, pixels = _scene(left_hip_depth=1.9)
+    del positions['LElbow']
+    filled = _estimator()._fill_missing_torso_depths(
+        positions, pixels, INTRINSICS, ['LElbow'])
+    assert 'LElbow' not in filled
+
+
 def test_disabled_with_non_positive_radius():
     positions, pixels = _scene(left_hip_depth=1.5)
     repaired = _estimator(occlusion_radius=0.0)._repair_occluded_torso_joints(
