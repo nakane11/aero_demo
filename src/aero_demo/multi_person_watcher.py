@@ -431,8 +431,13 @@ class TargetChooser(object):
         self._target_active_t = None
 
     def lock(self, locked=True):
-        self.locked = bool(locked)
-        self._challenger = None
+        """切り替えを止める/許す. ノードは見張りの結果ごとに呼ぶので、状態が
+        変わったときだけ切り替え候補を捨てる (毎回捨てると、候補が
+        ``switch_hold`` 秒続く前に消えて切り替えが成立しない)。"""
+        locked = bool(locked)
+        if locked != self.locked:
+            self._challenger = None
+        self.locked = locked
 
     def hold(self, until):
         """``until`` (画像の時刻) までは今の人を見失っても選び直さない."""

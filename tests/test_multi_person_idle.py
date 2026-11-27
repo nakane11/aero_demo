@@ -77,6 +77,27 @@ def test_offer_still_switches_by_score():
     assert target == ids[0]
 
 
+def test_switch_works_when_lock_is_called_every_update():
+    """ノードは見張りの結果ごとに lock(False) を呼ぶ。それでも切り替わること."""
+    sim = _Sim()
+    for _ in range(5):
+        sim.chooser.lock(False)
+        target, _, ids = sim.step([_person(100, 0.0, 3.0),
+                                   _person(320, 0.0, 1.4)])
+    assert target == ids[1]
+    for _ in range(5):
+        sim.chooser.lock(False)
+        target, _, ids = sim.step([_person(100, 0.9, 3.0),
+                                   _person(320, 0.0, 1.4)])
+    assert target == ids[0]
+    # 確定後 (lock(True)) は切り替えない。
+    for _ in range(5):
+        sim.chooser.lock(True)
+        target, _, ids = sim.step([_person(100, 0.0, 3.0),
+                                   _person(320, 0.9, 1.4)])
+    assert target == ids[0]
+
+
 def test_idle_switch_to_clearly_nearer_person_after_hold():
     sim = _Sim(idle_hold=1.0)
     for _ in range(5):
