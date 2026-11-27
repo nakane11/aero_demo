@@ -2420,6 +2420,10 @@ class HandshakePipelineNode(object):
         if publish_overlay or self._viewer_camera_image is not None:
             overlay = (skeleton_drawing.draw_skeleton_overlay(color, joints_2d[0])
                       if joints_2d else color)
+            if self.multi_watcher is not None or detect_color is not color:
+                overlay = self._draw_crowd_overlay(
+                    overlay.copy() if overlay is color else overlay, color,
+                    detect_color)
             if publish_overlay:
                 self.skeleton_image_pub.publish(
                     ndarray_to_imgmsg(overlay, 'bgr8', color_msg.header))
@@ -2613,6 +2617,37 @@ class HandshakePipelineNode(object):
             if switched:
                 self._on_multi_person_switch()
         return self.multi_watcher.view
+
+    def _draw_crowd_overlay(self, overlay, color, detect_color):
+        """表示用の画像に、遠くを塗って検出に使っていない所 (暗く) と、見張りが
+        見つけた人の枠 (選んだ人は緑の太枠、ほかは灰) と番号・差し出しスコア・
+        ``idle_cost`` を描く。見渡しの最中はその旨も描く。"""
+        if detect_color is not color:
+            ignored = (detect_color.max(axis=2) == 0) & (color.max(axis=2) > 0)
+            overlay[ignored] //= 3
+        watcher = self.multi_watcher
+        if watcher is None:
+            return overlay
+        scale = max(1.0, overlay.shape[1] / 960.0)
+        thin, thick = int(round(2 * scale)), int(round(5 * scale))
+        for person in watcher.summary():
+            x0, y0, x1, y1 = [int(round(v)) for v in person['box']]
+            target = person['target']
+            box_color = (0, 220, 0) if target else (180, 180, 180)
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), box_color,
+                          thick if target else thin)
+            cost = person.get('idle_cost')
+            label = '#{} offer {:.2f}{}'.format(
+                person['track_id'], person['score_ema'] or 0.0,
+                '' if cost is None else ' near {:.2f}'.format(cost))
+            cv2.putText(overlay, label, (x0, max(0, y0 - int(8 * scale))),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, box_color,
+                        thin)
+        if self._glance is not None:
+            cv2.putText(overlay, 'GLANCE', (int(20 * scale), int(50 * scale)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2 * scale, (0, 200, 255),
+                        thick)
+        return overlay
 
     def _far_masked(self, color, depth_m):
         """``--far-mask-depth`` より遠い画素を塗った検出用の画像."""
