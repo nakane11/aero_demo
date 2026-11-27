@@ -112,7 +112,9 @@ def measure_offer(joint_positions, palm, hand):
 class OfferAdvisor(object):
     """reachability map の表から、今の出し方に一番近い解ける出し方を探す。"""
 
-    def __init__(self, table_path=DEFAULT_TABLE_PATH):
+    def __init__(self, table_path=DEFAULT_TABLE_PATH, lang='ja'):
+        """``lang`` は発話句の言語 (``ja``/``en``)。"""
+        self.lang = lang
         with open(table_path) as f:
             table = json.load(f)
         self.points = {}
@@ -158,12 +160,12 @@ class OfferAdvisor(object):
             diff = target[key] - measure[key]
             if abs(diff) >= POSITION_ADVICE_MIN:
                 items.append((abs(diff), key, diff,
-                              _position_phrase(key, diff)))
+                              _position_phrase(key, diff, self.lang)))
         for key in _ANGLE_KEYS:
             diff = _wrap_deg(target[key] - measure[key])
             if abs(diff) >= ANGLE_ADVICE_MIN_DEG:
                 items.append((abs(diff) * ANGLE_WEIGHT_M_PER_DEG, key, diff,
-                              _angle_phrase(key, diff, target)))
+                              _angle_phrase(key, diff, target, self.lang)))
         items.sort(key=lambda item: -item[0])
         return [(key, diff, phrase)
                 for _, key, diff, phrase in items[:MAX_ADVICE]], target
@@ -174,8 +176,42 @@ def _centimeters(diff):
     return max(5, int(round(abs(diff) * 100.0 / 5.0)) * 5)
 
 
-def _position_phrase(key, diff):
+# 英語 (lang='en') の句は VOICEVOX で話すためカタカナで書き、間が空かないよう
+# 区切らずにつなげる (英単語のままだとアルファベット読みになる単語がある)。
+_EN_ONES = ('', 'ワン', 'ツー', 'スリー', 'フォー', 'ファイブ', 'シックス',
+            'セブン', 'エイト', 'ナイン', 'テン', 'イレブン', 'トゥエルブ',
+            'サーティーン', 'フォーティーン', 'フィフティーン', 'シックスティーン',
+            'セブンティーン', 'エイティーン', 'ナインティーン')
+_EN_TENS = ('', '', 'トゥエンティ', 'サーティ', 'フォーティ', 'フィフティ',
+            'シックスティ', 'セブンティ', 'エイティ', 'ナインティ')
+
+
+def english_number_kana(n):
+    """1〜999 の整数の英語の読みをカタカナで返す (例: 25 -> トゥエンティファイブ)。"""
+    n = int(n)
+    hundreds, rest = divmod(n, 100)
+    words = _EN_ONES[hundreds] + 'ハンドレッド' if hundreds else ''
+    if rest >= 20:
+        words += _EN_TENS[rest // 10] + _EN_ONES[rest % 10]
+    else:
+        words += _EN_ONES[rest]
+    return words
+
+
+def _position_phrase(key, diff, lang='ja'):
     cm = _centimeters(diff)
+    if lang == 'en':
+        # move your hand N centimeters forward / back toward your body /
+        # outward / toward the front of your body / up / down
+        if key == 'forward':
+            move = 'フォワード' if diff > 0 else 'バックトゥワードユアボディ'
+        elif key == 'lateral':
+            move = ('アウトワード' if diff > 0
+                    else 'トゥワードザフロントオブユアボディ')
+        else:
+            move = 'アップ' if diff > 0 else 'ダウン'
+        return 'ムーブユアハンド{}センチメーターズ{}'.format(
+            english_number_kana(cm), move)
     if key == 'forward':
         return ('あと{}センチ前に出して' if diff > 0
                 else '{}センチほど体の方に引いて').format(cm)
@@ -186,7 +222,35 @@ def _position_phrase(key, diff):
             else '{}センチほど下げて').format(cm)
 
 
-def _angle_phrase(key, diff, target):
+def _angle_phrase_en(key, diff, target):
+    if key == 'roll':
+        roll = target['roll']
+        if 60.0 <= roll <= 120.0:
+            return 'ターンユアパームダウン'  # turn your palm down
+        if 20.0 <= roll < 60.0:
+            return 'ターンユアパームダイアゴナリーダウン'
+        if -20.0 < roll < 20.0:
+            # turn your palm sideways with your thumb up
+            return 'ターンユアパームサイドウェイズウィズユアサムアップ'
+        if -60.0 < roll <= -20.0:
+            return 'ターンユアパームダイアゴナリーアップ'
+        if -120.0 <= roll <= -60.0:
+            return 'ターンユアパームアップ'
+        # twist your wrist so that your palm faces down / up
+        return 'ツイストユアリストソーザットユアパームフェイシズ{}'.format(
+            'ダウン' if diff > 0 else 'アップ')
+    if key == 'pitch':
+        # tilt your fingertips up / down a little
+        return 'ティルトユアフィンガーティップス{}アリトル'.format(
+            'アップ' if diff > 0 else 'ダウン')
+    # point your fingertips a little outward / inward
+    return 'ポイントユアフィンガーティップスアリトル{}'.format(
+        'アウトワード' if diff > 0 else 'インワード')
+
+
+def _angle_phrase(key, diff, target, lang='ja'):
+    if lang == 'en':
+        return _angle_phrase_en(key, diff, target)
     if key == 'roll':
         roll = target['roll']
         if 60.0 <= roll <= 120.0:
@@ -206,8 +270,11 @@ def _angle_phrase(key, diff, target):
     return '指先を少し{}に向けて'.format('外側' if diff > 0 else '内側')
 
 
-def advice_speech(advice):
+def advice_speech(advice, lang='ja'):
     """``advise`` の結果を 1 つの発話文にする."""
     if not advice:
         return ''
+    if lang == 'en':
+        # Please A. And B. (句ごとに「。」で区切る)
+        return 'プリーズ' + '。アンド'.join(phrase for _, _, phrase in advice)
     return '、'.join(phrase for _, _, phrase in advice) + 'ください。'

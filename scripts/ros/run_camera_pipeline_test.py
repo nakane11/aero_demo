@@ -260,9 +260,14 @@ WALK_TURN_ATTEMPTS = 2
 SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
 # 前進の後、手を離して RELEASE_WAIT_TIME 待ち、初期姿勢へ戻しながら
 # RELEASE_BACK_DISTANCE 下がる (腕と台車の所要時間は RELEASE_BACK_MIN_TIME 以上)。
-RELEASE_WAIT_TIME = 0.5  # [s]
+RELEASE_WAIT_TIME = 1.0  # [s]
 RELEASE_BACK_DISTANCE = 0.5  # [m]
 RELEASE_BACK_MIN_TIME = 3.0  # [s]
+# 下がった後のお辞儀: waist_p を BOW_WAIST_DEG (正が前屈み) まで傾けて
+# BOW_HOLD_TIME 止め、初期姿勢へ戻す。傾ける・戻すはそれぞれ BOW_MOVE_TIME 以上。
+BOW_WAIST_DEG = 15.0
+BOW_MOVE_TIME = 1.0  # [s]
+BOW_HOLD_TIME = 0.5  # [s]
 SPEECH_VOICE = '四国めたん-ノーマル'  # sound_play の voice
 SPEECH_START_TEXT = '今から行きますね'
 SPEECH_DONE_TEXT = 'どうぞ、手を握ってください'
@@ -274,6 +279,54 @@ SPEECH_APPROACH_FAIL_TEXT = ('ごめんなさい、近づく道が見つかり�
                              'もう一度手を出してください')
 SPEECH_TRANSITION_FAIL_TEXT = ('ごめんなさい、横に並ぶ道が見つかりませんでした。'
                                'もう一度手を出してください')
+PARTIAL_PRESS_SPEECH = '手を合わせてください'  # 押し込みを途中で止めて手を待つとき
+# 発話の言語 (--speech-lang) ごとの sound_play の action/topic・voice・文。
+# fail_join は SPEECH_FAIL_TEXT と後に続ける文 (助言など) のつなぎ。
+# per_char は action サーバが無いときの待ち時間の見積り (SPEECH_FALLBACK_PER_CHAR)。
+# 英語も VOICEVOX (robotsound_jp) で話す。VOICEVOX は辞書に無い英単語を
+# アルファベット読みする (hold, walk, together, me, are, mine, let's, i'm, sure,
+# couldn't, move, offer、文頭の Sorry など)。1 文の全単語が英語表記のまま読める
+# 文は英語表記で書き (末尾のピリオドは付けない)、読めない単語を含む文はすべて
+# カタカナで書く (手の出し方の助言も hand_offer_advice でカタカナ)。英語表記は
+# 単語ごとに間が空くので、カタカナの文は区切らずにつなげて書き、文の間だけ「。」で
+# 区切る。長い続きの中では「ファ」が「フア」、「トゥ」が「トオ」と割れて読まれる
+# ことがあるので、割れない言い方・書き方 (to は「トゥー」) を選んだ。どの文も
+# VOICEVOX の audio_query の読み・モーラで確認済み。
+SPEECH_LANGS = {
+    'ja': dict(
+        sound_action='robotsound_jp', voice=SPEECH_VOICE,
+        per_char=SPEECH_FALLBACK_PER_CHAR, fail_join='。',
+        start=SPEECH_START_TEXT, done=SPEECH_DONE_TEXT,
+        transition=SPEECH_TRANSITION_TEXT, fail=SPEECH_FAIL_TEXT,
+        retry=SPEECH_RETRY_TEXT, approach_fail=SPEECH_APPROACH_FAIL_TEXT,
+        transition_fail=SPEECH_TRANSITION_FAIL_TEXT,
+        timeout_fail=SPEECH_TIMEOUT_FAIL_TEXT,
+        walk_forward=SPEECH_WALK_FORWARD_TEXT, voice_arm_reply=VOICE_ARM_REPLY,
+        partial_press=PARTIAL_PRESS_SPEECH),
+    'en': dict(
+        sound_action='robotsound_jp', voice=SPEECH_VOICE,
+        per_char=SPEECH_FALLBACK_PER_CHAR, fail_join='。',
+        start='I am coming now',
+        # Here you are. Please hold my hand.
+        done='ヒアユーアー。プリーズホールドマイハンド',
+        transition='レッツスタンドサイドバイサイド',  # Let's stand side by side.
+        # 文頭を大文字の Sorry にするとアルファベット読みになる。
+        fail='sorry, I can not reach your hand',
+        # Please move your hand a little and offer it again.
+        retry='プリーズムーブユアハンドアリトルアンドオファーイットアゲイン',
+        # Sorry, I couldn't get close. (close は「クローズ」と読まれる)
+        approach_fail=('ソーリーアイクドゥントゲットクロース。'
+                       'Please give your hand again'),
+        transition_fail=('sorry, I can not stand by your side。'
+                         'Please give your hand again'),
+        # Sorry, it took me too long to think.
+        timeout_fail=('ソーリーイットトゥックミートゥーロングトゥーシンク。'
+                      'Please give your hand again'),
+        # Let's walk forward together.
+        walk_forward='レッツウォークフォワードトゥゲザー',
+        voice_arm_reply='シュアギブミーユアハンド',  # Sure, give me your hand.
+        partial_press='Please put your hand on my hand'),
+}
 VIEWER_CAMERA_FPS = 5.0  # [Hz] viser の状態パネルに出すカメラ画像の更新頻度
 # 差し出した手の掌の法線の、体の内側 (反対の肩の方向、水平) 成分がこれ未満なら掌と甲を
 # 取り違えているとみなして裏返す。正しい掌は -0.25 以上、-0.8 未満は裏返った推定。
@@ -378,8 +431,8 @@ WORKER_WARMUP_TIMEOUT = 60.0
 # 来たとみなす。狙った掌から PARTIAL_REAIM_MIN_SHIFT 以上離れた検出が
 # PARTIAL_REAIM_COUNT 回続いたら、出し直したとみなして今の姿勢から手先を合わせ
 # 直す (押し込みの残りの上限 PARTIAL_PRESS_MAX_REMAINING より大きくして、
-# ロボットの手へ寄せる動きと区別する)。
-PARTIAL_PRESS_SPEECH = '手を合わせてください'
+# ロボットの手へ寄せる動きと区別する)。PARTIAL_PRESS_SPEECH は発話の文と一緒に上で
+# 定義する。
 PARTIAL_ARRIVAL_DISTANCE = 0.04  # [m]
 PARTIAL_ARRIVAL_COUNT = 2
 PARTIAL_REAIM_MIN_SHIFT = 0.10  # [m]
@@ -1975,22 +2028,35 @@ class HandshakePipelineNode(object):
             threading.Thread(
                 target=self._head_tracking_loop, daemon=True).start()
 
+        self.speech_lang = args.speech_lang
+        self.speech = dict(SPEECH_LANGS[args.speech_lang])
+        if args.speech_voice is not None:
+            self.speech['voice'] = args.speech_voice
+        if args.speech_sound_action is not None:
+            self.speech['sound_action'] = args.speech_sound_action
         self.sound_client = None
         if args.auto_execute and self.ri is not None:
             try:
                 from sound_play.libsoundplay import SoundClient
                 self.sound_client = SoundClient(
-                    sound_action='robotsound_jp', sound_topic='robotsound_jp')
+                    sound_action=self.speech['sound_action'],
+                    sound_topic=self.speech['sound_action'])
+                print('[speech] 発話: 言語 {} / {} / voice {}'.format(
+                    args.speech_lang, self.speech['sound_action'],
+                    self.speech['voice'] or '(既定)'))
             except Exception as exc:  # noqa: BLE001
                 print('[speech] SoundClient の初期化に失敗したため発話し '
                       'ません ({})。'.format(exc))
-            if self.sound_client is not None:
+            # VOICEVOX を使うのは robotsound_jp だけ。
+            if (self.sound_client is not None
+                    and self.speech['sound_action'] == 'robotsound_jp'):
                 _check_voicevox_engine(args.voicevox_url)
         self.offer_advisor = None
         if args.speech_advice:
             try:
                 self.offer_advisor = hand_offer_advice.OfferAdvisor(
-                    hand_offer_advice.DEFAULT_TABLE_PATH)
+                    hand_offer_advice.DEFAULT_TABLE_PATH,
+                    lang=args.speech_lang)
             except Exception as exc:  # noqa: BLE001
                 print('[advice] 手の出し方の表 ({}) を読めないため、IK 失敗時'
                       'に出し方を助言しません ({})。'.format(
@@ -2632,7 +2698,7 @@ class HandshakePipelineNode(object):
                 transcript, self.state))
             return
         self._arm('声「{}」'.format(transcript))
-        self._say(VOICE_ARM_REPLY)
+        self._say(self.speech['voice_arm_reply'])
 
     def _on_reset_service(self, _req):
         if self.state in ('solving',):
@@ -3075,23 +3141,23 @@ class HandshakePipelineNode(object):
                   '助言しません。'.format(attempt, result.get('plan_timeout_stage')))
             self._log_debug(dict(event='advice', person=attempt, cause=cause,
                                  stage=result.get('plan_timeout_stage')))
-            return SPEECH_TIMEOUT_FAIL_TEXT
+            return self.speech['timeout_fail']
         if cause == 'approach':
             print('[advice] 試行{}: 接近の途中で干渉したため、手の出し方は'
                   '助言しません。'.format(attempt))
             self._log_debug(dict(event='advice', person=attempt, cause=cause))
-            return SPEECH_APPROACH_FAIL_TEXT
+            return self.speech['approach_fail']
         if cause == 'transition':
             print('[advice] 試行{}: 横並び移動が解けなかったため、手の出し方は'
                   '助言しません。'.format(attempt))
             self._log_debug(dict(event='advice', person=attempt, cause=cause))
-            return SPEECH_TRANSITION_FAIL_TEXT
+            return self.speech['transition_fail']
         measure = hand_offer_advice.measure_offer(
             joint_positions, palm, offered_hand)
         advice, target = [], None
         if self.offer_advisor is not None and measure is not None:
             advice, target = self.offer_advisor.advise(measure, offered_hand)
-        text = hand_offer_advice.advice_speech(advice)
+        text = hand_offer_advice.advice_speech(advice, lang=self.speech_lang)
         if measure is not None:
             print('[advice] 試行{} ({}): 今の出し方 前{forward:.2f} 外{lateral:.2f} '
                   '高さ{height:.2f} m、指先 yaw{yaw:.0f} pitch{pitch:.0f}、'
@@ -3100,8 +3166,9 @@ class HandshakePipelineNode(object):
         self._log_debug(dict(
             event='advice', person=attempt, cause=cause, measure=measure,
             target=target, advice=[[k, d] for k, d, _ in advice], text=text))
-        tail = text or SPEECH_RETRY_TEXT
-        return '。'.join(t for t in (SPEECH_FAIL_TEXT, tail) if t)
+        tail = text or self.speech['retry']
+        return self.speech['fail_join'].join(
+            t for t in (self.speech['fail'], tail) if t)
 
     @staticmethod
     def _failure_cause(result, motion):
@@ -4208,7 +4275,7 @@ class HandshakePipelineNode(object):
         print('[advice] 横並び移動が解けなかったため、手の出し方は助言しません。')
         self._last_failure = (
             offered_hand, self._palm_in_pre_move_frame(palm),
-            self._say(SPEECH_TRANSITION_FAIL_TEXT, wait=True))
+            self._say(self.speech['transition_fail'], wait=True))
         self._wait_pre_move()
         self._reset_view()
         self._arm('失敗', move_to_initial_pose=False, wait_offer_change=True)
@@ -4348,7 +4415,7 @@ class HandshakePipelineNode(object):
                   len(display_waypoints) + n_transition, reach_boundary,
                   len(display_waypoints) - reach_boundary, n_transition))
 
-        self._say(SPEECH_START_TEXT)
+        self._say(self.speech['start'])
         # 動き出す前の台車の odom の姿勢 (前進は人と同じ向き = これの逆向きへ
         # 進む)。待機点へ動き出していれば (pre-move) その前の姿勢を使う (今の
         # odom は回り始めた後のことがある)。基準スキャンも同じ位置で取っている。
@@ -4599,7 +4666,7 @@ class HandshakePipelineNode(object):
         if reach_boundary < len(display_waypoints):
             self._set_activity(STAGE_GRASP)
             self._set_hand_grasp(True)
-        self._say(SPEECH_DONE_TEXT)
+        self._say(self.speech['done'])
         # 握って待つ時間 (--side-by-side-delay) は押し込みの指令が終わった時刻
         # から数える (腕の追いつき待ちもこの中に入れる)。
         press_end_time = (self._press_motion_end
@@ -4681,6 +4748,24 @@ class HandshakePipelineNode(object):
         settle_time, _ = self._wait_odom_settle()
         log_debug('[execute][release] 後退後、止まるまで {:.2f}s'.format(
             settle_time))
+        self._bow(target_av)
+
+    def _bow(self, upright_av):
+        """``upright_av`` (初期姿勢) から ``waist_p_joint`` だけを
+        ``BOW_WAIST_DEG`` 前へ傾け、``BOW_HOLD_TIME`` 止めて ``upright_av`` へ
+        戻す (軽いお辞儀)。"""
+        upright_av = np.asarray(upright_av, dtype=np.float64)
+        index = self.real_robot.joint_list.index(self.real_robot.waist_p_joint)
+        bow_av = upright_av.copy()
+        bow_av[index] += math.radians(BOW_WAIST_DEG)
+        down, up = self._limited_time_list(
+            [bow_av, upright_av], None, [BOW_MOVE_TIME, BOW_MOVE_TIME],
+            start_av=upright_av)
+        print('[execute] お辞儀をします (腰 {:.0f}deg、{:.1f}+{:.1f}+{:.1f} 秒)。'
+              .format(BOW_WAIST_DEG, down, BOW_HOLD_TIME, up))
+        self.ri.angle_vector_sequence(
+            [bow_av, bow_av, upright_av], [down, BOW_HOLD_TIME, up])
+        self.ri.wait_interpolation()
 
     def _walk_forward(self, distance):
         """横並びの後、手をつないだまま台車だけを ``distance`` [m] 前 (台車の
@@ -4688,7 +4773,7 @@ class HandshakePipelineNode(object):
         回りながら ``SPEECH_WALK_FORWARD_TEXT`` を発話し、発話し終わってから
         進む。首は顔を追わず正面 (首の関節を全て 0) へ向ける。"""
         self._set_activity(STAGE_WALK_FORWARD)
-        spoken = self._say(SPEECH_WALK_FORWARD_TEXT, wait=True)
+        spoken = self._say(self.speech['walk_forward'], wait=True)
         self._turn_to_walk_heading()
         spoken.wait(SPEECH_RESULT_TIMEOUT)
         point = [float(distance), 0.0, 0.0]
@@ -4804,7 +4889,7 @@ class HandshakePipelineNode(object):
                   '戻す): {}'.format(
                       ', '.join('{} {:.0f}deg'.format(name, v)
                                 for v, name in largest) or '1deg 以下'))
-        self._say(SPEECH_TRANSITION_TEXT)
+        self._say(self.speech['transition'])
         self._set_activity(STAGE_TRANSITION)
         print('[execute] 手を下ろしながら横並びの位置へ移動します '
               '(waypoint {} 個)。'.format(len(waypoints)))
@@ -5189,7 +5274,7 @@ class HandshakePipelineNode(object):
         self._log_debug(dict(event='partial_press_wait',
                              reached=post.get('press_reached'),
                              remaining=post.get('press_remaining')))
-        self._say(PARTIAL_PRESS_SPEECH)
+        self._say(self.speech['partial_press'])
         t0 = time.time()
         arrived = moved = 0
         n_reaim = 0
@@ -5965,7 +6050,7 @@ class HandshakePipelineNode(object):
                              daemon=True).start()
             return done
         try:
-            self.sound_client.say(text, voice=SPEECH_VOICE)
+            self.sound_client.say(text, voice=self.speech['voice'])
         except Exception:  # noqa: BLE001  (発話失敗で実機動作を止めない)
             pass
         return None
@@ -5984,9 +6069,9 @@ class HandshakePipelineNode(object):
             client = self.sound_client.actionclient
             if not client.wait_for_server(
                     rospy.Duration(SPEECH_SERVER_TIMEOUT)):
-                self.sound_client.say(text, voice=SPEECH_VOICE)
+                self.sound_client.say(text, voice=self.speech['voice'])
                 estimate = (SPEECH_FALLBACK_BASE
-                            + SPEECH_FALLBACK_PER_CHAR * len(text))
+                            + self.speech['per_char'] * len(text))
                 print('[speech] 発話の action サーバが無いため、完了を待たずに '
                       '{:.1f} 秒待ちます。'.format(estimate))
                 time.sleep(estimate)
@@ -5995,7 +6080,7 @@ class HandshakePipelineNode(object):
             goal.sound_request.sound = SoundRequest.SAY
             goal.sound_request.command = SoundRequest.PLAY_ONCE
             goal.sound_request.arg = text
-            goal.sound_request.arg2 = SPEECH_VOICE
+            goal.sound_request.arg2 = self.speech['voice']
             goal.sound_request.volume = 1.0
             client.send_goal(
                 goal, feedback_cb=lambda _fb: first_feedback.append(
@@ -7472,6 +7557,18 @@ def build_arg_parser():
     parser.add_argument(
         '--voicevox-url', type=str, default=VOICEVOX_ENGINE_URL,
         help='起動時に応答を確かめる VOICEVOX エンジンの URL (空で確かめない)。')
+    parser.add_argument(
+        '--speech-lang', choices=sorted(SPEECH_LANGS), default='ja',
+        help='ロボットの発話の言語。en も VOICEVOX で話し、成功の流れの文は'
+             'VOICEVOX が読めない単語を含む文はカタカナ英語 (手の出し方の'
+             '助言も)。')
+    parser.add_argument(
+        '--speech-voice', type=str, default=None,
+        help='sound_play の voice (既定は --speech-lang ごとの値)。')
+    parser.add_argument(
+        '--speech-sound-action', type=str, default=None,
+        help='発話に使う sound_play の action/topic 名 (既定は --speech-lang '
+             'ごとの値)。')
     # --- rosbag での実カメラ無しテスト ---
     parser.add_argument(
         '--bag', type=str, default=None,
