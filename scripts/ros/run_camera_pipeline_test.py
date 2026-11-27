@@ -2407,11 +2407,14 @@ class HandshakePipelineNode(object):
         intrinsics = CameraIntrinsics.from_matrix(info_msg.K)
         # 見張り・骨格・手の検出には遠く (後ろの人だかり) を塗った画像を渡す。
         # 表示・保存は元の画像のまま。
-        detect_color = self._far_masked(color, depth_m)
+        far_masked = self._far_masked(color, depth_m)
 
         # 複数人のときはほかの人を塗った画像で見る (1 人なら view の boxes は空)。
-        view = self._multi_person_view(detect_color, depth_m, intrinsics,
+        view = self._multi_person_view(far_masked, depth_m, intrinsics,
                                        camera_to_base, color_msg.header.stamp)
+        # 見張りが選んだ人の枠の中は塗らない (遠くに立つ人を選んだとき、体が
+        # 塗られて手と頭しか残らなくなるため)。
+        detect_color = self._unmask_target(far_masked, color, view)
         people, joints_2d = self.pose_estimator.estimate_3d(
             detect_color, depth_m, intrinsics, output_transform=camera_to_base,
             mask=view)
@@ -2648,6 +2651,22 @@ class HandshakePipelineNode(object):
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2 * scale, (0, 200, 255),
                         thick)
         return overlay
+
+    @staticmethod
+    def _unmask_target(far_masked, color, view):
+        """遠くを塗った画像の、見張りが選んだ人の枠 (``view['keep']``) の中を
+        元の画像に戻す (塗っていない・選んだ人がいなければそのまま)。"""
+        if far_masked is color or not view or view.get('keep') is None:
+            return far_masked
+        h, w = color.shape[:2]
+        x0, y0, x1, y1 = view['keep']
+        x0, x1 = int(max(0, math.floor(x0))), int(min(w, math.ceil(x1)))
+        y0, y1 = int(max(0, math.floor(y0))), int(min(h, math.ceil(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return far_masked
+        image = far_masked.copy()
+        image[y0:y1, x0:x1] = color[y0:y1, x0:x1]
+        return image
 
     def _far_masked(self, color, depth_m):
         """``--far-mask-depth`` より遠い画素を塗った検出用の画像."""
