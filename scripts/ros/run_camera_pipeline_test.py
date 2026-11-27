@@ -7719,7 +7719,12 @@ def build_arg_parser():
     return parser
 
 
-CLOCK_OFFSET_WARN_SEC = 0.1  # [秒] ロボットとの時計ずれがこれを超えたら警告
+CLOCK_OFFSET_WARN_SEC = 0.1  # [秒] ロボットとの時計ずれがこれを超えたら警告して合わせる
+# [秒] 合わせても直らなかったとき、これを超えていたら起動を止める。問題が出たのは
+# 1 秒以上のずれ (短い台車のゴール 1〜2 秒が過去扱い、TF 待ちで処理が 4.6 Hz) で、
+# 0.1〜0.2 秒では出ていない。w32time は小さいずれを少しずつしか直さないので、
+# 0.1 秒を少し超えただけで止めると起動できない (11/27)。
+CLOCK_OFFSET_STOP_SEC = 0.3
 # カーネルの tick [us] の標準値と、これ以上外れていたら警告する幅。WSL では
 # Windows との差が数秒を超えると時計を Windows へ合わせ直し、WSL が先行して
 # いると tick を下げて追いつかせる (9167 前後、約 0.09 秒/秒)。普段の揺れは
@@ -7759,9 +7764,10 @@ def read_kernel_tick():
         return None
 
 
-def measure_robot_clock(host):
+def measure_robot_clock(host, limit=CLOCK_OFFSET_WARN_SEC):
     """ロボット (``host``) との時計ずれを ntpdate -q で測り、tick と合わせて
-    表示する。ずれ・引き戻しがあれば True、無ければ False、測れなければ None。"""
+    表示する。ずれが ``limit`` [秒] を超える・引き戻し中なら True、無ければ False、
+    測れなければ None。"""
     bad = False
     tick = read_kernel_tick()
     if tick is not None and abs(tick - KERNEL_TICK_NOMINAL) > KERNEL_TICK_WARN:
@@ -7784,8 +7790,10 @@ def measure_robot_clock(host):
         print('[clock][WARN] {} との時計ずれを測れませんでした '
               '(ntpdate -q {})。'.format(host, host))
         return True if bad else None
-    if abs(offset) <= CLOCK_OFFSET_WARN_SEC:
-        print('[clock] {} との時計ずれ {:+.3f} 秒 (OK)。'.format(host, offset))
+    if abs(offset) <= limit:
+        print('[clock] {} との時計ずれ {:+.3f} 秒 (OK{})。'.format(
+            host, offset, '' if limit == CLOCK_OFFSET_WARN_SEC
+            else '、{:.1f} 秒以下なので起動する'.format(limit)))
         return bad
     print('\033[1;31m[clock][WARN] PC の時計が {} より {:.3f} 秒{}います。'
           'このままだと ARM で腕が動かない・台車が暴れる等が起きます。'
@@ -7873,7 +7881,9 @@ def check_robot_clock_offset(auto_sync=True):
         print('\033[1;31m{}\033[0m'.format(SYNC_CLOCK_ADVICE))
         return
     run_sync_clock_task()
-    if measure_robot_clock(host):
+    # 合わせても 0.1 秒を少し超えるだけなら起動する (止めるのは CLOCK_OFFSET_STOP_SEC 超か
+    # 引き戻し中)。
+    if measure_robot_clock(host, limit=CLOCK_OFFSET_STOP_SEC):
         sys.exit('ロボットとの時計ずれを直せなかったので起動を止めます。\n{}\n'
                  '(承知の上で起動するには --no-clock-sync)'.format(
                      SYNC_CLOCK_ADVICE))

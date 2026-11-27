@@ -18,6 +18,7 @@ param(
     [string]$Robot = '192.168.96.215',
     [string]$Distro = 'Ubuntu-20.04',
     [double]$Threshold = 0.1,       # [s] これを超えたら補正する
+    [double]$MaxStepSec = 600,      # [s] resync 後に時計を直接動かすのはこれ未満のずれだけ
     [switch]$CheckOnly,
     [switch]$Install,
     [switch]$Uninstall,
@@ -32,12 +33,20 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Windows時計のロボットに対するずれ [s] (符号付き、正ならWindowsが遅れている)。
+# 3回測って絶対値が最小のもの。測れなければ $null
+function Get-WindowsSignedOffset {
+    $out = w32tm /stripchart /computer:$Robot /samples:3 /dataonly 2>&1 | Out-String
+    $vals = @([regex]::Matches($out, '([+-]\d+\.\d+)s') | ForEach-Object { [double]$_.Groups[1].Value })
+    if ($vals.Count -eq 0) { return $null }
+    return ($vals | Sort-Object { [math]::Abs($_) } | Select-Object -First 1)
+}
+
 # Windows時計のロボットに対するずれ [s] (絶対値)。測れなければ $null
 function Get-WindowsOffset {
-    $out = w32tm /stripchart /computer:$Robot /samples:3 /dataonly 2>&1 | Out-String
-    $vals = @([regex]::Matches($out, '([+-]\d+\.\d+)s') | ForEach-Object { [math]::Abs([double]$_.Groups[1].Value) })
-    if ($vals.Count -eq 0) { return $null }
-    return ($vals | Measure-Object -Minimum).Minimum
+    $off = Get-WindowsSignedOffset
+    if ($null -eq $off) { return $null }
+    return [math]::Abs($off)
 }
 
 # WSL時計のロボットに対するずれ [s] (絶対値)。測れなければ $null
@@ -95,6 +104,14 @@ function Fix-Windows {
     w32tm /config /manualpeerlist:$Robot /syncfromflags:manual /update | Out-Null
     w32tm /resync /rediscover | Out-Null
     w32tm /resync /force | Out-Null
+    # w32time は小さいずれ (0.1 秒前後) を一気には直さず少しずつ進めるので、直後に
+    # 測ってもずれたまま (11/13 は 0.40 秒が 30 分で約 0.03 秒しか縮まなかった)。
+    # 残っていれば測ったずれの分だけ時計を直接動かす (2026-11-27)。
+    $off = Get-WindowsSignedOffset
+    if (($null -ne $off) -and ([math]::Abs($off) -gt $Threshold) -and ([math]::Abs($off) -lt $MaxStepSec)) {
+        Write-Host ("Windows clock is still off by {0:N3} s after resync; stepping it" -f $off)
+        Set-Date -Adjust ([TimeSpan]::FromSeconds($off)) | Out-Null
+    }
 }
 
 function Fix-Wsl {
