@@ -187,6 +187,13 @@ HEAD_SCAN_YAW_DEG = 60.0
 HEAD_SCAN_PITCH_OFFSETS_DEG = (0.0, 15.0)
 HEAD_SCAN_DWELL = 1.0  # [秒] 止まった各向きで骨格を検出する時間
 HEAD_SCAN_SPEED_DEG = 30.0  # [deg/s] 見渡すときの首の速さ
+# 条件付きの見渡し (複数人の見張りあり、--no-head-glance で無効): 選んだ人が
+# しばらく手を出さなければ (条件は MultiPersonWatcher が決める)、首を左右の端へ
+# 素早く振って元の人へ戻る (人が見えないときの見渡しより短い、約 5 秒)。
+HEAD_GLANCE_YAW_DEG = 60.0  # 端の首ヨー
+HEAD_GLANCE_SPEED_DEG = 80.0  # [deg/s]
+HEAD_GLANCE_DWELL = 0.6  # [秒] 各端で止まって見る時間
+HEAD_GLANCE_BACK_TIME = 1.5  # [秒] 元の人へ戻す時間
 # 実行中に顔 (鼻、なければ両耳の中点、体幹) を追う首の動き。見えた位置を odom 系で
 # 覚え、見失っても向き続ける。
 HEAD_FACE_TRACK_DEADBAND_DEG = 4.0
@@ -1942,6 +1949,8 @@ class HandshakePipelineNode(object):
         self._segment_time_list = None
         # 直近に人へ向けた首ヨー指令 [rad] (見渡し中・停止中は None)。
         self._head_tracking_yaw = None
+        # 条件付きの見渡しの途中なら dict (_glance_step)、でなければ None。
+        self._glance = None
         self._frozen_joint_positions = None  # 差し出し手が決まった瞬間の骨格 (固定表示) or None
         self._current_result = None       # 直近の IK 結果 dict or None
         self._current_motion = None       # 直近の軌道計画結果 dict or None
@@ -2597,6 +2606,9 @@ class HandshakePipelineNode(object):
         if result is not None:
             # 差し出しを確定した後は見る人を変えない。
             self.multi_watcher.lock(self.state not in ('idle', 'armed'))
+            self.multi_watcher.glance_enabled = (
+                self.args.head_glance and self.args.head_tracking
+                and self.state == 'armed')
             _view, switched = self.multi_watcher.apply(*result)
             if switched:
                 self._on_multi_person_switch()
@@ -3984,6 +3996,64 @@ class HandshakePipelineNode(object):
                                             joint.max_angle)))
         return True
 
+    def _end_glance(self):
+        """条件付きの見渡しを終える (やめる)。"""
+        if self._glance is not None and self.multi_watcher is not None:
+            self.multi_watcher.glance_done()
+        self._glance = None
+
+    def _glance_step(self, now, seen, current_yaw, pitch):
+        """条件付きの見渡しで今向ける先。見渡していなければ None.
+
+        見張り (``MultiPersonWatcher``) の依頼を受けたら、首ヨーを今の向きに
+        近い側の端 (``HEAD_GLANCE_YAW_DEG``) → 反対の端の順に振って各端で
+        ``HEAD_GLANCE_DWELL`` 秒見てから、見渡す前に見ていた人の顔 (体幹) へ
+        ``HEAD_GLANCE_BACK_TIME`` 秒で戻る。人を追っている (``seen`` が新しい)
+        ときだけ始める。見渡している間に手を出した人へ見る人が切り替わったら
+        やめる。
+
+        Returns
+        -------
+        ('angles', (首ヨー, 首ピッチ)) か ('point', base_link 系の点) か None。
+        """
+        glance = self._glance
+        watcher = self.multi_watcher
+        if glance is None:
+            request = None if watcher is None else watcher.take_glance_request()
+            if request is None:
+                return None
+            if seen is None or now - seen[0] >= HEAD_SCAN_START_DELAY:
+                watcher.glance_done()
+                return None
+            speed = HEAD_GLANCE_SPEED_DEG
+            yaw = np.deg2rad(HEAD_GLANCE_YAW_DEG)
+            first = yaw if current_yaw >= 0 else -yaw
+            end1 = (now + abs(np.rad2deg(first - current_yaw)) / speed
+                    + HEAD_GLANCE_DWELL)
+            end2 = end1 + 2.0 * HEAD_GLANCE_YAW_DEG / speed + HEAD_GLANCE_DWELL
+            glance = self._glance = dict(
+                steps=[(end1, (first, pitch)), (end2, (-first, pitch))],
+                back=self._seen_target_odom(seen),
+                back_end=end2 + HEAD_GLANCE_BACK_TIME,
+                target_id=request['target_id'])
+            # 見渡している間は今の人を見失っても選び直さない。
+            watcher.hold_for(glance['back_end'] - now + 0.5)
+            print('[head] 選んだ人が手を出さないので、左右を見渡してから戻ります。')
+        elif watcher.target_id != glance['target_id']:
+            # 見渡している間に手を出した人へ切り替わった: その人を追う。
+            self._end_glance()
+            return None
+        for end, angles in glance['steps']:
+            if now < end:
+                return ('angles', angles)
+        odom_from_base = self._lookup_odom_from_base()
+        if (now >= glance['back_end'] or glance['back'] is None
+                or odom_from_base is None):
+            self._end_glance()
+            return None
+        return ('point', np.linalg.solve(
+            odom_from_base, np.append(glance['back'], 1.0))[:3])
+
     def _head_tracking_loop(self):
         """ARMED 中、人が見えていればカメラ光軸を体幹へ向け、見えなくなって
         ``HEAD_SCAN_START_DELAY`` 秒たったら首ヨーを往復させて探す。
@@ -4030,6 +4100,7 @@ class HandshakePipelineNode(object):
                         # _head_tracking_yaw はうなずきが読むので残す。
                         mode = None
                         last_command = None
+                        self._end_glance()
                         continue
                     with self._lock:
                         seen = self._head_person_seen
@@ -4041,7 +4112,33 @@ class HandshakePipelineNode(object):
                         joint.joint_angle(current_av[index])
                     target_av = current_av.copy()
                     target_av[neck_r_index] = spik.NECK_ROLL_FIXED_ANGLE
-                    if face:
+                    glance = (None if face else self._glance_step(
+                        now, seen, current_av[neck_y_index], scan_pitches[0]))
+                    if glance is not None:
+                        # 条件付きの見渡し: 左右の端を見て、元の人へ戻る。
+                        kind, value = glance
+                        if kind == 'angles':
+                            target_av[neck_y_index], target_av[neck_p_index] = \
+                                value
+                        else:
+                            gaze_robot.neck_y_joint.joint_angle(
+                                current_av[neck_y_index])
+                            gaze_robot.neck_p_joint.joint_angle(
+                                current_av[neck_p_index])
+                            if not self._seed_neck_yaw(gaze_robot, value):
+                                self._end_glance()
+                                continue
+                            spik._reaim_gaze(
+                                gaze_robot, gaze_coords, value,
+                                HEAD_TRACK_IK_STOP, HEAD_TRACK_IK_RTHRE)
+                            target_av[neck_y_index] = \
+                                gaze_robot.neck_y_joint.joint_angle()
+                            target_av[neck_p_index] = \
+                                gaze_robot.neck_p_joint.joint_angle()
+                        speed = np.deg2rad(HEAD_GLANCE_SPEED_DEG)
+                        mode = 'glance'
+                        self._head_tracking_yaw = None
+                    elif face:
                         # 実行中は人の顔 (螺旋以降は差し出し手の掌) を追う。見えなければ待つ。
                         track_mode = 'hand' if hand else 'face'
                         target = self._face_target(
@@ -4120,7 +4217,7 @@ class HandshakePipelineNode(object):
                         mode = 'scan'
                         self._head_tracking_yaw = None
                     command = target_av[[neck_y_index, neck_p_index]]
-                    if (mode in ('face', 'hand', 'track')
+                    if (mode in ('face', 'hand', 'track', 'glance')
                             and prev_mode == mode and last_command is not None
                             and float(np.max(np.abs(command - last_command)))
                             < np.deg2rad(HEAD_TRACK_RESEND_DEG)):
@@ -7611,6 +7708,10 @@ def build_arg_parser():
     parser.add_argument(
         '--no-head-tracking', dest='head_tracking', action='store_false',
         help='ARMED 中に首を人の方へ向けたり、見渡して人を探したりしない。')
+    parser.add_argument(
+        '--no-head-glance', dest='head_glance', action='store_false',
+        help='複数人の見張りがあるとき、選んだ人がしばらく手を出さなくても'
+             '左右を見渡さない。')
     parser.add_argument(
         '--no-clock-sync', dest='clock_sync', action='store_false',
         help='起動時にロボットとの時計ずれを見つけても Windows のタスク '

@@ -14,7 +14,8 @@ Holistic (``PeoplePoseEstimator``) は追跡モードで一度捕まえた人の
    付ける (手の点は使わない粗い値。確定は今までどおり Holistic と
    ``OfferedHandSelector`` で行う)。
 4. ``TargetChooser``: 詳しく見る人を決める。ほかの人の候補スコアが今の人より
-   明らかに高い状態が続けば切り替える。
+   明らかに高い状態が続けば切り替える。誰も手を出していなければ、正面の
+   近くでこちらを向いた人 (``idle_cost``) を見る。
 
 をまとめた ``MultiPersonWatcher`` を使う。Holistic にはほかの人を黒く塗った
 画像全体を渡す (``PeoplePoseEstimator`` の ``mask``)。ROS には依存しない。
@@ -29,7 +30,7 @@ from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision as mp_vision
 
 __all__ = ['PoseWatcher', 'PersonTracker', 'TargetChooser',
-           'MultiPersonWatcher', 'offer_candidate_score']
+           'MultiPersonWatcher', 'offer_candidate_score', 'idle_cost']
 
 # MediaPipe Pose の番号 (人物自身の左右)。
 POSE_INDEX = dict(
@@ -222,6 +223,42 @@ def torso_center(points):
     return np.mean(np.asarray(torso), axis=0)
 
 
+IDLE_BEARING_WEIGHT = 0.5  # [m/rad] ロボットの正面からの方位の重み
+IDLE_FACING_WEIGHT = 0.5  # [m] 背を向けた人に足す量 (横向きはその半分)
+
+
+def idle_cost(points, up=(0.0, 0.0, 1.0)):
+    """誰も手を出していないときに見る人を決める値 [m 相当] (小さいほど優先).
+
+    ``points`` は base_link 系 (x 前・y 左・z 上) の骨格。ロボットからの水平
+    距離に、正面からの方位 (``IDLE_BEARING_WEIGHT`` 倍) と、体がロボットを
+    向いていない度合い (肩の線の向きから、``IDLE_FACING_WEIGHT`` 倍) を足す。
+    部屋の入口に人が集まったとき、正面の近くでこちらを向いた人を見るため。
+    体幹が測れなければ None。
+    """
+    center = torso_center(points)
+    if center is None:
+        return None
+    up = np.asarray(up, dtype=np.float64)
+    c = center - center.dot(up) * up
+    distance = float(np.linalg.norm(c))
+    if distance < 1e-6:
+        return 0.0
+    bearing = abs(math.atan2(float(c[1]), float(c[0])))
+    facing = 0.0  # 分からなければ横向きと同じ扱い
+    if 'LShoulder' in points and 'RShoulder' in points:
+        s = (np.asarray(points['LShoulder'], dtype=np.float64)
+             - np.asarray(points['RShoulder'], dtype=np.float64))
+        s = s - s.dot(up) * up
+        # 人物自身の左肩 - 右肩と上向きの外積が体の正面。
+        front = np.cross(s, up)
+        norm = float(np.linalg.norm(front))
+        if norm > 1e-6:
+            facing = float(np.dot(front / norm, -c / distance))
+    return (distance + IDLE_BEARING_WEIGHT * bearing
+            + IDLE_FACING_WEIGHT * 0.5 * (1.0 - facing))
+
+
 def offer_candidate_score(points, robot_position, up=(0.0, 0.0, 1.0),
                           max_distance=3.0):
     """体の骨格 (3 次元、z 上向きの座標系) だけで差し出していそうかを付ける.
@@ -349,34 +386,66 @@ class PersonTracker(object):
 class TargetChooser(object):
     """詳しく見る人を決める.
 
-    - 対象がいない・見失った: 候補スコアが最も高い人 (同点なら近い人)。
+    - 対象がいない・見失った: 誰かのスコアが ``idle_score`` 以上ならスコアが
+      最も高い人 (同点なら近い人)。誰も手を出していなければ ``idle_cost``
+      (近さ・正面からの方位・こちらを向いているか) が最も小さい人。
     - ほかの人のスコア (指数移動平均) が ``switch_score`` 以上で、今の人より
       ``switch_margin`` 以上高い状態が ``switch_hold`` 秒続いたら切り替える。
+    - 今の人もほかの人もスコアが ``idle_score`` 未満のときは、``idle_cost``
+      が今の人より ``idle_margin`` 以上小さい人がいる状態が ``idle_hold``
+      秒続いたら切り替える (正面に近づいてきた人へ移る)。
     - ``lock()`` 中 (差し出しを確定した後など) は切り替えない。
+    - ``hold(until)`` の時刻までは、今の人を見失っても選び直さない (首を
+      よそへ向けて見渡している間)。手を出した人への切り替えは行う。
     - 切り替え先は ``min_hits`` 回以上見えた人だけ (一瞬の誤検出へ移らない)。
     """
 
     def __init__(self, switch_score=0.5, switch_margin=0.25, switch_hold=0.1,
-                 lost_timeout=0.7, ema_tau=0.15, min_hits=3):
+                 lost_timeout=0.7, ema_tau=0.15, min_hits=3, idle_score=0.3,
+                 idle_margin=0.3, idle_hold=1.0):
         self.min_hits = min_hits
         self.switch_score = switch_score
         self.switch_margin = switch_margin
         self.switch_hold = switch_hold
         self.lost_timeout = lost_timeout
         self.ema_tau = ema_tau
+        self.idle_score = idle_score
+        self.idle_margin = idle_margin
+        self.idle_hold = idle_hold
         self.target_id = None
         self.locked = False
-        self._challenger = None  # (track_id, 越え始めた時刻)
+        self._challenger = None  # (track_id, 越え始めた時刻, 続ける秒数)
         self._last_t = None
+        self._hold_until = None
+        # 今の人に決めた時刻と、最後に手を出しかけていた (スコアが
+        # idle_score 以上の) 時刻。``quiet_for`` で使う。
+        self._target_since = None
+        self._target_active_t = None
 
     def reset(self):
         self.target_id = None
         self.locked = False
         self._challenger = None
+        self._hold_until = None
+        self._target_since = None
+        self._target_active_t = None
 
     def lock(self, locked=True):
         self.locked = bool(locked)
         self._challenger = None
+
+    def hold(self, until):
+        """``until`` (画像の時刻) までは今の人を見失っても選び直さない."""
+        self._hold_until = until
+
+    def quiet_for(self, t):
+        """今の人が手を出しかけずにいる秒数 (人がいなければ 0)."""
+        if self.target_id is None or self._target_since is None:
+            return 0.0
+        start = self._target_since
+        if self._target_active_t is not None:
+            start = max(start, self._target_active_t)
+        return max(0.0, t - start)
 
     def update(self, tracks, all_tracks, t):
         """今の対象の番号と、切り替えたかどうかを返す."""
@@ -394,11 +463,24 @@ class TargetChooser(object):
         target = all_tracks.get(self.target_id)
         target_lost = (target is None
                        or t - target.last_seen > self.lost_timeout)
+        holding = (self.target_id is not None and self._hold_until is not None
+                   and t < self._hold_until)
         if target_lost and not (self.locked and target is not None):
-            self.target_id = self._best(list(visible.values()) or tracks)
-            self._challenger = None
+            if holding:
+                # 見渡している間は選び直さない。ただし手を出した人には移る。
+                self._consider_switch(target, visible, t, offers_only=True)
+            else:
+                self.target_id = self._best(list(visible.values()) or tracks)
+                self._challenger = None
         elif not self.locked and target is not None:
-            self._consider_switch(target, visible, t)
+            self._consider_switch(target, visible, t, offers_only=holding)
+        if self.target_id != previous:
+            self._target_since = t
+            self._target_active_t = None
+        current = all_tracks.get(self.target_id)
+        if (current is not None and current.score_ema is not None
+                and current.score_ema >= self.idle_score):
+            self._target_active_t = t
         # 初めて決めたときは捨てる履歴がないので「切り替え」にしない
         # (Holistic を作り直すと 1 人のときも今の方式と結果が変わる)。
         switched = (previous is not None and self.target_id is not None
@@ -411,24 +493,49 @@ class TargetChooser(object):
         return (track.score_ema or 0.0,
                 -(distance if distance is not None else 1e9))
 
+    @staticmethod
+    def _cost(track):
+        cost = track.person.get('idle_cost')
+        return float('inf') if cost is None else cost
+
     def _best(self, tracks):
         if not tracks:
             return None
+        if all((tr.score_ema or 0.0) < self.idle_score for tr in tracks):
+            # 誰も手を出していない: 正面の近くでこちらを向いた人。
+            nearest = min(tracks, key=self._cost)
+            if self._cost(nearest) < float('inf'):
+                return nearest.id
         return max(tracks, key=self._key).id
 
-    def _consider_switch(self, target, visible, t):
-        own = target.score_ema or 0.0
-        others = [tr for tid, tr in visible.items() if tid != target.id]
+    def _consider_switch(self, target, visible, t, offers_only=False):
+        own = 0.0 if target is None else (target.score_ema or 0.0)
+        target_id = self.target_id
+        others = [tr for tid, tr in visible.items() if tid != target_id]
         rival = max(others, key=self._key) if others else None
-        if (rival is None or (rival.score_ema or 0.0) < self.switch_score
-                or (rival.score_ema or 0.0) - own < self.switch_margin):
+        if (rival is not None and (rival.score_ema or 0.0) >= self.switch_score
+                and (rival.score_ema or 0.0) - own >= self.switch_margin):
+            self._challenge(rival.id, t, self.switch_hold)
+            return
+        if (offers_only or target is None or not others
+                or own >= self.idle_score
+                or any((tr.score_ema or 0.0) >= self.idle_score
+                       for tr in others)):
             self._challenger = None
             return
-        if self._challenger is None or self._challenger[0] != rival.id:
-            self._challenger = (rival.id, t)
+        # 誰も手を出していない: 正面に近い人がはっきりいれば移る。
+        nearest = min(others, key=self._cost)
+        if self._cost(target) - self._cost(nearest) >= self.idle_margin:
+            self._challenge(nearest.id, t, self.idle_hold)
+        else:
+            self._challenger = None
+
+    def _challenge(self, track_id, t, hold):
+        if self._challenger is None or self._challenger[0] != track_id:
+            self._challenger = (track_id, t, hold)
             return
-        if t - self._challenger[1] >= self.switch_hold:
-            self.target_id = rival.id
+        if t - self._challenger[1] >= self._challenger[2]:
+            self.target_id = track_id
             self._challenger = None
 
 
@@ -455,6 +562,12 @@ class MultiPersonWatcher(object):
     Holistic には切り出しではなく、ほかの人を黒く塗った画像全体を渡す
     (切り出す範囲が動くと Holistic の追跡がずれて骨格が崩れるため。
     11/23 に実機の録画で、範囲の飛びで誤って差し出しが確定するのを確認)。
+
+    条件付きの見渡し: ``glance_enabled`` の間、今の人が ``glance_quiet`` 秒
+    手を出しかけずにいたら ``glance_request`` を立てる。首を動かす側が
+    ``take_glance_request`` で受け取って見渡し、``hold_for`` で見渡している
+    間は今の人を選び直さないようにし、終わったら ``glance_done`` を呼ぶ。
+    前の見渡しが終わってから ``glance_interval`` 秒は次を頼まない。
     """
 
     def __init__(self, model_path, num_poses=2, interval=0.0,
@@ -462,7 +575,14 @@ class MultiPersonWatcher(object):
                  mask_keep_time=0.5, max_distance=3.0, tracker=None,
                  chooser=None, same_person_overlap=0.6, min_body_height=0.8,
                  not_person_time=0.5, suppress_time=5.0,
-                 suppress_pad=(0.2, 0.2)):
+                 suppress_pad=(0.2, 0.2), glance_quiet=8.0,
+                 glance_interval=6.0):
+        self.glance_enabled = False
+        self.glance_quiet = glance_quiet
+        self.glance_interval = glance_interval
+        self.glance_request = None
+        self._glance_active = False
+        self._last_glance_t = None
         self.watcher = PoseWatcher(model_path, num_poses=num_poses)
         self.min_body_height = min_body_height
         self.not_person_time = not_person_time
@@ -495,10 +615,42 @@ class MultiPersonWatcher(object):
         self._last_target_box = None
         self._suppressed = []
         self._not_person_since = None
+        self.glance_request = None
+        self._glance_active = False
+        self._last_glance_t = None
 
     @property
     def target_id(self):
         return self.chooser.target_id
+
+    def take_glance_request(self):
+        """立っている見渡しの依頼を取り出す (無ければ None)."""
+        request, self.glance_request = self.glance_request, None
+        return request
+
+    def hold_for(self, seconds):
+        """最後の画像の時刻から ``seconds`` 秒は今の人を選び直さない."""
+        if self.chooser._last_t is not None:
+            self.chooser.hold(self.chooser._last_t + seconds)
+
+    def glance_done(self):
+        """見渡しが終わった (やめた)。次はここから ``glance_interval`` 秒後."""
+        self._glance_active = False
+        self._last_glance_t = self.chooser._last_t
+
+    def _update_glance(self, t):
+        """条件を満たしたら ``glance_request`` を立てる (``apply`` から)."""
+        if not self.glance_enabled or self.chooser.locked:
+            self.glance_request = None
+            self._glance_active = False
+            return
+        if (self._glance_active or self.glance_request is not None
+                or self.chooser.quiet_for(t) < self.glance_quiet
+                or (self._last_glance_t is not None
+                    and t - self._last_glance_t < self.glance_interval)):
+            return
+        self._glance_active = True
+        self.glance_request = dict(t=t, target_id=self.chooser.target_id)
 
     def lock(self, locked=True):
         self.chooser.lock(locked)
@@ -558,7 +710,10 @@ class MultiPersonWatcher(object):
                     points, robot_position, up=up,
                     max_distance=self.max_distance)
             person.update(score=score, side=side, details=details,
-                          distance=(details or {}).get('distance'))
+                          distance=(details or {}).get('distance'),
+                          idle_cost=(idle_cost(points, up)
+                                     if camera_to_base is not None and points
+                                     else None))
         return people
 
     def apply(self, people, t, w, h):
@@ -576,6 +731,7 @@ class MultiPersonWatcher(object):
         previous_box = self._last_target_box
         target_id, switched = self.chooser.update(
             self.tracks, self.tracker.tracks, t)
+        self._update_glance(t)
         target = self.tracker.tracks.get(target_id)
         if (switched and target is not None and previous_box is not None
                 and (previous is None or previous.last_seen < t)
@@ -661,5 +817,6 @@ class MultiPersonWatcher(object):
                                 else float(tr.score_ema)),
                      side=tr.person.get('side'),
                      distance=tr.person.get('distance'),
+                     idle_cost=tr.person.get('idle_cost'),
                      target=(tr.id == self.chooser.target_id))
                 for tr in self.tracks]
