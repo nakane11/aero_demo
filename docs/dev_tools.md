@@ -512,8 +512,10 @@ python3 scripts/handshake_viewer.py --ros \
 ## 複数人の見張り (`--multi-person-model`)
 
 Holistic は追跡モードで一度捕まえた人の周りしか探さないので、ほかの人が手を
-出しても気が付かない。`--multi-person-model <pose_landmarker_lite.task>` を
-付けると `src/aero_demo/multi_person_watcher.py` の見張りが別スレッドで動き、
+出しても気が付かない。見張りは既定で有効で (`--multi-person-model` の既定は
+`~/.mediapipe/models/pose_landmarker_lite.task`。ファイルが無ければ警告して
+見張りなし、`--multi-person-model none` で無効)、
+`src/aero_demo/multi_person_watcher.py` の見張りが別スレッドで動き、
 
 1. PoseLandmarker (IMAGE モード) で全員の体の骨格を取る。画像全体ではほぼ
    1 人しか返さないので、見つけた人を黒く塗って探し直す (1 回 55〜80 ms)。
@@ -531,6 +533,15 @@ Holistic は追跡モードで一度捕まえた人の周りしか探さない�
    (`[multi-person] 人でないもの ... を見ていたので` が出る)。11/24 の実機の
    録画では、立った人は肩 1.13〜1.22 m、誤検出は肩 0.62 m 以下だった。
    しゃがんだ人・子どもはこの高さを下回ると見ない。
+
+遠くの人だかりは、見張り・Holistic・Hands に渡す前に画像から消す
+(`--far-mask-depth`、既定 2.5 m。0 以下で無効)。深度がこれより遠い画素を
+黒く塗り、深度の無い画素 (人の縁・髪で抜けやすい) と、近い画素から画像の幅の
+3% 以内は塗らない。指などの細い所は深度が背景の値になりやすく、余白なしで
+塗ると手が欠けて Hands が手を見つけなくなる (10/15 試行1 の bag で 27/54 →
+0/54 フレーム、余白ありで 36/54)。1 フレーム 2〜4 ms。表示・保存の画像は元のまま。見張りが見つけるのは最大 4 人なので、奥の人で数を使い切って
+手前の人を見落とすのも防ぐ。これまでの差し出し (11/20〜11/27 の 40 回) は
+体幹がロボットから 2.2 m 以内だった。
 
 モデルは `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task`
 (`_lite` を `_full` にすると full)。lite を勧める (11/24): full だと同じプロセスの

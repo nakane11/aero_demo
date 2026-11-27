@@ -399,6 +399,42 @@ class PeoplePoseEstimator(object):
             return np.asarray(depth_img, dtype=np.float32)
         raise ValueError('Unsupported depth encoding: {}'.format(encoding))
 
+    @staticmethod
+    def mask_far_pixels(bgr_img, depth_m, max_depth, keep_margin=0.03,
+                        step=4):
+        """深度が ``max_depth`` [m] より遠い画素を黒く塗った画像を返す.
+
+        後ろの人だかりを骨格・手の検出に見せないため。深度の無い画素 (0・NaN)
+        は人の縁や髪で抜けやすいので塗らない。近い画素から画像の幅の
+        ``keep_margin`` 倍以内も塗らない: 指などの細い所は深度が背景の値に
+        なりやすく、そのまま塗ると手が欠けて MediaPipe Hands が手を見つけ
+        なくなる (10/15 試行1 の bag で 27/54 → 0/54 フレーム。幅 3% の余白で
+        38/54)。速さのため ``step`` 画素おきの粗い格子で求めて広げる。
+        ``max_depth`` が None か 0 以下、または深度とカラーの大きさが違えば
+        元の画像をそのまま返す。
+        """
+        if (max_depth is None or max_depth <= 0 or depth_m is None
+                or depth_m.shape[:2] != bgr_img.shape[:2]):
+            return bgr_img
+        h, w = depth_m.shape[:2]
+        coarse = depth_m[::step, ::step]
+        valid = np.isfinite(coarse) & (coarse > 0)
+        far = valid & (coarse > max_depth)
+        if not far.any():
+            return bgr_img
+        radius = int(round(keep_margin * w / step))
+        if radius > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+            near = cv2.dilate((valid & ~far).astype(np.uint8),
+                              kernel).astype(bool)
+            far &= ~near
+            if not far.any():
+                return bgr_img
+        keep = cv2.resize((~far).astype(np.uint8), (w, h),
+                          interpolation=cv2.INTER_NEAREST)
+        return cv2.bitwise_and(bgr_img, bgr_img, mask=keep)
+
     def estimate_3d(self, bgr_img, depth_img, intrinsics,
                     output_transform=None, roi=None, mask=None):
         """深度画像 [m] とカメラ内部パラメータから 3 次元姿勢を求める.

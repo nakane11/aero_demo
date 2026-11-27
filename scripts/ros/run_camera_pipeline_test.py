@@ -1872,6 +1872,7 @@ class HandshakePipelineNode(object):
             dcutoff=args.joint_smoothing_dcutoff)
 
         self._lock = threading.Lock()
+        self._far_mask_warned = False
         self._start_multi_person_watcher(args)
         # viewer の add/delete/redraw は直列化する (別スレッド同時呼びで落ちる。
         # self._lock 保持中にも呼ぶので別 lock)。
@@ -2395,12 +2396,15 @@ class HandshakePipelineNode(object):
         depth_m = PeoplePoseEstimator.depth_to_meters(
             depth_raw, encoding=depth_msg.encoding)
         intrinsics = CameraIntrinsics.from_matrix(info_msg.K)
+        # 見張り・骨格・手の検出には遠く (後ろの人だかり) を塗った画像を渡す。
+        # 表示・保存は元の画像のまま。
+        detect_color = self._far_masked(color, depth_m)
 
         # 複数人のときはほかの人を塗った画像で見る (1 人なら view の boxes は空)。
-        view = self._multi_person_view(color, depth_m, intrinsics,
+        view = self._multi_person_view(detect_color, depth_m, intrinsics,
                                        camera_to_base, color_msg.header.stamp)
         people, joints_2d = self.pose_estimator.estimate_3d(
-            color, depth_m, intrinsics, output_transform=camera_to_base,
+            detect_color, depth_m, intrinsics, output_transform=camera_to_base,
             mask=view)
 
         publish_overlay = self.skeleton_image_pub.get_num_connections() > 0
@@ -2480,8 +2484,8 @@ class HandshakePipelineNode(object):
         if ((hand_frames_requested or hand_tracking or armed
              or hand_follow is not None) and is_base_frame):
             hands = self.pose_estimator.estimate_hands_3d(
-                color, depth_m, intrinsics, output_transform=camera_to_base,
-                mask=view)
+                detect_color, depth_m, intrinsics,
+                output_transform=camera_to_base, mask=view)
             if detection is not None:
                 detection['hands'] = hands
             stamp = color_msg.header.stamp.to_sec()
@@ -2523,13 +2527,22 @@ class HandshakePipelineNode(object):
         待たせず、最新のフレームだけを渡して結果は次のフレームから使う。
         """
         self.multi_watcher = None
-        if not args.multi_person_model:
+        if args.far_mask_depth > 0:
+            print('[far-mask] 深度 {:.1f} m より遠い画素を塗ってから人・手を'
+                  '検出します。'.format(args.far_mask_depth))
+        if not args.multi_person_model or args.multi_person_model == 'none':
+            print('[multi-person] 見張りなし (1 人前提) で動かします。')
+            return
+        model_path = os.path.expanduser(args.multi_person_model)
+        if not os.path.exists(model_path):
+            print('[multi-person][WARN] 見張りのモデル {} が無いため、見張りなし '
+                  '(1 人前提) で動かします。'.format(model_path))
             return
         from aero_demo.multi_person_watcher import (
             MultiPersonWatcher, TargetChooser, joints_box)
         self._joints_box = joints_box
         self.multi_watcher = MultiPersonWatcher(
-            args.multi_person_model,
+            model_path,
             chooser=TargetChooser(
                 switch_score=args.multi_person_switch_score,
                 switch_margin=args.multi_person_switch_margin,
@@ -2544,8 +2557,7 @@ class HandshakePipelineNode(object):
         # 切り替えで Holistic を作り直す時間 (約 80 ms) を待たないよう予備を持つ。
         self.pose_estimator.keep_spare()
         threading.Thread(target=self._multi_person_loop, daemon=True).start()
-        print('[multi-person] 見張りを有効にしました ({})。'.format(
-            args.multi_person_model))
+        print('[multi-person] 見張りを有効にしました ({})。'.format(model_path))
 
     def _multi_person_loop(self):
         while not rospy.is_shutdown():
@@ -2589,6 +2601,16 @@ class HandshakePipelineNode(object):
             if switched:
                 self._on_multi_person_switch()
         return self.multi_watcher.view
+
+    def _far_masked(self, color, depth_m):
+        """``--far-mask-depth`` より遠い画素を塗った検出用の画像."""
+        max_depth = self.args.far_mask_depth
+        if (max_depth > 0 and depth_m.shape[:2] != color.shape[:2]
+                and not self._far_mask_warned):
+            self._far_mask_warned = True
+            print('[far-mask] 深度 {} とカラー {} の大きさが違うため、遠くを塗らずに'
+                  '検出します。'.format(depth_m.shape[:2], color.shape[:2]))
+        return PeoplePoseEstimator.mask_far_pixels(color, depth_m, max_depth)
 
     def _reset_person_tracking(self):
         """前の人の追跡・平滑化・静止判定の履歴を捨てる."""
@@ -7435,9 +7457,16 @@ def build_arg_parser():
         '--robot-hand-frame', type=str, default='r_eef_grasp_link',
         help='差し出し手判定の基準にするロボット手先の TF フレーム。')
     parser.add_argument(
-        '--multi-person-model', type=str, default='',
-        help='複数人の見張りに使う PoseLandmarker のモデル '
-             '(pose_landmarker_lite.task を推奨)。空なら見張りなし (1 人前提)。')
+        '--multi-person-model', type=str,
+        default='~/.mediapipe/models/pose_landmarker_lite.task',
+        help='複数人の見張りに使う PoseLandmarker のモデル (既定は lite)。'
+             '空か none なら見張りなし (1 人前提)。ファイルが無ければ警告して'
+             '見張りなしで動かす。')
+    parser.add_argument(
+        '--far-mask-depth', type=float, default=2.5,
+        help='深度がこれ [m] より遠い画素を塗ってから見張り・骨格・手を検出する '
+             '(後ろの人だかりを見ない)。0 以下で無効。これまでの差し出しは体幹が'
+             'ロボットから 2.2 m 以内。')
     parser.add_argument(
         '--multi-person-switch-score', type=float, default=0.5,
         help='見張りの候補スコア (0〜1) がこれ以上の人へ切り替えうる。')
