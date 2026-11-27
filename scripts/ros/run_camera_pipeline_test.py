@@ -74,7 +74,8 @@ from aero_demo.handshake_stages import (  # noqa: E402
     STAGE_HOVER_SETTLE, STAGE_IDLE, STAGE_INITIAL_POSE, STAGE_LEAD_IN,
     STAGE_NOD_WAIT, STAGE_PARTIAL_WAIT, STAGE_PLAN_APPROACH, STAGE_PLAN_IK,
     STAGE_PLAN_TRANSITION,
-    STAGE_PRESS_IN, STAGE_PRESS_REFINE, STAGE_RESULT, STAGE_SPIRAL,
+    STAGE_PRESS_IN, STAGE_PRESS_REFINE, STAGE_RELEASE_BACK, STAGE_RESULT,
+    STAGE_SPIRAL,
     STAGE_STARTING, STAGE_TRANSITION, STAGE_TRANSITION_WAIT,
     STAGE_WALK_FORWARD, numbered_title)
 from aero_demo import in_motion_correction  # noqa: E402
@@ -254,7 +255,14 @@ WALK_TURN_MIN_TIME = 1.0  # [s]
 WALK_TURN_MAX_TIME = 3.0  # [s]
 WALK_TURN_RATE = math.radians(20.0)  # [rad/s]
 WALK_TURN_TOLERANCE = math.radians(1.0)
+# 回した後に測り直して回し直す回数の上限 (1 回目を含む)。
+WALK_TURN_ATTEMPTS = 2
 SPEECH_WALK_FORWARD_TEXT = '一緒に前に進みましょう'
+# 前進の後、手を離して RELEASE_WAIT_TIME 待ち、初期姿勢へ戻しながら
+# RELEASE_BACK_DISTANCE 下がる (腕と台車の所要時間は RELEASE_BACK_MIN_TIME 以上)。
+RELEASE_WAIT_TIME = 0.5  # [s]
+RELEASE_BACK_DISTANCE = 0.5  # [m]
+RELEASE_BACK_MIN_TIME = 3.0  # [s]
 SPEECH_VOICE = '四国めたん-ノーマル'  # sound_play の voice
 SPEECH_START_TEXT = '今から行きますね'
 SPEECH_DONE_TEXT = 'どうぞ、手を握ってください'
@@ -4165,7 +4173,7 @@ class HandshakePipelineNode(object):
         """計画済みの waypoint 列を実機に送る (``_execute_on_robot_body``)。
         途中で例外になっても顔追従・手の追跡は止める。"""
         self._hand_grasped = False
-        self._initial_base_yaw = None
+        self._initial_base_pose = None
         with self._lock:
             seen = self._head_person_seen
             self._head_person_ref = (
@@ -4341,8 +4349,13 @@ class HandshakePipelineNode(object):
                   len(display_waypoints) - reach_boundary, n_transition))
 
         self._say(SPEECH_START_TEXT)
-        # 動き出す前の台車の向き (前進は人と同じ向き = これの逆向きへ進む)。
-        self._initial_base_yaw = float(self._odom_pose(self.ri.odom)[2])
+        # 動き出す前の台車の odom の姿勢 (前進は人と同じ向き = これの逆向きへ
+        # 進む)。待機点へ動き出していれば (pre-move) その前の姿勢を使う (今の
+        # odom は回り始めた後のことがある)。基準スキャンも同じ位置で取っている。
+        start_odom = (pre_move.get('start_odom')
+                      if pre_move is not None else None)
+        self._initial_base_pose = self._odom_pose(
+            start_odom if start_odom is not None else self.ri.odom)
 
         ref_scan = None
         exclude_centers = None
@@ -4634,8 +4647,40 @@ class HandshakePipelineNode(object):
                 transition_waypoints_, joint_names, robot_arm,
                 hold_neck=hand_followed)
             self._walk_forward(WALK_FORWARD_DISTANCE)
+            self._release_and_back_off(RELEASE_BACK_DISTANCE)
 
         print('[execute] 実行を終了しました。')
+
+    def _release_and_back_off(self, distance):
+        """前進の後、ハンドを開いて ``RELEASE_WAIT_TIME`` 秒待ち、腕・首を初期
+        姿勢へ戻しながら台車を ``distance`` [m] 後ろ (台車の -x) へ下げる。
+        腕と台車は同じ所要時間で同時に動かす。"""
+        self._end_hand_follow()
+        self._set_face_tracking(False)
+        self._set_hand_grasp(False)
+        self._hand_grasped = False
+        rospy.sleep(RELEASE_WAIT_TIME)
+        current_av = self.ri.angle_vector()
+        self.real_robot.angle_vector(current_av)
+        name_to_initial_angle = dict(
+            zip(self._initial_joint_names, self._initial_joint_angle_vector))
+        for joint in self.real_robot.joint_list:
+            if joint.name in name_to_initial_angle:
+                joint.joint_angle(name_to_initial_angle[joint.name])
+        target_av = self.real_robot.angle_vector()
+        point = [-float(distance), 0.0, 0.0]
+        sec, = self._limited_time_list(
+            [target_av], [point], [RELEASE_BACK_MIN_TIME])
+        print('[execute] 手を離し、初期姿勢に戻しながら {:.2f}m 下がります '
+              '({:.1f} 秒)。'.format(distance, sec))
+        self._set_activity(STAGE_RELEASE_BACK)
+        self.ri.angle_vector(target_av, sec)
+        self._send_base_trajectory([point], [sec], wait=False)
+        self.ri.wait_interpolation()
+        self.ri.move_base_trajectory_action.wait_for_result()
+        settle_time, _ = self._wait_odom_settle()
+        log_debug('[execute][release] 後退後、止まるまで {:.2f}s'.format(
+            settle_time))
 
     def _walk_forward(self, distance):
         """横並びの後、手をつないだまま台車だけを ``distance`` [m] 前 (台車の
@@ -4662,34 +4707,58 @@ class HandshakePipelineNode(object):
                       moved[0], moved[1], math.degrees(moved[2]),
                       settle_time))
 
+    def _walk_heading_error(self):
+        """前進の向き (実行開始時の向きの逆向き) から今の台車の向きを引いた角度
+        [rad] と、その出どころ ('scan_chain' / 'odom') を返す (開始時の姿勢が
+        無ければ ``(None, None)``)。
+
+        aero の /odom は指令の積分で、接近・補正中のスリップ (20〜40deg に
+        なる) が入らないので、スキャンを順につないだ照合で測った開始時からの
+        実際の回転を優先し、取れなければ odom を使う。"""
+        start = self._initial_base_pose
+        if start is None:
+            return None, None
+        actual = self._chained_scan_delta(start)
+        if actual is not None:
+            rotated, source = float(actual[2]), 'scan_chain'
+        else:
+            rotated = float(scan_matching.relative(
+                start, self._odom_pose(self.ri.odom))[2])
+            source = 'odom'
+        return (math.pi - rotated + math.pi) % (2 * math.pi) - math.pi, source
+
     def _turn_to_walk_heading(self):
         """前進の前に、台車をその場で回して実行開始時の向きの逆向き (開始時に
         ロボットが -x を向いていたとすると +x) へ向ける。腕・脚には指令を
-        送らない。差が ``WALK_TURN_TOLERANCE`` 未満なら回さない。"""
-        initial_yaw = self._initial_base_yaw
-        if initial_yaw is None:
-            return
-        yaw = float(self._odom_pose(self.ri.odom)[2])
-        dyaw = (initial_yaw + math.pi - yaw + math.pi) % (2 * math.pi) - math.pi
-        if abs(dyaw) < WALK_TURN_TOLERANCE:
-            log_debug('[execute][walk] 前進の向きとの差 {:+.1f}deg のため回転'
-                      'しません'.format(math.degrees(dyaw)))
-            return
-        point = [0.0, 0.0, dyaw]
-        sec, = self._limited_time_list(
-            None, [point], [min(WALK_TURN_MAX_TIME,
-                                max(WALK_TURN_MIN_TIME,
-                                    abs(dyaw) / WALK_TURN_RATE))])
-        print('[execute] 前進の向きへその場で {:+.1f}deg 回転します ({:.1f} 秒)。'
-              .format(math.degrees(dyaw), sec))
-        self._send_base_trajectory([point], [sec], wait=True)
-        settle_time, _ = self._wait_odom_settle()
-        after = float(self._odom_pose(self.ri.odom)[2])
-        log_debug('[execute][walk] 回転後の向きの残り {:+.1f}deg、止まるまで '
-                  '{:.2f}s'.format(
-                      math.degrees((initial_yaw + math.pi - after + math.pi)
-                                   % (2 * math.pi) - math.pi),
-                      settle_time))
+        送らない。差が ``WALK_TURN_TOLERANCE`` 未満なら回さない。回した後に
+        測り直し、残りがあれば ``WALK_TURN_ATTEMPTS`` 回まで回し直す。"""
+        for attempt in range(WALK_TURN_ATTEMPTS):
+            dyaw, source = self._walk_heading_error()
+            if dyaw is None:
+                return
+            odom_dyaw = float((self._initial_base_pose[2] + math.pi
+                               - self._odom_pose(self.ri.odom)[2] + math.pi)
+                              % (2 * math.pi) - math.pi)
+            log_debug('[execute][walk] 前進の向きとの差 {:+.1f}deg [{}] '
+                      '(odom では {:+.1f}deg)'.format(
+                          math.degrees(dyaw), source, math.degrees(odom_dyaw)))
+            if abs(dyaw) < WALK_TURN_TOLERANCE:
+                return
+            point = [0.0, 0.0, dyaw]
+            sec, = self._limited_time_list(
+                None, [point], [min(WALK_TURN_MAX_TIME,
+                                    max(WALK_TURN_MIN_TIME,
+                                        abs(dyaw) / WALK_TURN_RATE))])
+            print('[execute] 前進の向きへその場で {:+.1f}deg 回転します '
+                  '({:.1f} 秒、{})。'.format(math.degrees(dyaw), sec, source))
+            self._send_base_trajectory([point], [sec], wait=True)
+            settle_time, _ = self._wait_odom_settle()
+            log_debug('[execute][walk] 回転 {}/{} の後、止まるまで {:.2f}s'
+                      .format(attempt + 1, WALK_TURN_ATTEMPTS, settle_time))
+        dyaw, source = self._walk_heading_error()
+        if dyaw is not None:
+            log_debug('[execute][walk] 回転後の向きの残り {:+.1f}deg [{}]'
+                      .format(math.degrees(dyaw), source))
 
     def _execute_transition(self, press_wp, planned_press_wp, waypoints,
                             joint_names, robot_arm, hold_neck=False):
